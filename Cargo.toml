@@ -1,0 +1,10 @@
+[package]
+name = "skillroster"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Local skill governance for AI agents"
+repository = "https://github.com/tt-a1i/skillroster"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
