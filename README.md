@@ -23,21 +23,21 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 
 ```bash
 skillroster scan
-skillroster tidy
-skillroster fit --agent codex --task "release a service"
+skillroster report
 skillroster find "database migration"
-skillroster plan
+skillroster plan --stdin
 skillroster apply <plan-id>
 skillroster undo <receipt-id>
+skillroster status
 ```
 
 These commands describe the intended interface; they are not implemented yet.
 
 ## Status
 
-Pre-alpha. The repository currently contains the Rust CLI scaffold and the initial product boundary. The next milestone is a read-only inventory prototype.
+Pre-alpha. The repository currently contains the Rust CLI scaffold and the locked product specification. Implementation proceeds through internal checkpoints, but the product is considered complete only when the full governance loop and acceptance gates pass.
 
-See [docs/product-brief.md](docs/product-brief.md) for the initial scope and vocabulary.
+See [docs/product-spec.md](docs/product-spec.md) for the complete requirements, [docs/implementation-plan.md](docs/implementation-plan.md) for delivery checkpoints, and [CONTEXT.md](CONTEXT.md) for canonical vocabulary.
 
 ## Development
 

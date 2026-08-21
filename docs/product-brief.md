@@ -2,7 +2,7 @@
 
 ## Problem
 
-Agent Skills accumulate across Codex, Claude Code, Pi, OpenCode, Hermes, and other harnesses. Users often cannot answer basic questions reliably:
+Agent Skills accumulate across Codex, Claude Code, Pi, OpenCode, Hermes, Cursor, Gemini CLI, and GitHub Copilot. Users often cannot answer basic questions reliably:
 
 - Which Skills are installed, and where did they come from?
 - Which Skills are exposed to each agent?
@@ -37,9 +37,9 @@ The complete local collection of known Skills, including active and cold entries
 
 The curated set of Skills visible to one agent in one scope. A roster is a view of the library, not a second copy of it.
 
-### Cold Skill
+### On-demand Skill
 
-A valid Skill retained in the library but omitted from a default roster. It remains discoverable through local search and can be proposed for a task.
+A valid Skill retained in the Library but omitted from a default Roster. It remains discoverable through local search and can be proposed for a task.
 
 ### Evidence
 
@@ -53,19 +53,19 @@ A deterministic preview of proposed filesystem or configuration changes. A plan 
 
 A record of an applied plan containing enough information to verify the result and undo SkillRoster-owned changes.
 
-## V1 scope
+## Complete first-release scope
 
 1. Discover supported local agent harnesses and their Skill locations.
 2. Build a normalized, path-aware inventory without modifying files.
 3. Identify copies, symlinks, collisions, broken references, and likely duplicates.
-4. Maintain a local search index for cold Skills.
+4. Maintain a local search index for On-demand Skills.
 5. Produce usage reports with explicit evidence quality and time windows.
 6. Generate per-agent roster proposals.
 7. Apply approved changes through bounded adapters and write receipts.
 8. Undo SkillRoster-owned changes without deleting canonical Skill contents.
 9. Expose machine-readable output suitable for agent callers.
 
-## Non-goals for V1
+## Non-goals for the first release
 
 - No MCP server.
 - No hosted marketplace or mandatory account.
@@ -73,6 +73,7 @@ A record of an applied plan containing enough information to verify the result a
 - No silent modification of agent configuration.
 - No assumption that every harness supports the same activation mechanism.
 - No claim that a successful scan proves a Skill is useful or safe at runtime.
+- No HTML report, GUI, daemon, plugin SDK, generic Agent adapter, or built-in model call.
 
 ## Safety contract
 
@@ -91,3 +92,5 @@ A record of an applied plan containing enough information to verify the result a
 - Adapter boundary per agent harness.
 - JSON output for agent callers; concise terminal output for people.
 - One thin bootstrap Skill that teaches agents when to call the CLI.
+
+The normative requirements, command contract, privacy rules, and completion gates live in [product-spec.md](product-spec.md). Domain terms are defined in the repository's [CONTEXT.md](../CONTEXT.md).
