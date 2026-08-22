@@ -2611,6 +2611,103 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
 }
 
 #[test]
+fn archived_same_name_identity_cannot_return_through_active_variant() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex = home.join(".codex/skills/shared-route");
+    let claude = home.join(".claude/skills/shared-route");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        codex.join("SKILL.md"),
+        "---\nname: shared-route\ndescription: archived identity\n---\narchived-only-marker\n",
+    )
+    .unwrap();
+    fs::write(
+        claude.join("SKILL.md"),
+        "---\nname: shared-route\ndescription: active identity\n---\nactive-search-marker\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let before = json_output(&run(
+        &[&common[..], &["find", "active search marker"]].concat(),
+        None,
+    ));
+    assert_eq!(before["result"]["matches"][0]["variant_count"], 2);
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let codex_skill_id = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["agent"] == "codex")
+        .and_then(|placement| placement["skill_id"].as_str())
+        .unwrap();
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "roster_changes": [{
+            "agent": "codex",
+            "skill_id": codex_skill_id,
+            "state": "archived"
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+
+    let after = json_output(&run(
+        &[&common[..], &["find", "active search marker"]].concat(),
+        None,
+    ));
+    assert_eq!(after["result"]["matches"][0]["variant_count"], 1);
+    assert!(after["result"]["matches"][0]["variants"].is_null());
+
+    json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+}
+
+#[test]
 fn find_rejects_content_drift_and_requests_rescan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

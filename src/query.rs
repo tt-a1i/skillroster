@@ -1038,7 +1038,7 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    find_matching(scan, task, limit, None)
+    find_matching(scan, task, limit, None, None)
 }
 
 pub(crate) fn find_matching(
@@ -1046,6 +1046,7 @@ pub(crate) fn find_matching(
     task: &str,
     limit: usize,
     candidate_ids: Option<&BTreeSet<String>>,
+    variant_eligible_ids: Option<&BTreeSet<String>>,
 ) -> Vec<FindMatch> {
     let query = task.trim().to_lowercase();
     if query.is_empty() || limit == 0 {
@@ -1057,7 +1058,7 @@ pub(crate) fn find_matching(
     for skill in scan
         .skills
         .iter()
-        .filter(|skill| candidate_ids.is_none_or(|ids| ids.contains(&skill.id)))
+        .filter(|skill| variant_eligible_ids.is_none_or(|ids| ids.contains(&skill.id)))
     {
         variants_by_name
             .entry(skill.name.trim().to_lowercase())
@@ -1128,18 +1129,17 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
-            let all_variant_skill_ids = variants_by_name
-                .get(&name.trim().to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| vec![skill.id.clone()]);
-            let variant_count = all_variant_skill_ids.len();
+            let all_variant_skill_ids = variants_by_name.get(&name.trim().to_lowercase());
+            let variant_count = all_variant_skill_ids.map_or(1, Vec::len);
             let variants_truncated = variant_count > 10;
             let variant_skill_ids = if variant_count > 1 {
                 std::iter::once(skill.id.clone())
                     .chain(
                         all_variant_skill_ids
                             .into_iter()
-                            .filter(|variant_id| variant_id != &skill.id),
+                            .flat_map(|variant_ids| variant_ids.iter())
+                            .filter(|variant_id| *variant_id != &skill.id)
+                            .cloned(),
                     )
                     .take(10)
                     .collect::<Vec<_>>()
@@ -1621,7 +1621,7 @@ mod tests {
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
 
         let eligible = BTreeSet::from([matched.skill_id.clone()]);
-        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible));
+        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&eligible));
         let filtered_match = filtered
             .iter()
             .find(|candidate| candidate.name == "tech-essay-writer")
@@ -1630,6 +1630,16 @@ mod tests {
         assert!(!filtered_match.variants_truncated);
         assert!(filtered_match.variant_skill_ids.is_empty());
         assert!(filtered_match.variants.is_empty());
+
+        let all_routable = scan
+            .skills
+            .iter()
+            .map(|skill| skill.id.clone())
+            .collect::<BTreeSet<_>>();
+        let partial_match =
+            find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&all_routable)).remove(0);
+        assert_eq!(partial_match.variant_count, 2);
+        assert_eq!(partial_match.variants.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 

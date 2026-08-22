@@ -1977,15 +1977,26 @@ fn find_command(
         .into_iter()
         .map(|id| id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
-    for skill_id in candidate_ids.clone() {
+    let mut routable_ids = scan
+        .skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for skill_id in routable_ids.clone() {
         let id = SkillId::parse(skill_id.clone())?;
         let states = store.roster_states_for_skill(&id)?;
         if !states.is_empty() && states.iter().all(|state| *state == RosterState::Archived) {
-            candidate_ids.remove(&skill_id);
+            routable_ids.remove(&skill_id);
         }
     }
-    let mut matches =
-        crate::query::find_matching(&scan, &retrieval_query, limit, Some(&candidate_ids));
+    candidate_ids.retain(|skill_id| routable_ids.contains(skill_id));
+    let mut matches = crate::query::find_matching(
+        &scan,
+        &retrieval_query,
+        limit,
+        Some(&candidate_ids),
+        Some(&routable_ids),
+    );
     let mut warnings = Vec::new();
     let mut rescan_required = false;
     for (index, found) in matches.iter_mut().enumerate() {
