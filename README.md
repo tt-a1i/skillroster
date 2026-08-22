@@ -131,3 +131,7 @@ cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --help
 ```
+
+## License
+
+SkillRoster is licensed under the [Apache License 2.0](LICENSE).
