@@ -52,6 +52,64 @@ fn assert_find_paths_are_readable(found: &Value) {
 }
 
 #[test]
+fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/archify");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: archify\ndescription: Create interactive architecture workflow diagrams\n---\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let unhinted = json_output(&run(
+        &[&common[..], &["find", "把架构流程画成可交互图"]].concat(),
+        None,
+    ));
+    assert!(unhinted["result"]["matches"].as_array().unwrap().is_empty());
+    assert!(
+        unhinted["result"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("--hint"))
+    );
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "把架构流程画成可交互图",
+                "--hint",
+                "interactive architecture workflow diagram",
+                "--hint",
+                "  interactive architecture workflow diagram  ",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["task"], "把架构流程画成可交互图");
+    assert_eq!(
+        found["result"]["retrieval_hints"],
+        json!(["interactive architecture workflow diagram"])
+    );
+    assert_eq!(found["result"]["matches"][0]["name"], "archify");
+}
+
+#[test]
 fn finding_drilldown_is_bounded_and_pageable() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

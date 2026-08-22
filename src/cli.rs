@@ -95,6 +95,10 @@ pub struct ReportArgs {
 pub struct FindArgs {
     pub task: String,
 
+    /// Add an Agent-authored lexical retrieval hint while preserving TASK. Repeatable.
+    #[arg(long = "hint", value_name = "TEXT")]
+    pub hints: Vec<String>,
+
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
     pub limit: u16,
 }

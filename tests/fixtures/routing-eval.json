@@ -38,5 +38,12 @@
   {"task":"clarify ambiguous domain concepts","skill":"domain-modeling"},
   {"task":"review a GitHub pull request inline","skill":"github-code-review"},
   {"task":"publish PR review comments","skill":"github-code-review"},
-  {"task":"inspect GitHub PR diffs","skill":"github-code-review"}
+  {"task":"inspect GitHub PR diffs","skill":"github-code-review"},
+  {"task":"调查官方 API 文档","hints":["research official API documentation"],"skill":"research"},
+  {"task":"审查一个拉取请求","hints":["review pull request code changes"],"skill":"code-review"},
+  {"task":"诊断命令的性能回归","hints":["diagnose command performance regression"],"skill":"diagnose"},
+  {"task":"画出系统请求生命周期","hints":["visualize system request lifecycle diagram"],"skill":"archify"},
+  {"task":"修改并收紧技术文章","hints":["edit tighten technical article"],"skill":"edit-article"},
+  {"task":"从 GitHub 安装一个 Skill","hints":["install skill from GitHub"],"skill":"skill-installer"},
+  {"task":"定义项目的统一领域术语","hints":["define domain terminology ubiquitous language"],"skill":"domain-modeling"}
 ]
