@@ -59,11 +59,13 @@ pub fn run(cli: Cli) -> Result<Output> {
     }
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    // Every command opens the same SQLite database, so even nominally read-only
-    // commands must serialize with lifecycle delete on platforms that forbid
-    // deleting an open database handle. Mutating change APIs use their locked
-    // variants below because this guard covers the full SQLite/filesystem unit.
-    let _write_lock = change::WriteLock::acquire(&state_dir)?;
+    // Shared guards let Agent read/analysis commands run concurrently while
+    // still excluding lifecycle deletion and filesystem mutations on Windows.
+    let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
+        change::StateLock::acquire_exclusive(&state_dir)?
+    } else {
+        change::StateLock::acquire_shared(&state_dir)?
+    };
     let store = StateStore::open(&database_path)?;
 
     let (command, result, warnings, actions) = match cli.command {
@@ -99,7 +101,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 warnings,
                 vec![action(
                     "report",
-                    &["report", "--json"],
+                    &["report", "--summary", "--json"],
                     false,
                     false,
                     "scan_complete",
@@ -108,7 +110,7 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
         Some(Command::Report(args)) => (
             "report",
-            report_command(&store, args.finding.as_deref())?,
+            report_command(&store, args.finding.as_deref(), args.summary)?,
             vec![],
             vec![action(
                 "plan",
@@ -258,6 +260,16 @@ pub fn run(cli: Cli) -> Result<Output> {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
     })
+}
+
+fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        Some(Command::Apply(_) | Command::Undo(_))
+            | Some(Command::Lifecycle(crate::cli::LifecycleArgs {
+                command: LifecycleCommand::Purge(_),
+            }))
+    )
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
@@ -973,7 +985,7 @@ fn scan_command(
     ))
 }
 
-fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
+fn report_command(store: &StateStore, finding: Option<&str>, summary_only: bool) -> Result<Value> {
     if let Some(id) = finding {
         let id = FindingId::parse(id.to_string())?;
         let stored = store
@@ -983,13 +995,60 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
             object.insert("evidence_ids".into(), json!(stored.evidence_ids));
+            let report = store
+                .get_report(&stored.report_id)?
+                .ok_or_else(|| anyhow!("Report {} does not exist", stored.report_id))?;
+            let scan: ScanResult = store
+                .scan_payload(&report.scan_id)?
+                .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            let affected_placement_ids = object
+                .get("affected_placement_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let placements = scan
+                .placements
+                .iter()
+                .filter(|placement| {
+                    affected_placement_ids
+                        .iter()
+                        .any(|id| id.as_str() == Some(&placement.id))
+                })
+                .map(|placement| {
+                    json!({
+                        "id": placement.id,
+                        "skill_id": placement.skill_id,
+                        "agent": placement.agent.map(AgentKind::id),
+                        "path": placement.entrypoint,
+                        "root": placement.root,
+                        "link_target": placement.link_target,
+                        "link_status": placement.link_status,
+                        "default_exposed": placement.default_exposed,
+                        "content_digest": placement.content_digest
+                    })
+                })
+                .collect::<Vec<_>>();
+            let evidence = stored
+                .evidence_ids
+                .iter()
+                .map(|id| store.get_evidence(id))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            object.insert("placements".into(), json!(placements));
+            object.insert("evidence".into(), json!(evidence));
         }
         return Ok(details);
     }
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id {
-            return Ok(existing.summary);
+            return Ok(if summary_only {
+                compact_report(&existing.summary)
+            } else {
+                existing.summary
+            });
         }
     }
     let report = crate::query::build_report(&scan);
@@ -1072,7 +1131,29 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
         },
         &findings,
     )?;
-    Ok(value)
+    Ok(if summary_only {
+        compact_report(&value)
+    } else {
+        value
+    })
+}
+
+fn compact_report(report: &Value) -> Value {
+    let findings = report["findings"].as_array().cloned().unwrap_or_default();
+    json!({
+        "report_id": report["report_id"],
+        "snapshot_id": report["snapshot_id"],
+        "skill_count": report["skill_count"],
+        "placement_count": report["placement_count"],
+        "default_exposure": report["default_exposure"],
+        "observed_use_agent_count": report["observed_use_agent_count"],
+        "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
+        "primary_metrics": report["primary_metrics"],
+        "finding_count": findings.len(),
+        "findings": findings.into_iter().take(3).collect::<Vec<_>>(),
+        "category_counts": report["category_counts"],
+        "files_changed": false
+    })
 }
 
 fn finding_json(
@@ -1234,25 +1315,20 @@ fn current_readable_skill_paths(
 
     let mut paths = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut rejected_existing = false;
     for path in candidates {
         if !seen.insert(path.clone()) || !path.exists() {
             continue;
         }
         let Ok(resolved) = std::fs::canonicalize(&path) else {
-            rejected_existing = true;
             continue;
         };
         if !resolved.is_file() || !approved_roots.iter().any(|root| resolved.starts_with(root)) {
-            rejected_existing = true;
             continue;
         }
         let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
-            rejected_existing = true;
             continue;
         };
         if actual_id != skill.id || actual_fingerprint != skill.content_digest {
-            rejected_existing = true;
             continue;
         }
         paths.push(path.display().to_string());
@@ -1260,7 +1336,7 @@ fn current_readable_skill_paths(
     paths.sort();
     paths.dedup();
     Ok(CurrentSkillPaths {
-        drifted: rejected_existing || paths.is_empty(),
+        drifted: paths.is_empty(),
         paths,
     })
 }
@@ -1925,13 +2001,13 @@ fn prepare_plan(
     {
         bail!("Plan has no effective Roster state change");
     }
-    store.save_plan(&plan_record(
-        &prepared,
-        input,
-        roster_before,
-        library_before,
-    )?)?;
-    let impact = if matches!(effective_origin, PlanOrigin::RosterGovernance) {
+    let change_summary = json!({
+        "operation_count": prepared.operations.len(),
+        "roster_change_count": prepared.roster_changes.len(),
+        "library_change_count": prepared.library_changes.len(),
+        "source_update_count": prepared.source_updates.len()
+    });
+    let mut impact = if matches!(effective_origin, PlanOrigin::RosterGovernance) {
         source_update_diffs
             .first()
             .cloned()
@@ -1939,6 +2015,29 @@ fn prepare_plan(
     } else {
         json!(source_update_diffs)
     };
+    if let Some(object) = impact.as_object_mut() {
+        object.insert(
+            "roster".into(),
+            json!({
+                "before": roster_before,
+                "after": prepared.roster_changes
+            }),
+        );
+        object.insert(
+            "library".into(),
+            json!({
+                "before": library_before,
+                "after": prepared.library_changes
+            }),
+        );
+        object.insert("operation_count".into(), json!(prepared.operations.len()));
+    }
+    store.save_plan(&plan_record(
+        &prepared,
+        input,
+        roster_before.clone(),
+        library_before.clone(),
+    )?)?;
     Ok(json!({
         "plan_id": prepared.id,
         "snapshot_id": prepared.scan_id,
@@ -1949,6 +2048,7 @@ fn prepare_plan(
         "evidence_ids": prepared.evidence_ids,
         "source_updates": prepared.source_updates,
         "library_changes": prepared.library_changes,
+        "change_summary": change_summary,
         "diff_summary": if matches!(effective_origin, PlanOrigin::SourceUpdate) {
             json!(source_update_diffs)
         } else {
@@ -2197,12 +2297,13 @@ fn setup_command(store: &StateStore, home: &Path, state_dir: &Path) -> Result<Va
         json!({"schema_version": 1, "scan_id": snapshot.id, "operations": operations}),
         PlanOrigin::BootstrapSetup,
     )?;
+    let operation_count = plan["operations"].as_array().map_or(0, Vec::len);
     Ok(json!({
         "detected_agents": detected,
         "plan_id": plan["plan_id"],
         "state": "preview_ready",
         "bootstrap_skill": "skillroster",
-        "operations": plan["operations"],
+        "operation_count": operation_count,
         "canonical_deletion_count": 0,
         "confirmation_required": true,
         "files_changed": false
@@ -3027,6 +3128,50 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn readable_skill_path_ignores_stale_alternatives_when_a_valid_copy_exists() {
+        let temp = TempDir::new().unwrap();
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        for (root, description) in [
+            (&first_root, "Current database migration helper"),
+            (&second_root, "Older unrelated helper"),
+        ] {
+            let directory = root.join("example");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: example\ndescription: {description}\n---\n"),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(temp.path().join("home"));
+        options.explicit_skill_roots = vec![
+            ExplicitSkillRoot {
+                agent: AgentKind::Codex,
+                path: first_root.clone(),
+            },
+            ExplicitSkillRoot {
+                agent: AgentKind::ClaudeCode,
+                path: second_root,
+            },
+        ];
+        options.include_session_evidence = false;
+        let scan = scan::scan(&options).unwrap();
+        let skill_id = scan
+            .placements
+            .iter()
+            .find(|placement| placement.root == first_root)
+            .unwrap()
+            .skill_id
+            .clone();
+
+        let current = current_readable_skill_paths(&scan, temp.path(), &skill_id).unwrap();
+
+        assert!(!current.drifted);
+        assert_eq!(current.paths.len(), 1);
+    }
 
     #[test]
     fn orphan_applied_journal_is_listed_and_blocks_the_next_write() {

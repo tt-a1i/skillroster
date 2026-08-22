@@ -1816,10 +1816,19 @@ fn reject_unresolved_recovery_except(state_dir: &Path, except: &str) -> Result<(
     Ok(())
 }
 
-pub(crate) struct WriteLock(File);
+#[derive(Debug)]
+pub(crate) struct StateLock(File);
 
-impl WriteLock {
-    pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
+impl StateLock {
+    pub(crate) fn acquire_shared(state_dir: &Path) -> Result<Self> {
+        Self::acquire(state_dir, false)
+    }
+
+    pub(crate) fn acquire_exclusive(state_dir: &Path) -> Result<Self> {
+        Self::acquire(state_dir, true)
+    }
+
+    fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
         let path = state_dir.join("write.lock");
         let file = OpenOptions::new()
             .read(true)
@@ -1827,11 +1836,19 @@ impl WriteLock {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(|e| ChangeError::io("open write lock", &path, e))?;
-        file.try_lock_exclusive().map_err(|error| {
+            .map_err(|e| ChangeError::io("open state lock", &path, e))?;
+        let result = if exclusive {
+            FileExt::try_lock_exclusive(&file)
+        } else {
+            FileExt::try_lock_shared(&file)
+        };
+        result.map_err(|error| {
             let mut result = ChangeError::new(
                 "write_locked",
-                format!("another Apply or Undo holds {}: {error}", path.display()),
+                format!(
+                    "another SkillRoster command is using local state guarded by {}: {error}",
+                    path.display()
+                ),
             );
             result.retryable = true;
             result
@@ -1840,9 +1857,19 @@ impl WriteLock {
     }
 }
 
-impl Drop for WriteLock {
+impl Drop for StateLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.0);
+    }
+}
+
+pub(crate) struct WriteLock {
+    _guard: StateLock,
+}
+
+impl WriteLock {
+    pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
+        StateLock::acquire_exclusive(state_dir).map(|guard| Self { _guard: guard })
     }
 }
 
@@ -1858,6 +1885,21 @@ mod tests {
         fs::create_dir(&root).unwrap();
         fs::create_dir(&state).unwrap();
         (temp, root, state)
+    }
+
+    #[test]
+    fn state_lock_allows_concurrent_readers_but_excludes_writers() {
+        let (_temp, _root, state) = fixture();
+        let first_reader = StateLock::acquire_shared(&state).unwrap();
+        let second_reader = StateLock::acquire_shared(&state).unwrap();
+        let blocked_writer = StateLock::acquire_exclusive(&state).unwrap_err();
+        assert_eq!(blocked_writer.code, "write_locked");
+        drop(second_reader);
+        drop(first_reader);
+        let writer = StateLock::acquire_exclusive(&state).unwrap();
+        let blocked_reader = StateLock::acquire_shared(&state).unwrap_err();
+        assert_eq!(blocked_reader.code, "write_locked");
+        drop(writer);
     }
 
     #[test]

@@ -9,11 +9,11 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 
 ## Inspect and propose
 
-1. Run `skillroster scan --json`, then `skillroster report --json`.
+1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis; do not request the full report unless exhaustive Finding enumeration is necessary.
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused.
-3. Use stable Finding and Evidence IDs for follow-up questions. Run `report --finding ID --json` against the same Snapshot rather than silently rescanning.
+3. Use stable Finding and Evidence IDs for follow-up questions. Run `report --finding ID --json` against the same Snapshot rather than silently rescanning. Explain its returned placement paths, link targets, and Evidence records; do not make the user infer them from opaque IDs.
 4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. Set request `schema_version` to `1`, include the latest `scan_id` and one or more relevant `evidence_ids`, and submit only the supported governance fields.
-5. Present the validated Plan in one viewport: diagnosis, four core metrics, three main Findings, before/after counts, affected Agents, uncertainty, canonical deletion count, reversibility, and Plan ID.
+5. Present the validated Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `impact` before/after facts, affected Agents, uncertainty, canonical deletion count, reversibility, and Plan ID. The source-oriented `diff_summary` may be empty for ordinary Roster or Library Plans; do not treat that as a missing Plan delta.
 
 Use only these Plan request families:
 
@@ -37,6 +37,6 @@ Use `skillroster status --json` for pending Plans, the last Receipt, retention, 
 
 ## Find an on-demand Skill
 
-Run `skillroster find "TASK" --json`. Explain the top matches and evidence, then read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
+Run `skillroster find "TASK" --json`. Explain the top matches and evidence, then read the selected `SKILL.md` directly from its returned path. If the lexical matches are clearly about another domain, retry once with concrete tool or operation terms already implied by the task (for example, `MySQL DDL` for a database migration); do not present an irrelevant top result as confidence. Finding a Skill does not activate or install it.
 
 Never parse styled terminal output, invent a health score, infer token savings, or claim files changed without a successful Receipt.

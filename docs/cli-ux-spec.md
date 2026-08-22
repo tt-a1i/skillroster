@@ -89,6 +89,11 @@ Show Agent coverage as it progresses, then independent Skill count, placement co
 
 Lead with four counts: independent Skills, placements, default exposure, and observed-use coverage. Show the three highest-priority Findings, then category totals. Evidence detail remains behind `report --finding`.
 
+Agent callers use `report --summary --json` by default. The compact payload
+contains those four metrics, total Finding count, category totals, and at most
+three complete Finding summaries. Full `report --json` is an explicit
+exhaustive view, not the bootstrap workflow default.
+
 ### `find`
 
 Show ranked matches with Skill name, current Roster state, source, and concise match reasons. Empty results are calm, successful output. Find never implies activation.

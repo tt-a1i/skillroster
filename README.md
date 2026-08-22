@@ -25,7 +25,8 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 
 ```bash
 skillroster scan --json
-skillroster report --json
+skillroster report --summary --json
+skillroster report --finding <finding-id> --json
 skillroster find "database migration" --json
 skillroster plan --stdin --json
 skillroster apply <plan-id> --json
@@ -44,6 +45,8 @@ commands never change Agent files. Plan stores an immutable preview, while Apply
 and Undo use fingerprints, journals, receipts, and recovery blocking.
 See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
 Plan/Receipt history or deleting the local database.
+See [docs/installation.md](docs/installation.md) for verified Release, Cargo,
+and Homebrew installation paths.
 
 Agent-authored Plans are declarative: they reference the latest Snapshot and
 Evidence IDs, then request Roster states, managed/hosted Library placement, or a

@@ -73,6 +73,10 @@ pub enum Command {
 pub struct ReportArgs {
     #[arg(long)]
     pub finding: Option<String>,
+
+    /// Return core metrics and the three highest-priority Findings.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(Debug, Args)]

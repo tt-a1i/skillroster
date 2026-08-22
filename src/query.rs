@@ -959,14 +959,19 @@ pub(crate) fn find_matching(
                 .to_lowercase();
             let triggers = skill.metadata.triggers.join(" ").to_lowercase();
             let all_text = skill_search_text(skill).to_lowercase();
-            let haystack_tokens = tokens(&all_text);
-            let overlap = query_tokens.intersection(&haystack_tokens).count();
-            let mut score = overlap as f64 * 8.0;
+            let name_overlap = query_tokens.intersection(&tokens(&name)).count();
+            let trigger_overlap = query_tokens.intersection(&tokens(&triggers)).count();
+            let description_overlap = query_tokens.intersection(&tokens(&description)).count();
+            let overlap = query_tokens.intersection(&tokens(&all_text)).count();
+            let mut score = name_overlap as f64 * 24.0
+                + trigger_overlap as f64 * 18.0
+                + description_overlap as f64 * 12.0
+                + overlap as f64 * 3.0;
             let mut reasons = Vec::new();
             if name == query {
                 score += 100.0;
                 reasons.push("exact_name".into());
-            } else if name.contains(&query) || query.contains(&name) {
+            } else if name.contains(&query) {
                 score += 45.0;
                 reasons.push("name_phrase".into());
             }
@@ -978,8 +983,17 @@ pub(crate) fn find_matching(
                 score += 25.0;
                 reasons.push("description_phrase".into());
             }
+            if name_overlap > 0 {
+                reasons.push(format!("name_tokens:{name_overlap}"));
+            }
+            if trigger_overlap > 0 {
+                reasons.push(format!("trigger_tokens:{trigger_overlap}"));
+            }
+            if description_overlap > 0 {
+                reasons.push(format!("description_tokens:{description_overlap}"));
+            }
             if overlap > 0 {
-                reasons.push(format!("token_overlap:{overlap}"));
+                reasons.push(format!("all_text_tokens:{overlap}"));
             }
             let observed_usage = scan.usage.iter().any(|usage| {
                 usage.skill_id == skill.id && usage.quality == EvidenceQuality::Observed
@@ -1276,6 +1290,54 @@ mod tests {
                 .contains(&"declared_trigger".into())
         );
         assert_eq!(matches[0].paths.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn find_prefers_task_terms_in_name_over_incidental_body_mentions() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-routing-fields-{nonce}"));
+        for (directory, contents) in [
+            (
+                "aaa-general-agent",
+                "---\nname: aaa-general-agent\ndescription: General coding assistant\n---\nCan also discuss database migration among many unrelated tasks.",
+            ),
+            (
+                "database-migration",
+                "---\nname: database-migration\ndescription: Plan and review safe schema changes\n---\nUse for production data changes.",
+            ),
+            (
+                "review",
+                "---\nname: review\ndescription: Review code\n---\nGeneric review helper.",
+            ),
+            (
+                "github-code-review",
+                "---\nname: github-code-review\ndescription: Review pull requests and publish inline comments\n---\nInspect a pull request diff.",
+            ),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), contents).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let matches = find(&scan, "database migration", 2);
+
+        assert_eq!(matches[0].name, "database-migration");
+        assert!(matches[0].match_reasons.contains(&"name_tokens:2".into()));
+        let review_matches = find(&scan, "review a pull request", 2);
+        assert_eq!(review_matches[0].name, "github-code-review");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -302,6 +302,18 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn scan_payload<T: DeserializeOwned>(&self, id: &ScanId) -> StorageResult<Option<T>> {
+        self.connection
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|payload| from_json(&payload))
+            .transpose()
+    }
+
     pub fn latest_report(&self) -> StorageResult<Option<ReportRecord>> {
         let stored = self
             .connection
@@ -612,6 +624,59 @@ impl StateStore {
         Ok(count == 1)
     }
 
+    pub fn get_evidence(&self, id: &EvidenceId) -> StorageResult<Option<EvidenceRecord>> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT scan_id, kind, quality, subject_type, subject_id, path, digest,
+                        details_json, observed_at
+                 FROM evidence WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        stored
+            .map(
+                |(
+                    scan_id,
+                    kind,
+                    quality,
+                    subject_type,
+                    subject_id,
+                    path,
+                    digest,
+                    details,
+                    observed_at,
+                )| {
+                    Ok(EvidenceRecord {
+                        id: id.clone(),
+                        scan_id: ScanId::parse(scan_id).map_err(invalid_id)?,
+                        kind: enum_from_text(&kind)?,
+                        quality: enum_from_text(&quality)?,
+                        subject_type,
+                        subject_id,
+                        path,
+                        digest,
+                        details: from_json(&details)?,
+                        observed_at,
+                    })
+                },
+            )
+            .transpose()
+    }
+
     pub fn save_roster_entry(&self, entry: &RosterEntry) -> StorageResult<()> {
         self.connection.execute(
             "INSERT INTO roster_entries (agent_id, skill_id, state, updated_at)
@@ -719,11 +784,26 @@ impl StateStore {
              ORDER BY bm25(skills_fts, 0.0, 8.0, 5.0, 6.0, 1.0), skill_id
              LIMIT ?2",
         )?;
-        let ids = statement
+        let mut ids = statement
             .query_map(params![expression, limit as i64], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            let mut fallback = self.connection.prepare(
+                "SELECT skill_id FROM skills_fts
+                 WHERE instr(lower(name), lower(?1)) > 0
+                    OR instr(lower(description), lower(?1)) > 0
+                    OR instr(lower(triggers), lower(?1)) > 0
+                    OR instr(lower(body), lower(?1)) > 0
+                 ORDER BY skill_id LIMIT ?2",
+            )?;
+            ids = fallback
+                .query_map(params![task.trim(), limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+        }
         ids.into_iter()
             .map(|id| SkillId::parse(id).map_err(invalid_id))
             .collect()
@@ -1847,6 +1927,26 @@ mod tests {
             2
         );
         assert!(store.search_skill_ids("\" OR *", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_falls_back_to_unicode_phrase_matching() {
+        let store = StateStore::open_in_memory().unwrap();
+        let skill = SkillId::parse("skill_database").unwrap();
+        store
+            .index_skill(
+                &skill,
+                "dms-mysql",
+                "MySQL 数据库管理和表结构查询",
+                "",
+                "执行查询",
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.search_skill_ids("数据库管理", 5).unwrap(),
+            vec![skill]
+        );
     }
 
     #[test]
