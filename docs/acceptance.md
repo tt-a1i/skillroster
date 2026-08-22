@@ -226,6 +226,32 @@ Plan. Selected IDs still lead to compact Evidence drilldown. Automated tests
 cover pagination, filtering, action argv, invalid flag combinations, and plain
 60-, 80-, and 120-column rendering.
 
+## Agent-led confirmed-source normalization dogfood
+
+The 1.8.5 pre-release dogfood used a fresh isolated state directory against the
+real eight-Agent home. Before source confirmation, Scan reported 244
+independent Skills, 740 placements, 548 default exposures, and 16 escaping-link
+placements without reading those targets. The trust-resolution response listed
+four observed targets. Two were a symlink alias and physical path for the same
+source; following the response literally caused the pre-fix inventory to add
+four source placements instead of three.
+
+Confirmed source roots are now resolved only after the caller explicitly
+supplies `--source-root`. The scanner preserves each confirmed alias for trust
+containment but inventories its canonical physical directory once. The same
+real rescan completed in 10.51 seconds with 231 independent Skills, 743
+placements, unchanged default exposure at 548, no unsafe-link warning, and no
+escaping-link Finding. The lower Skill count reflects formerly unread aliases
+resolving to shared content rather than removal or archive activity.
+
+On that Snapshot, `setup` prepared but did not apply a six-operation Plan for
+five logical bootstrap targets across three physical roots. The Chinese
+cross-Agent Skill-management task returned `agent-skills-manager` at rank one.
+The exact-duplicate Finding retained six logical placements, three physical
+canonical candidates, and a bounded five-operation managed-Library Plan. No
+real Agent file was changed; Apply/Undo remained confined to automated
+temporary-home acceptance tests.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

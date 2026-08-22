@@ -595,6 +595,10 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     let mut result = ScanResult::default();
     let known = known_agent_roots(&options.home);
     let plugin_roots = codex_plugin_skill_roots(&options.home, &mut result.warnings);
+    // These paths are already an explicit trust decision from the caller.
+    // Preserve the supplied aliases for link-containment checks, while
+    // inventorying each resolved physical source only once.
+    let confirmed_source_roots = normalized_confirmed_source_roots(&options.explicit_source_roots);
     let shared_roots = [
         options.home.join(".agents_skills"),
         options.home.join(".skillroster/library"),
@@ -611,6 +615,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
                 .map(|root| root.path.clone()),
         )
         .chain(options.explicit_source_roots.iter().cloned())
+        .chain(confirmed_source_roots.iter().cloned())
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
 
@@ -648,7 +653,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
             &mut candidates,
         );
     }
-    for root in &options.explicit_source_roots {
+    for root in &confirmed_source_roots {
         observe_skill_root(
             root,
             SkillRootPolicy {
@@ -726,6 +731,16 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     result.skills.sort_by(|a, b| a.id.cmp(&b.id));
     result.placements.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
+}
+
+fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut normalized = roots
+        .iter()
+        .map(|root| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn observe_excluded_session_roots(
@@ -2234,10 +2249,11 @@ enabled = true
 
     #[cfg(unix)]
     #[test]
-    fn explicit_source_root_approves_links_without_adding_agent_exposure() {
+    fn explicit_source_roots_deduplicate_physical_sources_and_preserve_confirmed_aliases() {
         let root = temp_directory("source-root");
         let home = root.join("home");
         let source_root = root.join("sources");
+        let source_alias = root.join("source-alias");
         let source_skill = source_root.join("external");
         fs::create_dir_all(&source_skill).unwrap();
         fs::write(
@@ -2245,31 +2261,40 @@ enabled = true
             "---\nname: external\ndescription: External source Skill\n---\n",
         )
         .unwrap();
+        std::os::unix::fs::symlink(&source_root, &source_alias).unwrap();
         let codex_root = home.join(".codex/skills");
+        let claude_root = home.join(".claude/skills");
         fs::create_dir_all(&codex_root).unwrap();
-        std::os::unix::fs::symlink(&source_skill, codex_root.join("external")).unwrap();
+        fs::create_dir_all(&claude_root).unwrap();
+        std::os::unix::fs::symlink(source_alias.join("external"), codex_root.join("external"))
+            .unwrap();
+        std::os::unix::fs::symlink(&source_skill, claude_root.join("external")).unwrap();
 
         let mut options = ScanOptions::for_home(&home);
-        options.explicit_source_roots.push(source_root.clone());
+        options.explicit_source_roots = vec![source_alias, source_root.clone()];
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
 
         assert!(result.warnings.is_empty());
         assert_eq!(result.skills.len(), 1);
-        assert_eq!(result.placements.len(), 2);
+        assert_eq!(result.placements.len(), 3);
         assert_eq!(
             result
                 .placements
                 .iter()
                 .filter(|placement| placement.default_exposed)
                 .count(),
-            1
+            2
         );
-        assert!(
-            result
-                .roots
-                .iter()
-                .any(|seen| { seen.path == source_root && seen.explicit && seen.agent.is_none() })
+        let source_observations = result
+            .roots
+            .iter()
+            .filter(|seen| seen.explicit && seen.agent.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(source_observations.len(), 1);
+        assert_eq!(
+            source_observations[0].path,
+            fs::canonicalize(source_root).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
     }

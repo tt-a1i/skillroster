@@ -3963,6 +3963,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.3",
         "3eba54753cfe8cdf987a8a4fe1ab1337317aef9b72e55b9be49b3158117470b1",
     ),
+    (
+        "1.8.4",
+        "2758bed89792128c47d01f613a4df277dd32c9641cb036e7ed1f03c0c94e8381",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5160,7 +5164,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn source_roots_must_be_absolute_and_are_deduplicated() {
+    fn source_roots_must_be_absolute_and_are_lexically_deduplicated() {
         assert!(parse_source_roots(&[PathBuf::from("relative")]).is_err());
         let absolute = std::env::current_dir().unwrap().join("source");
         assert_eq!(
