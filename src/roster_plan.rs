@@ -27,7 +27,8 @@ pub struct SupportedRosterChanges {
 }
 
 /// Keep a semantic bulk recommendation useful without weakening raw Plan safety.
-/// A demotion is excluded when no exact owned placement can remain or be migrated.
+/// A demotion is excluded when no exact owned placement can remain or be migrated,
+/// or when a non-Agent source link depends on a placement that would be removed.
 pub fn exclude_unpreservable_demotions(
     scan: &ScanResult,
     changes: Vec<RosterChange>,
@@ -77,9 +78,24 @@ pub fn exclude_unpreservable_demotions(
             .iter()
             .copied()
             .any(|placement| is_real_exact(placement, exact_digest));
-        if retained_owned || migratable_owned {
+        let non_agent_source_dependency = placements
+            .iter()
+            .copied()
+            .filter(|placement| placement.agent.is_none())
+            .any(|placement| {
+                placement.link_target.as_ref().is_some_and(|target| {
+                    removable.iter().any(|removed| {
+                        target == &removed.directory || target.starts_with(&removed.directory)
+                    })
+                })
+            });
+        let reason = if non_agent_source_dependency {
+            "non_agent_source_link_depends_on_removal"
+        } else if retained_owned || migratable_owned {
             continue;
-        }
+        } else {
+            "no_owned_exact_content_to_preserve"
+        };
         for request in requests
             .into_iter()
             .filter(|request| request.state != "core")
@@ -88,7 +104,7 @@ pub fn exclude_unpreservable_demotions(
             exclusions.push(RosterChangeExclusion {
                 agent: request.agent.clone(),
                 skill_id: request.skill_id.clone(),
-                reason: "no_owned_exact_content_to_preserve",
+                reason,
             });
         }
     }
@@ -560,6 +576,49 @@ mod tests {
         assert_eq!(
             supported.exclusions[0].reason,
             "no_owned_exact_content_to_preserve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_bulk_changes_exclude_a_non_agent_link_to_a_removed_placement() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let codex = home.join(".codex/skills/shared");
+        let source_root = temp.path().join("sources");
+        let dependent_source = source_root.join("shared");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&source_root).unwrap();
+        fs::write(codex.join("SKILL.md"), "---\nname: shared\n---\nfixture\n").unwrap();
+        std::os::unix::fs::symlink(&codex, &dependent_source).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options.explicit_source_roots.push(source_root);
+        let snapshot = scan(&options).unwrap();
+        let skill_id = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap()
+            .skill_id
+            .clone();
+
+        let supported = exclude_unpreservable_demotions(
+            &snapshot,
+            vec![RosterChange {
+                agent: "codex".into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(supported.changes.is_empty());
+        assert_eq!(supported.exclusions.len(), 1);
+        assert_eq!(supported.exclusions[0].skill_id, skill_id);
+        assert_eq!(
+            supported.exclusions[0].reason,
+            "non_agent_source_link_depends_on_removal"
         );
     }
 

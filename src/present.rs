@@ -445,6 +445,21 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
             "Blocked · no automatic change is supported",
             "Confirm trusted source directories before rescanning",
         ));
+    } else if value["planning"]["decision"].as_str() == Some("resolve_source_dependency") {
+        lines.push(String::new());
+        lines.push("  Dependent source link targets".into());
+        if let Some(targets) = value["planning"]["dependent_link_targets"].as_array() {
+            for target in targets.iter().filter_map(Value::as_str).take(5) {
+                lines.push(format!(
+                    "  {}",
+                    middle_truncate(target, width.saturating_sub(2))
+                ));
+            }
+        }
+        lines.extend(summary(
+            "Blocked · no automatic change is supported",
+            "Move or retarget the dependent source link before rescanning",
+        ));
     } else {
         lines.extend(summary(
             "Read-only · no Agent files changed",

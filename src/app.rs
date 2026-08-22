@@ -1669,6 +1669,10 @@ fn finding_roster_planning(
         })
         .collect::<Vec<_>>();
     if blocked_change_count > 0 {
+        let source_dependency = supported
+            .exclusions
+            .iter()
+            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal");
         let blocked_skill_ids = supported
             .exclusions
             .iter()
@@ -1681,6 +1685,28 @@ fn finding_roster_planning(
             .filter_map(|placement| placement.link_target.as_ref())
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
+        if source_dependency {
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": "source_dependency_blocks_roster_change",
+                "decision": "resolve_source_dependency",
+                "automatic_change_supported": false,
+                "snapshot_id": scan_id,
+                "request_field": "finding_roster_changes",
+                "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "absence_of_usage_evidence": "not_negative_evidence",
+                "explicit_only_or_archive_decision_implied": false,
+                "agent_count": agents.len(),
+                "agents": agents,
+                "blocked_change_count": blocked_change_count,
+                "blocked_changes": blocked_changes,
+                "blocked_changes_truncated": blocked_change_count > 5,
+                "dependent_link_targets": observed_link_targets,
+                "after_resolution": {
+                    "next": "move or retarget the dependent source link, then rescan and reopen the new large-Roster Finding"
+                }
+            })));
+        }
         return Ok(Some(json!({
             "supported": false,
             "reason": "trusted_canonical_sources_required",
@@ -2522,6 +2548,15 @@ fn expand_finding_roster_changes(
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
     if !supported.exclusions.is_empty() {
+        if supported
+            .exclusions
+            .iter()
+            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal")
+        {
+            bail!(
+                "Finding {finding_id} is blocked because a non-Agent source link depends on a placement scheduled for removal; resolve the reported source dependency, rescan, and use the new Finding"
+            );
+        }
         bail!(
             "Finding {finding_id} is blocked by {} Roster changes without owned exact content; confirm the reported source roots, rescan, and use the new Finding",
             supported.exclusions.len()

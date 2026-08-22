@@ -95,8 +95,9 @@ copying every Skill and placement into the request:
 The CLI preserves declared and protected Core Skills, ranks positive local
 usage evidence, and moves only the remainder to On-demand. Missing usage is not
 treated as evidence for archiving. A placement without exact owned canonical
-content blocks the semantic Plan; the Agent confirms the reported source roots
-and rescans instead of applying a partial scope.
+content blocks the semantic Plan; the Agent follows the typed decision to
+confirm source roots or resolve a dependent source link, then rescans instead
+of applying a partial scope.
 
 Finding drilldown is compact by default: each paged `item` carries one
 traceable Evidence ID, subject, path, and decision facts. Complete duplicate ID

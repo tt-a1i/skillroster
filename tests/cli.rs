@@ -2067,6 +2067,95 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
 }
 
 #[test]
+#[cfg(unix)]
+fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let canonical = root.join("zzz-canonical");
+    let source_root = temp.path().join("sources");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        canonical.join("SKILL.md"),
+        "---\nname: zzz-canonical\n---\nfixture\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&canonical, source_root.join("dependent-source")).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source_root.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], false);
+    assert_eq!(planning["reason"], "source_dependency_blocks_roster_change");
+    assert_eq!(planning["decision"], "resolve_source_dependency");
+    assert_eq!(planning["blocked_change_count"], 1);
+    assert_eq!(
+        planning["blocked_changes"][0]["reason"],
+        "non_agent_source_link_depends_on_removal"
+    );
+    assert_eq!(planning["dependent_link_targets"], json!([canonical]));
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("source link depends on a placement scheduled for removal")
+    );
+}
+
+#[test]
 fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
