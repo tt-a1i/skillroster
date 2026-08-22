@@ -485,47 +485,15 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
             .and_then(Value::as_str)
             .unwrap_or("unknown"),
     );
-    lines.push(String::new());
-    lines.push(format!(
-        "  {}",
-        middle_truncate(&text(value, "summary"), width.saturating_sub(2))
-    ));
-
-    let evidence_rows = value
-        .get("items")
-        .and_then(Value::as_array)
-        .or_else(|| value.get("placements").and_then(Value::as_array));
-    if let Some(rows) = evidence_rows.filter(|rows| !rows.is_empty()) {
-        let path_count = rows
-            .iter()
-            .filter(|row| row.get("path").and_then(Value::as_str).is_some())
-            .count();
-        let rows_with_paths = rows
-            .iter()
-            .filter(|row| row.get("path").and_then(Value::as_str).is_some())
-            .take(10)
-            .collect::<Vec<_>>();
-        if !rows_with_paths.is_empty() {
-            lines.push(String::new());
-            lines.push("  Evidence paths".into());
-        }
-        for row in rows_with_paths {
-            let agent = row
-                .get("facts")
-                .and_then(|facts| facts.get("agent"))
-                .and_then(Value::as_str)
-                .or_else(|| row.get("agent").and_then(Value::as_str))
-                .unwrap_or("source");
-            let prefix = format!("  {agent:<12} ");
-            let path = middle_truncate(
-                &text(row, "path"),
-                width.saturating_sub(display_width(&prefix)),
-            );
-            lines.push(format!("{prefix}{path}"));
-        }
-        if path_count > 10 {
-            lines.push(format!("  + {} more on this page", path_count - 10));
-        }
+    if let Some(overview) = value.get("usage_overview") {
+        usage_finding_overview(overview, lines, width);
+    } else {
+        lines.push(String::new());
+        lines.push(format!(
+            "  {}",
+            middle_truncate(&text(value, "summary"), width.saturating_sub(2))
+        ));
+        finding_evidence_paths(value, lines, width);
     }
 
     let trust_resolution =
@@ -618,6 +586,204 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
             "Read-only · no Agent files changed",
             "Use --full only when exact complete records are needed",
         ));
+    }
+}
+
+fn finding_evidence_paths(value: &Value, lines: &mut Vec<String>, width: usize) {
+    let evidence_rows = value
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("placements").and_then(Value::as_array));
+    let Some(rows) = evidence_rows.filter(|rows| !rows.is_empty()) else {
+        return;
+    };
+    let path_count = rows
+        .iter()
+        .filter(|row| row.get("path").and_then(Value::as_str).is_some())
+        .count();
+    let rows_with_paths = rows
+        .iter()
+        .filter(|row| row.get("path").and_then(Value::as_str).is_some())
+        .take(10)
+        .collect::<Vec<_>>();
+    if !rows_with_paths.is_empty() {
+        lines.push(String::new());
+        lines.push("  Evidence paths".into());
+    }
+    for row in rows_with_paths {
+        let agent = row
+            .get("facts")
+            .and_then(|facts| facts.get("agent"))
+            .and_then(Value::as_str)
+            .or_else(|| row.get("agent").and_then(Value::as_str))
+            .unwrap_or("source");
+        let prefix = format!("  {agent:<12} ");
+        let path = middle_truncate(
+            &text(row, "path"),
+            width.saturating_sub(display_width(&prefix)),
+        );
+        lines.push(format!("{prefix}{path}"));
+    }
+    if path_count > 10 {
+        lines.push(format!("  + {} more on this page", path_count - 10));
+    }
+}
+
+fn usage_finding_overview(overview: &Value, lines: &mut Vec<String>, width: usize) {
+    lines.push(String::new());
+    lines.push("  Stage evidence".into());
+    if let Some(stages) = overview.get("stages").and_then(Value::as_array) {
+        for stage in stages {
+            let label = title(&text(stage, "stage"));
+            let last_seen = stage.get("last_seen_unix").and_then(Value::as_i64);
+            let mut facts = vec![
+                format!("{} {}", text(stage, "count"), text(stage, "unit")),
+                text(stage, "quality"),
+            ];
+            if last_seen.is_some() {
+                facts.push(age(last_seen));
+            }
+            fact_items(lines, &label, facts, width);
+        }
+    }
+
+    if let Some(coverage) = overview.get("coverage") {
+        let supported = coverage["supported_agent_count"].as_u64().unwrap_or(0);
+        lines.push(String::new());
+        lines.push("  Session coverage".into());
+        fact_items(
+            lines,
+            "Roots / sampled",
+            vec![
+                ratio(coverage, "roots_present_agent_count", supported),
+                ratio(coverage, "sampled_agent_count", supported),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "Complete / limited",
+            vec![
+                ratio(coverage, "complete_agent_count", supported),
+                ratio(coverage, "limited_agent_count", supported),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "Missing / inaccessible",
+            vec![
+                ratio(coverage, "missing_agent_count", supported),
+                ratio(coverage, "inaccessible_agent_count", supported),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "File discovery",
+            vec![
+                format!("{} discovered", text(coverage, "files_discovered")),
+                format!("{} observed", text(coverage, "files_observed")),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "File handling",
+            vec![
+                format!("{} partial", text(coverage, "files_partially_observed")),
+                format!("{} skipped", text(coverage, "files_skipped")),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "Observed volume",
+            vec![
+                readable_bytes(coverage["bytes_observed"].as_u64().unwrap_or(0)),
+                format!("{} lines", text(coverage, "lines_observed")),
+            ],
+            width,
+        );
+        fact_items(
+            lines,
+            "Sample boundary",
+            vec![
+                if coverage["truncated"].as_bool() == Some(true) {
+                    "content bounded".into()
+                } else {
+                    "content complete".into()
+                },
+                if coverage["discovery_truncated"].as_bool() == Some(true) {
+                    "discovery bounded".into()
+                } else {
+                    "discovery complete".into()
+                },
+            ],
+            width,
+        );
+    }
+
+    lines.push(String::new());
+    lines.push("  Observed Skills".into());
+    let observed = overview
+        .get("observed_skills")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if observed.is_empty() {
+        lines.push("  none beyond default exposure".into());
+    } else {
+        for signal in observed {
+            let ambiguous_name = observed
+                .iter()
+                .filter(|candidate| {
+                    candidate["agent"] == signal["agent"]
+                        && candidate["skill_name"] == signal["skill_name"]
+                        && candidate["stage"] == signal["stage"]
+                })
+                .count()
+                > 1;
+            let mut suffix = format!(
+                " · {} ×{}",
+                text(signal, "stage"),
+                text(signal, "event_count")
+            );
+            if ambiguous_name {
+                suffix.push_str(&format!(
+                    " · {}",
+                    take_width(&text(signal, "skill_id"), 12, true)
+                ));
+            }
+            let detail_budget = width.saturating_sub(25);
+            let skill_name = middle_truncate(
+                &text(signal, "skill_name"),
+                detail_budget.saturating_sub(display_width(&suffix)),
+            );
+            let detail = format!("{skill_name}{suffix}");
+            fact(lines, &text(signal, "agent"), detail);
+        }
+        let total = overview["observed_signal_count"].as_u64().unwrap_or(0) as usize;
+        if total > observed.len() {
+            lines.push(format!(
+                "  + {} more observed Skill signals",
+                total - observed.len()
+            ));
+        }
+    }
+}
+
+fn ratio(value: &Value, key: &str, denominator: u64) -> String {
+    format!("{}/{}", value[key].as_u64().unwrap_or(0), denominator)
+}
+
+fn readable_bytes(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1} MB", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1} KB", value as f64 / 1_000.0)
+    } else {
+        format!("{value} bytes")
     }
 }
 
@@ -1555,6 +1721,122 @@ mod tests {
             assert!(output.contains("Observed link targets"));
             assert!(output.contains("no automatic change is supported"));
             assert!(!output.contains("Independent Skills     none"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_finding_is_readable_and_path_free_at_reference_widths() {
+        let first_skill_id = crate::model::SkillId::new().to_string();
+        let second_skill_id = crate::model::SkillId::new().to_string();
+        let first_skill_suffix = take_width(&first_skill_id, 12, true);
+        let second_skill_suffix = take_width(&second_skill_id, 12, true);
+        assert_ne!(first_skill_suffix, second_skill_suffix);
+        let value = json!({
+            "id": "finding_00000000000000000000000000000000",
+            "title": "Five-stage usage evidence",
+            "summary": "Exposed=548 [1..9; observed]; Matched=3 [2..9; observed]; Loaded=51 [3..9; observed]. Coverage: files discovered=3831, observed=302, partial=28, skipped=3529; truncated=true.",
+            "severity": "info",
+            "category": "usage",
+            "evidence_quality": "unknown",
+            "impact": {"affected_skill_count": 117, "affected_placement_count": 0},
+            "detail": {"mode": "compact"},
+            "usage_overview": {
+                "stages": [
+                    {"stage": "exposed", "count": 548, "unit": "placements", "quality": "observed", "last_seen_unix": null},
+                    {"stage": "matched", "count": 3, "unit": "events", "quality": "observed", "last_seen_unix": 9},
+                    {"stage": "loaded", "count": 51, "unit": "events", "quality": "observed", "last_seen_unix": 9},
+                    {"stage": "applied", "count": 0, "unit": "events", "quality": "unknown", "last_seen_unix": null},
+                    {"stage": "outcome", "count": 0, "unit": "events", "quality": "unknown", "last_seen_unix": null}
+                ],
+                "coverage": {
+                    "supported_agent_count": 8,
+                    "roots_present_agent_count": 5,
+                    "sampled_agent_count": 5,
+                    "complete_agent_count": 0,
+                    "limited_agent_count": 5,
+                    "missing_agent_count": 3,
+                    "inaccessible_agent_count": 0,
+                    "files_observed": 302,
+                    "files_discovered": 3831,
+                    "files_partially_observed": 28,
+                    "files_skipped": 3529,
+                    "bytes_observed": 19805822,
+                    "lines_observed": 30057,
+                    "truncated": true,
+                    "discovery_truncated": false
+                },
+                "observed_skills": [
+                    {"agent": "cursor", "skill_id": first_skill_id, "skill_name": "code-review", "stage": "loaded", "event_count": 1},
+                    {"agent": "claude-code", "skill_id": "skill_history11111", "skill_name": "computer-history", "stage": "matched", "event_count": 2},
+                    {"agent": "cursor", "skill_id": second_skill_id, "skill_name": "code-review", "stage": "loaded", "event_count": 3}
+                ],
+                "observed_signal_count": 8,
+                "observed_skills_truncated": true
+            },
+            "items": [{
+                "kind": "usage",
+                "path": "/Users/private/session.jsonl",
+                "facts": {"agent": "cursor", "skill_name": "code-review", "stage": "loaded"}
+            }]
+        });
+        for width in [60, 80, 120] {
+            let output = render(
+                "report",
+                &value,
+                RenderOptions {
+                    width,
+                    styled: false,
+                },
+            );
+            for expected in [
+                "Stage evidence",
+                "Exposed",
+                "548 placements",
+                "Loaded",
+                "51 events",
+                "Session coverage",
+                "Roots / sampled",
+                "5/8 · 5/8",
+                "3831 discovered",
+                "19.8 MB",
+                "30057 lines",
+                "Observed Skills",
+                "cursor",
+                "loaded ×1",
+                "+ 5 more observed Skill signals",
+                "Use --full only when exact complete records are needed",
+            ] {
+                assert!(
+                    output.contains(expected),
+                    "{expected} missing at {width}:\n{output}"
+                );
+            }
+            assert!(
+                output.contains(&first_skill_suffix),
+                "first stable Skill ID suffix missing at {width}:\n{output}"
+            );
+            assert!(
+                output.contains(&second_skill_suffix),
+                "second stable Skill ID suffix missing at {width}:\n{output}"
+            );
+            if width >= 80 {
+                assert!(
+                    output.contains("code-review"),
+                    "Skill name missing at {width}:\n{output}"
+                );
+            }
+            assert!(!output.contains("o…ncated=true"));
+            let exposed = output
+                .lines()
+                .find(|line| line.trim_start().starts_with("Exposed"))
+                .expect("Exposed row");
+            assert!(!exposed.contains("ago"));
+            assert!(!output.contains("unknown · unknown"));
+            assert!(!output.contains("/Users/private"));
             assert!(
                 output.lines().all(|line| display_width(line) <= width),
                 "line exceeded {width} columns:\n{output}"

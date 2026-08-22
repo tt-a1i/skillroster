@@ -2141,7 +2141,7 @@ fn finding_json(
     evidence_ids: &[EvidenceId],
     scan: &ScanResult,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "id": id,
         "kind": crate::roster_recommendation::finding_kind(
             &finding_category(finding.category),
@@ -2158,7 +2158,13 @@ fn finding_json(
         "impact": finding_impact(finding),
         "coverage": finding_coverage(finding, scan),
         "files_changed": false
-    })
+    });
+    if finding.category == crate::query::FindingCategory::Usage
+        && finding.title == "Five-stage usage evidence"
+    {
+        value["usage_overview"] = json!(crate::query::usage_overview(scan));
+    }
+    value
 }
 
 fn finding_impact(finding: &crate::query::Finding) -> Value {
@@ -4278,6 +4284,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.12",
         "69bf20da3494b69b634aee5e8d7dead8d8e30222f9e380461640af02bc83331e",
+    ),
+    (
+        "1.8.13",
+        "3063f8913c22846640389f5a633697aea253ab0805e974bd19fa0f06f2b01682",
     ),
 ];
 
