@@ -120,7 +120,11 @@ recoverable through Undo.
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or
 capability paraphrase while the CLI remains a deterministic local lexical
-index. The scanner reads ordinary and folded YAML description scalars. Ranking
+index. The task and hints share one token set but retain separate phrase
+boundaries for exact name, description, and declared-trigger evidence. The
+scanner reads ordinary and folded YAML description scalars. Ranking
+uses top-level `triggers` and standard-compatible
+`metadata.routing-triggers` as the same declared retrieval evidence. Ranking
 normalizes conservative ASCII plurals, treats explicit use and do-not-use
 description clauses as positive and exclusion evidence, and removes the
 low-confidence tail relative to the strongest result. Same-name Skill

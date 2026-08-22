@@ -266,15 +266,20 @@ The failure was not an `ego-browser` result previously seen in one query; that
 candidate did not reproduce across the routing matrix. The stable defect was
 lexical: common words such as `and` and `for` contributed positive score and
 could combine with `skill` to trigger a false two-token exclusion penalty for
-`Not for ...` clauses. Search scoring now removes a bounded English stopword
-set before field overlap and exclusion evaluation. The Bootstrap pointer also
-states the governance boundary against installation and shared-directory
-management.
+`Not for ...` clauses. A second independent replay showed that concatenating a
+CJK task and English hint also discarded exact phrase and declared-trigger
+evidence. Search scoring now removes a bounded English stopword set before
+field overlap and exclusion evaluation, keeps task and hint phrase boundaries,
+and accepts standard-compatible `metadata.routing-triggers`. The Bootstrap
+pointer and routing metadata state the governance boundary against installation
+and shared-directory management.
 
 Fresh real-home rescans then ranked `skillroster` first for inventory/usage
 evidence, Core/On-demand Roster governance, and approved Apply/Undo requests;
 shared installation and symlink synchronization still ranked
-`agent-skills-manager` first. The maintained 63-task English/CJK routing set
+`agent-skills-manager` first. The exact original `duplicate unused` query and
+each inventory, duplicate, usage-evidence, Roster, Plan, Apply, Receipt, and
+Undo branch passed independently. The maintained 84-task English/CJK routing set
 passed before governance, after Apply, and after Undo. Inspection and routing
 changed no real Agent files.
 

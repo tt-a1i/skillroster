@@ -1172,12 +1172,13 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    find_matching(scan, task, limit, None, None)
+    find_matching(scan, task, &[task], limit, None, None)
 }
 
 pub(crate) fn find_matching(
     scan: &ScanResult,
     task: &str,
+    retrieval_parts: &[&str],
     limit: usize,
     candidate_ids: Option<&BTreeSet<String>>,
     variant_eligible_ids: Option<&BTreeSet<String>>,
@@ -1187,6 +1188,11 @@ pub(crate) fn find_matching(
         return Vec::new();
     }
     let query_tokens = tokens(&query);
+    let query_phrases = retrieval_parts
+        .iter()
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
     for skill in scan
@@ -1239,18 +1245,23 @@ pub(crate) fn find_matching(
                 + overlap as f64 * 3.0
                 - exclusion_penalty_tokens as f64 * 18.0;
             let mut reasons = Vec::new();
-            if name == query {
+            if query_phrases.contains(&name) {
                 score += 100.0;
                 reasons.push("exact_name".into());
-            } else if name.contains(&query) {
+            } else if query_phrases.iter().any(|phrase| name.contains(phrase)) {
                 score += 45.0;
                 reasons.push("name_phrase".into());
             }
-            if !triggers.is_empty() && triggers.contains(&query) {
+            if !triggers.is_empty() && query_phrases.iter().any(|phrase| triggers.contains(phrase))
+            {
                 score += 35.0;
                 reasons.push("declared_trigger".into());
             }
-            if !positive_description.is_empty() && positive_description.contains(&query) {
+            if !positive_description.is_empty()
+                && query_phrases
+                    .iter()
+                    .any(|phrase| positive_description.contains(phrase))
+            {
                 score += 25.0;
                 reasons.push("description_phrase".into());
             }
@@ -1901,6 +1912,27 @@ mod tests {
     }
 
     #[test]
+    fn find_keeps_hint_phrases_separate_from_the_preserved_task() {
+        let (root, scan) = fixture();
+        let matches = find_matching(
+            &scan,
+            "调查事实 verify",
+            &["调查事实", "verify"],
+            3,
+            None,
+            None,
+        );
+
+        assert_eq!(matches[0].name, "research");
+        assert!(
+            matches[0]
+                .match_reasons
+                .contains(&"declared_trigger".into())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn find_prefers_task_terms_in_name_over_incidental_body_mentions() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2173,7 +2205,14 @@ mod tests {
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
 
         let eligible = BTreeSet::from([matched.skill_id.clone()]);
-        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&eligible));
+        let filtered = find_matching(
+            &scan,
+            "diagrams",
+            &["diagrams"],
+            10,
+            Some(&eligible),
+            Some(&eligible),
+        );
         let filtered_match = filtered
             .iter()
             .find(|candidate| candidate.name == "tech-essay-writer")
@@ -2188,8 +2227,15 @@ mod tests {
             .iter()
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
-        let partial_match =
-            find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&all_routable)).remove(0);
+        let partial_match = find_matching(
+            &scan,
+            "diagrams",
+            &["diagrams"],
+            10,
+            Some(&eligible),
+            Some(&all_routable),
+        )
+        .remove(0);
         assert_eq!(partial_match.variant_count, 2);
         assert_eq!(partial_match.variants.len(), 2);
         fs::remove_dir_all(root).unwrap();

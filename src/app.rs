@@ -2037,11 +2037,11 @@ fn find_command(
 ) -> Result<Value> {
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
-    let retrieval_query = std::iter::once(task.trim())
+    let retrieval_parts = std::iter::once(task.trim())
         .chain(retrieval_hints.iter().map(String::as_str))
         .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+        .collect::<Vec<_>>();
+    let retrieval_query = retrieval_parts.join(" ");
     let candidate_search_text = crate::query::candidate_search_text(&retrieval_query);
     let mut candidate_ids = store
         .search_skill_ids(&candidate_search_text, scan.skills.len())?
@@ -2064,6 +2064,7 @@ fn find_command(
     let mut matches = crate::query::find_matching(
         &scan,
         &retrieval_query,
+        &retrieval_parts,
         limit,
         Some(&candidate_ids),
         Some(&routable_ids),

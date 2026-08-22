@@ -1066,19 +1066,32 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
     }
     let lines = frontmatter;
     let mut list_key: Option<String> = None;
+    let mut top_level_key: Option<String> = None;
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
         let indentation = leading_whitespace(line);
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("- ") {
-            if list_key.as_deref() == Some("triggers") {
+            if matches!(list_key.as_deref(), Some("triggers" | "routing-triggers")) {
                 metadata.triggers.push(unquote(value));
             }
             index += 1;
             continue;
         }
         if indentation > 0 {
+            if top_level_key.as_deref() == Some("metadata") {
+                let Some((key, value)) = trimmed.split_once(':') else {
+                    index += 1;
+                    continue;
+                };
+                let key = key.trim();
+                let value = value.trim();
+                list_key = Some(key.to_owned());
+                if key == "routing-triggers" && !value.is_empty() {
+                    extend_trigger_values(&mut metadata, value);
+                }
+            }
             index += 1;
             continue;
         }
@@ -1088,6 +1101,7 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
         };
         let key = key.trim();
         let value = value.trim();
+        top_level_key = Some(key.to_owned());
         list_key = Some(key.to_owned());
         if value.is_empty() {
             index += 1;
@@ -1113,19 +1127,23 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
         }
         match key {
             "triggers" => {
-                metadata.triggers.extend(
-                    value
-                        .trim_matches(['[', ']'])
-                        .split(',')
-                        .map(unquote)
-                        .filter(|value| !value.is_empty()),
-                );
+                extend_trigger_values(&mut metadata, value);
             }
             _ => set_metadata_scalar(&mut metadata, key, unquote(value)),
         }
         index += 1;
     }
     metadata
+}
+
+fn extend_trigger_values(metadata: &mut SkillMetadata, value: &str) {
+    metadata.triggers.extend(
+        value
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(unquote)
+            .filter(|value| !value.is_empty()),
+    );
 }
 
 fn leading_whitespace(value: &str) -> usize {
@@ -2220,6 +2238,19 @@ enabled = true
             assert_eq!(metadata.version.as_deref(), Some("1.7.0"));
             assert_eq!(summarize_markdown(&markdown, 320), "Body");
         }
+    }
+
+    #[test]
+    fn parses_standard_metadata_routing_triggers() {
+        let metadata = parse_skill_markdown(
+            "---\nname: skillroster\ndescription: Govern Skills\nmetadata:\n  bootstrap-version: 1.8.6\n  routing-triggers:\n    - inventory installed Agent Skills\n    - create Skill Receipt\n---\nBody",
+        );
+
+        assert_eq!(
+            metadata.triggers,
+            ["inventory installed Agent Skills", "create Skill Receipt"]
+        );
+        assert!(metadata.version.is_none());
     }
 
     #[test]
