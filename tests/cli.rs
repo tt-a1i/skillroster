@@ -64,6 +64,13 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         "---\nname: example\ndescription: Example task helper\ntriggers: [example]\n---\n",
     )
     .unwrap();
+    let second_skill = home.join(".claude/skills/example");
+    fs::create_dir_all(&second_skill).unwrap();
+    fs::write(
+        second_skill.join("SKILL.md"),
+        "---\nname: example\ndescription: Example task helper\ntriggers: [example]\n---\n",
+    )
+    .unwrap();
     let session_root = home.join(".codex/sessions");
     fs::create_dir_all(&session_root).unwrap();
     fs::write(
@@ -103,7 +110,9 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(initial_status["result"]["retention"]["raw_usage_days"], 180);
     assert_eq!(initial_status["result"]["pending_plan_count"], 0);
 
-    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let report_output = run(&[&common[..], &["report"]].concat(), None);
+    let report_output_len = report_output.stdout.len();
+    let report = json_output(&report_output);
     assert_eq!(report["ok"], true);
     assert!(report["result"]["findings"].is_array());
     assert!(report["result"]["primary_metrics"].is_object());
@@ -112,7 +121,34 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         repeated_report["result"]["report_id"],
         report["result"]["report_id"]
     );
-    let finding_id = report["result"]["findings"][0]["id"].as_str().unwrap();
+    let summary_report_output = run(&[&common[..], &["report", "--summary"]].concat(), None);
+    let summary_report_output_len = summary_report_output.stdout.len();
+    let summary_report = json_output(&summary_report_output);
+    assert_eq!(
+        summary_report["result"]["finding_count"],
+        report["result"]["findings"].as_array().unwrap().len()
+    );
+    assert!(
+        summary_report["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 3
+    );
+    assert!(summary_report_output_len < report_output_len);
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["affected_placement_count"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        })
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
     let finding = json_output(&run(
         &[&common[..], &["report", "--finding", finding_id]].concat(),
         None,
@@ -122,6 +158,15 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert!(finding["result"]["affected_placement_ids"].is_array());
     assert!(finding["result"]["impact"].is_object());
     assert!(finding["result"]["coverage"].is_object());
+    assert!(
+        finding["result"]["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|placement| placement["path"].as_str()
+                == Some(skill.join("SKILL.md").to_str().unwrap()))
+    );
+    assert!(!finding["result"]["evidence"].as_array().unwrap().is_empty());
     for evidence_id in finding["result"]["evidence_ids"].as_array().unwrap() {
         let exists: i64 = database
             .query_row(
@@ -149,6 +194,9 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
 
     let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     let setup_plan = setup["result"]["plan_id"].as_str().unwrap();
+    assert!(setup["result"]["operation_count"].as_u64().unwrap() > 0);
+    assert!(setup["result"].get("operations").is_none());
+    assert!(!setup["result"].to_string().contains("## Safety boundaries"));
     let setup_applied = json_output(&run(&[&common[..], &["apply", setup_plan]].concat(), None));
     assert!(skill_root.join("skillroster/SKILL.md").is_file());
     let setup_receipt = setup_applied["result"]["receipt_id"].as_str().unwrap();
@@ -176,6 +224,11 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     ));
     assert_eq!(plan["result"]["files_changed"], false);
     assert_eq!(plan["result"]["evidence_ids"][0], evidence_id);
+    assert_eq!(plan["result"]["change_summary"]["roster_change_count"], 1);
+    assert_eq!(
+        plan["result"]["impact"]["roster"]["after"][0]["state"],
+        "on_demand"
+    );
     let plan_id = plan["result"]["plan_id"].as_str().unwrap();
 
     let agent_id: String = database
@@ -257,6 +310,24 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     ));
     assert_eq!(purged["result"]["plans_or_receipts_changed"], false);
     assert_eq!(purged["result"]["agent_files_changed"], false);
+
+    let shared_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.join("write.lock"))
+        .unwrap();
+    FileExt::try_lock_shared(&shared_lock).unwrap();
+    let concurrent_status = run(&[&common[..], &["status"]].concat(), None);
+    assert!(concurrent_status.status.success());
+    let blocked_purge = run(
+        &[&common[..], &["lifecycle", "purge", "--raw-days", "180"]].concat(),
+        None,
+    );
+    assert!(!blocked_purge.status.success());
+    FileExt::unlock(&shared_lock).unwrap();
+    drop(shared_lock);
 
     let write_lock = OpenOptions::new()
         .read(true)

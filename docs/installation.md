@@ -23,9 +23,21 @@ sha256sum -c skillroster-*.sha256     # Linux
 shasum -a 256 -c skillroster-*.sha256 # macOS
 ```
 
+On macOS or Linux, the archive contains a versioned directory. Extract it and
+install the binary from that directory (not from the current directory):
+
+```sh
+SKILLROSTER_VERSION=1.0.1
+SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
+tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
+install "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}/skillroster" \
+  "$HOME/.local/bin/skillroster"
+skillroster --version
+```
+
 On Windows, compare `Get-FileHash .\skillroster-*.zip -Algorithm SHA256` with
-the checksum file. Extract the archive, then place `skillroster` (or
-`skillroster.exe`) in a directory on `PATH`.
+the checksum file. Extract the archive, open its versioned directory, then
+place `skillroster.exe` in a directory on `PATH`.
 
 ## Build or install from source
 
