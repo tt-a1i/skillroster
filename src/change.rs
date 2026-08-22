@@ -976,42 +976,43 @@ fn validate_projected_state(
         expected_fingerprint,
         expected_source_fingerprint,
     } = operation
-        && (projected_missing.contains(target) || projected_present.contains(source))
     {
-        if projected_missing.contains(target) && expected_fingerprint != "missing" {
-            return Err(ChangeError::new(
-                "invalid_projected_fingerprint",
-                format!(
-                    "{} must expect missing after its planned move",
-                    target.display()
-                ),
-            ));
-        }
-        normalize_target(target, roots)?;
-        if let Some(actual_source) = projected_fingerprints.get(source) {
-            if actual_source != expected_source_fingerprint {
+        if projected_missing.contains(target) || projected_present.contains(source) {
+            if projected_missing.contains(target) && expected_fingerprint != "missing" {
                 return Err(ChangeError::new(
-                    "plan_drifted",
+                    "invalid_projected_fingerprint",
                     format!(
-                        "{} expected {expected_source_fingerprint}, found {actual_source}",
-                        source.display()
+                        "{} must expect missing after its planned move",
+                        target.display()
                     ),
                 ));
             }
-        } else {
-            normalize_source(source, roots)?;
-            let actual_source = fingerprint(source)?;
-            if &actual_source != expected_source_fingerprint {
-                return Err(ChangeError::new(
-                    "plan_drifted",
-                    format!(
-                        "{} expected {expected_source_fingerprint}, found {actual_source}",
-                        source.display()
-                    ),
-                ));
+            normalize_target(target, roots)?;
+            if let Some(actual_source) = projected_fingerprints.get(source) {
+                if actual_source != expected_source_fingerprint {
+                    return Err(ChangeError::new(
+                        "plan_drifted",
+                        format!(
+                            "{} expected {expected_source_fingerprint}, found {actual_source}",
+                            source.display()
+                        ),
+                    ));
+                }
+            } else {
+                normalize_source(source, roots)?;
+                let actual_source = fingerprint(source)?;
+                if &actual_source != expected_source_fingerprint {
+                    return Err(ChangeError::new(
+                        "plan_drifted",
+                        format!(
+                            "{} expected {expected_source_fingerprint}, found {actual_source}",
+                            source.display()
+                        ),
+                    ));
+                }
             }
+            return Ok(());
         }
-        return Ok(());
     }
     validate_current_state(operation, roots)
 }
@@ -1450,12 +1451,14 @@ fn normalize_roots(roots: &[PathBuf], state_dir: &Path) -> Result<Vec<PathBuf>> 
             result.push(canonical_directory(root, "approved root")?);
         } else {
             let mut root = lexical_absolute(root)?;
-            if let Some(parent) = root.parent()
-                && let Ok(canonical_parent) = fs::canonicalize(parent)
-                && canonical_parent == state_dir
-                && let Some(name) = root.file_name()
-            {
-                root = state_dir.join(name);
+            if let Some(parent) = root.parent() {
+                if let Ok(canonical_parent) = fs::canonicalize(parent) {
+                    if canonical_parent == state_dir {
+                        if let Some(name) = root.file_name() {
+                            root = state_dir.join(name);
+                        }
+                    }
+                }
             }
             if !is_controlled_state_root(&root, state_dir) {
                 return Err(ChangeError::new(
@@ -1532,11 +1535,11 @@ fn normalize_target(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
         let mut cursor = ancestor.parent();
         let mut crossed_from_root = false;
         while let Some(candidate) = cursor {
-            if let Ok(canonical) = fs::canonicalize(candidate)
-                && roots.iter().any(|root| canonical.starts_with(root))
-            {
-                crossed_from_root = true;
-                break;
+            if let Ok(canonical) = fs::canonicalize(candidate) {
+                if roots.iter().any(|root| canonical.starts_with(root)) {
+                    crossed_from_root = true;
+                    break;
+                }
             }
             cursor = candidate.parent();
         }

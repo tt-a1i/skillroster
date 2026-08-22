@@ -33,29 +33,29 @@ pub fn run(cli: Cli) -> Result<Output> {
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
-    if let Some(Command::Lifecycle(args)) = &cli.command
-        && let LifecycleCommand::Delete(args) = &args.command
-    {
-        if args.confirm != "DELETE-LOCAL-STATE" {
-            bail!("database deletion requires --confirm DELETE-LOCAL-STATE");
+    if let Some(Command::Lifecycle(args)) = &cli.command {
+        if let LifecycleCommand::Delete(args) = &args.command {
+            if args.confirm != "DELETE-LOCAL-STATE" {
+                bail!("database deletion requires --confirm DELETE-LOCAL-STATE");
+            }
+            if !cli.json
+                && !require_human_confirmation(
+                    &format!(
+                        "Delete SkillRoster local state at {}?",
+                        database_path.display()
+                    ),
+                    "The SQLite database and Receipt journals will be deleted. Agent and Library files are preserved. A new Scan rebuilds inventory state.",
+                )?
+            {
+                return cancelled_output("lifecycle");
+            }
+            let result = lifecycle_delete_command(&database_path, &state_dir)?;
+            let envelope = JsonEnvelope::success("lifecycle", result.clone());
+            return Ok(Output {
+                json: serde_json::to_string(&envelope)?,
+                human: crate::present::human("lifecycle", &result),
+            });
         }
-        if !cli.json
-            && !require_human_confirmation(
-                &format!(
-                    "Delete SkillRoster local state at {}?",
-                    database_path.display()
-                ),
-                "The SQLite database and Receipt journals will be deleted. Agent and Library files are preserved. A new Scan rebuilds inventory state.",
-            )?
-        {
-            return cancelled_output("lifecycle");
-        }
-        let result = lifecycle_delete_command(&database_path, &state_dir)?;
-        let envelope = JsonEnvelope::success("lifecycle", result.clone());
-        return Ok(Output {
-            json: serde_json::to_string(&envelope)?,
-            human: crate::present::human("lifecycle", &result),
-        });
     }
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
@@ -917,10 +917,10 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
         return Ok(details);
     }
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
-    if let Some(existing) = store.latest_report()?
-        && existing.scan_id == scan_id
-    {
-        return Ok(existing.summary);
+    if let Some(existing) = store.latest_report()? {
+        if existing.scan_id == scan_id {
+            return Ok(existing.summary);
+        }
     }
     let report = crate::query::build_report(&scan);
     let report_id = ReportId::new();
@@ -1425,14 +1425,16 @@ fn normalize_agent_plan(
         }
         if let Some(existing_upstream) =
             store.source_baseline(&request.source, &request.upstream_revision)?
-            && let Some(trusted_upstream) = existing_upstream.trusted_digest
-            && trusted_upstream != upstream_digest
         {
-            bail!(
-                "submitted upstream content conflicts with the trusted source baseline for {}@{}",
-                request.source,
-                request.upstream_revision
-            );
+            if let Some(trusted_upstream) = existing_upstream.trusted_digest {
+                if trusted_upstream != upstream_digest {
+                    bail!(
+                        "submitted upstream content conflicts with the trusted source baseline for {}@{}",
+                        request.source,
+                        request.upstream_revision
+                    );
+                }
+            }
         }
         let baseline_trusted = trusted_digest.is_some();
         let local_modified = trusted_digest.is_none_or(|digest| actual_file_digest != digest);
@@ -2026,15 +2028,16 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
         serde_json::from_value(record.verification["change_receipt"].clone())?;
     require_clear_journals(store, &original.state_dir)?;
     let mut outcome = change::undo(&original)?;
-    if outcome.verification_passed
-        && let Err(error) =
+    if outcome.verification_passed {
+        if let Err(error) =
             restore_roster_state(store, &record.verification["roster_state"]["before"]).and_then(
                 |()| restore_library_state(store, &record.verification["library_state"]["before"]),
             )
-    {
-        outcome.receipt.status = change::ReceiptStatus::RecoveryRequired;
-        outcome.receipt.error = Some(format!("Roster restoration failed: {error}"));
-        outcome.verification_passed = false;
+        {
+            outcome.receipt.status = change::ReceiptStatus::RecoveryRequired;
+            outcome.receipt.error = Some(format!("Roster restoration failed: {error}"));
+            outcome.verification_passed = false;
+        }
     }
     change::persist_journal_state(&outcome.receipt)?;
     let receipt = receipt_record(
@@ -2226,21 +2229,23 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
         })?;
         if let (Some(source), Some(revision)) =
             (skill.metadata.source.as_ref(), declared_revision.as_ref())
-            && let Some(placement) = scan
+        {
+            if let Some(placement) = scan
                 .placements
                 .iter()
                 .find(|placement| placement.skill_id == skill.id)
-        {
-            let entrypoint_digest = content_digest(&std::fs::read(&placement.entrypoint)?);
-            store.record_source_baseline(&crate::sqlite::SourceBaseline {
-                source: source.clone(),
-                revision: revision.clone(),
-                entrypoint_digest,
-                first_observed_scan_id: scan_id.clone(),
-                first_observed_at: observed_at,
-                trusted_digest: None,
-                trusted_by_receipt_id: None,
-            })?;
+            {
+                let entrypoint_digest = content_digest(&std::fs::read(&placement.entrypoint)?);
+                store.record_source_baseline(&crate::sqlite::SourceBaseline {
+                    source: source.clone(),
+                    revision: revision.clone(),
+                    entrypoint_digest,
+                    first_observed_scan_id: scan_id.clone(),
+                    first_observed_at: observed_at,
+                    trusted_digest: None,
+                    trusted_by_receipt_id: None,
+                })?;
+            }
         }
         store.index_skill(
             &stored_id,
