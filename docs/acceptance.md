@@ -14,7 +14,7 @@ The suite proves:
 
 - all eight direct adapters discover their independent filesystem fixture;
 - each adapter conservatively normalizes Exposed, Matched, Loaded, Applied, and Outcome evidence, while prose-only mentions create no observed stage;
-- the maintained 47-task routing set, including Agent-hinted Chinese tasks, reaches at least 95% Top-3 recall;
+- the maintained 59-task routing set, including Agent-hinted Chinese tasks, reaches 100% Top-3 recall;
 - a public `plan`/`apply` moves non-Core Skills to On-demand, `find` still returns readable paths, and Receipt-bounded `undo` restores the original Agent tree;
 - small (5 Skills), large (120 Skills), and cross-Agent (12 Skills) duplicate scenarios preserve counts, traceable Finding evidence, and the four report metrics;
 - plain 60-, 80-, and 120-column reports retain their core fields, no-change statement, and no ANSI bytes.
@@ -26,7 +26,7 @@ Top-3 routing and task success are separate checks:
 
 The governed run uses the public `scan`, `report`, `plan`, `apply`, `find`, and `undo` commands. It marks seven of ten Skills On-demand, then repeats both checks against paths returned after the real Apply. This validates deterministic fixture capability, not whether an external model completed a natural-language task.
 
-Current local result (2026-08-22): **47/47 Top-3 hits before governance and 47/47 after governance**. Re-run the test above for release evidence; this recorded result is not a substitute for CI.
+Current local result (2026-08-22): **59/59 Top-3 hits before governance and 59/59 after governance**. Re-run the test above for release evidence; this recorded result is not a substitute for CI.
 
 ## Executed three-arm value comparison
 
@@ -95,6 +95,23 @@ The maintained routing fixture now contains 59 English and cross-language
 cases. All 59 route within Top-3, all 12 surface-disambiguation cases require
 the dedicated capability at rank one, and the Apply/Undo governance loop must
 preserve those results.
+
+## Agent-led first-report performance evidence
+
+The 1.7.1 dogfood run used a fresh isolated state directory against the same
+reference home: eight Agents, 193 independent Skills, and 689 placements. The
+public 1.7.0 behavior took 34.26 seconds to produce the first 3,237-byte
+`report --summary --json`; the cached response took 0.04 seconds. Timing each
+Finding family showed semantic-overlap analysis consumed 34.59 seconds while
+all other report analysis completed in under 8 milliseconds.
+
+The analyzer now tokenizes each complete Skill search document once and reuses
+those vocabularies for pair comparison. On the unchanged real Snapshot the
+first report fell to 2.22 seconds with identical Finding counts, category
+counts, and first-view facts. A 193-Skill core regression that previously took
+75.32 seconds now completes in under one second and enforces a five-second
+upper bound in the unoptimized test profile. These measurements describe the
+recorded reference run, not a universal machine-performance guarantee.
 
 ## Release-candidate platform evidence
 
