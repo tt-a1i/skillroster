@@ -102,12 +102,18 @@ pub struct LifecycleArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LifecycleCommand {
+    /// Inspect retained local state and evidence-source exclusions.
+    Inspect,
     /// Export retained usage and evidence summaries as local JSON.
     Export(LifecycleExportArgs),
+    /// Exclude one Agent's session evidence from future Scans.
+    Exclude(LifecycleExcludeArgs),
     /// Aggregate and remove raw usage/evidence older than the retention window.
     Purge(LifecyclePurgeArgs),
     /// Inspect Receipts that require manual recovery.
     Recovery,
+    /// Delete only SkillRoster's SQLite state; Agent and Library files remain.
+    Delete(LifecycleDeleteArgs),
 }
 
 #[derive(Debug, Args)]
@@ -118,8 +124,33 @@ pub struct LifecycleExportArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct LifecycleExcludeArgs {
+    /// One of the eight supported Agent IDs.
+    pub agent: String,
+
+    /// Remove this exclusion and allow future local session-evidence scans.
+    #[arg(long)]
+    pub remove: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct LifecyclePurgeArgs {
     /// Raw usage/evidence retention window in days.
-    #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u16).range(1..=3650))]
-    pub raw_days: u16,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=3650))]
+    pub raw_days: Option<u16>,
+
+    /// Explicitly purge all Plans and Receipts, including their Undo history.
+    #[arg(long)]
+    pub plans_receipts: bool,
+
+    /// Required exact token when --plans-receipts is selected.
+    #[arg(long)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LifecycleDeleteArgs {
+    /// Required exact token: DELETE-LOCAL-STATE.
+    #[arg(long)]
+    pub confirm: String,
 }

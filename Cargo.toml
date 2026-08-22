@@ -1,6 +1,6 @@
 [package]
 name = "skillroster"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Local skill governance for AI agents"
@@ -12,6 +12,7 @@ aho-corasick = "1.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "6.0"
+ctrlc = "3.4"
 fs2 = "0.4"
 hex = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }

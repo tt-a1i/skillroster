@@ -72,6 +72,7 @@ pub(crate) enum OperationPolicy {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanInput {
+    pub schema_version: u32,
     pub scan_id: String,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
@@ -108,6 +109,8 @@ pub struct SourceUpdateAction {
     pub current_digest: String,
     pub expected_file_fingerprint: String,
     pub upstream_digest: String,
+    pub baseline_trusted: bool,
+    pub choice_reason: String,
     pub target: PathBuf,
 }
 
@@ -312,6 +315,15 @@ pub struct ApplyOutcome {
 pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     let input: PlanInput = serde_json::from_str(input)
         .map_err(|error| ChangeError::new("invalid_plan_json", error.to_string()))?;
+    if input.schema_version != 1 {
+        return Err(ChangeError::new(
+            "unsupported_plan_schema",
+            format!(
+                "plan schema_version must be 1, got {}",
+                input.schema_version
+            ),
+        ));
+    }
     if input.scan_id.trim().is_empty() {
         return Err(ChangeError::new(
             "invalid_plan",
@@ -822,7 +834,7 @@ fn normalize_operation(
             expected_fingerprint,
         } => Operation::MoveRecoverable {
             target: normalize_target(&target, roots)?,
-            source: normalize_source(&source, roots)?,
+            source: normalize_movable_source(&source, roots)?,
             expected_fingerprint,
         },
     };
@@ -832,7 +844,11 @@ fn normalize_operation(
 fn validate_current_state(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
     normalize_target(operation.target(), roots)?;
     if let Some(source) = operation.source() {
-        normalize_source(source, roots)?;
+        if matches!(operation, Operation::MoveRecoverable { .. }) {
+            normalize_movable_source(source, roots)?;
+        } else {
+            normalize_source(source, roots)?;
+        }
     }
     let (path, expected) = match operation {
         Operation::CreateDirectory {
@@ -1550,6 +1566,16 @@ fn normalize_source(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Validates the directory entry being moved without following its final
+/// symlink. Moving a link out of an Agent root must move the link itself, not
+/// the canonical Skill directory it points at.
+fn normalize_movable_source(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    let path = normalize_target(path, roots)?;
+    fs::symlink_metadata(&path)
+        .map_err(|error| ChangeError::io("inspect move source", &path, error))?;
+    Ok(path)
+}
+
 fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
     let mut current = path;
     loop {
@@ -1641,11 +1667,20 @@ pub fn journals(state_dir: &Path) -> Result<Vec<ChangeReceipt>> {
     let mut receipts = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| ChangeError::io("read receipt", &directory, error))?;
-        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let bytes = fs::read(entry.path())
-            .map_err(|error| ChangeError::io("read receipt", &entry.path(), error))?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| ChangeError::io("inspect receipt", &path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ChangeError::new(
+                "invalid_receipt_journal",
+                format!("receipt journal {} is not a regular file", path.display()),
+            ));
+        }
+        let bytes =
+            fs::read(&path).map_err(|error| ChangeError::io("read receipt", &path, error))?;
         let receipt: ChangeReceipt = serde_json::from_slice(&bytes)
             .map_err(|error| ChangeError::new("invalid_receipt_journal", error.to_string()))?;
         let receipt_state_dir = fs::canonicalize(&receipt.state_dir).map_err(|error| {
@@ -1778,12 +1813,31 @@ mod tests {
     }
 
     #[test]
+    fn prepare_requires_the_supported_request_schema() {
+        let (_temp, root, state) = fixture();
+        let context = PrepareContext {
+            approved_roots: vec![root],
+            state_dir: state,
+            operation_policy: OperationPolicy::GovernanceOnly,
+        };
+        let missing = prepare(r#"{"scan_id":"scan_1","roster_changes":[]}"#, &context).unwrap_err();
+        assert_eq!(missing.code, "invalid_plan_json");
+
+        let unsupported = prepare(
+            r#"{"schema_version":2,"scan_id":"scan_1","roster_changes":[]}"#,
+            &context,
+        )
+        .unwrap_err();
+        assert_eq!(unsupported.code, "unsupported_plan_schema");
+    }
+
+    #[test]
     fn prepare_refuses_target_through_escaping_symlink() {
         let (_temp, root, state) = fixture();
         let outside = state.join("outside");
         fs::create_dir(&outside).unwrap();
         create_symlink(&outside, &root.join("escape")).unwrap();
-        let input = serde_json::json!({"scan_id":"scan_1","operations":[{"kind":"create_directory","target":root.join("escape/new"),"expected_fingerprint":"missing"}]}).to_string();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{"kind":"create_directory","target":root.join("escape/new"),"expected_fingerprint":"missing"}]}).to_string();
         let error = prepare(
             &input,
             &PrepareContext {
@@ -1800,6 +1854,7 @@ mod tests {
     fn governance_plan_refuses_filesystem_operations() {
         let (_temp, root, state) = fixture();
         let input = serde_json::json!({
+            "schema_version": 1,
             "scan_id": "scan_1",
             "operations": [{
                 "kind": "write_file",
@@ -1826,7 +1881,7 @@ mod tests {
         let (_temp, root, state) = fixture();
         let source = root.join("source");
         fs::write(&source, "before").unwrap();
-        let input = serde_json::json!({"scan_id":"scan_1","operations":[{"kind":"copy","source":source,"target":root.join("copy"),"expected_fingerprint":fingerprint(&source).unwrap()}]}).to_string();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{"kind":"copy","source":source,"target":root.join("copy"),"expected_fingerprint":fingerprint(&source).unwrap()}]}).to_string();
         let plan = prepare(
             &input,
             &PrepareContext {
@@ -1847,7 +1902,7 @@ mod tests {
         fs::create_dir(&source).unwrap();
         let target = root.join("linked");
         let source_fingerprint = fingerprint(&source).unwrap();
-        let input = serde_json::json!({"scan_id":"scan_1","operations":[{"kind":"create_symlink","source":source,"target":target,"expected_fingerprint":"missing","expected_source_fingerprint":source_fingerprint}]}).to_string();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{"kind":"create_symlink","source":source,"target":target,"expected_fingerprint":"missing","expected_source_fingerprint":source_fingerprint}]}).to_string();
         let plan = prepare(
             &input,
             &PrepareContext {
@@ -1878,7 +1933,7 @@ mod tests {
         let source = root.join("source");
         fs::write(&source, "original").unwrap();
         let target = root.join("copy");
-        let input = serde_json::json!({"scan_id":"scan_1","operations":[{"kind":"copy","source":source,"target":target,"expected_fingerprint":fingerprint(&source).unwrap()}]}).to_string();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{"kind":"copy","source":source,"target":target,"expected_fingerprint":fingerprint(&source).unwrap()}]}).to_string();
         let plan = prepare(
             &input,
             &PrepareContext {
@@ -1899,7 +1954,7 @@ mod tests {
     fn write_file_round_trips_without_overwriting_existing_content() {
         let (_temp, root, state) = fixture();
         let target = root.join("SKILL.md");
-        let input = serde_json::json!({"scan_id":"scan_1","operations":[{"kind":"write_file","target":target,"content":"---\nname: test\n---\n","expected_fingerprint":"missing"}]}).to_string();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{"kind":"write_file","target":target,"content":"---\nname: test\n---\n","expected_fingerprint":"missing"}]}).to_string();
         let plan = prepare(
             &input,
             &PrepareContext {
@@ -1920,6 +1975,74 @@ mod tests {
     }
 
     #[test]
+    fn move_recoverable_moves_a_symlink_entry_not_its_canonical_directory() {
+        let (_temp, root, state) = fixture();
+        let canonical = root.join("canonical");
+        fs::create_dir(&canonical).unwrap();
+        fs::write(canonical.join("SKILL.md"), "---\nname: linked\n---\n").unwrap();
+        let link = root.join("linked");
+        create_symlink(&canonical, &link).unwrap();
+        let backup = root.join("linked-backup");
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "move_recoverable",
+                "source": link,
+                "target": backup,
+                "expected_fingerprint": fingerprint(&link).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let normalized_source = plan.operations[0].source().unwrap();
+        assert_eq!(normalized_source.file_name().unwrap(), "linked");
+        assert_ne!(normalized_source, fs::canonicalize(&link).unwrap());
+
+        let applied = apply(&plan).unwrap();
+        assert!(canonical.join("SKILL.md").is_file());
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(
+            fs::symlink_metadata(&backup)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let undone = undo(&applied.receipt).unwrap();
+        assert_eq!(undone.receipt.status, ReceiptStatus::Undone);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(canonical.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn journals_refuse_symlinks_before_reading_their_targets() {
+        let (temp, _root, state) = fixture();
+        let outside = temp.path().join("outside.json");
+        fs::write(&outside, r#"{"private":"must not be read as a journal"}"#).unwrap();
+        let receipts = state.join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        create_symlink(&outside, &receipts.join("receipt_escape.json")).unwrap();
+
+        let error = journals(&state).unwrap_err();
+        assert_eq!(error.code, "invalid_receipt_journal");
+        assert!(!error.message.contains("must not be read"));
+    }
+
+    #[test]
     fn receipt_records_every_filesystem_operation_without_file_content() {
         let (_temp, root, state) = fixture();
         let replace = root.join("replace.txt");
@@ -1933,6 +2056,7 @@ mod tests {
         let move_source = root.join("move-source");
         fs::create_dir(&move_source).unwrap();
         let input = serde_json::json!({
+            "schema_version": 1,
             "scan_id":"scan_1",
             "operations":[
                 {"kind":"create_directory","target":root.join("created"),"expected_fingerprint":"missing"},
@@ -1973,6 +2097,7 @@ mod tests {
         fs::create_dir(&unsafe_source).unwrap();
         create_symlink(&root, &unsafe_source.join("nested-link")).unwrap();
         let input = serde_json::json!({
+            "schema_version": 1,
             "scan_id":"scan_1",
             "operations":[
                 {"kind":"create_directory","target":root.join("first"),"expected_fingerprint":"missing"},

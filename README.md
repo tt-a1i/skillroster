@@ -32,7 +32,9 @@ skillroster apply <plan-id> --json
 skillroster undo <receipt-id> --json
 skillroster setup --json
 skillroster status --json
+skillroster lifecycle inspect --json
 skillroster lifecycle export --output ./skillroster-export.json --json
+skillroster lifecycle exclude codex --json
 skillroster lifecycle purge --raw-days 180 --json
 skillroster lifecycle recovery --json
 ```
@@ -40,6 +42,8 @@ skillroster lifecycle recovery --json
 Agents use JSON mode; people can omit it for concise terminal output. Read-only
 commands never change Agent files. Plan stores an immutable preview, while Apply
 and Undo use fingerprints, journals, receipts, and recovery blocking.
+See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
+Plan/Receipt history or deleting the local database.
 
 Agent-authored Plans are declarative: they reference the latest Snapshot and
 Evidence IDs, then request Roster states, managed/hosted Library placement, or a
@@ -49,11 +53,11 @@ with links; every applied sequence is bounded by a Receipt and can be undone.
 
 ## Status
 
-Pre-alpha. A working local governance path is available for fixture and macOS
-development use, including read-only analysis, immutable Plans, Receipt-bounded
-Apply/Undo, lifecycle retention, and recovery inspection. Full acceptance is
-still in progress. Cross-platform release artifacts and real-environment
-acceptance on Linux and Windows remain release gates rather than claimed support.
+1.0 release candidate. The complete local governance loop is implemented,
+including read-only analysis, versioned immutable Plans, Receipt-bounded
+Apply/Undo, lifecycle controls, recovery, and eight direct Agent adapters.
+Platform support is claimed only after the corresponding release workflow and
+artifact smoke test are recorded in the release acceptance evidence.
 
 See [docs/product-spec.md](docs/product-spec.md) for the complete requirements, [docs/implementation-plan.md](docs/implementation-plan.md) for delivery checkpoints, and [CONTEXT.md](CONTEXT.md) for canonical vocabulary.
 

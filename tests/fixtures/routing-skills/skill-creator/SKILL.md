@@ -4,3 +4,5 @@ description: Create, update, and scaffold reusable Codex skill packages and inst
 triggers: [create skill, update skill instructions, scaffold skill package]
 ---
 Create a focused reusable Skill.
+
+CAPABILITY: skill-creator

@@ -4,3 +4,5 @@ description: Edit, improve, revise, tighten, and restructure technical articles,
 triggers: [edit article, improve draft, revise essay, tighten prose]
 ---
 Improve structure and clarity while preserving the author's intent.
+
+CAPABILITY: edit-article

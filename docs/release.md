@@ -12,7 +12,7 @@ other user data.
    `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
    `cargo test --locked --all-targets --all-features` locally.
 3. Run the **Release candidate** workflow manually with a value such as
-   `0.1.0-rc.1`. It builds Linux x86_64, Windows x86_64, macOS arm64, and macOS
+   `1.0.0-rc.1`. It builds Linux x86_64, Windows x86_64, macOS arm64, and macOS
    x86_64 archives without creating a GitHub Release.
 4. Download all four workflow artifacts and verify every adjacent `.sha256`
    file. Smoke-test `skillroster --version`, `scan --json`, and a fixture-backed

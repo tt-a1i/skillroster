@@ -20,9 +20,16 @@ const MAX_SESSION_LINES_PER_AGENT: usize = 20_000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanOptions {
     pub home: PathBuf,
-    pub explicit_skill_roots: Vec<PathBuf>,
+    pub explicit_skill_roots: Vec<ExplicitSkillRoot>,
+    pub excluded_session_agents: BTreeSet<AgentKind>,
     pub include_session_evidence: bool,
     pub max_depth: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExplicitSkillRoot {
+    pub agent: AgentKind,
+    pub path: PathBuf,
 }
 
 impl ScanOptions {
@@ -30,6 +37,7 @@ impl ScanOptions {
         Self {
             home: home.into(),
             explicit_skill_roots: Vec::new(),
+            excluded_session_agents: BTreeSet::new(),
             include_session_evidence: true,
             max_depth: 5,
         }
@@ -93,6 +101,10 @@ pub struct SkillPlacement {
     pub link_target: Option<PathBuf>,
     pub link_status: LinkStatus,
     pub default_exposed: bool,
+    #[serde(default)]
+    pub executable_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub declared_name_matches_directory: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +115,9 @@ pub struct ScannedSkill {
     pub content_digest: String,
     pub digest_algorithm: String,
     pub summary: String,
+    /// Whitespace-normalized complete SKILL.md text used only by the local FTS index.
+    #[serde(default)]
+    pub normalized_text: String,
     pub modified_at_unix: Option<u64>,
 }
 
@@ -181,7 +196,12 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         .iter()
         .flat_map(|roots| roots.skill_roots.iter().cloned())
         .chain(shared_roots.iter().cloned())
-        .chain(options.explicit_skill_roots.iter().cloned())
+        .chain(
+            options
+                .explicit_skill_roots
+                .iter()
+                .map(|root| root.path.clone()),
+        )
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
 
@@ -211,8 +231,8 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     }
     for root in &options.explicit_skill_roots {
         observe_skill_root(
-            None,
-            root,
+            Some(root.agent),
+            &root.path,
             true,
             &approved_roots,
             options.max_depth,
@@ -225,26 +245,49 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
 
     if options.include_session_evidence {
         for roots in &known {
-            scan_sessions(roots.agent, &roots.session_roots, &mut result);
+            if options.excluded_session_agents.contains(&roots.agent) {
+                observe_excluded_session_roots(
+                    roots.agent,
+                    &roots.session_roots,
+                    "excluded by local lifecycle policy",
+                    &mut result,
+                );
+            } else {
+                scan_sessions(roots.agent, &roots.session_roots, &mut result);
+            }
         }
     } else {
         for roots in &known {
-            for root in &roots.session_roots {
-                result.roots.push(RootObservation {
-                    agent: Some(roots.agent),
-                    kind: RootKind::Sessions,
-                    path: root.clone(),
-                    status: RootStatus::Excluded,
-                    explicit: false,
-                    detail: Some("session evidence disabled".into()),
-                });
-            }
+            observe_excluded_session_roots(
+                roots.agent,
+                &roots.session_roots,
+                "session evidence disabled",
+                &mut result,
+            );
         }
     }
 
     result.skills.sort_by(|a, b| a.id.cmp(&b.id));
     result.placements.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
+}
+
+fn observe_excluded_session_roots(
+    agent: AgentKind,
+    roots: &[PathBuf],
+    detail: &str,
+    result: &mut ScanResult,
+) {
+    for root in roots {
+        result.roots.push(RootObservation {
+            agent: Some(agent),
+            kind: RootKind::Sessions,
+            path: root.clone(),
+            status: RootStatus::Excluded,
+            explicit: false,
+            detail: Some(detail.into()),
+        });
+    }
 }
 
 fn observe_skill_root(
@@ -466,6 +509,17 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
                     .map(|name| name.to_string_lossy().into())
             })
             .unwrap_or_else(|| "unnamed".into());
+        let normalized_text = normalize_search_text(&content);
+        let executable_files = if safe_to_read {
+            executable_files(&directory).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let declared_name_matches_directory = metadata.name.as_ref().and_then(|declared| {
+            directory.file_name().map(|directory_name| {
+                declared.eq_ignore_ascii_case(&directory_name.to_string_lossy())
+            })
+        });
         skills
             .entry(skill_id.clone())
             .or_insert_with(|| ScannedSkill {
@@ -475,6 +529,7 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
                 content_digest: digest.clone(),
                 digest_algorithm: "sha256-v1".into(),
                 summary: summarize_markdown(&content, 320),
+                normalized_text,
                 modified_at_unix: modified_at,
             });
         let placement_basis = format!(
@@ -494,6 +549,8 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             link_target: candidate.link_target,
             link_status: candidate.link_status,
             default_exposed: candidate.agent.is_some(),
+            executable_files,
+            declared_name_matches_directory,
         });
     }
     result.skills = skills.into_values().collect();
@@ -864,12 +921,80 @@ fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Opt
 }
 
 pub fn skill_search_text(skill: &ScannedSkill) -> String {
-    let mut parts = vec![skill.name.clone(), skill.summary.clone()];
+    let mut parts = vec![skill.name.clone(), skill.normalized_text.clone()];
     if let Some(description) = &skill.metadata.description {
         parts.push(description.clone());
     }
     parts.extend(skill.metadata.triggers.clone());
     parts.join(" ")
+}
+
+fn normalize_search_text(markdown: &str) -> String {
+    markdown.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn executable_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    let mut executable = files
+        .into_iter()
+        .filter_map(|(_, path, file_type)| {
+            if file_type.is_symlink() || !file_type.is_file() {
+                return None;
+            }
+            let extension_is_script = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "sh" | "bash"
+                            | "zsh"
+                            | "fish"
+                            | "py"
+                            | "pl"
+                            | "rb"
+                            | "js"
+                            | "mjs"
+                            | "cjs"
+                            | "ps1"
+                            | "bat"
+                            | "cmd"
+                    )
+                });
+            #[cfg(unix)]
+            let mode_is_executable = {
+                use std::os::unix::fs::PermissionsExt;
+                fs::metadata(&path)
+                    .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            };
+            #[cfg(not(unix))]
+            let mode_is_executable = false;
+            (extension_is_script || mode_is_executable).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    executable.sort();
+    executable.dedup();
+    Ok(executable)
+}
+
+pub(crate) fn inspect_skill_identity(entrypoint: &Path) -> io::Result<(String, String)> {
+    let directory = entrypoint
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Skill has no directory"))?;
+    let (content, _) = read_bounded(entrypoint, MAX_SKILL_FILE_BYTES)?;
+    let metadata = parse_skill_markdown(&content);
+    let digest = digest_skill_directory(directory)?;
+    let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
+        (Some(source), Some(version), _) => format!("source:{source}@{version}"),
+        (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
+        _ => format!("content:{digest}"),
+    };
+    Ok((
+        format!("skill_{}", stable_digest(identity_basis.as_bytes())),
+        digest,
+    ))
 }
 
 pub fn placements_by_skill(scan: &ScanResult) -> BTreeMap<&str, Vec<&SkillPlacement>> {
@@ -925,7 +1050,10 @@ mod tests {
             .unwrap();
         }
         let mut options = ScanOptions::for_home(root.join("empty-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
         assert_eq!(result.skills.len(), 1);
@@ -948,7 +1076,10 @@ mod tests {
             fs::write(directory.join("run.sh"), script).unwrap();
         }
         let mut options = ScanOptions::for_home(root.join("empty-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
         assert_eq!(result.skills.len(), 2);
@@ -993,7 +1124,10 @@ mod tests {
         fs::write(outside.join("SKILL.md"), "---\nname: outside\n---\n").unwrap();
         symlink(&outside, root.join("outside-link")).unwrap();
         let mut options = ScanOptions::for_home(root.join("empty-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
         assert_eq!(result.placements.len(), 1);
@@ -1027,7 +1161,10 @@ mod tests {
         symlink(root.join("alias/pkg"), root.join("skill")).unwrap();
 
         let mut options = ScanOptions::for_home(root.join("empty-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
 
@@ -1065,7 +1202,10 @@ mod tests {
         symlink(root.join("missing/pkg"), root.join("skill")).unwrap();
 
         let mut options = ScanOptions::for_home(root.join("empty-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
         options.include_session_evidence = false;
         let result = scan(&options).unwrap();
 

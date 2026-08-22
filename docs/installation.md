@@ -33,7 +33,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v0.1.0 skillroster
+  --tag v1.0.0 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the

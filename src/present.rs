@@ -1,7 +1,136 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fmt::Display;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const PROGRESS_BEGIN: &str = "\r\x1b[2K\x1b[?25l";
+const PROGRESS_END: &str = "\r\x1b[2K\x1b[?25h";
+static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static INTERRUPT_HANDLER: OnceLock<bool> = OnceLock::new();
+
+/// Owns the one-line TTY progress state and restores the terminal on every exit path.
+pub struct ProgressGuard {
+    active: bool,
+    stop: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ProgressGuard {
+    pub fn start(command: &str, json: bool) -> Self {
+        let progress = progress_copy(command);
+        let tty = std::io::stderr().is_terminal();
+        let styled = std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM").map_or(true, |term| term != "dumb");
+        let interactive = !json && tty && progress.is_some();
+        if !interactive {
+            return Self {
+                active: false,
+                stop: None,
+                worker: None,
+            };
+        }
+        let (stage, interrupted) = progress.expect("progress checked above");
+        let handler_ready = *INTERRUPT_HANDLER.get_or_init(|| {
+            ctrlc::set_handler(move || {
+                if PROGRESS_ACTIVE.swap(false, Ordering::SeqCst) {
+                    restore_terminal();
+                }
+                eprintln!("{interrupted}");
+                std::process::exit(130);
+            })
+            .is_ok()
+        });
+        let active = styled && handler_ready;
+        let (stop, worker) = if active {
+            PROGRESS_ACTIVE.store(true, Ordering::SeqCst);
+            let (stop, stopped) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let started = Instant::now();
+                let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                for tick in 0_usize.. {
+                    if !PROGRESS_ACTIVE.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let elapsed = started.elapsed().as_secs_f32();
+                    let _ = write!(
+                        std::io::stderr(),
+                        "{PROGRESS_BEGIN}{} {stage} · {elapsed:.1}s",
+                        frames[tick % frames.len()]
+                    );
+                    let _ = std::io::stderr().flush();
+                    match stopped.recv_timeout(Duration::from_millis(80)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            });
+            (Some(stop), Some(worker))
+        } else {
+            (None, None)
+        };
+        Self {
+            active,
+            stop,
+            worker,
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.restore();
+    }
+
+    fn restore(&mut self) {
+        if self.active {
+            self.active = false;
+            PROGRESS_ACTIVE.store(false, Ordering::SeqCst);
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            restore_terminal();
+        }
+    }
+}
+
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn progress_copy(command: &str) -> Option<(&'static str, &'static str)> {
+    match command {
+        "scan" => Some((
+            "Scanning configured Agent roots",
+            "Interrupted · scan incomplete · no Agent files changed.",
+        )),
+        "apply" => Some((
+            "Checking Plan and filesystem preconditions",
+            "Interrupted · Apply completion unknown · files may have changed under a durable journal; run skillroster status before retrying.",
+        )),
+        "undo" => Some((
+            "Checking Receipt and filesystem preconditions",
+            "Interrupted · Undo completion unknown · files may have changed under a durable journal; run skillroster status before retrying.",
+        )),
+        "setup" => Some((
+            "Inspecting bootstrap Skill targets",
+            "Interrupted · setup incomplete · no Agent files changed.",
+        )),
+        _ => None,
+    }
+}
+
+fn restore_terminal() {
+    let _ = std::io::stderr().write_all(PROGRESS_END.as_bytes());
+    let _ = std::io::stderr().flush();
+}
 
 pub fn human(command: &str, result: &Value) -> String {
     let options = RenderOptions {
@@ -280,6 +409,16 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
 }
 
 fn mutation(value: &Value, lines: &mut Vec<String>) {
+    if value.get("status").and_then(Value::as_str) == Some("cancelled") {
+        fact(lines, "Status", "cancelled");
+        fact(lines, "Changed paths", 0);
+        fact(lines, "Verification", "not run");
+        lines.extend(summary(
+            "Cancelled · no files changed",
+            "Review the immutable Plan before trying again",
+        ));
+        return;
+    }
     fact(lines, "Plan", text(value, "plan_id"));
     fact(lines, "Receipt", text(value, "receipt_id"));
     fact(lines, "Changed paths", text(value, "changed_path_count"));
@@ -488,6 +627,46 @@ fn take_width(value: &str, budget: usize, reverse: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn progress_is_limited_to_real_long_running_stages() {
+        assert_eq!(
+            progress_copy("scan"),
+            Some((
+                "Scanning configured Agent roots",
+                "Interrupted · scan incomplete · no Agent files changed."
+            ))
+        );
+        assert!(progress_copy("report").is_none());
+        assert!(progress_copy("find").is_none());
+        let interrupted = progress_copy("apply").unwrap().1;
+        assert!(interrupted.contains("completion unknown"));
+        assert!(interrupted.contains("files may have changed"));
+        assert!(interrupted.contains("skillroster status"));
+    }
+
+    #[test]
+    fn progress_sequences_hide_then_restore_the_cursor() {
+        assert!(PROGRESS_BEGIN.contains("?25l"));
+        assert!(PROGRESS_END.contains("?25h"));
+        assert!(PROGRESS_BEGIN.starts_with('\r'));
+        assert!(PROGRESS_END.starts_with('\r'));
+    }
+
+    #[test]
+    fn cancelled_mutation_is_a_successful_explicit_no_change_result() {
+        let output = render(
+            "apply",
+            &json!({"status": "cancelled", "files_changed": false}),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(output.contains("Cancelled · no files changed"));
+        assert!(output.contains("Verification           not run"));
+        assert!(!output.contains("bounded by the Receipt"));
+    }
 
     #[test]
     fn find_output_stays_plain_and_bounded_at_reference_widths() {

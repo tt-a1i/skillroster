@@ -21,7 +21,7 @@ use crate::model::{
     ReportRecord, RootId, RootRecord, RootStatus, RosterEntry, RosterState, ScanId, ScanRun,
     ScanStatus, Severity, SkillId, SkillRecord, SuggestedAction, UsageEvent, UsageStage,
 };
-use crate::scan::{self, RootKind, ScanOptions, ScanResult};
+use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
 
 pub struct Output {
@@ -32,9 +32,33 @@ pub struct Output {
 pub fn run(cli: Cli) -> Result<Output> {
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
+    let database_path = state_dir.join("skillroster.db");
+    if let Some(Command::Lifecycle(args)) = &cli.command
+        && let LifecycleCommand::Delete(args) = &args.command
+    {
+        if args.confirm != "DELETE-LOCAL-STATE" {
+            bail!("database deletion requires --confirm DELETE-LOCAL-STATE");
+        }
+        if !cli.json
+            && !require_human_confirmation(
+                &format!(
+                    "Delete SkillRoster local state at {}?",
+                    database_path.display()
+                ),
+                "The SQLite database and Receipt journals will be deleted. Agent and Library files are preserved. A new Scan rebuilds inventory state.",
+            )?
+        {
+            return cancelled_output("lifecycle");
+        }
+        let result = lifecycle_delete_command(&database_path, &state_dir)?;
+        let envelope = JsonEnvelope::success("lifecycle", result.clone());
+        return Ok(Output {
+            json: serde_json::to_string(&envelope)?,
+            human: crate::present::human("lifecycle", &result),
+        });
+    }
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
-    let database_path = state_dir.join("skillroster.db");
     let store = StateStore::open(&database_path)?;
 
     let (command, result, warnings, actions) = match cli.command {
@@ -91,7 +115,7 @@ pub fn run(cli: Cli) -> Result<Output> {
         ),
         Some(Command::Find(args)) => (
             "find",
-            find_command(&store, &args.task, usize::from(args.limit))?,
+            find_command(&store, &state_dir, &args.task, usize::from(args.limit))?,
             vec![],
             vec![],
         ),
@@ -113,12 +137,17 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
         Some(Command::Apply(args)) => {
             if !cli.json {
-                require_human_confirmation(
+                eprintln!("{}\n", human_plan_preview(&store, &args.id)?);
+                if !require_human_confirmation(
                     &format!("Apply Plan {} to the approved Agent roots?", args.id),
-                    "The exact immutable Plan will be applied; a Receipt will be written.",
-                )?;
+                    "The immutable Plan shown above will be applied; a Receipt will be written and no canonical Skill content will be deleted.",
+                )? {
+                    return cancelled_output("apply");
+                }
             }
+            let progress = crate::present::ProgressGuard::start("apply", cli.json);
             let result = apply_command(&store, &args.id)?;
+            progress.finish();
             let id = result["receipt_id"]
                 .as_str()
                 .unwrap_or_default()
@@ -138,33 +167,65 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
         Some(Command::Undo(args)) => {
             if !cli.json {
-                require_human_confirmation(
+                eprintln!("{}\n", human_undo_preview(&store, &args.id)?);
+                if !require_human_confirmation(
                     &format!("Undo Receipt {}?", args.id),
-                    "Only changes recorded by this Receipt will be reversed.",
-                )?;
+                    "Only the exact changed paths shown above will be reversed; unrelated Agent and Library files are outside this Undo.",
+                )? {
+                    return cancelled_output("undo");
+                }
             }
-            ("undo", undo_command(&store, &args.id)?, vec![], vec![])
+            let progress = crate::present::ProgressGuard::start("undo", cli.json);
+            let result = undo_command(&store, &args.id)?;
+            progress.finish();
+            ("undo", result, vec![], vec![])
         }
         Some(Command::Lifecycle(args)) => match args.command {
+            LifecycleCommand::Inspect => (
+                "lifecycle",
+                lifecycle_inspect_command(&store, &database_path, &state_dir)?,
+                vec![],
+                vec![],
+            ),
             LifecycleCommand::Export(args) => (
                 "lifecycle",
                 lifecycle_export_command(&store, &args.output)?,
                 vec![],
                 vec![],
             ),
+            LifecycleCommand::Exclude(args) => (
+                "lifecycle",
+                lifecycle_exclude_command(&store, &args.agent, args.remove)?,
+                vec![],
+                vec![],
+            ),
             LifecycleCommand::Purge(args) => {
-                if !cli.json {
-                    require_human_confirmation(
-                        &format!(
-                            "Aggregate and purge raw usage/evidence older than {} days?",
-                            args.raw_days
-                        ),
-                        "Only controlled SQLite usage/evidence rows are affected; Plans, Receipts, and Agent files are preserved.",
-                    )?;
+                if args.raw_days.is_none() && !args.plans_receipts {
+                    bail!("purge requires --raw-days DAYS and/or --plans-receipts");
+                }
+                if args.plans_receipts && args.confirm.as_deref() != Some("PURGE-PLANS-RECEIPTS") {
+                    bail!("Plans and Receipts purge requires --confirm PURGE-PLANS-RECEIPTS");
+                }
+                if !cli.json
+                    && !require_human_confirmation(
+                        "Purge the explicitly selected local lifecycle state?",
+                        if args.plans_receipts {
+                            "Selected Plans, Receipts, and their Undo history will be deleted. Agent and Library files are preserved."
+                        } else {
+                            "Only selected SQLite usage/evidence rows are affected; Plans, Receipts, Agent files, and Library files are preserved."
+                        },
+                    )?
+                {
+                    return cancelled_output("lifecycle");
                 }
                 (
                     "lifecycle",
-                    lifecycle_purge_command(&store, args.raw_days)?,
+                    lifecycle_purge_command(
+                        &store,
+                        &state_dir,
+                        args.raw_days,
+                        args.plans_receipts,
+                    )?,
                     vec![],
                     vec![],
                 )
@@ -175,6 +236,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 vec![],
                 vec![],
             ),
+            LifecycleCommand::Delete(_) => unreachable!("handled before opening SQLite"),
         },
         Some(Command::Setup) => (
             "setup",
@@ -304,7 +366,7 @@ fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(home)
 }
 
-fn require_human_confirmation(question: &str, consequence: &str) -> Result<()> {
+fn require_human_confirmation(question: &str, consequence: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!(
             "human mutation requires an interactive terminal; Agent callers must use --json only after explicit user confirmation"
@@ -314,32 +376,110 @@ fn require_human_confirmation(question: &str, consequence: &str) -> Result<()> {
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
-    if answer.trim() != "confirm" {
-        bail!("cancelled; no files changed");
-    }
-    Ok(())
+    Ok(answer.trim() == "confirm")
 }
 
-fn parse_explicit_roots(values: &[String]) -> Result<Vec<PathBuf>> {
+fn cancelled_output(command: &'static str) -> Result<Output> {
+    let result = json!({
+        "status": "cancelled",
+        "changed_path_count": 0,
+        "verification": "not_run",
+        "undo_available": false,
+        "files_changed": false
+    });
+    let envelope = JsonEnvelope::success(command, result.clone());
+    Ok(Output {
+        json: serde_json::to_string(&envelope)?,
+        human: crate::present::human(command, &result),
+    })
+}
+
+fn human_plan_preview(store: &StateStore, id: &str) -> Result<String> {
+    let id = PlanId::parse(id.to_string())?;
+    let record = store
+        .get_plan(&id)?
+        .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
+    let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
+    let raw = &record.input["raw"];
+    let risk = if raw["source_updates"]
+        .as_array()
+        .is_some_and(|v| !v.is_empty())
+    {
+        "source_update"
+    } else if raw["library_changes"]
+        .as_array()
+        .is_some_and(|v| !v.is_empty())
+    {
+        "library_governance"
+    } else if prepared.operations.is_empty() {
+        "roster_change"
+    } else {
+        "filesystem_change"
+    };
+    Ok(crate::present::human(
+        "plan",
+        &json!({
+            "plan_id": prepared.id,
+            "operations": prepared.operations,
+            "roster_changes": prepared.roster_changes,
+            "risk": risk,
+            "reversible": true,
+            "canonical_deletion_count": 0,
+            "blocked_preconditions": [],
+            "state": record.status,
+            "files_changed": false
+        }),
+    ))
+}
+
+fn human_undo_preview(store: &StateStore, id: &str) -> Result<String> {
+    let id = ReceiptId::parse(id.to_string())?;
+    let record = store
+        .get_receipt(&id)?
+        .ok_or_else(|| anyhow!("Receipt {id} does not exist"))?;
+    let paths = record.verification["change_receipt"]["changed_paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut preview = format!(
+        "SkillRoster · Undo Receipt\n\n  Receipt                {}\n  Plan                   {}\n  Recorded operations    {}\n  Changed paths          {}",
+        record.id,
+        record.plan_id,
+        record.operation_results.len(),
+        paths.len()
+    );
+    for path in paths {
+        preview.push_str("\n    ");
+        preview.push_str(path);
+    }
+    preview.push_str("\n\nPreview only · no files changed");
+    Ok(preview)
+}
+
+fn parse_explicit_roots(values: &[String]) -> Result<Vec<ExplicitSkillRoot>> {
     values
         .iter()
         .map(|value| {
             let (agent, path) = value
                 .split_once('=')
                 .ok_or_else(|| anyhow!("root must use AGENT=PATH: {value}"))?;
-            if !AgentKind::ALL
-                .iter()
-                .any(|candidate| candidate.id() == agent)
-            {
-                bail!("unsupported Agent in explicit root: {agent}");
-            }
+            let agent = parse_agent_kind(agent)?;
             let path = PathBuf::from(path);
             if !path.is_absolute() {
                 bail!("explicit root must be absolute: {}", path.display());
             }
-            Ok(path)
+            Ok(ExplicitSkillRoot { agent, path })
         })
         .collect()
+}
+
+fn parse_agent_kind(value: &str) -> Result<AgentKind> {
+    AgentKind::ALL
+        .into_iter()
+        .find(|candidate| candidate.id() == value)
+        .ok_or_else(|| anyhow!("unsupported Agent: {value}"))
 }
 
 fn home_result(store: &StateStore, state_dir: &Path) -> Result<Value> {
@@ -401,6 +541,8 @@ fn lifecycle_export_command(store: &StateStore, output: &Path) -> Result<Value> 
             "older_usage": "monthly_aggregates_retained",
         },
         "data": store.export_lifecycle()?,
+        "evidence_exclusions": store.evidence_exclusions()?,
+        "privacy": "derived summaries only; no raw conversation text",
     });
     let parent = output
         .parent()
@@ -433,19 +575,146 @@ fn lifecycle_export_command(store: &StateStore, output: &Path) -> Result<Value> 
     }))
 }
 
-fn lifecycle_purge_command(store: &StateStore, raw_days: u16) -> Result<Value> {
-    let cutoff = Utc::now().timestamp() - i64::from(raw_days) * 24 * 60 * 60;
-    let result = store.purge_usage_before(cutoff)?;
+fn lifecycle_inspect_command(
+    store: &StateStore,
+    database_path: &Path,
+    state_dir: &Path,
+) -> Result<Value> {
+    Ok(json!({
+        "operation": "inspect",
+        "database_path": database_path,
+        "counts": store.lifecycle_counts()?,
+        "evidence_exclusions": store.evidence_exclusions()?,
+        "recovery_state": recovery_text(store, state_dir)?,
+        "privacy": "derived summaries only; no raw conversation text",
+        "files_changed": false,
+    }))
+}
+
+fn lifecycle_exclude_command(store: &StateStore, agent: &str, remove: bool) -> Result<Value> {
+    let agent = parse_agent_kind(agent)?;
+    store.set_evidence_exclusion(agent.id(), !remove)?;
+    Ok(json!({
+        "operation": if remove { "exclusion_removed" } else { "exclude" },
+        "agent": agent.id(),
+        "scope": "future_session_evidence_scans",
+        "raw_conversations_copied": false,
+        "evidence_exclusions": store.evidence_exclusions()?,
+        "agent_files_changed": false,
+        "library_files_changed": false,
+        "files_changed": false,
+    }))
+}
+
+fn lifecycle_purge_command(
+    store: &StateStore,
+    state_dir: &Path,
+    raw_days: Option<u16>,
+    plans_receipts: bool,
+) -> Result<Value> {
+    let (cutoff, usage_result) = if let Some(raw_days) = raw_days {
+        let cutoff = Utc::now().timestamp() - i64::from(raw_days) * 24 * 60 * 60;
+        (Some(cutoff), Some(store.purge_usage_before(cutoff)?))
+    } else {
+        (None, None)
+    };
+    let plan_receipt_result = if plans_receipts {
+        if recovery_text(store, state_dir)? == "required" {
+            bail!("recovery is required before Plans and Receipts can be purged");
+        }
+        let removed_journals = remove_receipt_journals(state_dir)?;
+        let result = store.purge_plans_and_receipts()?;
+        Some(json!({
+            "plans": result.plans,
+            "receipts": result.receipts,
+            "receipt_journals": removed_journals,
+        }))
+    } else {
+        None
+    };
     Ok(json!({
         "operation": "purge",
         "raw_usage_days": raw_days,
         "cutoff": cutoff,
-        "result": result,
-        "monthly_aggregates_retained": true,
-        "plans_or_receipts_changed": false,
+        "usage_result": usage_result,
+        "plan_receipt_result": plan_receipt_result,
+        "monthly_aggregates_retained": raw_days.is_some(),
+        "plans_or_receipts_changed": plans_receipts,
         "agent_files_changed": false,
+        "library_files_changed": false,
         "files_changed": false,
     }))
+}
+
+fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Value> {
+    let existed = database_path.exists();
+    let journals = change::journals(state_dir)?;
+    if existed {
+        let store = StateStore::open(database_path)?;
+        if recovery_text(&store, state_dir)? == "required" {
+            bail!("recovery is required before the local state database can be deleted");
+        }
+        drop(store);
+    } else if !journals.is_empty() {
+        bail!("recovery is required before the local state database can be deleted");
+    }
+    let removed_journals = remove_receipt_journals(state_dir)?;
+    let mut removed_database_files = Vec::new();
+    for path in [
+        database_path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", database_path.display())),
+        PathBuf::from(format!("{}-shm", database_path.display())),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed_database_files.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot delete {}", path.display()));
+            }
+        }
+    }
+    let files_changed = !removed_database_files.is_empty() || removed_journals > 0;
+    Ok(json!({
+        "operation": "delete_local_state",
+        "database_path": database_path,
+        "database_existed": existed,
+        "removed_database_files": removed_database_files,
+        "removed_receipt_journals": removed_journals,
+        "rebuild_command": "skillroster scan --json",
+        "agent_files_changed": false,
+        "library_files_changed": false,
+        "files_changed": files_changed,
+    }))
+}
+
+fn remove_receipt_journals(state_dir: &Path) -> Result<u64> {
+    change::journals(state_dir)?;
+    let directory = state_dir.join("receipts");
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", directory.display()));
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!(
+                "refusing to delete non-file Receipt journal: {}",
+                path.display()
+            );
+        }
+        std::fs::remove_file(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
@@ -555,7 +824,7 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
 fn scan_command(
     store: &StateStore,
     home: &Path,
-    explicit: Vec<PathBuf>,
+    explicit: Vec<ExplicitSkillRoot>,
 ) -> Result<(Value, Vec<String>)> {
     let started = Utc::now().timestamp();
     let id = ScanId::new();
@@ -568,6 +837,11 @@ fn scan_command(
     })?;
     let mut options = ScanOptions::for_home(home);
     options.explicit_skill_roots = explicit;
+    options.excluded_session_agents = store
+        .evidence_exclusions()?
+        .iter()
+        .map(|agent| parse_agent_kind(agent))
+        .collect::<Result<_>>()?;
     let result = match scan::scan(&options) {
         Ok(result) => result,
         Err(error) => {
@@ -654,19 +928,20 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
         .findings
         .iter()
         .map(|finding| -> Result<FindingRecord> {
+            let id = FindingId::new();
             let evidence_ids = finding
                 .evidence
                 .iter()
                 .map(|reference| evidence_id(&scan_id, reference))
                 .collect::<Result<Vec<_>>>()?;
             Ok(FindingRecord {
-                id: FindingId::parse(finding.id.clone())?,
+                details: finding_json(&id, finding, &evidence_ids, &scan),
+                id,
                 report_id: report_id.clone(),
                 category: finding_category(finding.category),
                 severity: severity(finding.severity),
                 title: finding.title.clone(),
                 summary: finding.summary.clone(),
-                details: finding_json(finding, &evidence_ids, &scan),
                 evidence_ids,
             })
         })
@@ -677,7 +952,7 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
         .zip(&findings)
         .map(|(finding, stored)| {
             json!({
-                "id": finding.id,
+                "id": stored.id,
                 "category": finding.category,
                 "severity": finding.severity,
                 "title": finding.title,
@@ -731,12 +1006,13 @@ fn report_command(store: &StateStore, finding: Option<&str>) -> Result<Value> {
 }
 
 fn finding_json(
+    id: &FindingId,
     finding: &crate::query::Finding,
     evidence_ids: &[EvidenceId],
     scan: &ScanResult,
 ) -> Value {
     json!({
-        "id": finding.id,
+        "id": id,
         "category": finding.category,
         "severity": finding.severity,
         "title": finding.title,
@@ -784,14 +1060,144 @@ fn finding_coverage(finding: &crate::query::Finding, scan: &ScanResult) -> Value
     })
 }
 
-fn find_command(store: &StateStore, task: &str, limit: usize) -> Result<Value> {
+fn find_command(store: &StateStore, state_dir: &Path, task: &str, limit: usize) -> Result<Value> {
     let (scan_id, scan) = latest_scan(store)?;
+    let mut candidate_ids = store
+        .search_skill_ids(task, scan.skills.len())?
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    for skill_id in candidate_ids.clone() {
+        let id = SkillId::parse(skill_id.clone())?;
+        let states = store.roster_states_for_skill(&id)?;
+        if !states.is_empty() && states.iter().all(|state| *state == RosterState::Archived) {
+            candidate_ids.remove(&skill_id);
+        }
+    }
+    let mut matches = crate::query::find_matching(&scan, task, limit, Some(&candidate_ids));
+    let mut warnings = Vec::new();
+    let mut rescan_required = false;
+    for found in &mut matches {
+        let skill_id = SkillId::parse(found.skill_id.clone())?;
+        found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
+        let paths = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
+        found.paths = paths.paths;
+        if paths.drifted {
+            rescan_required = true;
+            warnings.push(format!(
+                "{} has no current path that matches the latest Snapshot identity and fingerprint; run skillroster scan",
+                found.name
+            ));
+        }
+    }
+    warnings.sort();
+    warnings.dedup();
     Ok(json!({
         "snapshot_id": scan_id,
         "task": task,
-        "matches": crate::query::find(&scan, task, limit),
+        "matches": matches,
+        "rescan_required": rescan_required,
+        "warnings": warnings,
         "files_changed": false
     }))
+}
+
+fn current_roster_state(states: &[RosterState]) -> String {
+    let mut names = states
+        .iter()
+        .map(|state| match state {
+            RosterState::Core => "core",
+            RosterState::OnDemand => "on_demand",
+            RosterState::ExplicitOnly => "explicit_only",
+            RosterState::Archived => "archived",
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    match names.len() {
+        0 => "unassigned".into(),
+        1 => names.pop_first().unwrap_or("unassigned").into(),
+        _ => "mixed".into(),
+    }
+}
+
+fn current_readable_skill_paths(
+    scan: &ScanResult,
+    state_dir: &Path,
+    skill_id: &str,
+) -> Result<CurrentSkillPaths> {
+    let skill = scan
+        .skills
+        .iter()
+        .find(|skill| skill.id == skill_id)
+        .ok_or_else(|| anyhow!("Skill {skill_id} is not in the latest Snapshot"))?;
+    let directory_name = safe_skill_directory_name(&skill.name)?;
+    let mut candidates = vec![
+        state_dir
+            .join("library")
+            .join(&directory_name)
+            .join("SKILL.md"),
+    ];
+    candidates.extend(
+        scan.placements
+            .iter()
+            .filter(|placement| placement.skill_id == skill_id)
+            .map(|placement| placement.entrypoint.clone()),
+    );
+    candidates.extend(
+        scan.roots
+            .iter()
+            .filter(|root| {
+                root.kind == RootKind::Skills && root.status == scan::RootStatus::Included
+            })
+            .map(|root| root.path.join(&directory_name).join("SKILL.md")),
+    );
+    let mut approved_roots = scan
+        .roots
+        .iter()
+        .filter(|root| root.kind == RootKind::Skills && root.status == scan::RootStatus::Included)
+        .filter_map(|root| std::fs::canonicalize(&root.path).ok())
+        .collect::<Vec<_>>();
+    if let Ok(library) = std::fs::canonicalize(state_dir.join("library")) {
+        approved_roots.push(library);
+    }
+    approved_roots.sort();
+    approved_roots.dedup();
+
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut rejected_existing = false;
+    for path in candidates {
+        if !seen.insert(path.clone()) || !path.exists() {
+            continue;
+        }
+        let Ok(resolved) = std::fs::canonicalize(&path) else {
+            rejected_existing = true;
+            continue;
+        };
+        if !resolved.is_file() || !approved_roots.iter().any(|root| resolved.starts_with(root)) {
+            rejected_existing = true;
+            continue;
+        }
+        let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
+            rejected_existing = true;
+            continue;
+        };
+        if actual_id != skill.id || actual_fingerprint != skill.content_digest {
+            rejected_existing = true;
+            continue;
+        }
+        paths.push(path.display().to_string());
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(CurrentSkillPaths {
+        drifted: rejected_existing || paths.is_empty(),
+        paths,
+    })
+}
+
+struct CurrentSkillPaths {
+    paths: Vec<String>,
+    drifted: bool,
 }
 
 fn plan_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
@@ -976,6 +1382,9 @@ fn normalize_agent_plan(
         let current_content = std::fs::read_to_string(&placement.entrypoint)?;
         let actual_file_digest = content_digest(current_content.as_bytes());
         let baseline = store.source_baseline(&request.source, &request.current_revision)?;
+        let trusted_digest = baseline
+            .as_ref()
+            .and_then(|baseline| baseline.trusted_digest.as_deref());
         if let Some(submitted) = request.base_digest.as_deref() {
             let submitted = normalized_digest(submitted)?;
             let stored = baseline.as_ref().ok_or_else(|| {
@@ -985,7 +1394,11 @@ fn normalize_agent_plan(
                     request.current_revision
                 )
             })?;
-            if submitted != stored.entrypoint_digest {
+            let expected = stored
+                .trusted_digest
+                .as_deref()
+                .unwrap_or(&stored.entrypoint_digest);
+            if submitted != expected {
                 bail!(
                     "submitted base_digest does not match the immutable source baseline for {}@{}",
                     request.source,
@@ -1010,18 +1423,28 @@ fn normalize_agent_plan(
         if actual_file_digest == upstream_digest {
             bail!("placement already has the submitted upstream content");
         }
-        let local_modified = baseline
-            .as_ref()
-            .is_none_or(|baseline| actual_file_digest != baseline.entrypoint_digest);
-        if local_modified && request.choice.is_none() {
-            if baseline.is_some() {
+        if let Some(existing_upstream) =
+            store.source_baseline(&request.source, &request.upstream_revision)?
+            && let Some(trusted_upstream) = existing_upstream.trusted_digest
+            && trusted_upstream != upstream_digest
+        {
+            bail!(
+                "submitted upstream content conflicts with the trusted source baseline for {}@{}",
+                request.source,
+                request.upstream_revision
+            );
+        }
+        let baseline_trusted = trusted_digest.is_some();
+        let local_modified = trusted_digest.is_none_or(|digest| actual_file_digest != digest);
+        if (!baseline_trusted || local_modified) && request.choice.is_none() {
+            if baseline_trusted {
                 bail!(
                     "local modification detected for placement {}; choice is required",
                     request.placement_id
                 );
             }
             bail!(
-                "no immutable source baseline exists for {}@{}; an explicit choice is required",
+                "source baseline for {}@{} is first-observed and untrusted; an explicit choice is required",
                 request.source,
                 request.current_revision
             );
@@ -1063,15 +1486,32 @@ fn normalize_agent_plan(
             "current_digest": request.current_fingerprint,
             "expected_file_fingerprint": expected_file_fingerprint,
             "upstream_digest": upstream_digest,
+            "baseline_trusted": baseline_trusted,
+            "choice_reason": if baseline_trusted {
+                if local_modified { "trusted_baseline_local_modification" } else { "trusted_baseline_clean" }
+            } else {
+                "first_observed_baseline_untrusted"
+            },
             "target": action_target
         }));
-        diffs.push(diff_summary(
+        let mut diff = diff_summary(
             &current_content,
             &request.upstream_content,
             local_modified,
             choice_name,
             &request.placement_id,
-        ));
+        );
+        diff["baseline_trusted"] = json!(baseline_trusted);
+        diff["choice_reason"] = json!(if baseline_trusted {
+            if local_modified {
+                "trusted_baseline_local_modification"
+            } else {
+                "trusted_baseline_clean"
+            }
+        } else {
+            "first_observed_baseline_untrusted"
+        });
+        diffs.push(diff);
     }
     input["operations"] = Value::Array(operations);
     input["source_updates"] = Value::Array(actions);
@@ -1544,8 +1984,24 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
         json!(prepared.evidence_ids),
         json!({"before": library_before, "after": prepared.library_changes}),
     )?;
+    let trusted_sources = if outcome.verification_passed && next == PlanStatus::Applied {
+        prepared
+            .source_updates
+            .iter()
+            .filter(|update| matches!(update.choice.as_str(), "adopt_upstream" | "preserve_both"))
+            .map(|update| crate::sqlite::TrustedSourceBaseline {
+                source: update.source.clone(),
+                revision: update.to_revision.clone(),
+                digest: update.upstream_digest.clone(),
+                scan_id: latest_scan_id.clone(),
+                observed_at: Utc::now().timestamp(),
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     store
-        .save_apply_receipt(&id, next, &receipt)
+        .save_apply_receipt_with_trusted_sources(&id, next, &receipt, &trusted_sources)
         .with_context(|| {
             format!(
                 "filesystem journal {} is durable but SQLite Apply finalization failed; run lifecycle recovery --json",
@@ -1665,7 +2121,7 @@ fn setup_command(store: &StateStore, home: &Path, state_dir: &Path) -> Result<Va
     let plan = prepare_plan(
         store,
         state_dir,
-        json!({"scan_id": snapshot.id, "operations": operations}),
+        json!({"schema_version": 1, "scan_id": snapshot.id, "operations": operations}),
         PlanOrigin::BootstrapSetup,
     )?;
     Ok(json!({
@@ -1697,7 +2153,11 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
         let path = root.path.to_string_lossy().into_owned();
         let root_id = stable_id(
             "root",
-            &format!("{}\0{path}", scan_id.as_str()),
+            &format!(
+                "{}\0{}\0{path}",
+                scan_id.as_str(),
+                root.agent.map(AgentKind::id).unwrap_or("shared")
+            ),
             RootId::parse,
         )?;
         store.save_root(&RootRecord {
@@ -1710,11 +2170,14 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             explicit: root.explicit,
             detail: root.detail.clone(),
         })?;
-        root_ids.insert(path.clone(), root_id.clone());
+        root_ids.insert((root.agent, path.clone()), root_id.clone());
         save_reference_evidence(
             store,
             scan_id,
-            &format!("path:{path}"),
+            &format!(
+                "path:{}:{path}",
+                root.agent.map(AgentKind::id).unwrap_or("shared")
+            ),
             EvidenceKind::Path,
             EvidenceQuality::Observed,
             "root",
@@ -1775,6 +2238,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 entrypoint_digest,
                 first_observed_scan_id: scan_id.clone(),
                 first_observed_at: observed_at,
+                trusted_digest: None,
+                trusted_by_receipt_id: None,
             })?;
         }
         store.index_skill(
@@ -1782,7 +2247,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             &skill.name,
             skill.metadata.description.as_deref().unwrap_or_default(),
             &skill.metadata.triggers.join(" "),
-            &skill.summary,
+            &skill.normalized_text,
         )?;
         skill_ids.insert(skill.id.clone(), stored_id.clone());
         save_reference_evidence(
@@ -1803,8 +2268,9 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
     for placement in &scan.placements {
         let path = placement.entrypoint.to_string_lossy().into_owned();
         let root_path = placement.root.to_string_lossy().into_owned();
+        let root_key = (placement.agent, root_path.clone());
         let root_id = root_ids
-            .get(&root_path)
+            .get(&root_key)
             .cloned()
             .ok_or_else(|| anyhow!("Placement root was not normalized: {root_path}"))?;
         let skill_id = skill_ids
@@ -1846,10 +2312,27 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             json!({
                 "skill_id": skill_id,
                 "agent": placement.agent.map(AgentKind::id),
-                "root_id": root_ids[&root_path],
+                "root_id": root_ids[&root_key],
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
+            }),
+            observed_at,
+        )?;
+        save_reference_evidence(
+            store,
+            scan_id,
+            &format!("digest:{}", placement.content_digest),
+            EvidenceKind::Digest,
+            EvidenceQuality::Observed,
+            "placement",
+            placement_id.as_str(),
+            Some(placement.entrypoint.to_string_lossy().into_owned()),
+            Some(placement.content_digest.clone()),
+            json!({
+                "algorithm": "sha256-v1",
+                "skill_id": skill_id,
+                "placement_id": placement_id,
             }),
             observed_at,
         )?;
@@ -2500,6 +2983,16 @@ mod recovery_tests {
         assert_eq!(issues[0]["tracked_in_sqlite"], false);
         assert!(require_clear_journals(&store, &state_dir).is_err());
         assert_eq!(recovery_text(&store, &state_dir).unwrap(), "required");
+        let database_path = state_dir.join("skillroster.db");
+        drop(StateStore::open(&database_path).unwrap());
+        assert!(lifecycle_delete_command(&database_path, &state_dir).is_err());
+        assert!(database_path.is_file());
+        assert!(
+            state_dir
+                .join("receipts")
+                .join(format!("{}.json", receipt.id))
+                .is_file()
+        );
     }
 
     #[test]

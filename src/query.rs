@@ -256,6 +256,37 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             );
         }
     }
+
+    let mismatches = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.declared_name_matches_directory == Some(false))
+        .collect::<Vec<_>>();
+    if !mismatches.is_empty() {
+        push_finding(
+            findings,
+            FindingCategory::Layout,
+            Severity::Low,
+            "Declared Skill names differ from placement directories",
+            format!(
+                "{} placements declare a Skill name that differs from the containing directory; this is a structural mismatch, not a runtime-safety judgment.",
+                mismatches.len()
+            ),
+            mismatches
+                .iter()
+                .map(|placement| placement.skill_id.clone())
+                .collect(),
+            mismatches
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            mismatches
+                .iter()
+                .map(|placement| format!("path:{}", placement.entrypoint.display()))
+                .collect(),
+            EvidenceQuality::Observed,
+        );
+    }
 }
 
 fn exposure_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
@@ -533,7 +564,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             Severity::Low,
             "Semantic overlap candidate",
             format!(
-                "{} and {} share routing vocabulary (Jaccard {:.2}); this is review-only candidate evidence, not duplicate proof.",
+                "{} and {} share routing vocabulary (Jaccard {:.2}); this is review-only candidate evidence, not a confirmed duplicate.",
                 left.name, right.name, similarity
             ),
             vec![left.id.clone(), right.id.clone()],
@@ -579,6 +610,41 @@ fn routing_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
 }
 
 fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
+    let executable = scan
+        .placements
+        .iter()
+        .filter(|placement| !placement.executable_files.is_empty())
+        .collect::<Vec<_>>();
+    if !executable.is_empty() {
+        let file_count = executable
+            .iter()
+            .map(|placement| placement.executable_files.len())
+            .sum::<usize>();
+        push_finding(
+            findings,
+            FindingCategory::Lifecycle,
+            Severity::Info,
+            "Skill packages contain executable scripts",
+            format!(
+                "{file_count} executable or script-extension files were observed across {} placements. Presence alone does not establish that code is safe, unsafe, or executed.",
+                executable.len()
+            ),
+            executable
+                .iter()
+                .map(|placement| placement.skill_id.clone())
+                .collect(),
+            executable
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            executable
+                .iter()
+                .map(|placement| format!("path:{}", placement.entrypoint.display()))
+                .collect(),
+            EvidenceQuality::Observed,
+        );
+    }
+
     let unknown_source = scan
         .skills
         .iter()
@@ -643,6 +709,47 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 .map(|skill| format!("digest:{}", skill.content_digest))
                 .collect(),
             EvidenceQuality::Unknown,
+        );
+    }
+
+    let mut by_source = BTreeMap::<&str, Vec<&ScannedSkill>>::new();
+    for skill in scan
+        .skills
+        .iter()
+        .filter(|skill| skill.metadata.source.is_some())
+    {
+        by_source
+            .entry(skill.metadata.source.as_deref().unwrap_or_default())
+            .or_default()
+            .push(skill);
+    }
+    for (source, skills) in by_source {
+        let revisions = skills
+            .iter()
+            .filter_map(|skill| {
+                skill
+                    .metadata
+                    .version
+                    .as_deref()
+                    .or(skill.metadata.revision.as_deref())
+            })
+            .collect::<BTreeSet<_>>();
+        if revisions.len() < 2 {
+            continue;
+        }
+        push_finding(
+            findings,
+            FindingCategory::Lifecycle,
+            Severity::Medium,
+            "Declared source has version divergence",
+            format!(
+                "Source {source} appears at {} declared versions or revisions across local Skills; this reports local divergence and does not determine which revision should be used.",
+                revisions.len()
+            ),
+            skills.iter().map(|skill| skill.id.clone()).collect(),
+            Vec::new(),
+            evidence_paths_for_skills(scan, &skills),
+            EvidenceQuality::Observed,
         );
     }
 
@@ -737,7 +844,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             FindingCategory::Lifecycle,
             Severity::Info,
             "Archive candidacy is unknown",
-            "Coverage is insufficient to treat missing usage as evidence for archive. No archive recommendation was made.",
+            "Coverage is insufficient to treat missing usage as evidence for archive. No archive action was suggested.",
             Vec::new(),
             Vec::new(),
             scan.coverage
@@ -823,6 +930,15 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
+    find_matching(scan, task, limit, None)
+}
+
+pub(crate) fn find_matching(
+    scan: &ScanResult,
+    task: &str,
+    limit: usize,
+    candidate_ids: Option<&BTreeSet<String>>,
+) -> Vec<FindMatch> {
     let query = task.trim().to_lowercase();
     if query.is_empty() || limit == 0 {
         return Vec::new();
@@ -832,6 +948,7 @@ pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
     let mut matches = scan
         .skills
         .iter()
+        .filter(|skill| candidate_ids.is_none_or(|ids| ids.contains(&skill.id)))
         .filter_map(|skill| {
             let name = skill.name.to_lowercase();
             let description = skill
@@ -971,7 +1088,12 @@ mod tests {
             fs::write(path.join("SKILL.md"), contents).unwrap();
         }
         let mut options = ScanOptions::for_home(root.join("home"));
-        options.explicit_skill_roots.push(root.clone());
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
         options.include_session_evidence = false;
         let scan = scan(&options).unwrap();
         (root, scan)
@@ -994,7 +1116,12 @@ mod tests {
             .iter()
             .find(|finding| finding.title == "Five-stage usage evidence")
             .unwrap();
-        for stage in ["Exposed", "Matched", "Loaded", "Applied", "Outcome"] {
+        assert!(
+            usage
+                .summary
+                .contains(&format!("Exposed={}", scan.placements.len()))
+        );
+        for stage in ["Matched", "Loaded", "Applied", "Outcome"] {
             assert!(usage.summary.contains(&format!("{stage}=0")));
         }
         assert!(report.findings.iter().any(|finding| {
@@ -1006,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_overlap_is_candidate_evidence_and_never_duplicate_proof() {
+    fn semantic_overlap_is_candidate_evidence_and_never_a_confirmed_duplicate() {
         let (root, mut scan) = fixture();
         let mut candidate = scan.skills[0].clone();
         candidate.id = "skill_semantic_candidate".into();
@@ -1016,6 +1143,8 @@ mod tests {
             Some("Search and verify primary sources using official evidence".into());
         candidate.metadata.triggers = vec!["research".into(), "verify".into()];
         candidate.summary = "Investigate facts with primary sources.".into();
+        candidate.normalized_text =
+            "Search and verify primary sources using official evidence Investigate facts".into();
         scan.skills.push(candidate);
 
         let report = build_report(&scan);
@@ -1026,7 +1155,7 @@ mod tests {
             .unwrap();
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("review-only candidate evidence"));
-        assert!(finding.summary.contains("not duplicate proof"));
+        assert!(finding.summary.contains("not a confirmed duplicate"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1049,6 +1178,55 @@ mod tests {
                 .iter()
                 .any(|item| item.starts_with("digest:"))
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_exposes_issue_nine_structural_and_version_findings() {
+        let (root, mut scan) = fixture();
+        let first_id = scan.skills[0].id.clone();
+        let first_placement = scan
+            .placements
+            .iter_mut()
+            .find(|placement| placement.skill_id == first_id)
+            .unwrap();
+        first_placement.executable_files = vec![first_placement.directory.join("run.sh")];
+        first_placement.declared_name_matches_directory = Some(false);
+        scan.skills[0].metadata.source = Some("github:owner/repo".into());
+        scan.skills[0].metadata.version = Some("v1".into());
+
+        let mut divergent = scan.skills[0].clone();
+        divergent.id = "skill_divergent_version".into();
+        divergent.metadata.version = Some("v2".into());
+        divergent.content_digest = "different-version-digest".into();
+        let mut divergent_placement = scan.placements[0].clone();
+        divergent_placement.id = "placement_divergent_version".into();
+        divergent_placement.skill_id = divergent.id.clone();
+        divergent_placement.content_digest = divergent.content_digest.clone();
+        scan.skills.push(divergent);
+        scan.placements.push(divergent_placement);
+
+        let report = build_report(&scan);
+        for title in [
+            "Skill packages contain executable scripts",
+            "Declared Skill names differ from placement directories",
+            "Declared source has version divergence",
+            "Upstream update drift is not verified",
+        ] {
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.title == title)
+                .unwrap_or_else(|| panic!("missing Finding: {title}"));
+            assert!(!finding.evidence.is_empty());
+            assert!(!finding.affected_skill_ids.is_empty());
+        }
+        let scripts = report
+            .findings
+            .iter()
+            .find(|finding| finding.title == "Skill packages contain executable scripts")
+            .unwrap();
+        assert!(scripts.summary.contains("does not establish"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1111,7 +1289,12 @@ mod tests {
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routing-skills");
         let mut options = ScanOptions::for_home(PathBuf::from("/nonexistent-fixture-home"));
-        options.explicit_skill_roots.push(root.clone());
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
         options.include_session_evidence = false;
         let scan = scan(&options).unwrap();
         let cases: Vec<Case> =

@@ -38,6 +38,16 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn assert_find_paths_are_readable(found: &Value) {
+    let paths = found["result"]["matches"][0]["paths"]
+        .as_array()
+        .expect("find paths");
+    assert!(!paths.is_empty());
+    for path in paths {
+        fs::File::open(path.as_str().unwrap()).expect("find must return a readable SKILL.md");
+    }
+}
+
 #[test]
 fn public_cli_scans_reports_plans_applies_and_undoes() {
     let temp = TempDir::new().unwrap();
@@ -147,6 +157,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert!(!skill_root.join("skillroster").exists());
 
     let plan_input = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "evidence_ids": [evidence_id],
         "roster_changes": [{
@@ -271,6 +282,38 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         )
         .unwrap();
     assert_eq!(recovery_count, 0);
+
+    let unconfirmed_history_purge = run(
+        &[&common[..], &["lifecycle", "purge", "--plans-receipts"]].concat(),
+        None,
+    );
+    assert!(!unconfirmed_history_purge.status.success());
+    let history = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "purge",
+                "--plans-receipts",
+                "--confirm",
+                "PURGE-PLANS-RECEIPTS",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(history["result"]["plans_or_receipts_changed"], true);
+    assert_eq!(history["result"]["agent_files_changed"], false);
+    assert_eq!(history["result"]["library_files_changed"], false);
+    for table in ["plans", "plan_operations", "receipts", "receipt_operations"] {
+        let count: i64 = database
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "explicit history purge must clear {table}");
+    }
+    assert!(skill.join("SKILL.md").is_file());
 }
 
 #[test]
@@ -292,6 +335,7 @@ fn agent_plan_refuses_arbitrary_skill_root_write_file() {
     let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
     let input = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "operations": [{
             "kind": "write_file",
@@ -308,6 +352,7 @@ fn agent_plan_refuses_arbitrary_skill_root_write_file() {
     assert!(!root.join("arbitrary.txt").exists());
 
     let missing_evidence = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "roster_changes": [{
             "agent": "codex",
@@ -330,6 +375,7 @@ fn agent_plan_refuses_arbitrary_skill_root_write_file() {
     );
 
     let missing_skill = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "roster_changes": [{
             "agent": "codex",
@@ -345,6 +391,7 @@ fn agent_plan_refuses_arbitrary_skill_root_write_file() {
     assert!(!rejected_skill.status.success());
 
     let stale_snapshot = json!({
+        "schema_version": 1,
         "scan_id": "scan_missing",
         "roster_changes": [{
             "agent": "codex",
@@ -397,6 +444,160 @@ fn json_failure_is_one_parseable_document() {
 }
 
 #[test]
+fn explicit_roots_preserve_all_eight_agent_identities() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("empty-home");
+    let state = temp.path().join("state");
+    let agents = [
+        ("codex", "codex"),
+        ("claude-code", "claude_code"),
+        ("pi", "pi"),
+        ("opencode", "open_code"),
+        ("hermes", "hermes"),
+        ("cursor", "cursor"),
+        ("gemini-cli", "gemini_cli"),
+        ("github-copilot", "git_hub_copilot"),
+    ];
+    let shared_root = temp.path().join("shared-skills");
+    let shared_skill = shared_root.join("shared-fixture");
+    fs::create_dir_all(&shared_skill).unwrap();
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        "---\nname: shared-fixture\n---\nshared fixture\n",
+    )
+    .unwrap();
+    let mut args = vec![
+        "--home".to_owned(),
+        home.display().to_string(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--json".to_owned(),
+    ];
+    for (agent, _) in agents {
+        args.push("--root".to_owned());
+        args.push(format!("{agent}={}", shared_root.display()));
+    }
+    args.push("scan".to_owned());
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let scan = json_output(&run(&refs, None));
+    let explicit = scan["result"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|root| root["explicit"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(explicit.len(), 8);
+    for (_, json_agent) in agents {
+        assert!(explicit.iter().any(|root| root["agent"] == json_agent));
+    }
+    assert!(explicit.iter().all(|root| root["status"] == "included"));
+    assert_eq!(scan["result"]["placement_count"], 8);
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let assigned_agents: i64 = database
+        .query_row(
+            "SELECT COUNT(DISTINCT p.agent_id)
+             FROM placements p JOIN roots r ON r.id = p.root_id
+             WHERE r.explicit = 1 AND p.exposed = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(assigned_agents, 8);
+}
+
+#[test]
+fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/example");
+    let session = home.join(".codex/sessions/session.jsonl");
+    let library = state.join("library/example");
+    fs::create_dir_all(&skill).unwrap();
+    fs::create_dir_all(session.parent().unwrap()).unwrap();
+    fs::create_dir_all(&library).unwrap();
+    fs::write(skill.join("SKILL.md"), "---\nname: example\n---\nbody\n").unwrap();
+    fs::write(
+        &session,
+        "{\"type\":\"invoke_skill\",\"invoked_skill\":\"example\",\"prompt\":\"PRIVATE-CONVERSATION-TEXT\"}\n",
+    )
+    .unwrap();
+    fs::write(library.join("SKILL.md"), "library sentinel\n").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let excluded = json_output(&run(
+        &[&common[..], &["lifecycle", "exclude", "codex"]].concat(),
+        None,
+    ));
+    assert_eq!(excluded["result"]["raw_conversations_copied"], false);
+    let rescanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert!(
+        rescanned["result"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root["agent"] == "codex"
+                && root["kind"] == "sessions"
+                && root["status"] == "excluded")
+    );
+    let inspect = json_output(&run(
+        &[&common[..], &["lifecycle", "inspect"]].concat(),
+        None,
+    ));
+    assert_eq!(inspect["result"]["evidence_exclusions"], json!(["codex"]));
+    let export_path = temp.path().join("lifecycle-export.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                export_path.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert!(
+        !fs::read_to_string(&export_path)
+            .unwrap()
+            .contains("PRIVATE-CONVERSATION-TEXT")
+    );
+
+    let wrong_confirmation = run(
+        &[&common[..], &["lifecycle", "delete", "--confirm", "wrong"]].concat(),
+        None,
+    );
+    assert!(!wrong_confirmation.status.success());
+    assert!(state.join("skillroster.db").is_file());
+    let deleted = json_output(&run(
+        &[
+            &common[..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(deleted["result"]["agent_files_changed"], false);
+    assert_eq!(deleted["result"]["library_files_changed"], false);
+    assert!(!state.join("skillroster.db").exists());
+    assert!(skill.join("SKILL.md").is_file());
+    assert!(library.join("SKILL.md").is_file());
+
+    let rebuilt = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(rebuilt["result"]["skill_count"], 1);
+    assert!(state.join("skillroster.db").is_file());
+}
+
+#[test]
 fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -439,6 +640,7 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         "---\nname: source-skill\nsource: github:example/source-skill\nversion: v2\n---\nnew\n";
     let digest = |content: &str| format!("{:x}", Sha256::digest(content.as_bytes()));
     let request = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "evidence_ids": [evidence_id],
         "source_updates": [{
@@ -453,11 +655,29 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
             "upstream_digest": digest(upstream)
         }]
     });
-    let plan = json_output(&run(
+    let untrusted_default = run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
+    );
+    assert!(!untrusted_default.status.success());
+    let untrusted_error: Value = serde_json::from_slice(&untrusted_default.stdout).unwrap();
+    assert!(
+        untrusted_error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("first-observed and untrusted")
+    );
+    let mut explicit_adopt = request.clone();
+    explicit_adopt["source_updates"][0]["choice"] = json!("adopt_upstream");
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&explicit_adopt.to_string()),
     ));
     assert_eq!(plan["result"]["risk"], "source_update");
+    assert_eq!(
+        plan["result"]["diff_summary"][0]["choice_reason"],
+        "first_observed_baseline_untrusted"
+    );
     assert_eq!(
         plan["result"]["diff_summary"][0]["choice"],
         "adopt_upstream"
@@ -472,6 +692,55 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     ));
     assert_eq!(fs::read_to_string(&entrypoint).unwrap(), upstream);
     let receipt = applied["result"]["receipt_id"].as_str().unwrap();
+
+    let trusted_digest: String = database
+        .query_row(
+            "SELECT trusted_digest FROM source_baselines
+             WHERE source = 'github:example/source-skill' AND revision = 'v2'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(trusted_digest, digest(upstream));
+    let trusted_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let trusted_snapshot = trusted_scan["result"]["snapshot_id"].as_str().unwrap();
+    let trusted_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [trusted_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let trusted_payload: Value = serde_json::from_str(&trusted_payload).unwrap();
+    let upstream_v3 =
+        "---\nname: source-skill\nsource: github:example/source-skill\nversion: v3\n---\nnewer\n";
+    let trusted_request = json!({
+        "schema_version": 1,
+        "scan_id": trusted_snapshot,
+        "evidence_ids": [database.query_row::<String, _, _>(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [trusted_snapshot],
+            |row| row.get(0),
+        ).unwrap()],
+        "source_updates": [{
+            "skill_id": trusted_payload["skills"][0]["id"],
+            "placement_id": trusted_payload["placements"][0]["id"],
+            "source": "github:example/source-skill",
+            "current_revision": "v2",
+            "current_fingerprint": trusted_payload["placements"][0]["content_digest"],
+            "upstream_revision": "v3",
+            "upstream_content": upstream_v3,
+            "upstream_digest": digest(upstream_v3)
+        }]
+    });
+    let trusted_plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&trusted_request.to_string()),
+    ));
+    assert_eq!(
+        trusted_plan["result"]["diff_summary"][0]["choice_reason"],
+        "trusted_baseline_clean"
+    );
     let undone = json_output(&run(&[&common[..], &["undo", receipt]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
@@ -488,6 +757,7 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
     let modified_request = json!({
+        "schema_version": 1,
         "scan_id": new_snapshot,
         "evidence_ids": [database.query_row::<String, _, _>(
             "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
@@ -686,6 +956,7 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         .unwrap();
     let request = |state_name: &str| {
         json!({
+            "schema_version": 1,
             "scan_id": snapshot,
             "evidence_ids": [evidence_id],
             "library_changes": [{
@@ -786,6 +1057,19 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         )
         .unwrap();
     assert_eq!(governance_state, "hosted");
+    let hosted_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
+    assert_eq!(
+        hosted_find["result"]["matches"][0]["roster_state"],
+        "unassigned"
+    );
+    assert_find_paths_are_readable(&hosted_find);
+    assert!(
+        hosted_find["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == library_skill.join("SKILL.md").to_str().unwrap())
+    );
     json_output(&run(
         &[
             &common[..],
@@ -798,6 +1082,15 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
     assert!(!state.join("plan-backups").exists());
     assert!(codex_skill.join("SKILL.md").is_file());
     assert!(claude_skill.join("SKILL.md").is_file());
+    let restored_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
+    assert_find_paths_are_readable(&restored_find);
+    assert!(
+        restored_find["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| !path.as_str().unwrap().contains("/library/"))
+    );
 
     let drift_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
@@ -875,6 +1168,7 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
         })
         .collect::<Vec<_>>();
     let proposal = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "evidence_ids": [evidence_id],
         "roster_changes": roster_changes
@@ -900,6 +1194,19 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     ));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     assert_eq!(fs::read_dir(state.join("library")).unwrap().count(), 101);
+    let governed_find = json_output(&run(&[&common[..], &["find", "skill-000"]].concat(), None));
+    assert_eq!(
+        governed_find["result"]["matches"][0]["roster_state"],
+        "on_demand"
+    );
+    assert_find_paths_are_readable(&governed_find);
+    assert!(
+        governed_find["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| path.as_str().unwrap().contains("/library/"))
+    );
     let undone = json_output(&run(
         &[
             &common[..],
@@ -914,6 +1221,12 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     for index in 0..101 {
         assert!(root.join(format!("skill-{index:03}/SKILL.md")).is_file());
     }
+    let restored_find = json_output(&run(&[&common[..], &["find", "skill-000"]].concat(), None));
+    assert_eq!(
+        restored_find["result"]["matches"][0]["roster_state"],
+        "unassigned"
+    );
+    assert_find_paths_are_readable(&restored_find);
 }
 
 #[test]
@@ -953,6 +1266,7 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
         )
         .unwrap();
     let request = json!({
+        "schema_version": 1,
         "scan_id": snapshot,
         "evidence_ids": [evidence_id],
         "roster_changes": [{"agent": "codex", "skill_id": skill_id, "state": "core"}]
@@ -984,6 +1298,16 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
         fs::canonicalize(&linked).unwrap(),
         fs::canonicalize(&canonical).unwrap()
     );
+    let core_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
+    assert_eq!(core_find["result"]["matches"][0]["roster_state"], "core");
+    assert_find_paths_are_readable(&core_find);
+    assert!(
+        core_find["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == linked.join("SKILL.md").to_str().unwrap())
+    );
     let undone = json_output(&run(
         &[
             &common[..],
@@ -995,6 +1319,19 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert!(!linked.exists());
     assert!(canonical.join("SKILL.md").is_file());
+    let restored_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
+    assert_eq!(
+        restored_find["result"]["matches"][0]["roster_state"],
+        "unassigned"
+    );
+    assert_find_paths_are_readable(&restored_find);
+    assert!(
+        restored_find["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|path| path != linked.join("SKILL.md").to_str().unwrap())
+    );
 
     let drift_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
@@ -1015,4 +1352,214 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
     );
     assert!(!drifted.status.success());
     assert!(!linked.exists());
+}
+
+#[test]
+fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/deep-search");
+    fs::create_dir_all(&skill).unwrap();
+    let filler = "ordinary ".repeat(80);
+    fs::write(
+        skill.join("SKILL.md"),
+        format!(
+            "---\nname: deep-search\ndescription: generic helper\n---\n{filler} phosphorescent-reconciliation\n"
+        ),
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let found = json_output(&run(
+        &[&common[..], &["find", "phosphorescent reconciliation"]].concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["name"], "deep-search");
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let skill_id = payload["skills"][0]["id"].as_str().unwrap();
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "roster_changes": [{"agent": "codex", "skill_id": skill_id, "state": "archived"}]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let archived = json_output(&run(
+        &[&common[..], &["find", "phosphorescent reconciliation"]].concat(),
+        None,
+    ));
+    assert_eq!(archived["result"]["matches"], json!([]));
+
+    json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let restored = json_output(&run(
+        &[&common[..], &["find", "phosphorescent reconciliation"]].concat(),
+        None,
+    ));
+    assert_eq!(restored["result"]["matches"][0]["name"], "deep-search");
+}
+
+#[test]
+fn find_rejects_content_drift_and_requests_rescan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/drift-check");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: drift-check\n---\nneedle-before-drift\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: drift-check\n---\nlocally changed\n",
+    )
+    .unwrap();
+
+    let found = json_output(&run(
+        &[&common[..], &["find", "needle before drift"]].concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["paths"], json!([]));
+    assert_eq!(found["result"]["rescan_required"], true);
+    assert!(
+        found["result"]["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("skillroster scan")
+    );
+}
+
+#[test]
+fn public_report_covers_issue_nine_finding_families_without_runtime_claims() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for (directory, version, body) in [
+        ("mismatch-one", "v1", "first body"),
+        ("mismatch-copy", "v1", "changed local body"),
+        ("mismatch-two", "v2", "second version body"),
+    ] {
+        let package = root.join(directory);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("SKILL.md"),
+            format!(
+                "---\nname: declared-name\nsource: github:owner/report-fixture\nversion: {version}\n---\n{body}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(package.join("run.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let findings = report["result"]["findings"].as_array().unwrap();
+    for title in [
+        "Declared identity has divergent local content",
+        "Skill packages contain executable scripts",
+        "Declared Skill names differ from placement directories",
+        "Declared source has version divergence",
+        "Upstream update drift is not verified",
+    ] {
+        let finding = findings
+            .iter()
+            .find(|finding| finding["title"] == title)
+            .unwrap_or_else(|| panic!("missing public Finding: {title}"));
+        assert!(finding["affected_skill_count"].as_u64().unwrap() > 0);
+        assert!(!finding["evidence_ids"].as_array().unwrap().is_empty());
+    }
+    let encoded = report.to_string().to_lowercase();
+    assert!(!encoded.contains("is malicious"));
+    assert!(!encoded.contains("is safe at runtime"));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_rejects_a_skill_symlink_that_now_escapes_approved_roots() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/escape-check");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: escape-check\n---\nunique escape needle\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let outside = temp.path().join("outside-skill");
+    fs::rename(&skill, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &skill).unwrap();
+
+    let found = json_output(&run(
+        &[&common[..], &["find", "unique escape needle"]].concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["paths"], json!([]));
+    assert_eq!(found["result"]["rescan_required"], true);
 }

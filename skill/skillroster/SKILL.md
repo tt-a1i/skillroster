@@ -12,7 +12,7 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 1. Run `skillroster scan --json`, then `skillroster report --json`.
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused.
 3. Use stable Finding and Evidence IDs for follow-up questions. Run `report --finding ID --json` against the same Snapshot rather than silently rescanning.
-4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. Include the latest `scan_id` and one or more relevant `evidence_ids`. Never submit raw filesystem operations.
+4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. Set request `schema_version` to `1`, include the latest `scan_id` and one or more relevant `evidence_ids`, and submit only the supported governance fields.
 5. Present the validated Plan in one viewport: diagnosis, four core metrics, three main Findings, before/after counts, affected Agents, uncertainty, canonical deletion count, reversibility, and Plan ID.
 
 Use only these Plan request families:

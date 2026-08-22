@@ -4,3 +4,5 @@ description: Create architecture diagrams and visualize workflows, data flow, de
 triggers: [architecture diagram, system workflow, data flow, request lifecycle]
 ---
 Build validated technical diagrams.
+
+CAPABILITY: archify

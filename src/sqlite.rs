@@ -10,7 +10,7 @@ use crate::model::{
     RosterEntry, ScanId, ScanRun, SkillId, SkillRecord, UsageEvent,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LifecycleCounts {
@@ -18,6 +18,9 @@ pub struct LifecycleCounts {
     pub raw_usage_rows: u64,
     pub monthly_usage_rows: u64,
     pub oldest_raw_usage_at: Option<i64>,
+    pub plans: u64,
+    pub receipts: u64,
+    pub evidence_exclusions: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -28,6 +31,12 @@ pub struct PurgeCounts {
     pub deleted_payload_usage_summaries: u64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PlanReceiptPurgeCounts {
+    pub plans: u64,
+    pub receipts: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceBaseline {
     pub source: String,
@@ -35,6 +44,17 @@ pub struct SourceBaseline {
     pub entrypoint_digest: String,
     pub first_observed_scan_id: ScanId,
     pub first_observed_at: i64,
+    pub trusted_digest: Option<String>,
+    pub trusted_by_receipt_id: Option<ReceiptId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedSourceBaseline {
+    pub source: String,
+    pub revision: String,
+    pub digest: String,
+    pub scan_id: ScanId,
+    pub observed_at: i64,
 }
 
 #[derive(Debug)]
@@ -169,6 +189,27 @@ impl StateStore {
         if current == 4 {
             let transaction = self.connection.transaction()?;
             migration_v5(&transaction)?;
+            transaction.pragma_update(None, "user_version", 5_i64)?;
+            transaction.commit()?;
+            current = 5;
+        }
+        if current == 5 {
+            let transaction = self.connection.transaction()?;
+            migration_v6(&transaction)?;
+            transaction.pragma_update(None, "user_version", 6_i64)?;
+            transaction.commit()?;
+            current = 6;
+        }
+        if current == 6 {
+            let transaction = self.connection.transaction()?;
+            migration_v7(&transaction)?;
+            transaction.pragma_update(None, "user_version", 7_i64)?;
+            transaction.commit()?;
+            current = 7;
+        }
+        if current == 7 {
+            let transaction = self.connection.transaction()?;
+            migration_v8(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -418,7 +459,8 @@ impl StateStore {
     ) -> StorageResult<Option<SourceBaseline>> {
         self.connection
             .query_row(
-                "SELECT entrypoint_digest, first_observed_scan_id, first_observed_at
+                "SELECT entrypoint_digest, first_observed_scan_id, first_observed_at,
+                        trusted_digest, trusted_by_receipt_id
                  FROM source_baselines WHERE source = ?1 AND revision = ?2",
                 params![source, revision],
                 |row| {
@@ -426,19 +468,27 @@ impl StateStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
             .optional()?
-            .map(|(entrypoint_digest, scan_id, first_observed_at)| {
-                Ok(SourceBaseline {
-                    source: source.to_owned(),
-                    revision: revision.to_owned(),
-                    entrypoint_digest,
-                    first_observed_scan_id: ScanId::parse(scan_id).map_err(invalid_id)?,
-                    first_observed_at,
-                })
-            })
+            .map(
+                |(entrypoint_digest, scan_id, first_observed_at, trusted_digest, receipt_id)| {
+                    Ok(SourceBaseline {
+                        source: source.to_owned(),
+                        revision: revision.to_owned(),
+                        entrypoint_digest,
+                        first_observed_scan_id: ScanId::parse(scan_id).map_err(invalid_id)?,
+                        first_observed_at,
+                        trusted_digest,
+                        trusted_by_receipt_id: receipt_id
+                            .map(|id| ReceiptId::parse(id).map_err(invalid_id))
+                            .transpose()?,
+                    })
+                },
+            )
             .transpose()
     }
 
@@ -604,6 +654,22 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn roster_states_for_skill(
+        &self,
+        skill_id: &SkillId,
+    ) -> StorageResult<Vec<crate::model::RosterState>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT state FROM roster_entries WHERE skill_id = ?1 ORDER BY agent_id")?;
+        let values = statement
+            .query_map([skill_id.as_str()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        values
+            .into_iter()
+            .map(|value| enum_from_text(&value))
+            .collect()
+    }
+
     pub fn delete_roster_entry(&self, agent_id: &AgentId, skill_id: &SkillId) -> StorageResult<()> {
         self.connection.execute(
             "DELETE FROM roster_entries WHERE agent_id = ?1 AND skill_id = ?2",
@@ -630,6 +696,37 @@ impl StateStore {
             params![skill_id.as_str(), name, description, triggers, body],
         )?;
         Ok(())
+    }
+
+    /// Returns local Skill IDs selected by SQLite FTS5. User input is reduced
+    /// to quoted unicode word terms so FTS operators cannot alter the query.
+    pub fn search_skill_ids(&self, task: &str, limit: usize) -> StorageResult<Vec<SkillId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let terms = task
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|term| !term.is_empty())
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let expression = terms.join(" OR ");
+        let mut statement = self.connection.prepare(
+            "SELECT skill_id FROM skills_fts
+             WHERE skills_fts MATCH ?1
+             ORDER BY bm25(skills_fts, 0.0, 8.0, 5.0, 6.0, 1.0), skill_id
+             LIMIT ?2",
+        )?;
+        let ids = statement
+            .query_map(params![expression, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| SkillId::parse(id).map_err(invalid_id))
+            .collect()
     }
 
     pub fn save_report(
@@ -854,8 +951,62 @@ impl StateStore {
                 "Apply receipt does not match the terminal Plan state".to_owned(),
             ));
         }
+        self.save_apply_receipt_with_trusted_sources(plan, next, receipt, &[])
+    }
+
+    pub fn save_apply_receipt_with_trusted_sources(
+        &self,
+        plan: &PlanId,
+        next: PlanStatus,
+        receipt: &ReceiptRecord,
+        trusted_sources: &[TrustedSourceBaseline],
+    ) -> StorageResult<()> {
+        if receipt.plan_id != *plan
+            || !matches!(
+                next,
+                PlanStatus::Applied | PlanStatus::FailedRolledBack | PlanStatus::RecoveryRequired
+            )
+        {
+            return Err(StorageError::InvalidData(
+                "Apply receipt does not match the terminal Plan state".to_owned(),
+            ));
+        }
+        if !trusted_sources.is_empty()
+            && (next != PlanStatus::Applied || receipt.status != ReceiptStatus::Applied)
+        {
+            return Err(StorageError::InvalidData(
+                "trusted source baselines require a verified Applied receipt".to_owned(),
+            ));
+        }
         let transaction = self.connection.unchecked_transaction()?;
         save_receipt_transaction(&transaction, receipt)?;
+        for source in trusted_sources {
+            let changed = transaction.execute(
+                "INSERT INTO source_baselines
+                    (source, revision, entrypoint_digest, first_observed_scan_id,
+                     first_observed_at, trusted_digest, trusted_by_receipt_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?3, ?6)
+                 ON CONFLICT(source, revision) DO UPDATE SET
+                    trusted_digest = excluded.trusted_digest,
+                    trusted_by_receipt_id = excluded.trusted_by_receipt_id
+                 WHERE source_baselines.trusted_digest IS NULL
+                    OR source_baselines.trusted_digest = excluded.trusted_digest",
+                params![
+                    source.source,
+                    source.revision,
+                    source.digest,
+                    source.scan_id.as_str(),
+                    source.observed_at,
+                    receipt.id.as_str(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::InvalidData(format!(
+                    "trusted source baseline conflicts for {}@{}",
+                    source.source, source.revision
+                )));
+            }
+        }
         let changed = transaction.execute(
             "UPDATE plans SET status = ?1 WHERE id = ?2 AND status = 'applying'",
             params![enum_text(&next)?, plan.as_str()],
@@ -1089,7 +1240,36 @@ impl StateStore {
                 [],
                 |row| row.get(0),
             )?,
+            plans: table_count(&self.connection, "plans")?,
+            receipts: table_count(&self.connection, "receipts")?,
+            evidence_exclusions: table_count(&self.connection, "evidence_exclusions")?,
         })
+    }
+
+    pub fn evidence_exclusions(&self) -> StorageResult<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT agent_kind FROM evidence_exclusions ORDER BY agent_kind")?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_evidence_exclusion(&self, agent_kind: &str, excluded: bool) -> StorageResult<()> {
+        if excluded {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO evidence_exclusions (agent_kind, created_at)
+                 VALUES (?1, CAST(strftime('%s', 'now') AS INTEGER))",
+                [agent_kind],
+            )?;
+        } else {
+            self.connection.execute(
+                "DELETE FROM evidence_exclusions WHERE agent_kind = ?1",
+                [agent_kind],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn export_lifecycle(&self) -> StorageResult<serde_json::Value> {
@@ -1207,6 +1387,29 @@ impl StateStore {
             deleted_evidence_rows,
             deleted_payload_usage_summaries,
         })
+    }
+
+    pub fn purge_plans_and_receipts(&self) -> StorageResult<PlanReceiptPurgeCounts> {
+        if self.recovery_required()? {
+            return Err(StorageError::InvalidData(
+                "recovery is required before Plans and Receipts can be purged".into(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let plans = table_count(&transaction, "plans")?;
+        let receipts = table_count(&transaction, "receipts")?;
+        transaction.execute(
+            "UPDATE source_baselines
+             SET trusted_by_receipt_id = NULL
+             WHERE trusted_by_receipt_id IS NOT NULL",
+            [],
+        )?;
+        transaction.execute("DELETE FROM receipt_operations", [])?;
+        transaction.execute("DELETE FROM receipts", [])?;
+        transaction.execute("DELETE FROM plan_operations", [])?;
+        transaction.execute("DELETE FROM plans", [])?;
+        transaction.commit()?;
+        Ok(PlanReceiptPurgeCounts { plans, receipts })
     }
 }
 
@@ -1428,6 +1631,47 @@ fn migration_v5(transaction: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn migration_v6(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE source_baselines ADD COLUMN trusted_digest TEXT;
+         ALTER TABLE source_baselines ADD COLUMN trusted_by_receipt_id TEXT REFERENCES receipts(id);",
+    )?;
+    Ok(())
+}
+
+fn migration_v7(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE evidence_exclusions (
+            agent_kind TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+fn migration_v8(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE placements RENAME TO placements_v8;
+         ALTER TABLE roots RENAME TO roots_v8;
+         CREATE TABLE roots (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL REFERENCES scans(id),
+            agent_id TEXT REFERENCES agents(id), path TEXT NOT NULL,
+            status TEXT NOT NULL, detail TEXT, kind TEXT NOT NULL DEFAULT 'skills',
+            explicit INTEGER NOT NULL DEFAULT 0, UNIQUE(scan_id, agent_id, path));
+         INSERT INTO roots SELECT * FROM roots_v8;
+         CREATE TABLE placements (
+            id TEXT PRIMARY KEY, scan_id TEXT NOT NULL REFERENCES scans(id),
+            skill_id TEXT NOT NULL REFERENCES skills(id), agent_id TEXT REFERENCES agents(id),
+            root_id TEXT NOT NULL REFERENCES roots(id), path TEXT NOT NULL, kind TEXT NOT NULL,
+            symlink_target TEXT, fingerprint TEXT NOT NULL, exposed INTEGER NOT NULL,
+            UNIQUE(scan_id, agent_id, path));
+         INSERT INTO placements SELECT * FROM placements_v8;
+         DROP TABLE placements_v8;
+         DROP TABLE roots_v8;",
+    )?;
+    Ok(())
+}
+
 fn table_count(connection: &Connection, table: &str) -> StorageResult<u64> {
     let query = format!("SELECT COUNT(*) FROM {table}");
     Ok(connection.query_row(&query, [], |row| row.get(0))?)
@@ -1574,6 +1818,38 @@ mod tests {
     }
 
     #[test]
+    fn fts_match_searches_complete_body_and_treats_operators_as_text() {
+        let store = StateStore::open_in_memory().unwrap();
+        let body_only = SkillId::parse("skill_body_only").unwrap();
+        let other = SkillId::parse("skill_other").unwrap();
+        store
+            .index_skill(
+                &body_only,
+                "helper",
+                "generic helper",
+                "",
+                "instructions include phosphorescent telemetry reconciliation",
+            )
+            .unwrap();
+        store
+            .index_skill(&other, "other", "unrelated", "", "different body")
+            .unwrap();
+
+        assert_eq!(
+            store.search_skill_ids("phosphorescent", 5).unwrap(),
+            vec![body_only.clone()]
+        );
+        assert_eq!(
+            store
+                .search_skill_ids("phosphorescent OR unrelated", 5)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(store.search_skill_ids("\" OR *", 5).unwrap().is_empty());
+    }
+
+    #[test]
     fn scan_snapshot_savepoint_rolls_back_partial_graph_writes() {
         let store = StateStore::open_in_memory().unwrap();
         store.begin_scan_snapshot().unwrap();
@@ -1600,7 +1876,7 @@ mod tests {
 
     #[test]
     fn migration_upgrades_prior_states_sequentially() {
-        for starting_version in [1_i64, 2, 3, 4] {
+        for starting_version in [1_i64, 2, 3, 4, 5] {
             let mut connection = Connection::open_in_memory().unwrap();
             let transaction = connection.transaction().unwrap();
             migration_v1(&transaction).unwrap();
@@ -1612,6 +1888,9 @@ mod tests {
             }
             if starting_version >= 4 {
                 migration_v4(&transaction).unwrap();
+            }
+            if starting_version >= 5 {
+                migration_v5(&transaction).unwrap();
             }
             transaction
                 .pragma_update(None, "user_version", starting_version)
@@ -1663,6 +1942,8 @@ mod tests {
             entrypoint_digest: "a".repeat(64),
             first_observed_scan_id: scan.id.clone(),
             first_observed_at: 20,
+            trusted_digest: None,
+            trusted_by_receipt_id: None,
         };
         store.record_source_baseline(&initial).unwrap();
         store

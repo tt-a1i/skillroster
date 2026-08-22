@@ -13,10 +13,21 @@ fn main() {
     };
     let json = cli.json;
     let command = cli.command_name();
+    // Apply and Undo start progress inside `app::run`, after human confirmation.
+    let progress = (!matches!(command, "apply" | "undo"))
+        .then(|| skillroster::present::ProgressGuard::start(command, json));
 
     match app::run(cli) {
-        Ok(output) => println!("{}", if json { output.json } else { output.human }),
+        Ok(output) => {
+            if let Some(progress) = progress {
+                progress.finish();
+            }
+            println!("{}", if json { output.json } else { output.human });
+        }
         Err(error) => {
+            if let Some(progress) = progress {
+                progress.finish();
+            }
             if json {
                 println!("{}", app::error_json(command, error.as_ref()));
             } else {

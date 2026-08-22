@@ -127,6 +127,7 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 
 - invoke commands with explicit `--json`;
 - validate `schema_version` and `ok` before reading `result`;
+- set `schema_version: 1` on every declarative Plan request;
 - never parse human terminal output or TUI frames;
 - treat `suggested_actions` as typed options, not authorization;
 - automatically prepare a read-only Plan when evidence is sufficient;

@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_json::Value;
 use skillroster::harness::{AgentKind, known_agent_roots};
-use skillroster::query::{FindingCategory, build_report, find};
-use skillroster::scan::{EvidenceQuality, ScanOptions, UsageStage, scan};
+use skillroster::query::{FindingCategory, build_report};
+use skillroster::scan::{EvidenceQuality, LinkStatus, ScanOptions, UsageStage, scan};
 use tempfile::TempDir;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -37,6 +38,163 @@ fn copy_tree(source: &Path, destination: &Path) {
             fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+fn cli_json(home: &Path, state: &Path, args: &[&str], stdin: Option<&str>) -> Value {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_skillroster"));
+    command.args([
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ]);
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().unwrap();
+    if let Some(input) = stdin {
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "command {args:?} failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["ok"], true);
+    envelope
+}
+
+fn plan_evidence_id(home: &Path, state: &Path) -> String {
+    let report = cli_json(home, state, &["report"], None);
+    let finding = report["result"]["findings"]
+        .as_array()
+        .and_then(|findings| findings.first())
+        .and_then(|finding| finding["id"].as_str())
+        .expect("fixture report must expose a traceable Finding");
+    let detail = cli_json(home, state, &["report", "--finding", finding], None);
+    detail["result"]["evidence_ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("Finding must expose Evidence through the public CLI")
+        .to_string()
+}
+
+fn public_skill_ids(home: &Path, state: &Path, names: &[String]) -> BTreeMap<String, String> {
+    names
+        .iter()
+        .map(|name| {
+            let found = cli_json(home, state, &["find", name, "--limit", "1"], None);
+            let matched = &found["result"]["matches"][0];
+            assert_eq!(matched["name"], name.as_str());
+            (
+                name.clone(),
+                matched["skill_id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn evaluate_capabilities(home: &Path, state: &Path, routes: &[RouteCase]) -> (usize, usize) {
+    let mut routed = 0;
+    let mut succeeded = 0;
+    for case in routes {
+        let found = cli_json(home, state, &["find", &case.task, "--limit", "3"], None);
+        let Some(matched) = found["result"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|matched| matched["name"] == case.skill)
+        else {
+            continue;
+        };
+        routed += 1;
+        let contract = format!("CAPABILITY: {}", case.skill);
+        let executable = matched["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(Path::new)
+            .find(|path| path.is_file())
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|contents| contents.lines().any(|line| line.trim() == contract));
+        succeeded += usize::from(executable);
+    }
+    (routed, succeeded)
+}
+
+fn populate_value_inventory(home: &Path) -> Vec<String> {
+    let codex = home.join(".codex/skills");
+    let claude = home.join(".claude/skills");
+    let names = (0..120)
+        .map(|index| format!("value-skill-{index:03}"))
+        .collect::<Vec<_>>();
+    for (index, name) in names.iter().enumerate() {
+        let contents = format!(
+            "---\nname: {name}\ndescription: deterministic value fixture {index}\n---\nCAPABILITY: {name}\n"
+        );
+        let primary = codex.join(name);
+        fs::create_dir_all(&primary).unwrap();
+        fs::write(primary.join("SKILL.md"), &contents).unwrap();
+        if index < 80 {
+            let duplicate = claude.join(name);
+            fs::create_dir_all(&duplicate).unwrap();
+            fs::write(duplicate.join("SKILL.md"), contents).unwrap();
+        }
+    }
+    names
+}
+
+fn exact_duplicate_placements(home: &Path) -> usize {
+    let result = scan(&ScanOptions::for_home(home.to_path_buf())).unwrap();
+    let mut copies = BTreeMap::<&str, usize>::new();
+    for placement in &result.placements {
+        if placement.agent.is_some() && placement.link_status == LinkStatus::NotLink {
+            *copies.entry(&placement.skill_id).or_default() += 1;
+        }
+    }
+    copies.values().map(|count| count.saturating_sub(1)).sum()
+}
+
+fn agent_tree_signature(home: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(root: &Path, current: &Path, output: &mut Vec<(String, Vec<u8>)>) {
+        if !current.exists() {
+            return;
+        }
+        for entry in fs::read_dir(current).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk(root, &path, output);
+            } else {
+                output.push((
+                    path.strip_prefix(root).unwrap().display().to_string(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut output = Vec::new();
+    for relative in [".codex/skills", ".claude/skills"] {
+        walk(home, &home.join(relative), &mut output);
+    }
+    output.sort();
+    output
 }
 
 #[test]
@@ -101,6 +259,40 @@ fn all_eight_agent_fixtures_discover_one_skill_and_all_five_usage_stages() {
 }
 
 #[test]
+fn reports_reuse_one_snapshot_but_scope_finding_ids_to_each_new_report() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = home.join(".skillroster");
+    copy_tree(&Path::new(FIXTURES).join("agents/home"), &home);
+
+    cli_json(&home, &state, &["scan"], None);
+    let first = cli_json(&home, &state, &["report"], None);
+    let repeated = cli_json(&home, &state, &["report"], None);
+    assert_eq!(
+        first["result"]["report_id"],
+        repeated["result"]["report_id"]
+    );
+    assert_eq!(first["result"]["findings"], repeated["result"]["findings"]);
+
+    cli_json(&home, &state, &["scan"], None);
+    let next = cli_json(&home, &state, &["report"], None);
+    assert_ne!(first["result"]["report_id"], next["result"]["report_id"]);
+    let first_ids = first["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    let next_ids = next["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["id"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert!(first_ids.is_disjoint(&next_ids));
+}
+
+#[test]
 fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_success() {
     let routes: Vec<RouteCase> =
         serde_json::from_slice(&fs::read(Path::new(FIXTURES).join("routing-eval.json")).unwrap())
@@ -110,47 +302,82 @@ fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_succes
         "the baseline must remain representative"
     );
 
-    let mut options = ScanOptions::for_home(PathBuf::from("/nonexistent-fixture-home"));
-    options
-        .explicit_skill_roots
-        .push(Path::new(FIXTURES).join("routing-skills"));
-    options.include_session_evidence = false;
-    let unmanaged = scan(&options).unwrap();
-
-    let successes = |inventory: &skillroster::scan::ScanResult| {
-        routes
-            .iter()
-            .filter(|case| {
-                find(inventory, &case.task, 3)
-                    .iter()
-                    .any(|matched| matched.name == case.skill)
-            })
-            .count()
-    };
-    let unmanaged_successes = successes(&unmanaged);
-    let recall = unmanaged_successes as f64 / routes.len() as f64;
-    assert!(recall >= 0.95, "Top-3 recall was {:.1}%", recall * 100.0);
-
-    // Roster governance changes exposure, not Library searchability. Model the
-    // post-governance inventory by taking every non-core placement off default
-    // exposure while retaining every Skill in the searchable Scan.
-    let mut governed = unmanaged.clone();
-    let core = BTreeSet::from(["research", "diagnose", "code-review"]);
-    let names = governed
-        .skills
-        .iter()
-        .map(|skill| (skill.id.clone(), skill.name.clone()))
-        .collect::<BTreeMap<_, _>>();
-    for placement in &mut governed.placements {
-        placement.default_exposed = names
-            .get(&placement.skill_id)
-            .is_some_and(|name| core.contains(name.as_str()));
-    }
-    let governed_successes = successes(&governed);
-    assert_eq!(
-        governed_successes, unmanaged_successes,
-        "moving Skills to On-demand must not regress task-success"
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = home.join(".skillroster");
+    copy_tree(
+        &Path::new(FIXTURES).join("routing-skills"),
+        &home.join(".codex/skills"),
     );
+    let before_signature = agent_tree_signature(&home);
+    let scan_result = cli_json(&home, &state, &["scan"], None);
+    let scan_id = scan_result["result"]["snapshot_id"].as_str().unwrap();
+    let (before_routed, before_succeeded) = evaluate_capabilities(&home, &state, &routes);
+    assert!(
+        before_routed * 100 >= routes.len() * 95,
+        "Top-3 recall was {before_routed}/{}",
+        routes.len()
+    );
+    assert_eq!(
+        before_succeeded, before_routed,
+        "every routed fixture must pass its independent capability contract"
+    );
+
+    let names = fs::read_dir(Path::new(FIXTURES).join("routing-skills"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let ids = public_skill_ids(&home, &state, &names);
+    let evidence_id = plan_evidence_id(&home, &state);
+    let core = BTreeSet::from(["research", "diagnose", "code-review"]);
+    let roster_changes = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "agent": "codex",
+                "skill_id": ids[name],
+                "state": if core.contains(name.as_str()) { "core" } else { "on_demand" }
+            })
+        })
+        .collect::<Vec<_>>();
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "scan_id": scan_id,
+        "evidence_ids": [evidence_id],
+        "roster_changes": roster_changes
+    });
+    let plan = cli_json(
+        &home,
+        &state,
+        &["plan", "--stdin"],
+        Some(&request.to_string()),
+    );
+    let applied = cli_json(
+        &home,
+        &state,
+        &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        None,
+    );
+    assert_eq!(applied["result"]["verification"], "passed");
+
+    let (after_routed, after_succeeded) = evaluate_capabilities(&home, &state, &routes);
+    assert_eq!(
+        after_routed, before_routed,
+        "Apply must not regress Top-3 routing"
+    );
+    assert_eq!(
+        after_succeeded, before_succeeded,
+        "Apply must preserve readable, executable capability contracts"
+    );
+
+    let undone = cli_json(
+        &home,
+        &state,
+        &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        None,
+    );
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(agent_tree_signature(&home), before_signature);
 }
 
 #[test]
@@ -222,36 +449,130 @@ fn small_large_and_cross_agent_duplicate_scenarios_keep_presentation_facts() {
 }
 
 #[test]
-fn synthetic_value_comparison_reduces_exposure_without_task_success_loss() {
-    let fixture: Value = serde_json::from_slice(
-        &fs::read(Path::new(FIXTURES).join("value-comparison.json")).unwrap(),
+fn three_arm_value_comparison_runs_real_filesystem_governance_and_restore() {
+    #[derive(Debug)]
+    struct Measured {
+        exposure: u64,
+        duplicates: usize,
+    }
+    let measure = |home: &Path, state: &Path| {
+        cli_json(home, state, &["scan"], None);
+        let report = cli_json(home, state, &["report"], None);
+        Measured {
+            exposure: report["result"]["default_exposure"].as_u64().unwrap(),
+            duplicates: exact_duplicate_placements(home),
+        }
+    };
+
+    // Arm 1: leave the duplicated Agent roots unmanaged and measure them.
+    let unmanaged_temp = TempDir::new().unwrap();
+    let unmanaged_home = unmanaged_temp.path().join("home");
+    populate_value_inventory(&unmanaged_home);
+    let unmanaged = measure(&unmanaged_home, &unmanaged_home.join(".skillroster"));
+
+    // Arm 2: perform a declared manual procedure using only filesystem moves,
+    // hard links, and a manifest. The resulting metrics are scanned, not filled in.
+    let manual_temp = TempDir::new().unwrap();
+    let manual_home = manual_temp.path().join("home");
+    let names = populate_value_inventory(&manual_home);
+    let library = manual_home.join(".agents_skills");
+    fs::create_dir_all(&library).unwrap();
+    let mut manifest = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        let source = manual_home.join(".codex/skills").join(name);
+        let canonical = library.join(name);
+        fs::rename(&source, &canonical).unwrap();
+        let duplicate = manual_home.join(".claude/skills").join(name);
+        // The careful-manual arm has an explicit scope budget: it resolves 70
+        // of the 80 cross-Agent copies and leaves 10 documented in the manifest.
+        if index >= 10 && duplicate.exists() {
+            fs::remove_dir_all(&duplicate).unwrap();
+        }
+        let state = if index < 54 { "core" } else { "on_demand" };
+        if state == "core" {
+            let exposed = manual_home.join(".codex/skills").join(name);
+            fs::create_dir_all(&exposed).unwrap();
+            fs::hard_link(canonical.join("SKILL.md"), exposed.join("SKILL.md")).unwrap();
+        }
+        manifest.push(serde_json::json!({
+            "skill": name,
+            "state": state,
+            "unresolved_cross_agent_copy": index < 10
+        }));
+    }
+    fs::write(
+        library.join("manual-roster.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
     )
     .unwrap();
-    let approaches = fixture["approaches"].as_array().unwrap();
-    let by_name = |name: &str| {
-        approaches
-            .iter()
-            .find(|approach| approach["name"] == name)
-            .unwrap()
-    };
-    let unmanaged = by_name("unmanaged");
-    let manual = by_name("careful_manual");
-    let roster = by_name("skillroster");
+    let manual = measure(&manual_home, &manual_home.join(".skillroster"));
+    assert_eq!(
+        manual.duplicates, 10,
+        "manual scope must be measured, not assumed"
+    );
 
-    assert!(manual["default_exposure"].as_u64() < unmanaged["default_exposure"].as_u64());
-    assert!(
-        roster["default_exposure"].as_u64().unwrap() * 2
-            <= unmanaged["default_exposure"].as_u64().unwrap()
+    // Arm 3: exercise the public SkillRoster loop and prove Receipt-bounded Undo.
+    let roster_temp = TempDir::new().unwrap();
+    let roster_home = roster_temp.path().join("home");
+    let roster_state = roster_home.join(".skillroster");
+    let names = populate_value_inventory(&roster_home);
+    let before_signature = agent_tree_signature(&roster_home);
+    let scan_result = cli_json(&roster_home, &roster_state, &["scan"], None);
+    let scan_id = scan_result["result"]["snapshot_id"].as_str().unwrap();
+    let ids = public_skill_ids(&roster_home, &roster_state, &names);
+    let evidence_id = plan_evidence_id(&roster_home, &roster_state);
+    let mut roster_changes = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        roster_changes.push(serde_json::json!({
+            "agent": "codex",
+            "skill_id": ids[name],
+            "state": if index < 36 { "core" } else { "on_demand" }
+        }));
+        if index < 80 {
+            roster_changes.push(serde_json::json!({
+                "agent": "claude-code",
+                "skill_id": ids[name],
+                "state": "on_demand"
+            }));
+        }
+    }
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "scan_id": scan_id,
+        "evidence_ids": [evidence_id],
+        "roster_changes": roster_changes
+    });
+    let plan = cli_json(
+        &roster_home,
+        &roster_state,
+        &["plan", "--stdin"],
+        Some(&request.to_string()),
     );
-    assert!(roster["remaining_duplicates"].as_u64() < manual["remaining_duplicates"].as_u64());
-    assert_eq!(roster["task_successes"], unmanaged["task_successes"]);
-    assert_eq!(roster["reversible_receipts"], true);
-    assert!(
-        fixture["notes"]
-            .as_str()
-            .unwrap()
-            .contains("Synthetic fixed")
+    let applied = cli_json(
+        &roster_home,
+        &roster_state,
+        &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        None,
     );
+    assert_eq!(applied["result"]["verification"], "passed");
+    let roster = measure(&roster_home, &roster_state);
+
+    assert!(manual.exposure < unmanaged.exposure);
+    assert!(roster.exposure * 2 <= unmanaged.exposure);
+    assert!(manual.duplicates < unmanaged.duplicates);
+    assert!(roster.duplicates < manual.duplicates);
+
+    let undone = cli_json(
+        &roster_home,
+        &roster_state,
+        &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        None,
+    );
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(agent_tree_signature(&roster_home), before_signature);
+    let restored = measure(&roster_home, &roster_state);
+    assert_eq!(restored.exposure, unmanaged.exposure);
+    assert_eq!(restored.duplicates, unmanaged.duplicates);
 }
 
 #[test]
