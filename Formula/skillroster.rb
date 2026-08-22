@@ -2,7 +2,7 @@ class Skillroster < Formula
   desc "Local skill governance for AI agents"
   homepage "https://github.com/tt-a1i/skillroster"
   url "https://github.com/tt-a1i/skillroster.git",
-      revision: "e054fcd51d661abab79601e974454a89cab36cfa"
+      revision: "3c36cc5aa3b0bf3c22b880a1c3855f570ba7cf0f"
   version "1.6.0"
 
   depends_on "rust" => :build
