@@ -135,6 +135,7 @@ pub fn derive(
     let mut affected_placements = BTreeSet::new();
     let mut operation_groups = BTreeMap::<&str, usize>::new();
     let mut exclusions = Vec::new();
+    let mut retargeted_placements = BTreeSet::new();
 
     for (skill_id, requests) in by_skill {
         let skill = scan
@@ -210,6 +211,64 @@ pub fn derive(
             });
         }
 
+        let dependent_links = placements
+            .iter()
+            .copied()
+            .filter(|placement| !removal.iter().any(|removed| removed.id == placement.id))
+            .filter(|placement| {
+                placement.link_target.as_ref().is_some_and(|target| {
+                    removal.iter().any(|removed| {
+                        target == &removed.directory || target.starts_with(&removed.directory)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        if dependent_links
+            .iter()
+            .any(|placement| placement.agent.is_none())
+        {
+            bail!(
+                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
+            );
+        }
+        if !dependent_links.is_empty() {
+            let source = source
+                .clone()
+                .ok_or_else(|| anyhow!("Skill {skill_id} has no verified canonical source"))?;
+            let source_fingerprint = source_fingerprint
+                .clone()
+                .ok_or_else(|| anyhow!("Skill {skill_id} source fingerprint is unavailable"))?;
+            for placement in dependent_links {
+                needs_backup_root |= !backup_root.exists();
+                before_exposure += usize::from(placement.default_exposed);
+                after_exposure += usize::from(placement.default_exposed);
+                affected_placements.insert(placement.id.clone());
+                if let Some(agent) = placement.agent {
+                    affected_agents.insert(agent.id().to_owned());
+                }
+                retargeted_placements.insert(placement.id.clone());
+                operations.push(json!({
+                    "kind": "move_recoverable",
+                    "source": placement.directory,
+                    "target": backup_root.join(format!("{nonce}-{}", placement.id)),
+                    "expected_fingerprint": change::fingerprint(&placement.directory)?
+                }));
+                *operation_groups
+                    .entry("preserve_dependent_link")
+                    .or_default() += 1;
+                operations.push(json!({
+                    "kind": "create_symlink",
+                    "source": source,
+                    "target": placement.directory,
+                    "expected_fingerprint": "missing",
+                    "expected_source_fingerprint": source_fingerprint
+                }));
+                *operation_groups
+                    .entry("retarget_dependent_link")
+                    .or_default() += 1;
+            }
+        }
+
         for placement in &removal {
             before_exposure += usize::from(placement.default_exposed);
             affected_placements.insert(placement.id.clone());
@@ -236,8 +295,20 @@ pub fn derive(
                 .collect::<Vec<_>>();
             before_exposure += existing
                 .iter()
+                .filter(|placement| !retargeted_placements.contains(&placement.id))
                 .filter(|placement| placement.default_exposed)
                 .count();
+            if existing
+                .iter()
+                .any(|placement| retargeted_placements.contains(&placement.id))
+            {
+                exclusions.push(json!({
+                    "agent": request.agent,
+                    "skill_id": skill_id,
+                    "reason": "retargeted_from_removed_canonical"
+                }));
+                continue;
+            }
             if existing.iter().any(|placement| {
                 placement.default_exposed
                     && placement.link_status != LinkStatus::Broken
@@ -524,7 +595,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn core_link_is_retargeted_when_its_canonical_directory_moves() {
+    fn out_of_scope_agent_link_is_retargeted_when_its_canonical_directory_moves() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
         let codex = home.join(".codex/skills/shared");
@@ -538,28 +609,69 @@ mod tests {
         let skill_id = snapshot.skills[0].id.clone();
         let state = temp.path().join("state");
         fs::create_dir(&state).unwrap();
+        let state = fs::canonicalize(state).unwrap();
 
         let plan = derive(
             &snapshot,
             &state,
-            &[
-                RosterChange {
-                    agent: "codex".into(),
-                    skill_id: skill_id.clone(),
-                    state: "on_demand".into(),
-                },
-                RosterChange {
-                    agent: "claude-code".into(),
-                    skill_id,
-                    state: "core".into(),
-                },
-            ],
+            &[RosterChange {
+                agent: "codex".into(),
+                skill_id,
+                state: "on_demand".into(),
+            }],
         )
         .unwrap();
 
         assert!(plan.operations.iter().any(|operation| {
             operation["kind"] == "move_recoverable" && operation["source"] == json!(claude)
         }));
+        assert_eq!(plan.impact["before_default_exposure"], 2);
+        assert_eq!(plan.impact["after_default_exposure"], 1);
+
+        let mut approved_roots = snapshot
+            .roots
+            .iter()
+            .filter(|root| root.kind == RootKind::Skills && root.status == RootStatus::Included)
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        approved_roots.push(state.join("library"));
+        approved_roots.push(state.join("plan-backups"));
+        let prepared = change::prepare(
+            &json!({
+                "schema_version": 1,
+                "scan_id": "scan_fixture",
+                "evidence_ids": ["evidence_fixture"],
+                "operations": plan.operations,
+                "roster_changes": [{
+                    "agent": "codex",
+                    "skill_id": snapshot.skills[0].id,
+                    "state": "on_demand"
+                }],
+                "library_changes": plan.implicit_library_changes
+            })
+            .to_string(),
+            &change::PrepareContext {
+                approved_roots,
+                state_dir: state.clone(),
+                operation_policy: change::OperationPolicy::LibraryGovernance,
+            },
+        )
+        .unwrap();
+        let applied = change::apply(&prepared).unwrap();
+        assert!(applied.verification_passed);
+        assert!(!codex.exists());
+        assert_eq!(
+            fs::canonicalize(&claude).unwrap(),
+            fs::canonicalize(state.join("library/shared")).unwrap()
+        );
+
+        let undone = change::undo(&applied.receipt).unwrap();
+        assert!(undone.verification_passed);
+        assert!(codex.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::canonicalize(&claude).unwrap(),
+            fs::canonicalize(codex).unwrap()
+        );
         assert!(plan.operations.iter().any(|operation| {
             operation["kind"] == "create_symlink"
                 && operation["target"] == json!(claude)
