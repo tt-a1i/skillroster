@@ -36,4 +36,9 @@ Compress-Archive -Path $Stage -DestinationPath $Archive -Force
 Remove-Item $Stage -Recurse -Force
 
 $Hash = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLowerInvariant()
-"$Hash  $Name.zip" | Set-Content -Encoding ASCII "$Archive.sha256"
+$ChecksumLine = "$Hash  $Name.zip`n"
+[System.IO.File]::WriteAllText(
+    $Checksum,
+    $ChecksumLine,
+    [System.Text.UTF8Encoding]::new($false)
+)
