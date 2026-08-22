@@ -305,6 +305,29 @@ path together, returned `choose_same_name_variant`, and offered no Plan before
 the canonical-content decision. Human output preserved the same facts at 60,
 80, and 120 columns without displaying null paths or changing Agent files.
 
+The v1.8.12 Agent-hint dogfood used another fresh isolated state store against
+the same 232-Skill, 744-placement real inventory. Twenty previously unseen
+Chinese tasks tested ordinary Find, followed by twelve Agent-authored English
+capability hints where the target metadata was English or the native result was
+uncertain. The pre-fix combined-token ranking moved `humanizer-zh` from rank two
+for the original task to rank six after the appropriate hint `humanize Chinese
+writing remove AI tone`, outside the requested Top-5. Task/hint reciprocal-rank
+fusion restored it to rank two while independently recovering
+`computer-history`, `Spreadsheets`, `control-chrome`, `code-review`,
+`hi-im-reader`, `documents`, and `imagegen` in Top-2. The run also retained
+honest misses: a generic `executable specification` hint did not contain the
+`spec` vocabulary needed to discover `to-spec`, while a refined `write
+technical spec` hint ranked it second. The maintained 86-task routing set and
+the task-preservation regression passed without changing Agent files.
+
+The same dogfood reproduced an Agent-pipeline failure by closing the consumer
+before a full Finding JSON response was written. v1.8.11 exited 101 and printed
+a raw Rust Broken-pipe panic. The fallible stdout boundary now treats only
+`BrokenPipe` as quiet consumer completion; other output errors remain failures.
+A process-level regression closes the stdout reader before write, and the real
+large-response replay exits zero with empty stderr. Connected JSON responses
+remain one complete versioned document.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

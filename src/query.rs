@@ -82,6 +82,10 @@ pub struct FindMatch {
     /// True when at least one placement may participate in a governance Plan.
     pub governable: bool,
     pub match_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_channel_rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub augmented_channel_rank: Option<usize>,
     pub evidence_quality: EvidenceQuality,
     /// Same declared name with distinct Skill identities is one ambiguous capability result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1445,6 +1449,8 @@ pub(crate) fn find_matching(
                 providers,
                 governable,
                 match_reasons: reasons,
+                task_channel_rank: None,
+                augmented_channel_rank: None,
                 evidence_quality: if observed_usage {
                     EvidenceQuality::Observed
                 } else {
@@ -1488,6 +1494,137 @@ pub(crate) fn find_matching(
         matched.rank = index + 1;
     }
     capabilities
+}
+
+pub(crate) fn fuse_retrieval_channels(
+    task_matches: Vec<FindMatch>,
+    augmented_matches: Vec<FindMatch>,
+    task: &RetrievalQuery,
+    limit: usize,
+) -> Vec<FindMatch> {
+    const RECIPROCAL_RANK_OFFSET: f64 = 60.0;
+    const AUGMENTED_CHANNEL_WEIGHT: f64 = 3.0;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    struct FusedMatch {
+        matched: FindMatch,
+        task_rank: Option<usize>,
+        augmented_rank: Option<usize>,
+        fused_score: f64,
+    }
+
+    let mut fused = BTreeMap::<String, FusedMatch>::new();
+    for matched in task_matches {
+        let capability = matched.name.trim().to_lowercase();
+        let rank = matched.rank;
+        fused.insert(
+            capability,
+            FusedMatch {
+                matched,
+                task_rank: Some(rank),
+                augmented_rank: None,
+                fused_score: 1.0 / (RECIPROCAL_RANK_OFFSET + rank as f64),
+            },
+        );
+    }
+    for mut matched in augmented_matches {
+        let capability = matched.name.trim().to_lowercase();
+        let rank = matched.rank;
+        if let Some(existing) = fused.get_mut(&capability) {
+            matched
+                .match_reasons
+                .extend(existing.matched.match_reasons.iter().cloned());
+            matched.match_reasons.sort();
+            matched.match_reasons.dedup();
+            existing.matched = matched;
+            existing.augmented_rank = Some(rank);
+            existing.fused_score +=
+                AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64);
+        } else {
+            fused.insert(
+                capability,
+                FusedMatch {
+                    matched,
+                    task_rank: None,
+                    augmented_rank: Some(rank),
+                    fused_score: AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64),
+                },
+            );
+        }
+    }
+
+    let mut fused = fused.into_values().collect::<Vec<_>>();
+    fused.sort_by(|left, right| {
+        right
+            .fused_score
+            .partial_cmp(&left.fused_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.augmented_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.augmented_rank.unwrap_or(usize::MAX))
+            })
+            .then_with(|| {
+                left.task_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.task_rank.unwrap_or(usize::MAX))
+            })
+            .then_with(|| left.matched.name.cmp(&right.matched.name))
+            .then_with(|| left.matched.skill_id.cmp(&right.matched.skill_id))
+    });
+    let mut fused = fused
+        .into_iter()
+        .map(|mut fused| {
+            fused.matched.match_reasons.sort();
+            fused.matched.match_reasons.dedup();
+            fused.matched.task_channel_rank = fused.task_rank;
+            fused.matched.augmented_channel_rank = fused.augmented_rank;
+            fused.matched.score = (fused.fused_score * 100_000.0).round() / 100.0;
+            fused.matched
+        })
+        .collect::<Vec<_>>();
+    let protected_task_capabilities = fused
+        .iter()
+        .filter(|matched| {
+            matched.task_channel_rank.is_some_and(|rank| rank <= limit)
+                && has_protectable_task_evidence(matched)
+        })
+        .map(|matched| matched.name.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
+    let protected_task_matches = fused
+        .iter()
+        .filter(|matched| protected_task_capabilities.contains(&matched.name.trim().to_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+    trim_low_confidence_tail(&mut fused, tokens(task.text()).len());
+    for matched in protected_task_matches {
+        if !fused
+            .iter()
+            .any(|candidate| candidate.name.eq_ignore_ascii_case(&matched.name))
+        {
+            fused.push(matched);
+        }
+    }
+    while fused.len() > limit {
+        let removable = fused.iter().rposition(|matched| {
+            !protected_task_capabilities.contains(&matched.name.trim().to_lowercase())
+        });
+        match removable {
+            Some(index) => {
+                fused.remove(index);
+            }
+            None => {
+                fused.truncate(limit);
+            }
+        }
+    }
+    for (index, matched) in fused.iter_mut().enumerate() {
+        matched.rank = index + 1;
+    }
+    fused
 }
 
 fn tokens(text: &str) -> BTreeSet<String> {
@@ -1679,6 +1816,22 @@ fn has_strong_lexical_evidence(matched: &FindMatch) -> bool {
         ) || reason.starts_with("name_tokens:")
             || reason.starts_with("trigger_tokens:")
             || reason.starts_with("description_tokens:")
+    })
+}
+
+fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
+    matched.match_reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "exact_name" | "name_phrase" | "declared_trigger" | "description_phrase"
+        ) || ["name_tokens:", "trigger_tokens:", "description_tokens:"]
+            .iter()
+            .any(|prefix| {
+                reason
+                    .strip_prefix(prefix)
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .is_some_and(|count| count >= 2)
+            })
     })
 }
 
@@ -2160,6 +2313,67 @@ mod tests {
                 .iter()
                 .all(|matched| matched.name != "agent-session-miner")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hint_fusion_preserves_a_strong_task_match_missing_from_the_augmented_pool() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-hint-fusion-{nonce}"));
+        for (directory, contents) in [
+            (
+                "native-task",
+                "---\nname: native-task\ndescription: 原始任务专用能力\n---\n",
+            ),
+            (
+                "hint-one",
+                "---\nname: hint-one\ndescription: English capability paraphrase\n---\n",
+            ),
+            (
+                "hint-two",
+                "---\nname: hint-two\ndescription: English capability paraphrase helper\n---\n",
+            ),
+            (
+                "hint-three",
+                "---\nname: hint-three\ndescription: English capability paraphrase workflow\n---\n",
+            ),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), contents).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let task_query = RetrievalQuery::from_parts(["原始任务专用能力"]);
+        let task_matches = find_matching(&scan, &task_query, 3, None, None);
+        let augmented_matches = find(&scan, "English capability paraphrase", 3);
+        assert_eq!(task_matches[0].name, "native-task");
+        assert!(
+            augmented_matches
+                .iter()
+                .all(|matched| matched.name != "native-task")
+        );
+
+        let fused = fuse_retrieval_channels(task_matches, augmented_matches, &task_query, 3);
+        let native = fused
+            .iter()
+            .find(|matched| matched.name == "native-task")
+            .expect("a strong original-task match must remain in the bounded result");
+        assert_eq!(native.task_channel_rank, Some(1));
+        assert_eq!(native.augmented_channel_rank, None);
+        assert!(native.rank <= 3);
+        assert_eq!(fused.len(), 3);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -2229,13 +2229,36 @@ fn find_command(
         candidate_ids.extend(routable_ids.iter().cloned());
     }
     candidate_ids.retain(|skill_id| routable_ids.contains(skill_id));
-    let mut matches = crate::query::find_matching(
+    let pool_limit = if retrieval_hints.is_empty() {
+        limit
+    } else {
+        limit.saturating_mul(4).clamp(20, 100)
+    };
+    let augmented_matches = crate::query::find_matching(
         &scan,
         &retrieval_query,
-        limit,
+        pool_limit,
         Some(&candidate_ids),
         Some(&routable_ids),
     );
+    let ranking_strategy = if retrieval_hints.is_empty() {
+        "single_lexical_channel"
+    } else {
+        "task_hint_reciprocal_rank_fusion"
+    };
+    let mut matches = if retrieval_hints.is_empty() {
+        augmented_matches
+    } else {
+        let task_query = crate::query::RetrievalQuery::from_parts([task]);
+        let task_matches = crate::query::find_matching(
+            &scan,
+            &task_query,
+            pool_limit,
+            Some(&candidate_ids),
+            Some(&routable_ids),
+        );
+        crate::query::fuse_retrieval_channels(task_matches, augmented_matches, &task_query, limit)
+    };
     let mut warnings = Vec::new();
     let mut rescan_required = false;
     for (index, found) in matches.iter_mut().enumerate() {
@@ -2305,6 +2328,7 @@ fn find_command(
         "snapshot_id": scan_id,
         "task": task,
         "retrieval_hints": retrieval_hints,
+        "ranking_strategy": ranking_strategy,
         "matches": matches,
         "rescan_required": rescan_required,
         "warnings": warnings,
@@ -4246,6 +4270,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.10",
         "dbc604dbfc45db5bf766609b28513eacb1ba87a96fc0cba7bb11337561bddd01",
+    ),
+    (
+        "1.8.11",
+        "501c0ce97d677b1a3c68d25dd1ece99590895dd51e23e671ea96312925e98c59",
     ),
 ];
 
