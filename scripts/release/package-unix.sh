@@ -36,8 +36,14 @@ fi
 mkdir -p "$stage"
 install -m 0755 "target/${target}/release/skillroster" "$stage/skillroster"
 cp README.md "$stage/README.md"
+cp LICENSE "$stage/LICENSE"
 tar -C "$dist_root" -czf "$archive" "$name"
 rm -rf "$stage"
+
+if ! tar -xOf "$archive" "$name/LICENSE" | cmp - LICENSE; then
+  echo "release archive does not contain the repository LICENSE" >&2
+  exit 1
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "$dist_root" && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")

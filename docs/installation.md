@@ -27,7 +27,7 @@ On macOS or Linux, the archive contains a versioned directory. Extract it and
 install the binary from that directory (not from the current directory):
 
 ```sh
-SKILLROSTER_VERSION=1.8.6
+SKILLROSTER_VERSION=1.8.7
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
 install "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}/skillroster" \
@@ -37,7 +37,8 @@ skillroster --version
 
 On Windows, compare `Get-FileHash .\skillroster-*.zip -Algorithm SHA256` with
 the checksum file. Extract the archive, open its versioned directory, then
-place `skillroster.exe` in a directory on `PATH`.
+place `skillroster.exe` in a directory on `PATH`. Every release archive also
+contains the complete Apache-2.0 `LICENSE` distributed with the binary.
 
 ## Build or install from source
 
@@ -45,7 +46,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v1.8.6 skillroster
+  --tag v1.8.7 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the
@@ -59,7 +60,7 @@ clone the release tag and install the checked-in Formula:
 ```sh
 git clone https://github.com/tt-a1i/skillroster.git
 cd skillroster
-git checkout v1.8.6
+git checkout v1.8.7
 brew install --formula ./Formula/skillroster.rb
 brew test skillroster
 ```
