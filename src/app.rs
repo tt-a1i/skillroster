@@ -1696,6 +1696,7 @@ fn finding_roster_planning(
             })));
         }
     };
+    let (selection_evidence, uncertainty) = roster_selection_evidence(&recommendation);
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     let agents = recommendation
@@ -1830,6 +1831,8 @@ fn finding_roster_planning(
         "absence_of_usage_evidence": "not_negative_evidence",
         "automatic_target_states": ["core", "on_demand"],
         "explicit_only_or_archive_decision_implied": false,
+        "selection_evidence": selection_evidence,
+        "uncertainty": uncertainty,
         "blocked_change_count": blocked_change_count,
         "blocked_changes": blocked_changes,
         "blocked_changes_truncated": blocked_change_count > 5,
@@ -2750,6 +2753,83 @@ struct FindingRosterChangeRequest {
 struct FindingPlanProvenance {
     report_id: ReportId,
     finding_ids: Vec<FindingId>,
+    selection_evidence: Option<Value>,
+    uncertainty: Option<Value>,
+}
+
+fn roster_selection_evidence(
+    recommendation: &crate::roster_recommendation::RosterRecommendation,
+) -> (Value, Option<Value>) {
+    let mut core_selection_count = 0_usize;
+    let mut forced_core_count = 0_usize;
+    let mut positive_signal_core_count = 0_usize;
+    let mut stable_fallback_core_count = 0_usize;
+    let mut fallback_dominated_agent_count = 0_usize;
+    let mut reason_counts = std::collections::BTreeMap::<&str, usize>::new();
+    let agents = recommendation
+        .agents
+        .iter()
+        .map(|agent| {
+            let mut forced = 0_usize;
+            let mut positive = 0_usize;
+            let mut fallback = 0_usize;
+            for selection in &agent.core_selections {
+                *reason_counts.entry(selection.reason).or_default() += 1;
+                match selection.reason {
+                    "protected_by_request" | "declared_core" | "skillroster_bootstrap" => {
+                        forced += 1;
+                    }
+                    "stable_fallback" => fallback += 1,
+                    _ => positive += 1,
+                }
+            }
+            let core_count = agent.core_selections.len();
+            let fallback_dominated = fallback > core_count / 2;
+            core_selection_count += core_count;
+            forced_core_count += forced;
+            positive_signal_core_count += positive;
+            stable_fallback_core_count += fallback;
+            fallback_dominated_agent_count += usize::from(fallback_dominated);
+            json!({
+                "agent": agent.agent.id(),
+                "core_selection_count": core_count,
+                "forced_core_count": forced,
+                "positive_signal_core_count": positive,
+                "stable_fallback_core_count": fallback,
+                "fallback_dominated": fallback_dominated
+            })
+        })
+        .collect::<Vec<_>>();
+    let fallback_dominated = fallback_dominated_agent_count > 0;
+    let evidence = json!({
+        "selection_policy": [
+            "protected_by_request",
+            "declared_core",
+            "skillroster_bootstrap",
+            "positive_usage_evidence",
+            "stable_fallback"
+        ],
+        "core_selection_count": core_selection_count,
+        "forced_core_count": forced_core_count,
+        "positive_signal_core_count": positive_signal_core_count,
+        "stable_fallback_core_count": stable_fallback_core_count,
+        "fallback_dominated": fallback_dominated,
+        "fallback_dominated_agent_count": fallback_dominated_agent_count,
+        "reason_counts": reason_counts,
+        "agents": agents,
+        "absence_of_usage_evidence": "not_negative_evidence"
+    });
+    let uncertainty = fallback_dominated.then(|| {
+        json!({
+            "code": "fallback_dominated_core_selection",
+            "review_required": true,
+            "core_selection_count": core_selection_count,
+            "stable_fallback_core_count": stable_fallback_core_count,
+            "fallback_dominated_agent_count": fallback_dominated_agent_count,
+            "absence_of_usage_evidence": "not_negative_evidence"
+        })
+    });
+    (evidence, uncertainty)
 }
 
 fn declared_core_pairs(
@@ -2843,8 +2923,9 @@ fn expand_finding_roster_changes(
             protected_skill_ids,
         },
     )?;
+    let (selection_evidence, uncertainty) = roster_selection_evidence(&recommendation);
     let supported =
-        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
+        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     if !supported.exclusions.is_empty() {
         if supported
             .exclusions
@@ -2871,6 +2952,8 @@ fn expand_finding_roster_changes(
         Some(FindingPlanProvenance {
             report_id: finding.report_id,
             finding_ids: vec![finding_id],
+            selection_evidence: Some(selection_evidence),
+            uncertainty,
         }),
     ))
 }
@@ -3021,6 +3104,8 @@ fn expand_finding_library_changes(
         Some(FindingPlanProvenance {
             report_id: report_id.expect("non-empty Finding requests have a Report"),
             finding_ids,
+            selection_evidence: None,
+            uncertainty: None,
         }),
     ))
 }
@@ -3737,6 +3822,12 @@ fn prepare_plan(
     let report_id = finding_provenance
         .as_ref()
         .map(|provenance| provenance.report_id.clone());
+    let selection_evidence = finding_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.selection_evidence.clone());
+    let uncertainty = finding_provenance
+        .as_ref()
+        .and_then(|provenance| provenance.uncertainty.clone());
     let risk = plan_risk(&prepared);
     let operations_by_kind = operation_groups(&prepared.operations);
     let impact = bounded_plan_impact(impact);
@@ -3748,7 +3839,7 @@ fn prepare_plan(
         &operations_by_kind,
         &impact,
     );
-    let summary = json!({
+    let mut summary = json!({
         "detail_level": "summary",
         "plan_id": prepared.id,
         "snapshot_id": prepared.scan_id,
@@ -3780,6 +3871,15 @@ fn prepare_plan(
         "confirmation_required": true,
         "files_changed": false
     });
+    let summary_object = summary
+        .as_object_mut()
+        .expect("Plan summary is always an object");
+    if let Some(selection_evidence) = selection_evidence {
+        summary_object.insert("selection_evidence".into(), selection_evidence);
+    }
+    if let Some(uncertainty) = uncertainty {
+        summary_object.insert("uncertainty".into(), uncertainty);
+    }
     store.save_plan(&plan_record(
         &prepared,
         input,
@@ -4060,6 +4160,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.8",
         "15dc6c0bd25dc7a6e97336124960b7d548ecea9a3a58b34d55a4d57dbc4d5aeb",
+    ),
+    (
+        "1.8.9",
+        "1087110d8f8f9bb2c1839b1eda11b4417ca7b57af4449113a6fb5b1394e3309d",
     ),
 ];
 
@@ -5178,6 +5282,48 @@ mod recovery_tests {
         assert_eq!(rollups[0]["finding_count"], 2);
         assert_eq!(rollups[0]["affected_skill_count"], 2);
         assert_eq!(rollups[0]["affected_placement_count"], 3);
+    }
+
+    #[test]
+    fn roster_selection_uncertainty_requires_a_fallback_majority() {
+        let recommendation = crate::roster_recommendation::RosterRecommendation {
+            changes: vec![],
+            agents: vec![crate::roster_recommendation::AgentRecommendation {
+                agent: AgentKind::Codex,
+                before_default_exposure: 51,
+                unique_skill_count: 51,
+                core_count: 3,
+                on_demand_count: 48,
+                positive_signal_count: 1,
+                fallback_core_count: 1,
+                core_selections: vec![
+                    crate::roster_recommendation::CoreSelection {
+                        skill_id: "skill_forced".into(),
+                        name: "forced".into(),
+                        reason: "protected_by_request",
+                    },
+                    crate::roster_recommendation::CoreSelection {
+                        skill_id: "skill_observed".into(),
+                        name: "observed".into(),
+                        reason: "observed_loaded",
+                    },
+                    crate::roster_recommendation::CoreSelection {
+                        skill_id: "skill_fallback".into(),
+                        name: "fallback".into(),
+                        reason: "stable_fallback",
+                    },
+                ],
+            }],
+        };
+
+        let (evidence, uncertainty) = roster_selection_evidence(&recommendation);
+
+        assert_eq!(evidence["core_selection_count"], 3);
+        assert_eq!(evidence["forced_core_count"], 1);
+        assert_eq!(evidence["positive_signal_core_count"], 1);
+        assert_eq!(evidence["stable_fallback_core_count"], 1);
+        assert_eq!(evidence["fallback_dominated"], false);
+        assert!(uncertainty.is_none());
     }
 
     #[test]

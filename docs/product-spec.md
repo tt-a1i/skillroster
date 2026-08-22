@@ -162,7 +162,7 @@ it does not repeat complete affected-ID, placement, and Evidence collections.
 the Finding returns a trust-confirmation resolution and observed link targets;
 it must not advertise an automatic Plan before the source is confirmed.
 
-`plan --stdin --json` returns a bounded decision-complete summary: total change counts, operation groups, affected-scope counts with at most ten Skill IDs, before/after impact, risk, reversibility, and the immutable Plan ID. It does not inline filesystem operations or complete large ID collections. `plan --show PLAN_ID --json` is the explicit full-detail path; it reads the stored Plan and never mutates files.
+`plan --stdin --json` returns a bounded decision-complete summary: total change counts, operation groups, affected-scope counts with at most ten Skill IDs, before/after impact, risk, reversibility, and the immutable Plan ID. A Finding-derived Roster Plan also persists `selection_evidence`, including forced, positive-signal, and stable-fallback Core counts. When fallback selection dominates any affected Agent, the Plan carries typed `uncertainty` with `review_required: true`; absence of usage evidence remains explicitly non-negative. It does not inline filesystem operations or complete large ID collections. `plan --show PLAN_ID --json` is the explicit full-detail path; it reads the stored Plan and never mutates files.
 
 ## 6. Agent presentation contract
 

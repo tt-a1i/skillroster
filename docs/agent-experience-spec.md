@@ -61,7 +61,7 @@ The initial response should fit roughly one conversation viewport. It contains:
 2. **Four core metrics:** independent Skills, placements, default exposure, and observed-use coverage. Usage coverage names sampled, complete, limited, missing-root, and inaccessible Agent counts separately.
 3. **Top three Findings:** fact, impact, and Evidence quality.
 4. **Proposed change:** current → proposed counts and affected Agents.
-5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty.
+5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty. For semantic Roster Plans, include forced, positive-signal, and stable-fallback Core counts; fallback-dominated selection remains a review-required proposal.
 6. **One primary action:** the exact phrase the user can reply with.
 
 Do not lead with raw paths, every Finding, an aggregate health score, a wall of JSON, or unsupported token/performance estimates.

@@ -921,7 +921,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.9"
+        "1.8.10"
     );
 
     let undone = json_output(&run(
@@ -1091,7 +1091,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.9");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.10");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -2640,6 +2640,15 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     assert_eq!(planning["agents"][0]["before_default_exposure"], 61);
     assert_eq!(planning["agents"][0]["proposed_core_count"], 50);
     assert_eq!(planning["agents"][0]["proposed_on_demand_count"], 11);
+    assert_eq!(
+        planning["selection_evidence"]["stable_fallback_core_count"],
+        49
+    );
+    assert_eq!(
+        planning["uncertainty"]["code"],
+        "fallback_dominated_core_selection"
+    );
+    assert_eq!(planning["uncertainty"]["review_required"], true);
     assert!(
         planning["agents"][0]["core_preview"]
             .as_array()
@@ -2666,15 +2675,59 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     assert_eq!(plan["result"]["impact"]["before_default_exposure"], 61);
     assert_eq!(plan["result"]["impact"]["after_default_exposure"], 10);
     assert_eq!(plan["result"]["canonical_deletion_count"], 0);
+    assert_eq!(
+        plan["result"]["selection_evidence"]["core_selection_count"],
+        10
+    );
+    assert_eq!(plan["result"]["selection_evidence"]["forced_core_count"], 1);
+    assert_eq!(
+        plan["result"]["selection_evidence"]["positive_signal_core_count"],
+        0
+    );
+    assert_eq!(
+        plan["result"]["selection_evidence"]["stable_fallback_core_count"],
+        9
+    );
+    assert_eq!(
+        plan["result"]["selection_evidence"]["fallback_dominated"],
+        true
+    );
+    assert_eq!(
+        plan["result"]["uncertainty"]["code"],
+        "fallback_dominated_core_selection"
+    );
+    assert_eq!(plan["result"]["uncertainty"]["review_required"], true);
 
-    let applied = json_output(&run(
-        &[
-            &common[..],
-            &["apply", plan["result"]["plan_id"].as_str().unwrap()],
-        ]
-        .concat(),
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
         None,
     ));
+    assert_eq!(
+        detail["result"]["selection_evidence"],
+        plan["result"]["selection_evidence"]
+    );
+    assert_eq!(
+        detail["result"]["uncertainty"],
+        plan["result"]["uncertainty"]
+    );
+    let human = run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "plan",
+            "--show",
+            plan_id,
+        ],
+        None,
+    );
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("0 signals · 1 forced · 9 fallback"));
+    assert!(human.contains("fallback-dominated Core selection"));
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 10);
     assert_eq!(fs::read_dir(state.join("library")).unwrap().count(), 51);
 
