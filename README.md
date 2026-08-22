@@ -25,8 +25,9 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 
 ```bash
 skillroster scan --json
+skillroster --source-root /absolute/trusted/source scan --json
 skillroster report --summary --json
-skillroster report --finding <finding-id> --json
+skillroster report --finding <finding-id> --limit 20 --json
 skillroster find "database migration" --json
 skillroster plan --stdin --json
 skillroster apply <plan-id> --json
@@ -47,6 +48,11 @@ See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
 Plan/Receipt history or deleting the local database.
 See [docs/installation.md](docs/installation.md) for verified Release, Cargo,
 and Homebrew installation paths.
+
+`--root AGENT=PATH` adds an Agent placement root and therefore contributes to
+that Agent's default exposure. `--source-root PATH` approves a non-exposed
+canonical source directory for the current Scan. Neither option crawls outside
+the exact supplied path.
 
 Agent-authored Plans are declarative: they reference the latest Snapshot and
 Evidence IDs, then request Roster states, managed/hosted Library placement, or a

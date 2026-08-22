@@ -11,7 +11,7 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 
 1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis; do not request the full report unless exhaustive Finding enumeration is necessary.
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused.
-3. Use stable Finding and Evidence IDs for follow-up questions. Run `report --finding ID --json` against the same Snapshot rather than silently rescanning. Explain its returned placement paths, link targets, and Evidence records; do not make the user infer them from opaque IDs.
+3. Use stable Finding and Evidence IDs for follow-up questions. The summary exposes one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when the exact paths or Evidence affect the decision. Finding detail is paged. Continue with `--offset NEXT_OFFSET --limit 20` only until the requested decision has enough relevant evidence, and keep the same Snapshot rather than silently rescanning.
 4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. Set request `schema_version` to `1`, include the latest `scan_id` and one or more relevant `evidence_ids`, and submit only the supported governance fields.
 5. Present the validated Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `impact` before/after facts, affected Agents, uncertainty, canonical deletion count, reversibility, and Plan ID. The source-oriented `diff_summary` may be empty for ordinary Roster or Library Plans; do not treat that as a missing Plan delta.
 
@@ -21,9 +21,17 @@ Use only these Plan request families:
 - `library_changes`: `skill_id`, `canonical_placement_id`, the complete `placement_ids` set returned by the Snapshot, and `requested_state` (`managed` or `hosted`).
 - `source_updates`: the latest Skill/placement/source/revision/fingerprint facts plus upstream content and SHA-256 digest. If local content changed, include the user's explicit `choice`: `retain_local`, `adopt_upstream`, or `preserve_both`.
 
-Keep source updates and Library changes in separate Plans. Treat a rejected stale Snapshot, Evidence ID, fingerprint, incomplete placement set, or source revision as a reason to rescan or ask the user—not as permission to weaken the request.
+Keep source updates and Library changes in separate Plans. Cite Evidence returned by the relevant Finding page; a convenient but unrelated Evidence ID is not support for a governance change. Treat a rejected stale Snapshot, Evidence ID, fingerprint, incomplete placement set, or source revision as a reason to rescan or ask the user—not as permission to weaken the request.
 
 State explicitly that inspection and planning changed no Agent files. When evidence cannot justify a change, recommend keeping the current state.
+
+For `Skill links escape an approved root`, load one Finding page and show the
+link targets. Treat each target as unread until the user confirms that its
+source directory is intentional and trusted. After confirmation, rescan with
+one repeatable `--source-root ABSOLUTE_PATH` per canonical source directory;
+this approves reading without adding Agent exposure. Then prefer a reviewed
+Hosted or Managed Library Plan so future Scans no longer depend on the
+temporary source-root arguments. Keep unconfirmed targets unread.
 
 ## Apply or undo
 

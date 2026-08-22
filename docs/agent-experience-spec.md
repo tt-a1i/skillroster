@@ -144,7 +144,7 @@ Machine results should expose facts, not preformatted prose:
 
 - `primary_metrics` with value, unit, coverage, and comparison baseline;
 - Findings with stable ID, category, severity, Evidence quality, impact fields, and affected IDs;
-- a bounded `report --summary --json` first view with no more than three Findings, plus explicit placement paths and Evidence facts from `report --finding ID --json`;
+- a bounded `report --summary --json` first view with no more than three Findings and one primary Evidence reference, plus paged placement paths and Evidence facts from `report --finding ID --json`;
 - Plan `change_summary` counts and `impact` deltas for current and proposed state; source-update line details remain in `diff_summary`;
 - affected Agents, Skills, placements, operation groups, exclusions, and deletion count;
 - risk, reversibility, drift, confirmation, and recovery state;
@@ -165,6 +165,13 @@ The Agent reports that no change is justified and does not create artificial arc
 ### Partial Evidence
 
 The Agent distinguishes “not observed” from “unused,” names missing coverage, and avoids a destructive recommendation.
+
+### External canonical source
+
+The Agent leaves an escaping link unread, shows its target, and asks whether
+the source is intentional. A confirmed source is rescanned through
+`--source-root` without increasing any Agent's default exposure; unconfirmed
+sources remain excluded.
 
 ### One-confirmation Apply
 

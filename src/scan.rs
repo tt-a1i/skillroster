@@ -21,6 +21,7 @@ const MAX_SESSION_LINES_PER_AGENT: usize = 20_000;
 pub struct ScanOptions {
     pub home: PathBuf,
     pub explicit_skill_roots: Vec<ExplicitSkillRoot>,
+    pub explicit_source_roots: Vec<PathBuf>,
     pub excluded_session_agents: BTreeSet<AgentKind>,
     pub include_session_evidence: bool,
     pub max_depth: usize,
@@ -37,6 +38,7 @@ impl ScanOptions {
         Self {
             home: home.into(),
             explicit_skill_roots: Vec::new(),
+            explicit_source_roots: Vec::new(),
             excluded_session_agents: BTreeSet::new(),
             include_session_evidence: true,
             max_depth: 5,
@@ -202,6 +204,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
                 .iter()
                 .map(|root| root.path.clone()),
         )
+        .chain(options.explicit_source_roots.iter().cloned())
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
 
@@ -223,6 +226,17 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
             None,
             root,
             false,
+            &approved_roots,
+            options.max_depth,
+            &mut result,
+            &mut candidates,
+        );
+    }
+    for root in &options.explicit_source_roots {
+        observe_skill_root(
+            None,
+            root,
+            true,
             &approved_roots,
             options.max_depth,
             &mut result,
@@ -1059,6 +1073,48 @@ mod tests {
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.placements.len(), 2);
         assert!(result.roots.iter().any(|seen| seen.explicit));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_source_root_approves_links_without_adding_agent_exposure() {
+        let root = temp_directory("source-root");
+        let home = root.join("home");
+        let source_root = root.join("sources");
+        let source_skill = source_root.join("external");
+        fs::create_dir_all(&source_skill).unwrap();
+        fs::write(
+            source_skill.join("SKILL.md"),
+            "---\nname: external\ndescription: External source Skill\n---\n",
+        )
+        .unwrap();
+        let codex_root = home.join(".codex/skills");
+        fs::create_dir_all(&codex_root).unwrap();
+        std::os::unix::fs::symlink(&source_skill, codex_root.join("external")).unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.explicit_source_roots.push(source_root.clone());
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.placements.len(), 2);
+        assert_eq!(
+            result
+                .placements
+                .iter()
+                .filter(|placement| placement.default_exposed)
+                .count(),
+            1
+        );
+        assert!(
+            result
+                .roots
+                .iter()
+                .any(|seen| { seen.path == source_root && seen.explicit && seen.agent.is_none() })
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

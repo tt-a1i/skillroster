@@ -26,6 +26,10 @@ pub struct Cli {
     #[arg(long = "root", global = true, value_name = "AGENT=PATH")]
     pub roots: Vec<String>,
 
+    /// Add a non-exposed approved Skill source directory. Repeatable.
+    #[arg(long = "source-root", global = true, value_name = "PATH")]
+    pub source_roots: Vec<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -77,6 +81,14 @@ pub struct ReportArgs {
     /// Return core metrics and the three highest-priority Findings.
     #[arg(long)]
     pub summary: bool,
+
+    /// Maximum Finding detail rows returned per collection.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
+    pub limit: u16,
+
+    /// Zero-based offset for Finding detail pagination.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
 }
 
 #[derive(Debug, Args)]

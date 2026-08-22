@@ -98,12 +98,7 @@ pub fn build_report(scan: &ScanResult) -> Report {
     overlap_findings(scan, &mut findings);
     routing_findings(scan, &mut findings);
     lifecycle_findings(scan, &mut findings);
-    findings.sort_by(|left, right| {
-        right
-            .severity
-            .cmp(&left.severity)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    prioritize_report_findings(&mut findings, 3);
 
     let mut category_counts = BTreeMap::new();
     for finding in &findings {
@@ -116,6 +111,84 @@ pub fn build_report(scan: &ScanResult) -> Report {
         findings,
         category_counts,
         files_changed: false,
+    }
+}
+
+fn prioritize_report_findings(findings: &mut Vec<Finding>, first_view_limit: usize) {
+    findings.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| {
+                evidence_priority(right.evidence_quality)
+                    .cmp(&evidence_priority(left.evidence_quality))
+            })
+            .then_with(|| {
+                right
+                    .affected_placement_ids
+                    .len()
+                    .cmp(&left.affected_placement_ids.len())
+            })
+            .then_with(|| {
+                right
+                    .affected_skill_ids
+                    .len()
+                    .cmp(&left.affected_skill_ids.len())
+            })
+            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if first_view_limit == 0 || findings.is_empty() {
+        return;
+    }
+
+    let ranked = findings.clone();
+    let mut selected_ids = BTreeSet::new();
+    let mut selected_categories = BTreeSet::new();
+    for severity in [
+        Severity::High,
+        Severity::Medium,
+        Severity::Low,
+        Severity::Info,
+    ] {
+        for finding in ranked.iter().filter(|finding| finding.severity == severity) {
+            if selected_ids.len() == first_view_limit {
+                break;
+            }
+            let category = category_name(finding.category);
+            if selected_categories.insert(category) {
+                selected_ids.insert(finding.id.clone());
+            }
+        }
+        for finding in ranked.iter().filter(|finding| finding.severity == severity) {
+            if selected_ids.len() == first_view_limit {
+                break;
+            }
+            selected_ids.insert(finding.id.clone());
+        }
+        if selected_ids.len() == first_view_limit {
+            break;
+        }
+    }
+
+    let mut ordered = ranked
+        .iter()
+        .filter(|finding| selected_ids.contains(&finding.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    ordered.extend(
+        ranked
+            .into_iter()
+            .filter(|finding| !selected_ids.contains(&finding.id)),
+    );
+    *findings = ordered;
+}
+
+fn evidence_priority(quality: EvidenceQuality) -> u8 {
+    match quality {
+        EvidenceQuality::Observed => 2,
+        EvidenceQuality::Inferred => 1,
+        EvidenceQuality::Unknown => 0,
     }
 }
 
@@ -300,35 +373,45 @@ fn exposure_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             exposed_by_agent.entry(agent).or_default().push(placement);
         }
     }
-    for (agent, placements) in exposed_by_agent {
-        // This is a review threshold, not a claim that any Skill is useless.
-        if placements.len() > 50 {
-            push_finding(
-                findings,
-                FindingCategory::Exposure,
-                Severity::Medium,
-                "Large default Roster needs review",
-                format!(
-                    "{} has {} default-exposed placements; no archive decision is implied.",
-                    agent.display_name(),
-                    placements.len()
-                ),
-                placements
-                    .iter()
-                    .map(|placement| placement.skill_id.clone())
-                    .collect(),
-                placements
-                    .iter()
-                    .map(|placement| placement.id.clone())
-                    .collect(),
-                placements
-                    .iter()
-                    .map(|placement| format!("path:{}", placement.entrypoint.display()))
-                    .collect(),
-                EvidenceQuality::Observed,
-            );
-        }
+    let oversized = exposed_by_agent
+        .into_iter()
+        .filter(|(_, placements)| placements.len() > 50)
+        .collect::<Vec<_>>();
+    if oversized.is_empty() {
+        return;
     }
+    let breakdown = oversized
+        .iter()
+        .map(|(agent, placements)| format!("{}={}", agent.display_name(), placements.len()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // This is a review threshold, not a claim that any Skill is useless.
+    push_finding(
+        findings,
+        FindingCategory::Exposure,
+        Severity::Medium,
+        "Large default Rosters need review",
+        format!(
+            "{} Agents exceed 50 default-exposed placements: {breakdown}; no archive decision is implied.",
+            oversized.len()
+        ),
+        oversized
+            .iter()
+            .flat_map(|(_, placements)| placements.iter())
+            .map(|placement| placement.skill_id.clone())
+            .collect(),
+        oversized
+            .iter()
+            .flat_map(|(_, placements)| placements.iter())
+            .map(|placement| placement.id.clone())
+            .collect(),
+        oversized
+            .iter()
+            .flat_map(|(_, placements)| placements.iter())
+            .map(|placement| format!("path:{}", placement.entrypoint.display()))
+            .collect(),
+        EvidenceQuality::Observed,
+    );
 }
 
 fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
@@ -1339,6 +1422,116 @@ mod tests {
         let review_matches = find(&scan, "review a pull request", 2);
         assert_eq!(review_matches[0].name, "github-code-review");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_first_view_prioritizes_systemic_and_category_diverse_findings() {
+        fn finding(
+            category: FindingCategory,
+            severity: Severity,
+            title: &str,
+            skill_count: usize,
+            placement_count: usize,
+        ) -> Finding {
+            Finding {
+                id: format!("finding_{title}"),
+                category,
+                severity,
+                title: title.into(),
+                summary: title.into(),
+                affected_skill_ids: (0..skill_count)
+                    .map(|index| format!("skill_{title}_{index}"))
+                    .collect(),
+                affected_placement_ids: (0..placement_count)
+                    .map(|index| format!("placement_{title}_{index}"))
+                    .collect(),
+                evidence: Vec::new(),
+                evidence_quality: EvidenceQuality::Observed,
+            }
+        }
+
+        let mut findings = vec![
+            finding(
+                FindingCategory::Overlap,
+                Severity::Medium,
+                "duplicate-a",
+                1,
+                6,
+            ),
+            finding(
+                FindingCategory::Overlap,
+                Severity::Medium,
+                "duplicate-b",
+                1,
+                5,
+            ),
+            finding(
+                FindingCategory::Layout,
+                Severity::High,
+                "unsafe-links",
+                16,
+                16,
+            ),
+            finding(
+                FindingCategory::Exposure,
+                Severity::Medium,
+                "large-roster",
+                128,
+                128,
+            ),
+            finding(
+                FindingCategory::Layout,
+                Severity::Medium,
+                "name-conflicts",
+                8,
+                8,
+            ),
+            finding(FindingCategory::Usage, Severity::Info, "coverage", 0, 0),
+        ];
+
+        prioritize_report_findings(&mut findings, 3);
+
+        assert_eq!(
+            findings
+                .iter()
+                .take(3)
+                .map(|finding| finding.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unsafe-links", "large-roster", "duplicate-a"]
+        );
+    }
+
+    #[test]
+    fn exposure_is_one_systemic_finding_with_an_agent_breakdown() {
+        let mut scan = ScanResult::default();
+        for (agent, count) in [
+            (crate::harness::AgentKind::Codex, 52_usize),
+            (crate::harness::AgentKind::ClaudeCode, 51_usize),
+        ] {
+            scan.placements
+                .extend((0..count).map(|index| crate::scan::SkillPlacement {
+                    id: format!("placement_{}_{index}", agent.id()),
+                    skill_id: format!("skill_{}_{index}", agent.id()),
+                    agent: Some(agent),
+                    root: PathBuf::from(format!("/{}/skills", agent.id())),
+                    directory: PathBuf::from(format!("/{}/skills/{index}", agent.id())),
+                    entrypoint: PathBuf::from(format!("/{}/skills/{index}/SKILL.md", agent.id())),
+                    content_digest: format!("digest_{index}"),
+                    link_target: None,
+                    link_status: crate::scan::LinkStatus::NotLink,
+                    default_exposed: true,
+                    executable_files: Vec::new(),
+                    declared_name_matches_directory: Some(true),
+                }));
+        }
+        let mut findings = Vec::new();
+
+        exposure_findings(&scan, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].affected_placement_ids.len(), 103);
+        assert!(findings[0].summary.contains("Codex=52"));
+        assert!(findings[0].summary.contains("Claude Code=51"));
     }
 
     #[test]
