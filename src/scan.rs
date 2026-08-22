@@ -242,13 +242,13 @@ fn codex_enabled_plugin_skill_roots(
     let mut roots = Vec::new();
     for (plugin, marketplace) in enabled_plugins {
         let plugin_id = format!("{plugin}@{marketplace}");
-        let plugin_cache = cache_root.join(&marketplace).join(&plugin);
-        if !plugin_cache.is_dir() {
+        let unresolved_plugin_cache = cache_root.join(&marketplace).join(&plugin);
+        let Some(plugin_cache) = contained_directory(&cache_root, &unresolved_plugin_cache) else {
             warnings.push(format!(
-                "enabled Codex plugin {plugin_id} has no local cache; skipped"
+                "enabled Codex plugin {plugin_id} has no contained local cache; skipped"
             ));
             continue;
-        }
+        };
         let latest = plugin_cache.join("latest/skills");
         if let Some(path) = contained_directory(&plugin_cache, &latest) {
             roots.push(CodexPluginSkillRoot { plugin_id, path });
@@ -1545,6 +1545,43 @@ enabled = true
                 .any(|warning| warning.contains("multiple cached Skill versions"))
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_cache_link_cannot_escape_the_codex_cache_root() {
+        let home = temp_directory("escaping-plugin-cache");
+        let outside = temp_directory("outside-plugin-cache");
+        let outside_skill = outside.join("1.0.0/skills/escape");
+        fs::create_dir_all(&outside_skill).unwrap();
+        fs::write(
+            outside_skill.join("SKILL.md"),
+            "---\nname: escaped-plugin-skill\n---\n",
+        )
+        .unwrap();
+        let marketplace = home.join(".codex/plugins/cache/openai-bundled");
+        fs::create_dir_all(&marketplace).unwrap();
+        std::os::unix::fs::symlink(&outside, marketplace.join("browser")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"browser@openai-bundled\"]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no contained local cache"))
+        );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
