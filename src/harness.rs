@@ -147,6 +147,7 @@ fn collect_object_observations(
     output: &mut Vec<SessionObservation>,
 ) -> bool {
     let record_text = Value::Object(object.clone()).to_string();
+    let mut object_observations = Vec::new();
     for (field, signal) in [
         ("outcome_skill", SessionSignal::Outcome),
         ("applied_skill", SessionSignal::Applied),
@@ -156,7 +157,7 @@ fn collect_object_observations(
         ("matched_skill", SessionSignal::Matched),
     ] {
         if let Some(reference) = object.get(field).and_then(Value::as_str) {
-            output.push(SessionObservation {
+            object_observations.push(SessionObservation {
                 signal,
                 record_text: record_text.clone(),
                 explicit_references: vec![reference.to_owned()],
@@ -165,7 +166,8 @@ fn collect_object_observations(
     }
 
     if let Some(observation) = structured_tool_observation(object, &record_text) {
-        output.push(observation);
+        object_observations.push(observation);
+        append_unique_observations(output, object_observations);
         return false;
     }
     if object.get("type").and_then(Value::as_str) == Some("function")
@@ -174,6 +176,7 @@ fn collect_object_observations(
             .and_then(Value::as_object)
             .is_some_and(|function| !function.contains_key("arguments"))
     {
+        append_unique_observations(output, object_observations);
         return false;
     }
 
@@ -240,13 +243,27 @@ fn collect_object_observations(
         None
     };
     if let Some(signal) = signal {
-        output.push(SessionObservation {
+        object_observations.push(SessionObservation {
             signal,
             record_text,
             explicit_references: generic_references,
         });
     }
+    append_unique_observations(output, object_observations);
     true
+}
+
+fn append_unique_observations(
+    output: &mut Vec<SessionObservation>,
+    observations: Vec<SessionObservation>,
+) {
+    let mut unique = Vec::new();
+    for observation in observations {
+        if !unique.contains(&observation) {
+            unique.push(observation);
+        }
+    }
+    output.extend(unique);
 }
 
 fn structured_tool_observation(
@@ -430,8 +447,8 @@ mod tests {
     #[test]
     fn identical_sibling_events_remain_distinct_observations() {
         let record = serde_json::json!([
-            {"type": "load_skill", "skill_name": "research"},
-            {"type": "load_skill", "skill_name": "research"}
+            {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"},
+            {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"}
         ])
         .to_string();
         let observations = session_record_observations(AgentKind::Hermes, &record);
@@ -442,6 +459,20 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn overlapping_schemas_count_one_object_once() {
+        let record = serde_json::json!({
+            "type": "load_skill",
+            "skill_name": "research",
+            "loaded_skill": "research"
+        })
+        .to_string();
+        let observations = session_record_observations(AgentKind::Hermes, &record);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].signal, SessionSignal::Loaded);
+        assert_eq!(observations[0].explicit_references, ["research"]);
     }
 
     #[test]

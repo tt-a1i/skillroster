@@ -2214,8 +2214,8 @@ enabled = true
         fs::write(
             sessions.join("session.json"),
             serde_json::json!([
-                {"type": "load_skill", "skill_name": "research"},
-                {"type": "load_skill", "skill_name": "research"}
+                {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"},
+                {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"}
             ])
             .to_string(),
         )
