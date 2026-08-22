@@ -1695,7 +1695,10 @@ pub(crate) fn fuse_retrieval_channels(
     task: &RetrievalQuery,
     limit: usize,
 ) -> Vec<FindMatch> {
-    const RECIPROCAL_RANK_OFFSET: f64 = 60.0;
+    // Find fuses small, already-ranked candidate pools. A large web-search-style
+    // offset flattens rank positions enough for weak overlap to beat the Agent's
+    // high-ranked capability hint.
+    const RECIPROCAL_RANK_OFFSET: f64 = 1.0;
     const AUGMENTED_CHANNEL_WEIGHT: f64 = 3.0;
 
     if limit == 0 {
@@ -2641,6 +2644,54 @@ mod tests {
         assert!(native.rank <= 3);
         assert_eq!(fused.len(), 3);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hint_fusion_prefers_a_high_rank_hint_match_over_weak_channel_overlap() {
+        fn matched(name: &str, rank: usize, reasons: &[&str]) -> FindMatch {
+            FindMatch {
+                rank,
+                skill_id: format!("skill_{name}"),
+                name: name.into(),
+                score: 1.0,
+                paths: Vec::new(),
+                agents: Vec::new(),
+                roster_state: "unknown".into(),
+                source: None,
+                providers: Vec::new(),
+                governable: true,
+                match_reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
+                task_channel_rank: None,
+                augmented_channel_rank: None,
+                evidence_quality: EvidenceQuality::Inferred,
+                variant_skill_ids: Vec::new(),
+                variants: Vec::new(),
+                variant_count: 1,
+                variants_truncated: false,
+            }
+        }
+
+        let task_matches = vec![
+            matched("native-task", 1, &["description_tokens:2"]),
+            matched("weak-overlap", 2, &["description_tokens:1"]),
+        ];
+        let augmented_matches = vec![
+            matched("direct-hint", 1, &["declared_trigger"]),
+            matched("weak-overlap", 3, &["all_text_tokens:5"]),
+        ];
+        let task_query = RetrievalQuery::from_parts(["原始任务"]);
+
+        let fused = fuse_retrieval_channels(task_matches, augmented_matches, &task_query, 3);
+        let rank = |name: &str| {
+            fused
+                .iter()
+                .find(|matched| matched.name == name)
+                .map(|matched| matched.rank)
+                .expect("expected bounded capability")
+        };
+
+        assert!(rank("direct-hint") < rank("weak-overlap"));
+        assert!(rank("native-task") <= 3);
     }
 
     #[test]

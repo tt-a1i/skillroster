@@ -144,6 +144,8 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
   relevant metadata may be English or the native-language result is uncertain;
 - when hints are present, require task/hint rank fusion and retain the channel
   ranks so a hint cannot silently replace the user's original task evidence;
+  high-ranked hint evidence must outrank weak overlap that only appears in both
+  lexical channels;
 - treat `suggested_actions` as typed options, not authorization;
 - automatically prepare a read-only Plan when evidence is sufficient;
 - show the complete Plan impact before Apply;
