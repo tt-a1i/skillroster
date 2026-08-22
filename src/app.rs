@@ -3967,6 +3967,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.4",
         "2758bed89792128c47d01f613a4df277dd32c9641cb036e7ed1f03c0c94e8381",
     ),
+    (
+        "1.8.5",
+        "9f25609e002ad63e750214c54d7138f6e877849e46626aef441e00eaca8738d1",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

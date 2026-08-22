@@ -1431,7 +1431,37 @@ fn tokens(text: &str) -> BTreeSet<String> {
         .map(str::trim)
         .filter(|token| token.len() >= 2)
         .map(normalize_token)
+        .filter(|token| !is_search_stopword(token))
         .collect()
+}
+
+fn is_search_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "an" | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "not"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "this"
+            | "to"
+            | "use"
+            | "using"
+            | "with"
+    )
 }
 
 pub(crate) fn candidate_search_text(text: &str) -> String {
@@ -2006,6 +2036,16 @@ mod tests {
                 "spreadsheet".to_owned(),
             ])
         );
+        assert_eq!(
+            tokens("inspect and govern Skills for Agents with evidence"),
+            BTreeSet::from([
+                "agent".to_owned(),
+                "evidence".to_owned(),
+                "govern".to_owned(),
+                "inspect".to_owned(),
+                "skill".to_owned(),
+            ])
+        );
         assert_eq!(candidate_search_text("publish blogs"), "publish blogs blog");
     }
 
@@ -2053,6 +2093,22 @@ mod tests {
 
         assert_eq!(desired, "use for standalone spreadsheet files");
         assert_eq!(excluded, "not for a live excel session");
+    }
+
+    #[test]
+    fn exclusion_evidence_ignores_shared_stopwords() {
+        let query = tokens("govern a Skill roster into Core and On-demand states");
+        let excluded = tokens(
+            "not for installing Skills or migrating, distributing, synchronizing, or repairing shared Skill directories and symlinks",
+        );
+
+        assert_eq!(
+            query
+                .intersection(&excluded)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["skill".to_owned()])
+        );
     }
 
     #[test]

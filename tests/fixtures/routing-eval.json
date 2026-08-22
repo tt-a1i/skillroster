@@ -52,10 +52,14 @@
   {"task":"analyze a standalone spreadsheet file","skill":"Spreadsheets","rank_first":true,"max_matches":3},
   {"task":"control the open workbook in a live Microsoft Excel session","skill":"excel-live-control","rank_first":true,"max_matches":3},
   {"task":"mine local coding Agent session history","skill":"agent-session-miner","rank_first":true,"max_matches":3},
+  {"task":"scan installed Agent Skills for duplicates and uncertain usage evidence","skill":"skillroster","rank_first":true},
+  {"task":"govern a large default Skill roster into Core and On-demand states","skill":"skillroster","rank_first":true},
+  {"task":"apply an approved Skill governance Plan and keep an Undo Receipt","skill":"skillroster","rank_first":true},
   {"task":"manage Skills across coding Agents with shared symlinks","skill":"agent-skills-manager","rank_first":true,"max_matches":3},
   {"task":"在已经登录的 Chrome 页面里检查并操作","hints":["control existing logged-in Chrome browser tabs"],"skill":"control-chrome","rank_first":true,"max_matches":3},
   {"task":"制作一份产品发布演示文稿","hints":["create product release presentation slide deck PowerPoint"],"skill":"Presentations","rank_first":true,"max_matches":3},
   {"task":"分析本地 Excel 表格并生成结论","hints":["analyze standalone spreadsheet file workbook data"],"skill":"Spreadsheets","rank_first":true,"max_matches":3},
   {"task":"挖掘本地 Agent 会话历史","hints":["mine local coding Agent session history"],"skill":"agent-session-miner","rank_first":true,"max_matches":3},
+  {"task":"检查电脑上安装的 Skill、重复项和使用证据","hints":["scan installed Agent Skills for duplicates and uncertain usage evidence"],"skill":"skillroster","rank_first":true},
   {"task":"统一管理各个 Agent 安装的 Skill","hints":["manage Skills across coding Agents with shared library symlinks"],"skill":"agent-skills-manager","rank_first":true,"max_matches":3}
 ]

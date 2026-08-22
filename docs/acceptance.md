@@ -252,6 +252,32 @@ canonical candidates, and a bounded five-operation managed-Library Plan. No
 real Agent file was changed; Apply/Undo remained confined to automated
 temporary-home acceptance tests.
 
+## Agent-led governance-routing dogfood
+
+The 1.8.6 pre-release run added the bundled Bootstrap as an explicitly trusted,
+non-exposed source beside the real 231-Skill inventory. This represented the
+searchable state after Setup without applying the pending real-home Setup Plan.
+In v1.8.5, a request to inventory installed Skills and analyze duplicates or
+uncertain usage ranked the shared-symlink `agent-skills-manager` first and
+`skillroster` third. The former cannot produce governance Evidence, Plans, or
+Receipts.
+
+The failure was not an `ego-browser` result previously seen in one query; that
+candidate did not reproduce across the routing matrix. The stable defect was
+lexical: common words such as `and` and `for` contributed positive score and
+could combine with `skill` to trigger a false two-token exclusion penalty for
+`Not for ...` clauses. Search scoring now removes a bounded English stopword
+set before field overlap and exclusion evaluation. The Bootstrap pointer also
+states the governance boundary against installation and shared-directory
+management.
+
+Fresh real-home rescans then ranked `skillroster` first for inventory/usage
+evidence, Core/On-demand Roster governance, and approved Apply/Undo requests;
+shared installation and symlink synchronization still ranked
+`agent-skills-manager` first. The maintained 63-task English/CJK routing set
+passed before governance, after Apply, and after Undo. Inspection and routing
+changed no real Agent files.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
