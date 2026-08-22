@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Local skill governance for AI agents"
 repository = "https://github.com/tt-a1i/skillroster"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"
