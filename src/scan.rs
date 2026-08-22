@@ -1406,8 +1406,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(stages.contains(&(UsageStage::Exposed, EvidenceQuality::Inferred)));
-        assert!(stages.contains(&(UsageStage::Matched, EvidenceQuality::Observed)));
-        assert!(stages.contains(&(UsageStage::Loaded, EvidenceQuality::Observed)));
+        assert!(
+            stages.contains(&(UsageStage::Matched, EvidenceQuality::Observed)),
+            "entrypoint={} placements={:?} usage={:?}",
+            entrypoint.display(),
+            result.placements,
+            result.usage
+        );
+        assert!(
+            stages.contains(&(UsageStage::Loaded, EvidenceQuality::Observed)),
+            "entrypoint={} placements={:?} usage={:?}",
+            entrypoint.display(),
+            result.placements,
+            result.usage
+        );
         assert!(
             result
                 .usage
