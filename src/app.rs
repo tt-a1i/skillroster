@@ -1295,6 +1295,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
             })
         })
         .collect::<Vec<_>>();
+    let finding_rollups = finding_rollups(&compact_findings);
     let session_coverage = json!({
         "supported_agents": AgentKind::ALL.len(),
         "roots_present_agents": report.metrics.agents_with_session_roots,
@@ -1337,6 +1338,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
             }
         },
         "findings": compact_findings,
+        "finding_rollups": finding_rollups,
         "category_counts": report.category_counts,
         "files_changed": false
     });
@@ -1873,6 +1875,82 @@ fn compact_finding_summary(finding: &Value) -> Value {
     })
 }
 
+struct FindingRollup {
+    category: String,
+    severity: String,
+    title: String,
+    finding_count: usize,
+    skill_ids: BTreeSet<String>,
+    placement_ids: BTreeSet<String>,
+}
+
+fn finding_rollups(findings: &[Value]) -> Vec<Value> {
+    let mut rollups = Vec::<FindingRollup>::new();
+    for finding in findings {
+        let category = finding["category"].as_str().unwrap_or("unknown");
+        let severity = finding["severity"].as_str().unwrap_or("unknown");
+        let title = finding["title"].as_str().unwrap_or("Unknown Finding");
+        let index = rollups
+            .iter()
+            .position(|rollup| {
+                rollup.category == category && rollup.severity == severity && rollup.title == title
+            })
+            .unwrap_or_else(|| {
+                rollups.push(FindingRollup {
+                    category: category.to_owned(),
+                    severity: severity.to_owned(),
+                    title: title.to_owned(),
+                    finding_count: 0,
+                    skill_ids: BTreeSet::new(),
+                    placement_ids: BTreeSet::new(),
+                });
+                rollups.len() - 1
+            });
+        let rollup = &mut rollups[index];
+        rollup.finding_count += 1;
+        for id in finding["affected_skill_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            rollup.skill_ids.insert(id.to_owned());
+        }
+        for id in finding["affected_placement_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            rollup.placement_ids.insert(id.to_owned());
+        }
+    }
+    rollups
+        .into_iter()
+        .map(|rollup| {
+            json!({
+                "category": rollup.category,
+                "severity": rollup.severity,
+                "title": rollup.title,
+                "finding_count": rollup.finding_count,
+                "affected_skill_count": rollup.skill_ids.len(),
+                "affected_placement_count": rollup.placement_ids.len()
+            })
+        })
+        .collect()
+}
+
+fn report_finding_rollups(report: &Value) -> Value {
+    report.get("finding_rollups").cloned().unwrap_or_else(|| {
+        json!(finding_rollups(
+            report["findings"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        ))
+    })
+}
+
 fn paged_finding_report(
     report: &Value,
     category: Option<ReportCategory>,
@@ -1918,6 +1996,7 @@ fn paged_finding_report(
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
         "matched_finding_count": total,
+        "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
         "filters": {
             "category": category.map(ReportCategory::id),
@@ -1963,6 +2042,7 @@ fn compact_report(report: &Value) -> Value {
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
         "findings": compact_findings,
+        "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
         "files_changed": false
     })
@@ -3977,6 +4057,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.7",
         "68007e9c80a942cf4afa581f90639bbd260b69a36cb72aebdbca63e92d787eed",
     ),
+    (
+        "1.8.8",
+        "15dc6c0bd25dc7a6e97336124960b7d548ecea9a3a58b34d55a4d57dbc4d5aeb",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5068,6 +5152,33 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn finding_rollups_count_unique_affected_subjects() {
+        let findings = vec![
+            json!({
+                "category": "overlap",
+                "severity": "medium",
+                "title": "Exact duplicate Skill placements",
+                "affected_skill_ids": ["skill_a"],
+                "affected_placement_ids": ["placement_a", "placement_b"]
+            }),
+            json!({
+                "category": "overlap",
+                "severity": "medium",
+                "title": "Exact duplicate Skill placements",
+                "affected_skill_ids": ["skill_a", "skill_b"],
+                "affected_placement_ids": ["placement_b", "placement_c"]
+            }),
+        ];
+
+        let rollups = finding_rollups(&findings);
+
+        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups[0]["finding_count"], 2);
+        assert_eq!(rollups[0]["affected_skill_count"], 2);
+        assert_eq!(rollups[0]["affected_placement_count"], 3);
+    }
 
     #[test]
     fn exact_duplicate_planning_never_governs_provider_managed_placements() {

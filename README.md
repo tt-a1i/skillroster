@@ -108,8 +108,10 @@ collections, placement records, and Evidence records stay behind explicit
 decision and observed targets instead of suggesting an automatic filesystem
 Plan.
 
-The three-Finding summary leads to `report --findings`, a compact paged list
-that can be filtered by category or severity. This gives Agents a bounded path
+The three-Finding summary also includes compact Finding-group rollups with
+deduplicated affected Skill and placement counts. It leads to
+`report --findings`, a compact paged list that can be filtered by category or
+severity. This gives Agents both the complete problem scale and a bounded path
 to every Finding without loading the exhaustive report. Only a selected
 Finding leads to Evidence inspection or planning.
 
