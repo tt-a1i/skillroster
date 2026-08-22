@@ -247,7 +247,7 @@ impl StateStore {
             .query_row(
                 "SELECT id, started_at, completed_at, status, coverage_notes_json
                  FROM scans WHERE status = 'completed'
-                 ORDER BY completed_at DESC, started_at DESC, id DESC LIMIT 1",
+                 ORDER BY completed_at DESC, started_at DESC, rowid DESC LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -292,7 +292,7 @@ impl StateStore {
                 "SELECT p.scan_id, p.payload_json FROM scan_payloads p
                  JOIN scans s ON s.id = p.scan_id
                  WHERE s.status = 'completed'
-                 ORDER BY s.completed_at DESC, s.started_at DESC, s.id DESC LIMIT 1",
+                 ORDER BY s.completed_at DESC, s.started_at DESC, s.rowid DESC LIMIT 1",
                 [],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -2221,6 +2221,39 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.latest_completed_scan().unwrap().unwrap().id, scan.id);
+    }
+
+    #[test]
+    fn latest_scan_uses_insertion_order_when_timestamps_tie() {
+        let store = StateStore::open_in_memory().unwrap();
+        let first = ScanRun {
+            id: ScanId::parse("scan_ffffffffffffffffffffffffffffffff").unwrap(),
+            started_at: 10,
+            completed_at: Some(20),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        let second = ScanRun {
+            id: ScanId::parse("scan_00000000000000000000000000000000").unwrap(),
+            ..first.clone()
+        };
+        store.save_scan(&first).unwrap();
+        store
+            .save_scan_payload(&first.id, &serde_json::json!({"order": 1}))
+            .unwrap();
+        store.save_scan(&second).unwrap();
+        store
+            .save_scan_payload(&second.id, &serde_json::json!({"order": 2}))
+            .unwrap();
+
+        assert_eq!(
+            store.latest_completed_scan().unwrap().unwrap().id,
+            second.id
+        );
+        let (latest_id, payload): (ScanId, serde_json::Value) =
+            store.latest_scan_payload().unwrap().unwrap();
+        assert_eq!(latest_id, second.id);
+        assert_eq!(payload["order"], 2);
     }
 
     #[test]
