@@ -78,6 +78,10 @@ pub struct ReportArgs {
     #[arg(long)]
     pub finding: Option<String>,
 
+    /// Show complete IDs, placement records, and Evidence records for one Finding.
+    #[arg(long, requires = "finding")]
+    pub full: bool,
+
     /// Return core metrics and the three highest-priority Findings.
     #[arg(long)]
     pub summary: bool,

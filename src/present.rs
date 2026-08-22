@@ -162,7 +162,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
     match command {
         "status" => status(result, &mut lines),
         "scan" => scan(result, &mut lines),
-        "report" => report(result, &mut lines),
+        "report" => report(result, &mut lines, options.width),
         "find" => find(result, &mut lines, options.width),
         "plan" => plan(result, &mut lines),
         "apply" | "undo" => mutation(result, &mut lines),
@@ -240,7 +240,13 @@ fn scan(value: &Value, lines: &mut Vec<String>) {
     ));
 }
 
-fn report(value: &Value, lines: &mut Vec<String>) {
+fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
+    if value.get("id").and_then(Value::as_str).is_some()
+        && value.get("title").and_then(Value::as_str).is_some()
+    {
+        finding_report(value, lines, width);
+        return;
+    }
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Default exposure", text(value, "default_exposure"));
@@ -279,6 +285,99 @@ fn report(value: &Value, lines: &mut Vec<String>) {
         "Read-only · no Agent files changed",
         "Review evidence before planning changes",
     ));
+}
+
+fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
+    fact(
+        lines,
+        "Finding",
+        middle_truncate(&text(value, "id"), width.saturating_sub(25)),
+    );
+    fact(
+        lines,
+        "Issue",
+        middle_truncate(&text(value, "title"), width.saturating_sub(25)),
+    );
+    fact(
+        lines,
+        "Severity",
+        format!("{} · {}", text(value, "severity"), text(value, "category")),
+    );
+    fact(lines, "Evidence quality", text(value, "evidence_quality"));
+    fact(
+        lines,
+        "Affected",
+        format!(
+            "{} Skills · {} placements",
+            value
+                .pointer("/impact/affected_skill_count")
+                .map_or_else(|| "none".into(), Value::to_string),
+            value
+                .pointer("/impact/affected_placement_count")
+                .map_or_else(|| "none".into(), Value::to_string)
+        ),
+    );
+    fact(
+        lines,
+        "Detail",
+        value
+            .pointer("/detail/mode")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    lines.push(String::new());
+    lines.push(format!(
+        "  {}",
+        middle_truncate(&text(value, "summary"), width.saturating_sub(2))
+    ));
+
+    let evidence_rows = value
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("placements").and_then(Value::as_array));
+    if let Some(rows) = evidence_rows.filter(|rows| !rows.is_empty()) {
+        lines.push(String::new());
+        lines.push("  Evidence paths".into());
+        for row in rows.iter().take(10) {
+            let agent = row
+                .get("facts")
+                .and_then(|facts| facts.get("agent"))
+                .and_then(Value::as_str)
+                .or_else(|| row.get("agent").and_then(Value::as_str))
+                .unwrap_or("source");
+            let prefix = format!("  {agent:<12} ");
+            let path = middle_truncate(
+                &text(row, "path"),
+                width.saturating_sub(display_width(&prefix)),
+            );
+            lines.push(format!("{prefix}{path}"));
+        }
+        if rows.len() > 10 {
+            lines.push(format!("  + {} more on this page", rows.len() - 10));
+        }
+    }
+
+    if value["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots") {
+        lines.push(String::new());
+        lines.push("  Observed link targets".into());
+        if let Some(targets) = value["resolution"]["observed_link_targets"].as_array() {
+            for target in targets.iter().filter_map(Value::as_str).take(5) {
+                lines.push(format!(
+                    "  {}",
+                    middle_truncate(target, width.saturating_sub(2))
+                ));
+            }
+        }
+        lines.extend(summary(
+            "Blocked · no automatic change is supported",
+            "Confirm trusted source directories before rescanning",
+        ));
+    } else {
+        lines.extend(summary(
+            "Read-only · no Agent files changed",
+            "Use --full only when exact complete records are needed",
+        ));
+    }
 }
 
 fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
@@ -884,7 +983,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "bootstrap_version": "1.2.0",
+                "bootstrap_version": "1.3.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -906,7 +1005,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "bootstrap_version": "1.2.0",
+                "bootstrap_version": "1.3.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -1008,6 +1107,47 @@ mod tests {
                 assert!(output.contains(expected), "{expected} missing at {width}");
             }
             assert!(!output.contains("Coverage\n"));
+        }
+    }
+
+    #[test]
+    fn finding_report_shows_evidence_and_trust_decision_instead_of_empty_metrics() {
+        let value = json!({
+            "id": "finding_00000000000000000000000000000000",
+            "title": "Skill links escape an approved root",
+            "summary": "One placement points outside its approved Agent root.",
+            "severity": "high",
+            "category": "layout",
+            "evidence_quality": "observed",
+            "impact": {"affected_skill_count": 1, "affected_placement_count": 1},
+            "detail": {"mode": "compact"},
+            "items": [{
+                "path": "/Users/example/.codex/skills/example/SKILL.md",
+                "facts": {"agent": "codex"}
+            }],
+            "resolution": {
+                "decision": "confirm_trusted_source_roots",
+                "observed_link_targets": ["/Users/example/source/example"]
+            }
+        });
+        for width in [60, 80, 120] {
+            let output = render(
+                "report",
+                &value,
+                RenderOptions {
+                    width,
+                    styled: false,
+                },
+            );
+            assert!(output.contains("Skill links escape an approved root"));
+            assert!(output.contains("Evidence paths"));
+            assert!(output.contains("Observed link targets"));
+            assert!(output.contains("no automatic change is supported"));
+            assert!(!output.contains("Independent Skills     none"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
         }
     }
 

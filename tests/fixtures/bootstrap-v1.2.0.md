@@ -1,6 +1,8 @@
 ---
 name: skillroster
 description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
+metadata:
+  bootstrap-version: "1.2.0"
 ---
 
 # SkillRoster
@@ -35,6 +37,8 @@ Hosted or Managed Library Plan so future Scans no longer depend on the
 temporary source-root arguments. Keep unconfirmed targets unread.
 
 ## Apply or undo
+
+Run `skillroster setup --json` when installing the Bootstrap Skill or after upgrading the CLI. An exact official older copy produces a normal upgrade Plan. If `state` is `modified_choice_required`, show the affected Agent targets and ask whether to `retain-local` or `adopt-current`; do not choose for the user. Adopting still only prepares a recoverable Plan and requires the usual Apply confirmation. Treat `unsupported_targets` as blocked rather than replacing links or non-files.
 
 Show the complete immutable Plan before requesting one explicit confirmation. After the user confirms, run `skillroster apply PLAN_ID --json`; do not substitute direct filesystem commands or bypass drift checks. Report verification, changed-path count, Receipt ID, and canonical deletion count.
 

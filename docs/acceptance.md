@@ -110,10 +110,27 @@ authorization for the synthetic scope, then verified Apply, Receipt, Undo, and
 recovery-clear Status. The bootstrap Skill separately requires an explicit user
 confirmation before any real Apply or Undo and never asks per-file questions.
 
+## Agent-led Finding drilldown evidence
+
+Before the 1.3 release, the Agent reused one immutable read-only Snapshot from
+the reference macOS home: 180 independent Skills, 676 placements, 548 default
+exposures, and 189 Findings. It changed no Agent files. On that same Snapshot:
+
+- the unsafe-link Finding response fell from 24,817 to 10,410 bytes (58.1%) in
+  default compact mode while retaining all 16 paged Evidence items;
+- an exact-duplicate Finding fell from 11,814 to 6,807 bytes (42.4%) while
+  retaining seven traceable Evidence items and its planning action;
+- `--full` preserved the complete IDs, placements, and Evidence records on
+  explicit request;
+- unsafe links no longer suggest a generic Plan. They return a typed trust
+  decision, observed targets, and a repeatable `--source-root` rescan template;
+- plain 60-, 80-, and 120-column Finding views preserve the issue, counts,
+  Evidence paths, and next decision without exceeding the requested width.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
 not claim model quality, token or labor savings, production performance, or
 access to arbitrary future Agent log formats. Final support additionally
-requires the official `v1.0.0` tag workflow, published artifact checksums, and
+ requires the official release tag workflow, published artifact checksums, and
 the installation checks recorded in the Release notes.

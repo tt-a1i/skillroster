@@ -94,14 +94,22 @@ contains those four metrics, total Finding count, category totals, and at most
 three complete Finding summaries. Full `report --json` is an explicit
 exhaustive view, not the bootstrap workflow default.
 
-`report --finding ID --json` returns at most 20 affected IDs, placements, and
-Evidence records per collection. Its `page.next_offset` is the only pagination
-cursor; callers request another page only when the decision still lacks
-relevant evidence. Counts and `primary_evidence_id` remain available in the
-compact first view. An actionable exact-duplicate Finding also returns a
-bounded `planning` object with at most five owned canonical candidates and the
-semantic `finding_library_changes` request shape; the complete placement set
-remains CLI-owned rather than Agent-copied.
+`report --finding ID --json` returns at most 20 compact Evidence items. Each
+item combines its stable Evidence ID, subject, path, quality, and decision facts
+without repeating affected-ID, placement, and full Evidence collections.
+`report --finding ID --full --json` explicitly returns those complete paged
+records. `page.next_offset` is the only pagination cursor; callers request
+another page only when the decision still lacks relevant evidence. Counts and
+`primary_evidence_id` remain available in the compact first view. An actionable
+exact-duplicate Finding also returns a bounded `planning` object with at most
+five owned canonical candidates and the semantic `finding_library_changes`
+request shape; the complete placement set remains CLI-owned rather than
+Agent-copied. An escaping-link Finding returns observed targets and a required
+trust decision instead of a Plan suggestion.
+
+Human Finding output shows the issue, severity, affected counts, bounded paths,
+and any required trust decision. It must not render a Finding as an empty
+aggregate report.
 
 ### `find`
 
