@@ -323,6 +323,68 @@ fn reports_reuse_one_snapshot_but_scope_finding_ids_to_each_new_report() {
 }
 
 #[test]
+fn usage_finding_names_skills_and_uses_public_agent_ids() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = home.join(".skillroster");
+    copy_tree(&Path::new(FIXTURES).join("agents/home"), &home);
+
+    cli_json(&home, &state, &["scan"], None);
+    let report = cli_json(&home, &state, &["report"], None);
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Five-stage usage evidence")
+        .and_then(|finding| finding["id"].as_str())
+        .expect("usage Finding")
+        .to_owned();
+
+    let compact = cli_json(
+        &home,
+        &state,
+        &["report", "--finding", &finding_id, "--limit", "100"],
+        None,
+    );
+    let compact_claude = compact["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| {
+            item["kind"] == "usage"
+                && item["facts"]["agent"] == "claude-code"
+                && item["facts"]["stage"] == "loaded"
+        })
+        .expect("compact Claude Code Loaded evidence");
+    assert_eq!(compact_claude["facts"]["skill_name"], "claude-code-fixture");
+
+    let full = cli_json(
+        &home,
+        &state,
+        &[
+            "report",
+            "--finding",
+            &finding_id,
+            "--full",
+            "--limit",
+            "100",
+        ],
+        None,
+    );
+    let full_claude = full["result"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|evidence| {
+            evidence["kind"] == "usage"
+                && evidence["details"]["agent"] == "claude-code"
+                && evidence["details"]["stage"] == "loaded"
+        })
+        .expect("full Claude Code Loaded evidence");
+    assert_eq!(full_claude["details"]["skill_name"], "claude-code-fixture");
+}
+
+#[test]
 fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_success() {
     let routes: Vec<RouteCase> =
         serde_json::from_slice(&fs::read(Path::new(FIXTURES).join("routing-eval.json")).unwrap())

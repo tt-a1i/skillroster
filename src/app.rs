@@ -4275,6 +4275,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.11",
         "501c0ce97d677b1a3c68d25dd1ece99590895dd51e23e671ea96312925e98c59",
     ),
+    (
+        "1.8.12",
+        "69bf20da3494b69b634aee5e8d7dead8d8e30222f9e380461640af02bc83331e",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4594,6 +4598,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
     }
 
     let mut skill_ids = std::collections::BTreeMap::new();
+    let mut skill_names = std::collections::BTreeMap::new();
     for skill in &scan.skills {
         let id = SkillId::parse(skill.id.clone())?;
         let canonical_path = scan
@@ -4650,6 +4655,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             &skill.normalized_text,
         )?;
         skill_ids.insert(skill.id.clone(), stored_id.clone());
+        skill_names.insert(skill.id.clone(), skill.name.clone());
         save_reference_evidence(
             store,
             scan_id,
@@ -4765,6 +4771,9 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
         let Some(skill_id) = skill_ids.get(&usage.skill_id).cloned() else {
             continue;
         };
+        let Some(skill_name) = skill_names.get(&usage.skill_id) else {
+            continue;
+        };
         let agent_id = agent_ids[&usage.agent].clone();
         let reference = format!(
             "usage:{}:{}:{:?}:{}",
@@ -4783,7 +4792,17 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             skill_id.as_str(),
             None,
             Some(usage.source_path_digest.clone()),
-            serde_json::to_value(usage)?,
+            json!({
+                "agent": usage.agent.id(),
+                "skill_id": skill_id,
+                "skill_name": skill_name,
+                "stage": usage.stage,
+                "quality": usage.quality,
+                "event_count": usage.event_count,
+                "first_seen_unix": usage.first_seen_unix,
+                "last_seen_unix": usage.last_seen_unix,
+                "source_path_digest": usage.source_path_digest,
+            }),
             observed_at,
         )?;
         store.save_usage_event(&UsageEvent {

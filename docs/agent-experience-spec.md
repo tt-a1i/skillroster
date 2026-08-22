@@ -66,6 +66,12 @@ The initial response should fit roughly one conversation viewport. It contains:
 
 Do not lead with raw paths, every Finding, an aggregate health score, a wall of JSON, or unsupported token/performance estimates.
 
+When the user asks which Skills were observed, drill into `Five-stage usage
+evidence`. Keep `skill_name`, canonical `agent`, stage, quality, event count,
+and observation window together; the opaque Skill ID remains the stable
+identity, not the user-facing label. Incomplete coverage still forbids usage
+percentages and “unused” conclusions.
+
 ## 5. Ready Plan response
 
 ```text
