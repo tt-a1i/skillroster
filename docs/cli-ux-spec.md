@@ -121,7 +121,13 @@ Human TTY mode repeats the exact Plan or Receipt impact before confirmation. JSO
 
 ### `setup`
 
-Show detected Agents and exact bootstrap Skill targets. Installation remains a normal Plan followed by Apply.
+Show the bundled bootstrap version, detected Agents, exact targets, verified
+installed version when known, and counts for current, missing,
+official-outdated, locally modified, and unsupported states. Installation and
+official upgrades remain a normal Plan followed by Apply. A modified copy
+stops planning until the user chooses `retain-local` or `adopt-current`; the
+Agent must not choose. Unsupported targets remain unchanged and are shown as
+blocked.
 
 ## 7. Confirmation language
 
