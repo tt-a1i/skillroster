@@ -932,6 +932,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         ("1.6.0", include_str!("fixtures/bootstrap-v1.6.0.md")),
         ("1.7.0", include_str!("fixtures/bootstrap-v1.7.0.md")),
         ("1.7.1", include_str!("fixtures/bootstrap-v1.7.1.md")),
+        ("1.8.0", include_str!("fixtures/bootstrap-v1.8.0.md")),
     ] {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
