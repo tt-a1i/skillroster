@@ -859,8 +859,8 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 let lower = line.to_lowercase();
                 let Some(matcher) = &matcher else { continue };
                 for matched in matcher.find_iter(&lower) {
-                    let (skill_id, _) = &skill_lookup[matched.pattern().as_usize()];
-                    let (stage, quality) = classify_usage_line(agent, &line);
+                    let (skill_id, skill_name) = &skill_lookup[matched.pattern().as_usize()];
+                    let (stage, quality) = classify_usage_line(agent, &line, skill_name);
                     let key = (skill_id.clone(), stage, source_path_digest.clone());
                     let event = events.entry(key).or_insert_with(|| UsageEvidence {
                         agent,
@@ -918,14 +918,68 @@ fn collect_session_files(
     Ok(false)
 }
 
-fn classify_usage_line(agent: AgentKind, line: &str) -> (UsageStage, EvidenceQuality) {
+fn classify_usage_line(
+    agent: AgentKind,
+    line: &str,
+    matched_skill_name: &str,
+) -> (UsageStage, EvidenceQuality) {
     match classify_session_record(agent, line) {
+        Some(_)
+            if agent == AgentKind::Codex
+                && !codex_line_explicitly_references_skill(line, matched_skill_name)
+                && !line_has_explicit_skill_field(line, matched_skill_name) =>
+        {
+            (UsageStage::Exposed, EvidenceQuality::Inferred)
+        }
         Some(SessionSignal::Outcome) => (UsageStage::Outcome, EvidenceQuality::Observed),
         Some(SessionSignal::Applied) => (UsageStage::Applied, EvidenceQuality::Observed),
         Some(SessionSignal::Loaded) => (UsageStage::Loaded, EvidenceQuality::Observed),
         Some(SessionSignal::Matched) => (UsageStage::Matched, EvidenceQuality::Observed),
         None => (UsageStage::Exposed, EvidenceQuality::Inferred),
     }
+}
+
+fn line_has_explicit_skill_field(line: &str, skill_name: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let payload = object.get("payload").and_then(serde_json::Value::as_object);
+    [
+        "skill_id",
+        "skill_name",
+        "selected_skill",
+        "matched_skill",
+        "loaded_skill",
+        "applied_skill",
+        "invoked_skill",
+        "outcome_skill",
+    ]
+    .into_iter()
+    .any(|field| {
+        [
+            object.get(field),
+            payload.and_then(|payload| payload.get(field)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|value| value.eq_ignore_ascii_case(skill_name))
+    })
+}
+
+fn codex_line_explicitly_references_skill(line: &str, skill_name: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    let skill_name = skill_name.to_ascii_lowercase();
+    [
+        format!("/{skill_name}/skill.md"),
+        format!("\\{skill_name}\\skill.md"),
+        format!("${skill_name}]("),
+    ]
+    .iter()
+    .any(|reference| line.contains(reference))
 }
 
 fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Option<u64>) {
@@ -1168,6 +1222,91 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(discovered, AgentKind::ALL.into_iter().collect());
         assert_eq!(result.skills.len(), 8);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_nested_records_produce_matched_and_loaded_usage() {
+        let home = temp_directory("codex-nested-usage");
+        let skill = home.join(".codex/skills/research");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Primary-source research\n---\n",
+        )
+        .unwrap();
+        let generic = home.join(".codex/skills/plan");
+        fs::create_dir_all(&generic).unwrap();
+        fs::write(
+            generic.join("SKILL.md"),
+            "---\nname: plan\ndescription: Planning workflow\n---\n",
+        )
+        .unwrap();
+        let records = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "research: /skills/research/SKILL.md"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Plan this with [$research](/skills/research/SKILL.md)"
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "await tools.exec_command({cmd: \"sed -n '1,80p' /skills/research/SKILL.md\"})"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(sessions.join("session.jsonl"), records).unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let skill_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "research")
+            .unwrap()
+            .id;
+        let generic_skill_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "plan")
+            .unwrap()
+            .id;
+        let stages = result
+            .usage
+            .iter()
+            .filter(|usage| usage.skill_id == *skill_id && usage.agent == AgentKind::Codex)
+            .map(|usage| (usage.stage, usage.quality))
+            .collect::<Vec<_>>();
+
+        assert!(stages.contains(&(UsageStage::Exposed, EvidenceQuality::Inferred)));
+        assert!(stages.contains(&(UsageStage::Matched, EvidenceQuality::Observed)));
+        assert!(stages.contains(&(UsageStage::Loaded, EvidenceQuality::Observed)));
+        assert!(
+            result
+                .usage
+                .iter()
+                .filter(|usage| usage.skill_id == *generic_skill_id)
+                .all(|usage| usage.stage == UsageStage::Exposed)
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

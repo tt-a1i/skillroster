@@ -77,7 +77,7 @@ pub enum SessionSignal {
 pub fn classify_session_record(agent: AgentKind, line: &str) -> Option<SessionSignal> {
     let value: Value = serde_json::from_str(line).ok()?;
     let keys = adapter_event_keys(agent);
-    classify_value(&value, keys)
+    classify_value(agent, &value, keys)
 }
 
 fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
@@ -93,14 +93,34 @@ fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
     }
 }
 
-fn classify_value(value: &Value, event_keys: &[&str]) -> Option<SessionSignal> {
+fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Option<SessionSignal> {
     let object = value.as_object()?;
-    let event = event_keys
-        .iter()
-        .filter_map(|key| object.get(*key).and_then(Value::as_str))
+    let record_type = object.get("type").and_then(Value::as_str);
+    let payload = object.get("payload").and_then(Value::as_object);
+    let active = if matches!(record_type, Some("response_item" | "event_msg")) {
+        payload.unwrap_or(object)
+    } else {
+        object
+    };
+    let mut event_parts = Vec::new();
+    for key in event_keys {
+        event_parts.extend([
+            object.get(*key).and_then(Value::as_str),
+            active.get(*key).and_then(Value::as_str),
+        ]);
+    }
+    event_parts.extend(
+        ["type", "name", "event", "tool", "tool_name", "subtype"]
+            .into_iter()
+            .map(|key| active.get(key).and_then(Value::as_str)),
+    );
+    let event = event_parts
+        .into_iter()
+        .flatten()
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join(" ");
+    let contains_field = |key: &str| object.contains_key(key) || active.contains_key(key);
     let explicit_skill_field = [
         "skill_id",
         "skill_name",
@@ -112,31 +132,53 @@ fn classify_value(value: &Value, event_keys: &[&str]) -> Option<SessionSignal> {
         "outcome_skill",
     ]
     .iter()
-    .any(|key| object.contains_key(*key));
-    let serialized = value.to_string().to_ascii_lowercase();
+    .any(|key| contains_field(key));
+    let serialized = Value::Object(active.clone())
+        .to_string()
+        .to_ascii_lowercase();
     let reads_skill_file = serialized.contains("skill.md")
         && ["read_file", "read", "load", "open"]
             .iter()
             .any(|marker| event.contains(marker));
+    let codex_shell_read = agent == AgentKind::Codex
+        && active.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+        && active.get("name").and_then(Value::as_str) == Some("exec")
+        && active
+            .get("input")
+            .and_then(Value::as_str)
+            .is_some_and(|input| {
+                let input = input.to_ascii_lowercase();
+                input.contains("skill.md")
+                    && input.contains("exec_command")
+                    && ["sed ", "rg ", "head ", "tail ", "awk ", "grep ", "less "]
+                        .iter()
+                        .any(|marker| input.contains(marker))
+            });
+    let codex_user_skill_reference = agent == AgentKind::Codex
+        && record_type == Some("response_item")
+        && active.get("type").and_then(Value::as_str) == Some("message")
+        && active.get("role").and_then(Value::as_str) == Some("user")
+        && serialized.contains("skill.md");
 
-    if explicit_skill_field
-        && (object.contains_key("outcome_skill") || event.contains("skill_outcome"))
+    if explicit_skill_field && (contains_field("outcome_skill") || event.contains("skill_outcome"))
     {
         Some(SessionSignal::Outcome)
     } else if explicit_skill_field
-        && (object.contains_key("applied_skill")
-            || object.contains_key("invoked_skill")
+        && (contains_field("applied_skill")
+            || contains_field("invoked_skill")
             || event.contains("invoke_skill")
             || event.contains("apply_skill"))
     {
         Some(SessionSignal::Applied)
     } else if reads_skill_file
-        || object.contains_key("loaded_skill")
+        || codex_shell_read
+        || contains_field("loaded_skill")
         || (explicit_skill_field && event.contains("load_skill"))
     {
         Some(SessionSignal::Loaded)
-    } else if object.contains_key("selected_skill")
-        || object.contains_key("matched_skill")
+    } else if codex_user_skill_reference
+        || contains_field("selected_skill")
+        || contains_field("matched_skill")
         || (explicit_skill_field && event.contains("match_skill"))
     {
         Some(SessionSignal::Matched)
@@ -225,5 +267,51 @@ mod tests {
             ),
             Some(SessionSignal::Applied)
         );
+    }
+
+    #[test]
+    fn codex_nested_exec_read_is_loaded_evidence() {
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "await tools.exec_command({cmd: \"sed -n '1,80p' /skills/research/SKILL.md\"})"
+            }
+        })
+        .to_string();
+        assert_eq!(
+            classify_session_record(AgentKind::Codex, &line),
+            Some(SessionSignal::Loaded)
+        );
+    }
+
+    #[test]
+    fn codex_user_skill_link_is_matched_but_catalog_metadata_is_not() {
+        let invoked = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "[$research](/skills/research/SKILL.md)"
+                }]
+            }
+        })
+        .to_string();
+        assert_eq!(
+            classify_session_record(AgentKind::Codex, &invoked),
+            Some(SessionSignal::Matched)
+        );
+
+        let catalog = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "base_instructions": "research is stored at /skills/research/SKILL.md"
+            }
+        })
+        .to_string();
+        assert_eq!(classify_session_record(AgentKind::Codex, &catalog), None);
     }
 }
