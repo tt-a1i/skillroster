@@ -1273,14 +1273,21 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     break;
                 }
                 lines_observed += physical_lines;
-                let lower = line.to_lowercase();
                 if let Some((stage, quality)) = classify_usage_line(agent, line) {
-                    let mut observed_skill_ids = observed_reference_skill_ids(
-                        line,
-                        reference_matcher.as_ref(),
-                        &reference_lookup,
-                    );
-                    for reference in explicit_skill_field_values(line) {
+                    let explicit_references = explicit_skill_field_values(line);
+                    let mut observed_skill_ids =
+                        if matches!(stage, UsageStage::Applied | UsageStage::Outcome)
+                            && !explicit_references.is_empty()
+                        {
+                            BTreeSet::new()
+                        } else {
+                            observed_reference_skill_ids(
+                                line,
+                                reference_matcher.as_ref(),
+                                &reference_lookup,
+                            )
+                        };
+                    for reference in explicit_references {
                         if result.skills.iter().any(|skill| skill.id == reference) {
                             observed_skill_ids.insert(reference.clone());
                         }
@@ -1306,6 +1313,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     }
                     continue;
                 }
+                let lower = line.to_lowercase();
                 let Some(matcher) = &matcher else { continue };
                 for matched in matcher.find_iter(&lower) {
                     let (skill_id, _) = &skill_lookup[matched.pattern().as_usize()];
@@ -2237,6 +2245,71 @@ enabled = true
                     .denominator_reliable
             );
         }
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn explicit_skill_invocation_does_not_elevate_other_paths_in_the_same_record() {
+        let home = temp_directory("mixed-skill-record");
+        for name in ["research", "review"] {
+            let skill = home.join(".claude/skills").join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} workflow\n---\n"),
+            )
+            .unwrap();
+        }
+        let sessions = home.join(".claude/projects");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Skill",
+                        "input": {"skill": "research", "args": ""}
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {
+                            "path": home.join(".claude/skills/review/SKILL.md")
+                        }
+                    }
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let research_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "research")
+            .unwrap()
+            .id;
+        let review_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "review")
+            .unwrap()
+            .id;
+
+        assert!(
+            result.usage.iter().any(|usage| {
+                usage.skill_id == *research_id && usage.stage == UsageStage::Applied
+            })
+        );
+        assert!(
+            !result.usage.iter().any(|usage| {
+                usage.skill_id == *review_id && usage.stage == UsageStage::Applied
+            })
+        );
 
         fs::remove_dir_all(home).unwrap();
     }
