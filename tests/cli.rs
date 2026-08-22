@@ -41,6 +41,50 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[test]
+fn public_cli_exits_quietly_when_the_output_consumer_closes() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    for index in 0..80 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\ndescription: fixture\n---\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"][0]["id"].as_str().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_skillroster"))
+        .args([&common[..], &["report", "--finding", finding_id, "--full"]].concat())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn assert_find_paths_are_readable(found: &Value) {
     let paths = found["result"]["matches"][0]["paths"]
         .as_array()
@@ -108,6 +152,98 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
         json!(["interactive architecture workflow diagram"])
     );
     assert_eq!(found["result"]["matches"][0]["name"], "archify");
+    assert_eq!(
+        found["result"]["ranking_strategy"],
+        "task_hint_reciprocal_rank_fusion"
+    );
+}
+
+#[test]
+fn public_find_hints_do_not_erase_a_native_task_match() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    let native = skill_root.join("humanizer-zh");
+    fs::create_dir_all(&native).unwrap();
+    fs::write(
+        native.join("SKILL.md"),
+        "---\nname: humanizer-zh\ndescription: 把中文文章改得更自然，更像人类写的。\n---\n保留原意并去掉机器表达。\n",
+    )
+    .unwrap();
+    for name in [
+        "ai-tone-editor",
+        "content-polisher",
+        "english-humanizer",
+        "writing-assistant",
+        "x-post-writer",
+        "zh-copy-editor",
+    ] {
+        let directory = skill_root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Humanize Chinese writing, remove AI tone, and polish English posts.\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "把这篇中文文章改得像人写的";
+    let unhinted = json_output(&run(
+        &[&common[..], &["find", task, "--limit", "3"]].concat(),
+        None,
+    ));
+    assert!(
+        unhinted["result"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|matched| matched["name"] == "humanizer-zh")
+    );
+
+    let hinted = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                task,
+                "--hint",
+                "humanize Chinese writing remove AI tone",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let native = hinted["result"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|matched| matched["name"] == "humanizer-zh")
+        .expect("the task-only native match must survive hint fusion");
+    assert!(native["rank"].as_u64().unwrap() <= 3);
+    assert!(
+        native["match_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().starts_with("task_channel_rank:"))
+    );
+    assert_eq!(
+        hinted["result"]["ranking_strategy"],
+        "task_hint_reciprocal_rank_fusion"
+    );
 }
 
 #[test]
@@ -1052,7 +1188,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.11"
+        "1.8.12"
     );
 
     let undone = json_output(&run(
@@ -1222,7 +1358,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.11");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.12");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],

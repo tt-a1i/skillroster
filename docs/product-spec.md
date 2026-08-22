@@ -120,9 +120,15 @@ recoverable through Undo.
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or
 capability paraphrase while the CLI remains a deterministic local lexical
-index. The task and hints share one token set but retain separate phrase
-boundaries for exact name, description, and declared-trigger evidence. The
-scanner reads ordinary and folded YAML description scalars. Ranking uses
+index. Without hints, Find uses one lexical channel. With hints, it ranks the
+original task and the task-plus-hints expansion independently, then applies
+deterministic reciprocal-rank fusion over a bounded candidate pool. The JSON
+`ranking_strategy`, `task_channel_rank`, and `augmented_channel_rank` facts make
+that decision inspectable. A hint can therefore surface English metadata
+without letting its raw token count set one global cutoff that discards a
+strong native-task result. Each task or hint also remains a separate phrase for
+exact name, description, and declared-trigger evidence. The scanner reads
+ordinary and folded YAML description scalars. Ranking uses
 top-level `triggers` and the semicolon-separated string
 `metadata.skillroster-routing-triggers` as the same declared retrieval
 evidence. The latter must be explicitly quoted and remains valid under the
@@ -134,8 +140,8 @@ only to the already-scanned, locally routable Skill set so natural CJK
 paraphrases can reach CJK metadata even when SQLite FTS has no whole-token
 candidate; Archived Skills remain excluded. Match reasons expose CJK
 description and full-text bigram counts. Ranking also treats explicit use and
-do-not-use description clauses as positive and exclusion evidence, and removes the
-low-confidence tail relative to the strongest result. Same-name Skill
+do-not-use description clauses as positive and exclusion evidence, and removes
+the low-confidence tail relative to the strongest result. Same-name Skill
 identities occupy one ranked capability result and are
 reported as explicit variants rather than silently treated as equivalent.
 The corresponding divergent-content Finding carries the affected placements

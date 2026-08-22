@@ -1490,6 +1490,114 @@ pub(crate) fn find_matching(
     capabilities
 }
 
+pub(crate) fn fuse_retrieval_channels(
+    task_matches: Vec<FindMatch>,
+    augmented_matches: Vec<FindMatch>,
+    task: &RetrievalQuery,
+    limit: usize,
+) -> Vec<FindMatch> {
+    const RECIPROCAL_RANK_OFFSET: f64 = 60.0;
+    const AUGMENTED_CHANNEL_WEIGHT: f64 = 3.0;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    struct FusedMatch {
+        matched: FindMatch,
+        task_rank: Option<usize>,
+        augmented_rank: Option<usize>,
+        fused_score: f64,
+    }
+
+    let mut fused = BTreeMap::<String, FusedMatch>::new();
+    for matched in task_matches {
+        let capability = matched.name.trim().to_lowercase();
+        let rank = matched.rank;
+        fused.insert(
+            capability,
+            FusedMatch {
+                matched,
+                task_rank: Some(rank),
+                augmented_rank: None,
+                fused_score: 1.0 / (RECIPROCAL_RANK_OFFSET + rank as f64),
+            },
+        );
+    }
+    for mut matched in augmented_matches {
+        let capability = matched.name.trim().to_lowercase();
+        let rank = matched.rank;
+        if let Some(existing) = fused.get_mut(&capability) {
+            matched
+                .match_reasons
+                .extend(existing.matched.match_reasons.iter().cloned());
+            matched.match_reasons.sort();
+            matched.match_reasons.dedup();
+            existing.matched = matched;
+            existing.augmented_rank = Some(rank);
+            existing.fused_score +=
+                AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64);
+        } else {
+            fused.insert(
+                capability,
+                FusedMatch {
+                    matched,
+                    task_rank: None,
+                    augmented_rank: Some(rank),
+                    fused_score: AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64),
+                },
+            );
+        }
+    }
+
+    let mut fused = fused.into_values().collect::<Vec<_>>();
+    fused.sort_by(|left, right| {
+        right
+            .fused_score
+            .partial_cmp(&left.fused_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.augmented_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.augmented_rank.unwrap_or(usize::MAX))
+            })
+            .then_with(|| {
+                left.task_rank
+                    .unwrap_or(usize::MAX)
+                    .cmp(&right.task_rank.unwrap_or(usize::MAX))
+            })
+            .then_with(|| left.matched.name.cmp(&right.matched.name))
+            .then_with(|| left.matched.skill_id.cmp(&right.matched.skill_id))
+    });
+    let mut fused = fused
+        .into_iter()
+        .map(|mut fused| {
+            if let Some(rank) = fused.task_rank {
+                fused
+                    .matched
+                    .match_reasons
+                    .push(format!("task_channel_rank:{rank}"));
+            }
+            if let Some(rank) = fused.augmented_rank {
+                fused
+                    .matched
+                    .match_reasons
+                    .push(format!("augmented_channel_rank:{rank}"));
+            }
+            fused.matched.match_reasons.sort();
+            fused.matched.match_reasons.dedup();
+            fused.matched.score = (fused.fused_score * 100_000.0).round() / 100.0;
+            fused.matched
+        })
+        .collect::<Vec<_>>();
+    trim_low_confidence_tail(&mut fused, tokens(task.text()).len());
+    fused.truncate(limit);
+    for (index, matched) in fused.iter_mut().enumerate() {
+        matched.rank = index + 1;
+    }
+    fused
+}
+
 fn tokens(text: &str) -> BTreeSet<String> {
     let mut output = BTreeSet::new();
     let mut word = String::new();

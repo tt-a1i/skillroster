@@ -1,12 +1,34 @@
+use std::io::{self, Write};
+
 use clap::Parser;
 use skillroster::{app, cli::Cli};
+
+fn write_stdout_or_exit(output: &str) {
+    let result = {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_all(output.as_bytes())
+            .and_then(|()| stdout.write_all(b"\n"))
+    };
+    if let Err(error) = result {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        let _ = writeln!(
+            io::stderr().lock(),
+            "failed writing command output: {error}"
+        );
+        std::process::exit(1);
+    }
+}
 
 fn main() {
     let wants_json = std::env::args_os().any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) if wants_json => {
-            println!("{}", app::error_json("cli", &error));
+            write_stdout_or_exit(&app::error_json("cli", &error));
             std::process::exit(2);
         }
         Err(error) => error.exit(),
@@ -22,14 +44,14 @@ fn main() {
             if let Some(progress) = progress {
                 progress.finish();
             }
-            println!("{}", if json { output.json } else { output.human });
+            write_stdout_or_exit(if json { &output.json } else { &output.human });
         }
         Err(error) => {
             if let Some(progress) = progress {
                 progress.finish();
             }
             if json {
-                println!("{}", app::error_json(command, error.as_ref()));
+                write_stdout_or_exit(&app::error_json(command, error.as_ref()));
             } else {
                 eprintln!("{}", skillroster::present::error_human(&error));
             }

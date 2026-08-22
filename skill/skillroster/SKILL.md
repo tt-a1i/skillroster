@@ -8,7 +8,7 @@ description: >
   distributing, synchronizing, or repairing shared Skill directories and
   symlinks.
 metadata:
-  bootstrap-version: "1.8.11"
+  bootstrap-version: "1.8.12"
   skillroster-routing-triggers: "scan analyze duplicate unused local Agent Skills; inventory installed Agent Skills; analyze duplicate Agent Skills; evaluate possible unused local Agent Skills from usage evidence; govern a Skill Roster; prepare a Skill governance Plan; apply approved Skill Plan; create Skill Receipt; undo Skill organization"
 ---
 
@@ -61,7 +61,7 @@ Use `skillroster status --json` for pending Plans, the last Receipt, retention, 
 
 ## Find an on-demand Skill
 
-Run `skillroster find "TASK" --json`, keeping the user's task verbatim. For a non-English or mixed-language task, include one concise English capability paraphrase through `--hint "TEXT"` on the first call. Build the hint entirely from the desired target surface, object, operation, and state—for example, `control existing logged-in Chrome tabs` or `analyze standalone spreadsheet file workbook data`. Use terms implied by the task rather than a guessed Skill name. Retry once with a refined target description only when the result is empty or clearly about another domain. Explain the top matches and evidence. A `variant_count` above one is unresolved same-name content ambiguity: keep each returned variant's path and provider facts together, respect `variants_truncated`, show the warning, and inspect the corresponding layout Finding before choosing content. Otherwise read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
+Run `skillroster find "TASK" --json`, keeping the user's task verbatim. For a non-English or mixed-language task, include one concise English capability paraphrase through `--hint "TEXT"` on the first call. Build the hint entirely from the desired target surface, object, operation, and state—for example, `control existing logged-in Chrome tabs` or `analyze standalone spreadsheet file workbook data`. Use terms implied by the task rather than a guessed Skill name. With hints, require `ranking_strategy: task_hint_reciprocal_rank_fusion`; use `task_channel_rank` and `augmented_channel_rank` reasons to distinguish native task evidence from hint-expanded evidence. Retry once with a refined target description only when the result is empty or clearly about another domain. Explain the top matches and evidence. A `variant_count` above one is unresolved same-name content ambiguity: keep each returned variant's path and provider facts together, respect `variants_truncated`, show the warning, and inspect the corresponding layout Finding before choosing content. Otherwise read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
 
 Treat `providers` with `governable: false` as locally discovered provider-managed Skills. They may come from explicit Codex configuration or a verified remote-plugin install marker. They are valid read-only search results, but must not be moved, updated, consolidated, or added to a governance Plan.
 
