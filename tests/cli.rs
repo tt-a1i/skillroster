@@ -674,7 +674,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(
         fs::read_to_string(&bootstrap).unwrap(),
-        include_str!("../skill/skillroster/SKILL.md")
+        include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
     );
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
@@ -742,7 +742,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     assert_eq!(applied["result"]["verification"], "passed");
     assert_eq!(
         fs::read_to_string(&bootstrap).unwrap(),
-        include_str!("../skill/skillroster/SKILL.md")
+        include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
     );
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");

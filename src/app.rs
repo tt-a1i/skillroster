@@ -3008,6 +3008,17 @@ fn bootstrap_content_status(digest: &str, current_digest: &str) -> BootstrapCont
     }
 }
 
+fn normalized_bootstrap_content(content: &str) -> String {
+    content.replace("\r\n", "\n")
+}
+
+fn bootstrap_content_digest(content: &[u8]) -> String {
+    match std::str::from_utf8(content) {
+        Ok(content) => content_digest(normalized_bootstrap_content(content).as_bytes()),
+        Err(_) => content_digest(content),
+    }
+}
+
 fn setup_command(
     store: &StateStore,
     home: &Path,
@@ -3033,7 +3044,8 @@ fn setup_command(
             "next": "skillroster scan --json"
         }));
     };
-    let current_content = include_str!("../skill/skillroster/SKILL.md");
+    let current_content =
+        normalized_bootstrap_content(include_str!("../skill/skillroster/SKILL.md"));
     let current_digest = content_digest(current_content.as_bytes());
     let mut detected = Vec::new();
     let mut targets = Vec::new();
@@ -3065,7 +3077,7 @@ fn setup_command(
                 }
                 Ok(_) => match std::fs::read(&entrypoint) {
                     Ok(content) => {
-                        let digest = content_digest(&content);
+                        let digest = bootstrap_content_digest(&content);
                         let content_status = bootstrap_content_status(&digest, &current_digest);
                         match content_status {
                             BootstrapContentStatus::Current => current_count += 1,
@@ -3075,7 +3087,7 @@ fn setup_command(
                                 operations.push(json!({
                                     "kind": "replace_file",
                                     "target": entrypoint,
-                                    "content": current_content,
+                                    "content": &current_content,
                                     "expected_fingerprint": change::fingerprint(&entrypoint)?
                                 }));
                             }
@@ -3089,7 +3101,7 @@ fn setup_command(
                                     operations.push(json!({
                                         "kind": "replace_file",
                                         "target": entrypoint,
-                                        "content": current_content,
+                                        "content": &current_content,
                                         "expected_fingerprint": change::fingerprint(&entrypoint)?
                                     }));
                                 }
@@ -3117,7 +3129,7 @@ fn setup_command(
                     operations.push(json!({
                         "kind": "write_file",
                         "target": entrypoint,
-                        "content": current_content,
+                        "content": &current_content,
                         "expected_fingerprint": "missing"
                     }));
                     ("missing", None)
@@ -4020,7 +4032,7 @@ mod recovery_tests {
 
     #[test]
     fn bootstrap_digest_classification_distinguishes_release_content_from_local_edits() {
-        let current = content_digest(include_bytes!("../skill/skillroster/SKILL.md"));
+        let current = bootstrap_content_digest(include_bytes!("../skill/skillroster/SKILL.md"));
         assert_eq!(
             bootstrap_content_status(&current, &current),
             BootstrapContentStatus::Current
@@ -4039,6 +4051,15 @@ mod recovery_tests {
         assert_eq!(
             bootstrap_content_status("sha256:local-edit", &current),
             BootstrapContentStatus::Modified
+        );
+        let windows_legacy =
+            include_str!("../tests/fixtures/bootstrap-v1.1.0.md").replace('\n', "\r\n");
+        assert_eq!(
+            bootstrap_content_status(
+                &bootstrap_content_digest(windows_legacy.as_bytes()),
+                &current
+            ),
+            BootstrapContentStatus::OfficialOutdated("1.1.0")
         );
     }
 
