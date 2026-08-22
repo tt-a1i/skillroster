@@ -41,7 +41,18 @@ installation with `skillroster --version` and `skillroster --help`.
 
 ## Homebrew
 
-There is currently no official SkillRoster Homebrew tap or formula. Do not use
-an unrelated third-party formula. This section will be updated when a verified
-tap exists; until then use a signed GitHub Release archive or install from
-source after verifying the published checksum.
+The repository includes a source-building Formula. Until a public tap exists,
+clone the release tag and install the checked-in Formula:
+
+```sh
+git clone https://github.com/tt-a1i/skillroster.git
+cd skillroster
+git checkout v1.0.0
+brew install --formula ./Formula/skillroster.rb
+brew test skillroster
+```
+
+The repository is currently private, so GitHub access must already be
+configured for the clone performed by Homebrew. This is a verified Formula,
+not a public tap; users without repository access should use an authorized
+Release archive. Never paste a GitHub token into the Formula or a command line.
