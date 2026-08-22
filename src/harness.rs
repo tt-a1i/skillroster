@@ -98,13 +98,6 @@ pub fn session_record_observations(agent: AgentKind, record: &str) -> Vec<Sessio
     };
     let mut observations = Vec::new();
     collect_observations(agent, &value, &mut observations);
-    observations.sort_by(|left, right| {
-        signal_rank(left.signal)
-            .cmp(&signal_rank(right.signal))
-            .then_with(|| left.record_text.cmp(&right.record_text))
-            .then_with(|| left.explicit_references.cmp(&right.explicit_references))
-    });
-    observations.dedup();
     observations
 }
 
@@ -432,6 +425,23 @@ mod tests {
             observation.signal == SessionSignal::Applied
                 && observation.explicit_references == ["review"]
         }));
+    }
+
+    #[test]
+    fn identical_sibling_events_remain_distinct_observations() {
+        let record = serde_json::json!([
+            {"type": "load_skill", "skill_name": "research"},
+            {"type": "load_skill", "skill_name": "research"}
+        ])
+        .to_string();
+        let observations = session_record_observations(AgentKind::Hermes, &record);
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| observation.signal == SessionSignal::Loaded)
+                .count(),
+            2
+        );
     }
 
     #[test]

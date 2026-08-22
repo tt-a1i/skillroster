@@ -1418,10 +1418,7 @@ fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
                     let Some(start) = stack.pop() else {
                         continue;
                     };
-                    let end = index + 1;
-                    if serde_json::from_slice::<serde_json::Value>(&bytes[start..end]).is_ok() {
-                        candidates.push((start, end));
-                    }
+                    candidates.push((start, index + 1));
                 }
                 _ => {}
             }
@@ -1429,17 +1426,28 @@ fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
     }
     candidates.sort_unstable();
     candidates.dedup();
-    candidates.sort_by_key(|(start, end)| (std::cmp::Reverse(end - start), *start));
+    candidates.sort_by_key(|(start, end)| (*start, std::cmp::Reverse(*end)));
     let mut selected = Vec::<(usize, usize)>::new();
-    for candidate in candidates {
-        if !selected
-            .iter()
-            .any(|(start, end)| *start <= candidate.0 && *end >= candidate.1)
-        {
-            selected.push(candidate);
+    let mut covered_until = 0;
+    let mut parse_bytes = 0_u64;
+    for (start, end) in candidates {
+        if end <= covered_until {
+            continue;
+        }
+        let candidate_bytes = (end - start) as u64;
+        if parse_bytes.saturating_add(candidate_bytes) > 8 * MAX_SESSION_BYTES_PER_FILE {
+            continue;
+        }
+        parse_bytes += candidate_bytes;
+        if serde_json::from_slice::<serde_json::Value>(&bytes[start..end]).is_ok() {
+            selected.push((start, end));
+            covered_until = covered_until.max(end);
         }
     }
     selected.sort_by_key(|(start, _)| *start);
+    if selected.len() > MAX_SESSION_LINES_PER_AGENT {
+        selected.drain(..selected.len() - MAX_SESSION_LINES_PER_AGENT);
+    }
     selected
         .into_iter()
         .map(|(start, end)| {
@@ -2189,6 +2197,51 @@ enabled = true
         assert!(coverage.bytes_observed <= 2 * MAX_SESSION_BYTES_PER_FILE);
 
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repeated_events_in_one_json_document_keep_their_count() {
+        let home = temp_directory("repeated-json-events");
+        let skill = home.join(".hermes/skills/research");
+        let sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Research workflow\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("session.json"),
+            serde_json::json!([
+                {"type": "load_skill", "skill_name": "research"},
+                {"type": "load_skill", "skill_name": "research"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let loaded = result
+            .usage
+            .iter()
+            .find(|usage| usage.agent == AgentKind::Hermes && usage.stage == UsageStage::Loaded)
+            .unwrap();
+        assert_eq!(loaded.event_count, 2);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn json_object_extraction_is_bounded_for_many_siblings() {
+        let sample = format!("[{}]", vec!["{}"; 100_000].join(","));
+        let records = extract_complete_json_objects(&sample);
+        assert_eq!(records.len(), MAX_SESSION_LINES_PER_AGENT);
+        assert!(
+            records
+                .iter()
+                .all(|(record, lines)| record == "{}" && *lines == 1)
+        );
     }
 
     #[test]
