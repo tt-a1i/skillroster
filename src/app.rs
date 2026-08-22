@@ -4263,6 +4263,13 @@ fn validate_roster_changes(
         if !store.skill_exists(&skill_id)? {
             bail!("Skill {skill_id} is not present in the Library index");
         }
+        if !scan
+            .placements
+            .iter()
+            .any(|placement| placement.skill_id == change.skill_id && placement.governable)
+        {
+            bail!("Skill {skill_id} is provider-managed and read-only");
+        }
         if !requested.insert((change.agent.as_str(), change.skill_id.as_str())) {
             bail!(
                 "Plan contains conflicting duplicate Roster changes for Agent {} and Skill {skill_id}",

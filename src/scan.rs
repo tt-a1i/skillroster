@@ -303,13 +303,17 @@ fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<
             continue;
         };
         let value = line.split('#').next().unwrap_or_default().trim();
-        if value == "enabled = true" || value == "enabled=true" {
+        let enabled = value
+            .split_once('=')
+            .filter(|(key, _)| key.trim() == "enabled")
+            .map(|(_, value)| value.trim());
+        if enabled == Some("true") {
             sections
                 .entry(plugin_id.clone())
                 .or_default()
                 .enabled_values
                 .push(true);
-        } else if value == "enabled = false" || value == "enabled=false" {
+        } else if enabled == Some("false") {
             sections
                 .entry(plugin_id.clone())
                 .or_default()
@@ -1443,9 +1447,9 @@ mod tests {
         let plugins = parse_enabled_codex_plugins(
             r#"
 [plugins."browser@openai-bundled"]
-enabled = true
+enabled  =  true
 [plugins."disabled@openai-bundled"]
-enabled = false
+enabled	=	false
 [plugins."../escape@openai-bundled"]
 enabled = true
 [plugins."duplicate@openai-bundled"]
