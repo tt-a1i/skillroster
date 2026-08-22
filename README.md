@@ -72,10 +72,11 @@ Evidence IDs, then request Roster states, managed/hosted Library placement, or a
 source update. Raw filesystem operations are rejected. Library consolidation
 keeps canonical content recoverable and replaces verified duplicate placements
 with links; every applied sequence is bounded by a Receipt and can be undone.
-The initial Plan response is a bounded decision summary. Exact operations and
-complete internal ID lists remain in the immutable local Plan and are available
-on demand through `plan --show`, so large governance scopes do not flood the
-Agent's context.
+The initial Plan response is a bounded decision summary. Its `diff_summary`
+shows the semantic Roster, Library, and filesystem deltas (or bounded line
+facts for a source update). Exact operations and complete internal ID lists
+remain in the immutable local Plan and are available on demand through
+`plan --show`, so large governance scopes do not flood the Agent's context.
 
 For an exact-duplicate Finding, the Agent submits only the choices it owns:
 
