@@ -568,7 +568,16 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let missing_root_count = scan
         .coverage
         .iter()
-        .filter(|coverage| coverage.roots_present == 0)
+        .filter(|coverage| {
+            coverage.roots_present == 0
+                && coverage.roots_missing > 0
+                && coverage.roots_inaccessible == 0
+        })
+        .count();
+    let inaccessible_root_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.roots_inaccessible > 0)
         .count();
     let limited_root_count = scan
         .coverage
@@ -622,7 +631,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         Severity::Info,
         "Five-stage usage evidence",
         format!(
-            "{}. Coverage: roots {roots_present_count}/{supported}, sampled {sampled_count}/{supported}, complete {reliable_count}/{supported}; files discovered={coverage_discovered}, observed={coverage_observed}, partial={coverage_partial}, skipped={coverage_skipped}; bytes={coverage_bytes}, lines={coverage_lines}, truncated={coverage_truncated}, discovery_truncated={discovery_truncated}.",
+            "{}. Coverage: roots {roots_present_count}/{supported}, sampled {sampled_count}/{supported}, complete {reliable_count}/{supported}, missing {missing_root_count}/{supported}, inaccessible {inaccessible_root_count}/{supported}; files discovered={coverage_discovered}, observed={coverage_observed}, partial={coverage_partial}, skipped={coverage_skipped}; bytes={coverage_bytes}, lines={coverage_lines}, truncated={coverage_truncated}, discovery_truncated={discovery_truncated}.",
             stage_summaries.join("; "),
             supported = AgentKind::ALL.len(),
         ),
@@ -652,7 +661,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             Severity::Info,
             "Usage coverage is incomplete",
             format!(
-                "A complete observable-session denominator is unavailable for {incomplete_count}/{} supported Agents: {missing_root_count} session roots are missing and {limited_root_count} present roots have bounded or incomplete samples. Recent observed events remain usable; absence of evidence is not evidence of non-use.",
+                "A complete observable-session denominator is unavailable for {incomplete_count}/{} supported Agents: {missing_root_count} session roots are missing, {inaccessible_root_count} are inaccessible, and {limited_root_count} present roots have bounded or incomplete samples. Recent observed events remain usable; absence of evidence is not evidence of non-use.",
                 AgentKind::ALL.len(),
             ),
             Vec::new(),

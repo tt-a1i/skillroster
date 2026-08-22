@@ -3012,6 +3012,24 @@ fn report_distinguishes_inaccessible_and_missing_session_roots() {
         report["result"]["session_coverage"]["inaccessible_agents"],
         1
     );
+    let usage_findings = json_output(&run(
+        &[
+            &json_common[..],
+            &["report", "--findings", "--category", "usage"],
+        ]
+        .concat(),
+        None,
+    ));
+    let coverage_summary = usage_findings["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Usage coverage is incomplete")
+        .unwrap()["summary"]
+        .as_str()
+        .unwrap();
+    assert!(coverage_summary.contains("7 session roots are missing"));
+    assert!(coverage_summary.contains("1 are inaccessible"));
 
     let human = run(&[&common[..], &["report", "--summary"]].concat(), None);
     assert!(human.status.success());
