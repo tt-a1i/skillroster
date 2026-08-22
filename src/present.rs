@@ -752,7 +752,7 @@ fn usage_finding_overview(overview: &Value, lines: &mut Vec<String>, width: usiz
             if ambiguous_name {
                 suffix.push_str(&format!(
                     " · {}",
-                    take_width(&text(signal, "skill_id"), 12, false)
+                    take_width(&text(signal, "skill_id"), 12, true)
                 ));
             }
             let detail_budget = width.saturating_sub(25);
@@ -1730,6 +1730,11 @@ mod tests {
 
     #[test]
     fn usage_finding_is_readable_and_path_free_at_reference_widths() {
+        let first_skill_id = crate::model::SkillId::new().to_string();
+        let second_skill_id = crate::model::SkillId::new().to_string();
+        let first_skill_suffix = take_width(&first_skill_id, 12, true);
+        let second_skill_suffix = take_width(&second_skill_id, 12, true);
+        assert_ne!(first_skill_suffix, second_skill_suffix);
         let value = json!({
             "id": "finding_00000000000000000000000000000000",
             "title": "Five-stage usage evidence",
@@ -1765,9 +1770,9 @@ mod tests {
                     "discovery_truncated": false
                 },
                 "observed_skills": [
-                    {"agent": "cursor", "skill_id": "skill_a111111111111", "skill_name": "code-review", "stage": "loaded", "event_count": 1},
+                    {"agent": "cursor", "skill_id": first_skill_id, "skill_name": "code-review", "stage": "loaded", "event_count": 1},
                     {"agent": "claude-code", "skill_id": "skill_history11111", "skill_name": "computer-history", "stage": "matched", "event_count": 2},
-                    {"agent": "cursor", "skill_id": "skill_b222222222222", "skill_name": "code-review", "stage": "loaded", "event_count": 3}
+                    {"agent": "cursor", "skill_id": second_skill_id, "skill_name": "code-review", "stage": "loaded", "event_count": 3}
                 ],
                 "observed_signal_count": 8,
                 "observed_skills_truncated": true
@@ -1802,8 +1807,6 @@ mod tests {
                 "Observed Skills",
                 "cursor",
                 "loaded ×1",
-                "skill_a11111",
-                "skill_b22222",
                 "+ 5 more observed Skill signals",
                 "Use --full only when exact complete records are needed",
             ] {
@@ -1812,6 +1815,14 @@ mod tests {
                     "{expected} missing at {width}:\n{output}"
                 );
             }
+            assert!(
+                output.contains(&first_skill_suffix),
+                "first stable Skill ID suffix missing at {width}:\n{output}"
+            );
+            assert!(
+                output.contains(&second_skill_suffix),
+                "second stable Skill ID suffix missing at {width}:\n{output}"
+            );
             if width >= 80 {
                 assert!(
                     output.contains("code-review"),
