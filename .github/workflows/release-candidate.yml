@@ -1,0 +1,94 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Artifact version, for example 0.1.0-rc.1"
+        required: true
+        type: string
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: unix
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: windows
+          - os: macos-15
+            target: aarch64-apple-darwin
+            package: unix
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: unix
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --target "$TARGET"
+          rustup default 1.85.0
+
+      - name: Validate release version
+        shell: bash
+        run: |
+          version="${RELEASE_VERSION#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] || [[ "$version" == *..* ]]; then
+            echo "Version must be SemVer without build metadata" >&2
+            exit 1
+          fi
+          case "$TARGET" in
+            x86_64-unknown-linux-gnu|x86_64-pc-windows-msvc|aarch64-apple-darwin|x86_64-apple-darwin) ;;
+            *) echo "Unsupported release target: $TARGET" >&2; exit 1 ;;
+          esac
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          case "$version" in
+            "$cargo_version"|"$cargo_version"-*) ;;
+            *) echo "Version $version does not match Cargo package $cargo_version" >&2; exit 1 ;;
+          esac
+
+      - name: Build locked release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package Unix artifact
+        if: matrix.package == 'unix'
+        shell: bash
+        run: scripts/release/package-unix.sh "$TARGET" "${RELEASE_VERSION#v}"
+
+      - name: Package Windows artifact
+        if: matrix.package == 'windows'
+        shell: pwsh
+        run: scripts/release/package-windows.ps1 -Target $env:TARGET -Version ($env:RELEASE_VERSION -replace '^v', '')
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: skillroster-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
