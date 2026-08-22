@@ -908,7 +908,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.2"
+        "1.8.3"
     );
 
     let undone = json_output(&run(
@@ -934,6 +934,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         ("1.7.1", include_str!("fixtures/bootstrap-v1.7.1.md")),
         ("1.8.0", include_str!("fixtures/bootstrap-v1.8.0.md")),
         ("1.8.1", include_str!("fixtures/bootstrap-v1.8.1.md")),
+        ("1.8.2", include_str!("fixtures/bootstrap-v1.8.2.md")),
     ] {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
@@ -1075,7 +1076,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.2");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.3");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
