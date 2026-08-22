@@ -1459,8 +1459,9 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
         } => {
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
+            let planning_blocked = result["planning"]["supported"].as_bool() == Some(false);
             let mut actions = Vec::new();
-            if !requires_trust_decision {
+            if !requires_trust_decision && !planning_blocked {
                 actions.push(action(
                     "plan",
                     &["plan", "--stdin", "--json"],
@@ -1579,9 +1580,7 @@ fn finding_roster_planning(
     latest_scan_id: &ScanId,
     scan: &ScanResult,
 ) -> Result<Option<Value>> {
-    if finding.category != FindingCategory::Exposure
-        || finding.title != "Large default Rosters need review"
-    {
+    if !crate::roster_recommendation::is_large_roster_finding(finding) {
         return Ok(None);
     }
     if scan_id != latest_scan_id {
@@ -1662,6 +1661,42 @@ fn finding_roster_planning(
             })
         })
         .collect::<Vec<_>>();
+    if blocked_change_count > 0 {
+        let blocked_skill_ids = supported
+            .exclusions
+            .iter()
+            .map(|exclusion| exclusion.skill_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let observed_link_targets = scan
+            .placements
+            .iter()
+            .filter(|placement| blocked_skill_ids.contains(placement.skill_id.as_str()))
+            .filter_map(|placement| placement.link_target.as_ref())
+            .map(|path| path.display().to_string())
+            .collect::<BTreeSet<_>>();
+        return Ok(Some(json!({
+            "supported": false,
+            "reason": "trusted_canonical_sources_required",
+            "decision": "confirm_trusted_source_roots",
+            "automatic_change_supported": false,
+            "snapshot_id": scan_id,
+            "request_field": "finding_roster_changes",
+            "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+            "absence_of_usage_evidence": "not_negative_evidence",
+            "explicit_only_or_archive_decision_implied": false,
+            "agent_count": agents.len(),
+            "agents": agents,
+            "blocked_change_count": blocked_change_count,
+            "blocked_changes": blocked_changes,
+            "blocked_changes_truncated": blocked_change_count > 5,
+            "observed_link_targets": observed_link_targets,
+            "after_confirmation": {
+                "repeatable_option": "--source-root",
+                "value": "absolute canonical source directory",
+                "next": "rescan and reopen the new large-Roster Finding"
+            }
+        })));
+    }
     Ok(Some(json!({
         "supported": true,
         "decision": "right_size_default_rosters",
@@ -1819,6 +1854,10 @@ fn finding_json(
 ) -> Value {
     json!({
         "id": id,
+        "kind": crate::roster_recommendation::finding_kind(
+            &finding_category(finding.category),
+            &finding.title
+        ),
         "category": finding.category,
         "severity": finding.severity,
         "title": finding.title,
@@ -1828,7 +1867,8 @@ fn finding_json(
         "affected_skill_ids": finding.affected_skill_ids,
         "affected_placement_ids": finding.affected_placement_ids,
         "impact": finding_impact(finding),
-        "coverage": finding_coverage(finding, scan)
+        "coverage": finding_coverage(finding, scan),
+        "files_changed": false
     })
 }
 
@@ -2225,6 +2265,15 @@ fn state_counts(values: &[Value], key: &str) -> Value {
     json!(counts)
 }
 
+fn transition_change_count(before: &[Value], after: &[Value], after_state_key: &str) -> usize {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(before, after)| before.get("state") != after.get(after_state_key))
+        .count()
+        + before.len().abs_diff(after.len())
+}
+
 fn bound_transition(value: &mut Value, after_state_key: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -2237,7 +2286,10 @@ fn bound_transition(value: &mut Value, after_state_key: &str) {
         .remove("after")
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
-    object.insert("change_count".into(), json!(after.len()));
+    object.insert(
+        "change_count".into(),
+        json!(transition_change_count(&before, &after, after_state_key)),
+    );
     object.insert("before_state_counts".into(), state_counts(&before, "state"));
     object.insert(
         "after_state_counts".into(),
@@ -2367,7 +2419,6 @@ struct FindingRosterChangeRequest {
 struct FindingPlanProvenance {
     report_id: ReportId,
     finding_ids: Vec<FindingId>,
-    roster_exclusions: Vec<Value>,
 }
 
 fn declared_core_pairs(
@@ -2463,8 +2514,11 @@ fn expand_finding_roster_changes(
     )?;
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
-    if supported.changes.is_empty() {
-        bail!("Finding {finding_id} has no safely governable Roster changes");
+    if !supported.exclusions.is_empty() {
+        bail!(
+            "Finding {finding_id} is blocked by {} Roster changes without owned exact content; confirm the reported source roots, rescan, and use the new Finding",
+            supported.exclusions.len()
+        );
     }
     if finding.evidence_ids.is_empty() {
         bail!("Finding {finding_id} has no Evidence");
@@ -2477,18 +2531,6 @@ fn expand_finding_roster_changes(
         Some(FindingPlanProvenance {
             report_id: finding.report_id,
             finding_ids: vec![finding_id],
-            roster_exclusions: supported
-                .exclusions
-                .into_iter()
-                .map(|exclusion| {
-                    json!({
-                        "agent": exclusion.agent,
-                        "skill_id": exclusion.skill_id,
-                        "reason": exclusion.reason,
-                        "state": "unchanged"
-                    })
-                })
-                .collect(),
         }),
     ))
 }
@@ -2639,7 +2681,6 @@ fn expand_finding_library_changes(
         Some(FindingPlanProvenance {
             report_id: report_id.expect("non-empty Finding requests have a Report"),
             finding_ids,
-            roster_exclusions: Vec::new(),
         }),
     ))
 }
@@ -3234,22 +3275,28 @@ fn prepare_plan(
     validate_plan_evidence(store, &prepared, &scan_id)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     let library_before = capture_library_state(store, &prepared)?;
+    let roster_after = serde_json::to_value(&prepared.roster_changes)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let library_after = serde_json::to_value(&prepared.library_changes)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let effective_roster_change_count =
+        transition_change_count(&roster_before, &roster_after, "state");
+    let effective_library_change_count =
+        transition_change_count(&library_before, &library_after, "requested_state");
     if matches!(effective_origin, PlanOrigin::Agent)
         && prepared.source_updates.is_empty()
-        && roster_before
-            .iter()
-            .zip(&prepared.roster_changes)
-            .all(|(before, change)| {
-                before["state"]
-                    == serde_json::to_value(roster_state(&change.state).ok()).unwrap_or(Value::Null)
-            })
+        && effective_roster_change_count == 0
     {
         bail!("Plan has no effective Roster state change");
     }
     let change_summary = json!({
         "operation_count": prepared.operations.len(),
-        "roster_change_count": prepared.roster_changes.len(),
-        "library_change_count": prepared.library_changes.len(),
+        "roster_change_count": effective_roster_change_count,
+        "library_change_count": effective_library_change_count,
         "source_update_count": prepared.source_updates.len()
     });
     let mut impact = if matches!(effective_origin, PlanOrigin::RosterGovernance) {
@@ -3260,15 +3307,6 @@ fn prepare_plan(
     } else {
         json!(source_update_diffs)
     };
-    if let (Some(object), Some(provenance)) = (impact.as_object_mut(), finding_provenance.as_ref())
-    {
-        if !provenance.roster_exclusions.is_empty() {
-            object.insert(
-                "blocked_preconditions".into(),
-                json!(provenance.roster_exclusions),
-            );
-        }
-    }
     if let Some(object) = impact.as_object_mut() {
         object.insert(
             "roster".into(),
@@ -4912,6 +4950,22 @@ mod recovery_tests {
         assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true).is_err());
         let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transition_counts_only_effective_state_changes() {
+        let before = vec![
+            json!({"state": "core"}),
+            json!({"state": "on_demand"}),
+            json!({"state": Value::Null}),
+        ];
+        let after = vec![
+            json!({"state": "core"}),
+            json!({"state": "core"}),
+            json!({"state": "on_demand"}),
+        ];
+
+        assert_eq!(transition_change_count(&before, &after, "state"), 2);
     }
 }
 

@@ -424,10 +424,16 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
     }
 
-    if value["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots") {
+    let trust_resolution =
+        if value["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots") {
+            &value["resolution"]
+        } else {
+            &value["planning"]
+        };
+    if trust_resolution["decision"].as_str() == Some("confirm_trusted_source_roots") {
         lines.push(String::new());
         lines.push("  Observed link targets".into());
-        if let Some(targets) = value["resolution"]["observed_link_targets"].as_array() {
+        if let Some(targets) = trust_resolution["observed_link_targets"].as_array() {
             for target in targets.iter().filter_map(Value::as_str).take(5) {
                 lines.push(format!(
                     "  {}",
@@ -659,9 +665,16 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
         lines,
         "Blocked preconditions",
         value
-            .get("blocked_preconditions")
-            .and_then(Value::as_array)
-            .map_or_else(|| "none".into(), |items| items.len().to_string()),
+            .pointer("/impact/blocked_precondition_count")
+            .and_then(Value::as_u64)
+            .map(|count| count.to_string())
+            .or_else(|| {
+                value
+                    .get("blocked_preconditions")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len().to_string())
+            })
+            .unwrap_or_else(|| "none".into()),
     );
     fact(lines, "State", text(value, "state"));
     lines.extend(summary(

@@ -242,6 +242,9 @@ pub fn derive(
                 placement.default_exposed
                     && placement.link_status != LinkStatus::Broken
                     && placement.content_digest == skill.content_digest
+                    && !placement.link_target.as_ref().is_some_and(|target| {
+                        removal.iter().any(|removed| target == &removed.directory)
+                    })
             }) {
                 after_exposure += 1;
                 exclusions.push(json!({
@@ -516,6 +519,51 @@ mod tests {
         assert!(plan.operations.iter().any(|operation| {
             operation["kind"] == "create_symlink"
                 && operation["target"] == codex_root.join("shared").to_string_lossy().as_ref()
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_link_is_retargeted_when_its_canonical_directory_moves() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let codex = home.join(".codex/skills/shared");
+        let claude_root = home.join(".claude/skills");
+        let claude = claude_root.join("shared");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::write(codex.join("SKILL.md"), "---\nname: shared\n---\nfixture\n").unwrap();
+        std::os::unix::fs::symlink(&codex, &claude).unwrap();
+        let snapshot = scan(&ScanOptions::for_home(&home)).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let plan = derive(
+            &snapshot,
+            &state,
+            &[
+                RosterChange {
+                    agent: "codex".into(),
+                    skill_id: skill_id.clone(),
+                    state: "on_demand".into(),
+                },
+                RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id,
+                    state: "core".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(plan.operations.iter().any(|operation| {
+            operation["kind"] == "move_recoverable" && operation["source"] == json!(claude)
+        }));
+        assert!(plan.operations.iter().any(|operation| {
+            operation["kind"] == "create_symlink"
+                && operation["target"] == json!(claude)
+                && operation["source"] == json!(state.join("library/shared"))
         }));
     }
 }

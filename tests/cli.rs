@@ -1969,6 +1969,101 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
         stale_detail["result"]["planning"]["reason"],
         "stale_finding"
     );
+    assert!(
+        stale_detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let outside = temp.path().join("unconfirmed-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("SKILL.md"),
+        "---\nname: external\n---\nfixture\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("zzz-external")).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["kind"], "large_default_roster");
+    assert_eq!(detail["result"]["files_changed"], false);
+    assert_eq!(detail["result"]["planning"]["supported"], false);
+    assert_eq!(
+        detail["result"]["planning"]["reason"],
+        "trusted_canonical_sources_required"
+    );
+    assert_eq!(detail["result"]["planning"]["blocked_change_count"], 1);
+    assert_eq!(
+        detail["result"]["planning"]["observed_link_targets"],
+        json!([outside])
+    );
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("confirm the reported source roots")
+    );
 }
 
 #[test]

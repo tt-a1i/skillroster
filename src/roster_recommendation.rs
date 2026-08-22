@@ -9,6 +9,23 @@ use crate::model::{FindingCategory, FindingRecord};
 use crate::scan::{EvidenceQuality, ScanResult, UsageStage};
 
 pub const MAX_CORE_BUDGET: usize = 50;
+pub const LARGE_ROSTER_FINDING_KIND: &str = "large_default_roster";
+pub const LARGE_ROSTER_FINDING_TITLE: &str = "Large default Rosters need review";
+
+pub fn finding_kind(category: &FindingCategory, title: &str) -> Option<&'static str> {
+    (*category == FindingCategory::Exposure && title == LARGE_ROSTER_FINDING_TITLE)
+        .then_some(LARGE_ROSTER_FINDING_KIND)
+}
+
+pub fn is_large_roster_finding(finding: &FindingRecord) -> bool {
+    finding
+        .details
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(LARGE_ROSTER_FINDING_KIND)
+        || (finding.details.get("kind").is_none()
+            && finding_kind(&finding.category, &finding.title).is_some())
+}
 
 #[derive(Clone, Debug)]
 pub struct RecommendationRequest {
@@ -240,9 +257,7 @@ fn exposure_finding_scope<'a>(
     finding: &FindingRecord,
     scan: &'a ScanResult,
 ) -> Result<BTreeMap<AgentKind, Vec<&'a crate::scan::SkillPlacement>>> {
-    if finding.category != FindingCategory::Exposure
-        || finding.title != "Large default Rosters need review"
-    {
+    if !is_large_roster_finding(finding) {
         bail!("Finding {} is not a large-Roster Finding", finding.id);
     }
     let ids = finding
