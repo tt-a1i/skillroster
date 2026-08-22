@@ -108,7 +108,9 @@ another page only when the decision still lacks relevant evidence. Counts and
 exact-duplicate Finding also returns a bounded `planning` object with at most
 five owned canonical candidates and the semantic `finding_library_changes`
 request shape; the complete placement set remains CLI-owned rather than
-Agent-copied. An escaping-link Finding returns observed targets and a required
+Agent-copied. A large default-Roster Finding similarly returns a bounded
+per-Agent selection preview and the semantic `finding_roster_changes` shape;
+complete placement and Roster changes remain CLI-owned. An escaping-link Finding returns observed targets and a required
 trust decision instead of a Plan suggestion.
 
 Human Finding output shows the issue, severity, affected counts, bounded paths,

@@ -424,10 +424,16 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
     }
 
-    if value["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots") {
+    let trust_resolution =
+        if value["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots") {
+            &value["resolution"]
+        } else {
+            &value["planning"]
+        };
+    if trust_resolution["decision"].as_str() == Some("confirm_trusted_source_roots") {
         lines.push(String::new());
         lines.push("  Observed link targets".into());
-        if let Some(targets) = value["resolution"]["observed_link_targets"].as_array() {
+        if let Some(targets) = trust_resolution["observed_link_targets"].as_array() {
             for target in targets.iter().filter_map(Value::as_str).take(5) {
                 lines.push(format!(
                     "  {}",
@@ -438,6 +444,21 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         lines.extend(summary(
             "Blocked · no automatic change is supported",
             "Confirm trusted source directories before rescanning",
+        ));
+    } else if value["planning"]["decision"].as_str() == Some("resolve_source_dependency") {
+        lines.push(String::new());
+        lines.push("  Dependent source link targets".into());
+        if let Some(targets) = value["planning"]["dependent_link_targets"].as_array() {
+            for target in targets.iter().filter_map(Value::as_str).take(5) {
+                lines.push(format!(
+                    "  {}",
+                    middle_truncate(target, width.saturating_sub(2))
+                ));
+            }
+        }
+        lines.extend(summary(
+            "Blocked · no automatic change is supported",
+            "Move or retarget the dependent source link before rescanning",
         ));
     } else {
         lines.extend(summary(
@@ -659,9 +680,16 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
         lines,
         "Blocked preconditions",
         value
-            .get("blocked_preconditions")
-            .and_then(Value::as_array)
-            .map_or_else(|| "none".into(), |items| items.len().to_string()),
+            .pointer("/impact/blocked_precondition_count")
+            .and_then(Value::as_u64)
+            .map(|count| count.to_string())
+            .or_else(|| {
+                value
+                    .get("blocked_preconditions")
+                    .and_then(Value::as_array)
+                    .map(|items| items.len().to_string())
+            })
+            .unwrap_or_else(|| "none".into()),
     );
     fact(lines, "State", text(value, "state"));
     lines.extend(summary(
@@ -1050,7 +1078,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "bootstrap_version": "1.4.0",
+                "bootstrap_version": "1.5.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -1072,7 +1100,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "bootstrap_version": "1.4.0",
+                "bootstrap_version": "1.5.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,

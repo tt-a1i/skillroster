@@ -828,7 +828,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.4.0"
+        "1.5.0"
     );
 
     let undone = json_output(&run(
@@ -858,7 +858,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     )
     .unwrap();
     fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
-    let legacy = include_str!("fixtures/bootstrap-v1.3.0.md");
+    let legacy = include_str!("fixtures/bootstrap-v1.4.0.md");
     fs::write(&bootstrap, legacy).unwrap();
     let common = [
         "--home",
@@ -880,7 +880,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     );
     assert_eq!(
         upgrade["result"]["targets"][0]["installed_version"],
-        "1.3.0"
+        "1.4.0"
     );
     assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
 
@@ -918,7 +918,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.4.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.5.0");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -1969,6 +1969,294 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
         stale_detail["result"]["planning"]["reason"],
         "stale_finding"
     );
+    assert!(
+        stale_detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let outside = temp.path().join("unconfirmed-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("SKILL.md"),
+        "---\nname: external\n---\nfixture\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("zzz-external")).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["kind"], "large_default_roster");
+    assert_eq!(detail["result"]["files_changed"], false);
+    assert_eq!(detail["result"]["planning"]["supported"], false);
+    assert_eq!(
+        detail["result"]["planning"]["reason"],
+        "trusted_canonical_sources_required"
+    );
+    assert_eq!(detail["result"]["planning"]["blocked_change_count"], 1);
+    assert_eq!(
+        detail["result"]["planning"]["observed_link_targets"],
+        json!([outside])
+    );
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("confirm the reported source roots")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let canonical = root.join("zzz-canonical");
+    let source_root = temp.path().join("sources");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::create_dir_all(&source_root).unwrap();
+    fs::write(
+        canonical.join("SKILL.md"),
+        "---\nname: zzz-canonical\n---\nfixture\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&canonical, source_root.join("dependent-source")).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source_root.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], false);
+    assert_eq!(planning["reason"], "source_dependency_blocks_roster_change");
+    assert_eq!(planning["decision"], "resolve_source_dependency");
+    assert_eq!(planning["blocked_change_count"], 1);
+    assert_eq!(
+        planning["blocked_changes"][0]["reason"],
+        "non_agent_source_link_depends_on_removal"
+    );
+    assert_eq!(planning["dependent_link_targets"], json!([canonical]));
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("source link depends on a placement scheduled for removal")
+    );
+}
+
+#[test]
+fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    for index in 0..61 {
+        let name = if index == 0 {
+            "skillroster".to_owned()
+        } else {
+            format!("skill-{index:03}")
+        };
+        let directory = root.join(&name);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], true);
+    assert_eq!(planning["request_field"], "finding_roster_changes");
+    assert_eq!(
+        planning["absence_of_usage_evidence"],
+        "not_negative_evidence"
+    );
+    assert_eq!(planning["explicit_only_or_archive_decision_implied"], false);
+    assert_eq!(planning["agents"][0]["before_default_exposure"], 61);
+    assert_eq!(planning["agents"][0]["proposed_core_count"], 50);
+    assert_eq!(planning["agents"][0]["proposed_on_demand_count"], 11);
+    assert!(
+        planning["agents"][0]["core_preview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "skillroster" && item["reason"] == "skillroster_bootstrap")
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 10,
+            "protected_skill_ids": []
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    assert_eq!(plan["result"]["findings"]["ids"], json!([finding_id]));
+    assert_eq!(plan["result"]["change_summary"]["roster_change_count"], 61);
+    assert_eq!(plan["result"]["affected"]["placement_count"], 61);
+    assert_eq!(plan["result"]["impact"]["before_default_exposure"], 61);
+    assert_eq!(plan["result"]["impact"]["after_default_exposure"], 10);
+    assert_eq!(plan["result"]["canonical_deletion_count"], 0);
+
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 10);
+    assert_eq!(fs::read_dir(state.join("library")).unwrap().count(), 51);
+
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
+    assert!(!state.join("library").exists());
 }
 
 #[test]

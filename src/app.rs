@@ -1103,6 +1103,13 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         let mut details = stored.details.clone();
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
+            object.entry("kind").or_insert_with(|| {
+                json!(crate::roster_recommendation::finding_kind(
+                    &stored.category,
+                    &stored.title
+                ))
+            });
+            object.insert("files_changed".into(), json!(false));
             let report = store
                 .get_report(&stored.report_id)?
                 .ok_or_else(|| anyhow!("Report {} does not exist", stored.report_id))?;
@@ -1115,6 +1122,10 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 .id;
             if let Some(planning) =
                 finding_library_planning(&stored, &report.scan_id, &latest_scan_id, &scan)
+            {
+                object.insert("planning".into(), planning);
+            } else if let Some(planning) =
+                finding_roster_planning(store, &stored, &report.scan_id, &latest_scan_id, &scan)?
             {
                 object.insert("planning".into(), planning);
             }
@@ -1455,8 +1466,9 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
         } => {
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
+            let planning_blocked = result["planning"]["supported"].as_bool() == Some(false);
             let mut actions = Vec::new();
-            if !requires_trust_decision {
+            if !requires_trust_decision && !planning_blocked {
                 actions.push(action(
                     "plan",
                     &["plan", "--stdin", "--json"],
@@ -1566,6 +1578,193 @@ fn finding_library_planning(
             }]
         }
     }))
+}
+
+fn finding_roster_planning(
+    store: &StateStore,
+    finding: &FindingRecord,
+    scan_id: &ScanId,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<Option<Value>> {
+    if !crate::roster_recommendation::is_large_roster_finding(finding) {
+        return Ok(None);
+    }
+    if scan_id != latest_scan_id {
+        return Ok(Some(json!({
+            "supported": false,
+            "reason": "stale_finding",
+            "snapshot_id": scan_id,
+            "latest_snapshot_id": latest_scan_id
+        })));
+    }
+    let recommendation = match crate::roster_recommendation::recommend(
+        finding,
+        scan,
+        &declared_core_pairs(store, scan)?,
+        &crate::roster_recommendation::RecommendationRequest {
+            core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
+            protected_skill_ids: BTreeSet::new(),
+        },
+    ) {
+        Ok(recommendation) => recommendation,
+        Err(error) => {
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": "automatic_roster_selection_unavailable",
+                "detail": error.to_string(),
+                "snapshot_id": scan_id
+            })));
+        }
+    };
+    let supported =
+        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
+    let agents = recommendation
+        .agents
+        .iter()
+        .map(|agent| {
+            let unchanged_blocked_count = supported
+                .exclusions
+                .iter()
+                .filter(|exclusion| exclusion.agent == agent.agent.id())
+                .count();
+            let preview = agent
+                .core_selections
+                .iter()
+                .take(5)
+                .map(|selection| {
+                    json!({
+                        "skill_id": selection.skill_id,
+                        "name": selection.name,
+                        "reason": selection.reason
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "agent": agent.agent.id(),
+                "before_default_exposure": agent.before_default_exposure,
+                "unique_skill_count": agent.unique_skill_count,
+                "proposed_core_count": agent.core_count,
+                "proposed_on_demand_count": agent.on_demand_count.saturating_sub(unchanged_blocked_count),
+                "unchanged_blocked_count": unchanged_blocked_count,
+                "positive_signal_count": agent.positive_signal_count,
+                "fallback_core_count": agent.fallback_core_count,
+                "core_preview": preview,
+                "core_preview_truncated": agent.core_selections.len() > 5
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked_change_count = supported.exclusions.len();
+    let blocked_changes = supported
+        .exclusions
+        .iter()
+        .take(5)
+        .map(|exclusion| {
+            json!({
+                "agent": exclusion.agent,
+                "skill_id": exclusion.skill_id,
+                "reason": exclusion.reason,
+                "state": "unchanged"
+            })
+        })
+        .collect::<Vec<_>>();
+    if blocked_change_count > 0 {
+        let source_dependency = supported
+            .exclusions
+            .iter()
+            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal");
+        let blocked_skill_ids = supported
+            .exclusions
+            .iter()
+            .map(|exclusion| exclusion.skill_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let observed_link_targets = scan
+            .placements
+            .iter()
+            .filter(|placement| blocked_skill_ids.contains(placement.skill_id.as_str()))
+            .filter_map(|placement| placement.link_target.as_ref())
+            .map(|path| path.display().to_string())
+            .collect::<BTreeSet<_>>();
+        if source_dependency {
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": "source_dependency_blocks_roster_change",
+                "decision": "resolve_source_dependency",
+                "automatic_change_supported": false,
+                "snapshot_id": scan_id,
+                "request_field": "finding_roster_changes",
+                "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "absence_of_usage_evidence": "not_negative_evidence",
+                "explicit_only_or_archive_decision_implied": false,
+                "agent_count": agents.len(),
+                "agents": agents,
+                "blocked_change_count": blocked_change_count,
+                "blocked_changes": blocked_changes,
+                "blocked_changes_truncated": blocked_change_count > 5,
+                "dependent_link_targets": observed_link_targets,
+                "after_resolution": {
+                    "next": "move or retarget the dependent source link, then rescan and reopen the new large-Roster Finding"
+                }
+            })));
+        }
+        return Ok(Some(json!({
+            "supported": false,
+            "reason": "trusted_canonical_sources_required",
+            "decision": "confirm_trusted_source_roots",
+            "automatic_change_supported": false,
+            "snapshot_id": scan_id,
+            "request_field": "finding_roster_changes",
+            "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+            "absence_of_usage_evidence": "not_negative_evidence",
+            "explicit_only_or_archive_decision_implied": false,
+            "agent_count": agents.len(),
+            "agents": agents,
+            "blocked_change_count": blocked_change_count,
+            "blocked_changes": blocked_changes,
+            "blocked_changes_truncated": blocked_change_count > 5,
+            "observed_link_targets": observed_link_targets,
+            "after_confirmation": {
+                "repeatable_option": "--source-root",
+                "value": "absolute canonical source directory",
+                "next": "rescan and reopen the new large-Roster Finding"
+            }
+        })));
+    }
+    Ok(Some(json!({
+        "supported": true,
+        "decision": "right_size_default_rosters",
+        "snapshot_id": scan_id,
+        "request_field": "finding_roster_changes",
+        "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+        "allowed_core_budget": {
+            "minimum": 1,
+            "maximum": crate::roster_recommendation::MAX_CORE_BUDGET,
+            "unit": "skills_per_affected_agent"
+        },
+        "selection_policy": [
+            "protected_by_request",
+            "declared_core",
+            "skillroster_bootstrap",
+            "positive_usage_evidence",
+            "stable_fallback"
+        ],
+        "absence_of_usage_evidence": "not_negative_evidence",
+        "automatic_target_states": ["core", "on_demand"],
+        "explicit_only_or_archive_decision_implied": false,
+        "blocked_change_count": blocked_change_count,
+        "blocked_changes": blocked_changes,
+        "blocked_changes_truncated": blocked_change_count > 5,
+        "agent_count": agents.len(),
+        "agents": agents,
+        "plan_request_template": {
+            "schema_version": 1,
+            "finding_roster_changes": [{
+                "finding_id": finding.id,
+                "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "protected_skill_ids": []
+            }]
+        }
+    })))
 }
 
 fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
@@ -1688,6 +1887,10 @@ fn finding_json(
 ) -> Value {
     json!({
         "id": id,
+        "kind": crate::roster_recommendation::finding_kind(
+            &finding_category(finding.category),
+            &finding.title
+        ),
         "category": finding.category,
         "severity": finding.severity,
         "title": finding.title,
@@ -1697,7 +1900,8 @@ fn finding_json(
         "affected_skill_ids": finding.affected_skill_ids,
         "affected_placement_ids": finding.affected_placement_ids,
         "impact": finding_impact(finding),
-        "coverage": finding_coverage(finding, scan)
+        "coverage": finding_coverage(finding, scan),
+        "files_changed": false
     })
 }
 
@@ -2028,17 +2232,33 @@ fn affected_summary(prepared: &PreparedPlan, scan: &ScanResult) -> Value {
                 .map(|change| change.skill_id.clone()),
         )
         .collect::<std::collections::BTreeSet<_>>();
-    let placements = prepared
-        .library_changes
+    let roster_pairs = prepared
+        .roster_changes
         .iter()
-        .flat_map(|change| change.placement_ids.iter().cloned())
-        .chain(
-            prepared
-                .source_updates
-                .iter()
-                .map(|change| change.placement_id.clone()),
-        )
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|change| (change.agent.as_str(), change.skill_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut placements = scan
+        .placements
+        .iter()
+        .filter(|placement| {
+            placement.agent.is_some_and(|agent| {
+                roster_pairs.contains(&(agent.id(), placement.skill_id.as_str()))
+            })
+        })
+        .map(|placement| placement.id.clone())
+        .collect::<BTreeSet<_>>();
+    placements.extend(
+        prepared
+            .library_changes
+            .iter()
+            .flat_map(|change| change.placement_ids.iter().cloned())
+            .chain(
+                prepared
+                    .source_updates
+                    .iter()
+                    .map(|change| change.placement_id.clone()),
+            ),
+    );
     for placement in &scan.placements {
         if placements.contains(&placement.id) {
             if let Some(agent) = placement.agent {
@@ -2078,6 +2298,15 @@ fn state_counts(values: &[Value], key: &str) -> Value {
     json!(counts)
 }
 
+fn transition_change_count(before: &[Value], after: &[Value], after_state_key: &str) -> usize {
+    before
+        .iter()
+        .zip(after)
+        .filter(|(before, after)| before.get("state") != after.get(after_state_key))
+        .count()
+        + before.len().abs_diff(after.len())
+}
+
 fn bound_transition(value: &mut Value, after_state_key: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -2090,7 +2319,10 @@ fn bound_transition(value: &mut Value, after_state_key: &str) {
         .remove("after")
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
-    object.insert("change_count".into(), json!(after.len()));
+    object.insert(
+        "change_count".into(),
+        json!(transition_change_count(&before, &after, after_state_key)),
+    );
     object.insert("before_state_counts".into(), state_counts(&before, "state"));
     object.insert(
         "after_state_counts".into(),
@@ -2128,6 +2360,20 @@ fn bounded_plan_impact(mut impact: Value) -> Value {
             json!(exclusions.iter().take(5).collect::<Vec<_>>()),
         );
         object.insert("exclusions_truncated".into(), json!(exclusions.len() > 5));
+    }
+    if let Some(blocked) = object
+        .remove("blocked_preconditions")
+        .and_then(|value| value.as_array().cloned())
+    {
+        object.insert("blocked_precondition_count".into(), json!(blocked.len()));
+        object.insert(
+            "blocked_preconditions".into(),
+            json!(blocked.iter().take(5).collect::<Vec<_>>()),
+        );
+        object.insert(
+            "blocked_preconditions_truncated".into(),
+            json!(blocked.len() > 5),
+        );
     }
     if let Some(roster) = object.get_mut("roster") {
         bound_transition(roster, "state");
@@ -2194,9 +2440,141 @@ struct FindingLibraryChangeRequest {
     requested_state: RequestedGovernanceState,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingRosterChangeRequest {
+    finding_id: String,
+    core_budget: usize,
+    #[serde(default)]
+    protected_skill_ids: Vec<String>,
+}
+
 struct FindingPlanProvenance {
     report_id: ReportId,
     finding_ids: Vec<FindingId>,
+}
+
+fn declared_core_pairs(
+    store: &StateStore,
+    scan: &ScanResult,
+) -> Result<BTreeSet<(AgentKind, String)>> {
+    let mut pairs = BTreeSet::new();
+    let unique = scan
+        .placements
+        .iter()
+        .filter_map(|placement| {
+            placement
+                .agent
+                .map(|agent| (agent, placement.skill_id.as_str()))
+        })
+        .collect::<BTreeSet<_>>();
+    for (agent, skill_id) in unique {
+        let Some(agent_id) = store.agent_id(&model_agent(agent))? else {
+            continue;
+        };
+        let skill_id = SkillId::parse(skill_id.to_owned())?;
+        if store
+            .roster_entry(&agent_id, &skill_id)?
+            .is_some_and(|entry| entry.state == RosterState::Core)
+        {
+            pairs.insert((agent, skill_id.as_str().to_owned()));
+        }
+    }
+    Ok(pairs)
+}
+
+fn expand_finding_roster_changes(
+    store: &StateStore,
+    mut input: Value,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<(Value, Option<FindingPlanProvenance>)> {
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Plan input must be a JSON object"))?;
+    let raw = object
+        .remove("finding_roster_changes")
+        .unwrap_or_else(|| json!([]));
+    let requests: Vec<FindingRosterChangeRequest> = serde_json::from_value(raw)?;
+    if requests.is_empty() {
+        return Ok((input, None));
+    }
+    if requests.len() != 1 {
+        bail!("one finding_roster_changes request is allowed per Plan");
+    }
+    if [
+        "scan_id",
+        "evidence_ids",
+        "roster_changes",
+        "source_updates",
+        "library_changes",
+        "finding_library_changes",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        bail!(
+            "finding_roster_changes cannot be mixed with CLI-derived IDs or other governance changes"
+        );
+    }
+    let request = requests.into_iter().next().expect("length checked");
+    let protected_skill_ids = request
+        .protected_skill_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if protected_skill_ids.len() != request.protected_skill_ids.len() {
+        bail!("finding_roster_changes contains duplicate protected Skill IDs");
+    }
+    let finding_id = FindingId::parse(request.finding_id)?;
+    let finding = store
+        .get_finding(&finding_id)?
+        .ok_or_else(|| anyhow!("Finding {finding_id} does not exist"))?;
+    let report = store
+        .get_report(&finding.report_id)?
+        .ok_or_else(|| anyhow!("Report {} does not exist", finding.report_id))?;
+    if report.scan_id != *latest_scan_id {
+        bail!("Finding {finding_id} does not belong to the latest Snapshot {latest_scan_id}");
+    }
+    let recommendation = crate::roster_recommendation::recommend(
+        &finding,
+        scan,
+        &declared_core_pairs(store, scan)?,
+        &crate::roster_recommendation::RecommendationRequest {
+            core_budget: request.core_budget,
+            protected_skill_ids,
+        },
+    )?;
+    let supported =
+        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
+    if !supported.exclusions.is_empty() {
+        if supported
+            .exclusions
+            .iter()
+            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal")
+        {
+            bail!(
+                "Finding {finding_id} is blocked because a non-Agent source link depends on a placement scheduled for removal; resolve the reported source dependency, rescan, and use the new Finding"
+            );
+        }
+        bail!(
+            "Finding {finding_id} is blocked by {} Roster changes without owned exact content; confirm the reported source roots, rescan, and use the new Finding",
+            supported.exclusions.len()
+        );
+    }
+    if finding.evidence_ids.is_empty() {
+        bail!("Finding {finding_id} has no Evidence");
+    }
+    input["scan_id"] = json!(latest_scan_id);
+    input["evidence_ids"] = json!(finding.evidence_ids);
+    input["roster_changes"] = serde_json::to_value(supported.changes)?;
+    Ok((
+        input,
+        Some(FindingPlanProvenance {
+            report_id: finding.report_id,
+            finding_ids: vec![finding_id],
+        }),
+    ))
 }
 
 fn exact_duplicate_finding_scope(
@@ -2288,6 +2666,7 @@ fn expand_finding_library_changes(
         "roster_changes",
         "source_updates",
         "library_changes",
+        "finding_roster_changes",
     ]
     .iter()
     .any(|key| object.contains_key(*key))
@@ -2872,7 +3251,11 @@ fn prepare_plan(
     }
     let (scan_id, scan) = latest_scan(store)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
-        expand_finding_library_changes(store, input, &scan_id, &scan)?
+        let (input, roster_provenance) =
+            expand_finding_roster_changes(store, input, &scan_id, &scan)?;
+        let (input, library_provenance) =
+            expand_finding_library_changes(store, input, &scan_id, &scan)?;
+        (input, roster_provenance.or(library_provenance))
     } else {
         (input, None)
     };
@@ -2934,22 +3317,28 @@ fn prepare_plan(
     validate_plan_evidence(store, &prepared, &scan_id)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     let library_before = capture_library_state(store, &prepared)?;
+    let roster_after = serde_json::to_value(&prepared.roster_changes)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let library_after = serde_json::to_value(&prepared.library_changes)?
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let effective_roster_change_count =
+        transition_change_count(&roster_before, &roster_after, "state");
+    let effective_library_change_count =
+        transition_change_count(&library_before, &library_after, "requested_state");
     if matches!(effective_origin, PlanOrigin::Agent)
         && prepared.source_updates.is_empty()
-        && roster_before
-            .iter()
-            .zip(&prepared.roster_changes)
-            .all(|(before, change)| {
-                before["state"]
-                    == serde_json::to_value(roster_state(&change.state).ok()).unwrap_or(Value::Null)
-            })
+        && effective_roster_change_count == 0
     {
         bail!("Plan has no effective Roster state change");
     }
     let change_summary = json!({
         "operation_count": prepared.operations.len(),
-        "roster_change_count": prepared.roster_changes.len(),
-        "library_change_count": prepared.library_changes.len(),
+        "roster_change_count": effective_roster_change_count,
+        "library_change_count": effective_library_change_count,
         "source_update_count": prepared.source_updates.len()
     });
     let mut impact = if matches!(effective_origin, PlanOrigin::RosterGovernance) {
@@ -3258,6 +3647,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.3.0",
         "0fe2e7b8aed1f6db1c57a3d5b6efc247b795e1af01d5422b9168e707bc8c7b47",
+    ),
+    (
+        "1.4.0",
+        "2161ba4834fb350afee75fd6ab90ecff49741c971bb2d670b8d3c9f6588f9b70",
     ),
 ];
 
@@ -4344,13 +4737,13 @@ mod recovery_tests {
             BootstrapContentStatus::Modified
         );
         let windows_legacy =
-            include_str!("../tests/fixtures/bootstrap-v1.3.0.md").replace('\n', "\r\n");
+            include_str!("../tests/fixtures/bootstrap-v1.4.0.md").replace('\n', "\r\n");
         assert_eq!(
             bootstrap_content_status(
                 &bootstrap_content_digest(windows_legacy.as_bytes()),
                 &current
             ),
-            BootstrapContentStatus::OfficialOutdated("1.3.0")
+            BootstrapContentStatus::OfficialOutdated("1.4.0")
         );
     }
 
@@ -4599,6 +4992,22 @@ mod recovery_tests {
         assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true).is_err());
         let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transition_counts_only_effective_state_changes() {
+        let before = vec![
+            json!({"state": "core"}),
+            json!({"state": "on_demand"}),
+            json!({"state": Value::Null}),
+        ];
+        let after = vec![
+            json!({"state": "core"}),
+            json!({"state": "core"}),
+            json!({"state": "on_demand"}),
+        ];
+
+        assert_eq!(transition_change_count(&before, &after, "state"), 2);
     }
 }
 

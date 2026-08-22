@@ -2,7 +2,7 @@
 name: skillroster
 description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
 metadata:
-  bootstrap-version: "1.5.0"
+  bootstrap-version: "1.4.0"
 ---
 
 # SkillRoster
@@ -13,19 +13,18 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 
 1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis.
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused. When the three-item summary is insufficient, use `report --findings --limit 20 --json`; narrow it with one `--category` or `--severity` from the summary totals, and follow `page.next_offset` only while that category still affects the decision. This paged list is the enumeration path; keep the exhaustive report out of the Agent context.
-3. Use stable Finding and Evidence IDs for follow-up questions. The summary and paged list expose one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Its compact `items` combine the Evidence ID, subject, path, quality, and decision facts without repeating complete internal collections. Use `--full` only when an exact complete ID or record is needed. Exact-duplicate and large-Roster details include bounded `planning` choices independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
-4. Make semantic governance choices in the conversation, then submit them to `skillroster plan --stdin --json`. For exact duplicates or a large default Roster, send `schema_version` plus the corresponding Finding request below; SkillRoster derives the current Snapshot, Evidence, Skills, placements, and complete changes. Other request families include the latest `scan_id` and relevant `evidence_ids`.
+3. Use stable Finding and Evidence IDs for follow-up questions. The summary and paged list expose one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Its compact `items` combine the Evidence ID, subject, path, and decision facts without repeating complete internal collections. Use `--full` only when an exact complete ID or record is needed. Exact-duplicate detail includes a bounded `planning.canonical_candidates` list independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
+4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. For an exact-duplicate Finding, send `schema_version` plus `finding_library_changes`; SkillRoster derives the current Snapshot, Evidence, Skill, and complete placement set. For other request families, include the latest `scan_id` and relevant `evidence_ids`.
 5. Present the validated summary Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `operation_groups`, bounded `affected` facts, `impact` before/after facts, uncertainty, canonical deletion count, reversibility, and Plan ID. The full immutable representation stays in local state; use `skillroster plan --show PLAN_ID --json` only when an exact operation, path, or complete ID list is needed to answer the user. Do not load it by default.
 
 Use only these Plan request families:
 
-- `finding_roster_changes` (preferred for `Large default Rosters need review`): `finding_id`, a per-Agent `core_budget` from 1 through 50, and optional `protected_skill_ids`. Review `planning.agents`, especially positive-signal and fallback counts, before choosing the budget. SkillRoster preserves requested, declared, and bootstrap Core Skills, ranks positive usage evidence, and uses stable ordering only as a fallback. Remaining affected Skills become On-demand; this request never implies Explicit-only or Archived. If `planning.supported` is false, follow its typed `decision`: confirm reported source roots or resolve dependent source links, then rescan. Do not submit a partial Plan.
 - `finding_library_changes` (preferred for exact duplicates): `finding_id`, a `canonical_placement_id` chosen from `planning.canonical_candidates`, and `requested_state` (`managed` or `hosted`). Do not copy paged placement or Evidence IDs into this request.
-- `roster_changes`: the advanced raw form with `agent`, `skill_id`, and `state` (`core`, `on_demand`, `explicit_only`, or `archived`). Use it for deliberate exceptions or when no supported Finding can bind the complete scope.
+- `roster_changes`: `agent`, `skill_id`, and `state` (`core`, `on_demand`, `explicit_only`, or `archived`).
 - `library_changes`: the advanced raw form with `skill_id`, `canonical_placement_id`, the complete `placement_ids` set, and `requested_state`. Use it only when there is no exact-duplicate Finding to bind.
 - `source_updates`: the latest Skill/placement/source/revision/fingerprint facts plus upstream content and SHA-256 digest. If local content changed, include the user's explicit `choice`: `retain_local`, `adopt_upstream`, or `preserve_both`.
 
-Keep Roster, source-update, and Library changes in separate Plans. Semantic Finding requests derive their Evidence internally. For raw requests, cite Evidence returned by the relevant Finding page; a convenient but unrelated Evidence ID is not support for a governance change. Treat a rejected stale Snapshot, Evidence ID, fingerprint, incomplete scope, or source revision as a reason to rescan or ask the user—not as permission to weaken the request.
+Keep source updates and Library changes in separate Plans. Cite Evidence returned by the relevant Finding page; a convenient but unrelated Evidence ID is not support for a governance change. Treat a rejected stale Snapshot, Evidence ID, fingerprint, incomplete placement set, or source revision as a reason to rescan or ask the user—not as permission to weaken the request.
 
 State explicitly that inspection and planning changed no Agent files. When evidence cannot justify a change, recommend keeping the current state.
 
