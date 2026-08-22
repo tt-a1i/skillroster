@@ -233,13 +233,8 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
         .find(|matched| matched["name"] == "humanizer-zh")
         .expect("the task-only native match must survive hint fusion");
     assert!(native["rank"].as_u64().unwrap() <= 3);
-    assert!(
-        native["match_reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|reason| reason.as_str().unwrap().starts_with("task_channel_rank:"))
-    );
+    assert!(native["task_channel_rank"].as_u64().unwrap() <= 3);
+    assert!(native["augmented_channel_rank"].is_number());
     assert_eq!(
         hinted["result"]["ranking_strategy"],
         "task_hint_reciprocal_rank_fusion"
