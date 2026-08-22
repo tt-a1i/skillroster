@@ -327,13 +327,13 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
             lines.push("  No matching Skills found.".into());
         }
     }
-    if let Some(warnings) = value.get("warnings").and_then(Value::as_array)
-        && !warnings.is_empty()
-    {
-        lines.push(String::new());
-        lines.push("  Retrieval notes".into());
-        for warning in warnings.iter().filter_map(Value::as_str).take(3) {
-            lines.push(format!("  - {warning}"));
+    if let Some(warnings) = value.get("warnings").and_then(Value::as_array) {
+        if !warnings.is_empty() {
+            lines.push(String::new());
+            lines.push("  Retrieval notes".into());
+            for warning in warnings.iter().filter_map(Value::as_str).take(3) {
+                lines.push(format!("  - {warning}"));
+            }
         }
     }
     lines.extend(summary(
