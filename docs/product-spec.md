@@ -125,22 +125,26 @@ All JSON responses use a versioned envelope:
 }
 ```
 
-IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is concise and intended for debugging; Agents consume JSON rather than scraping styled text.
+IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
 
 ## 6. Agent presentation contract
 
-The bootstrap Skill instructs an Agent to present:
+The normative conversation flow, one-confirmation Apply behavior, state-dependent primary action, and bootstrap Skill rules live in [agent-experience-spec.md](agent-experience-spec.md).
+
+The bootstrap Skill instructs an Agent to prepare a complete read-only Plan when Evidence is sufficient, then present:
 
 1. a one-sentence diagnosis;
 2. independent Skill count, placement count, default exposure, and observed-use count;
 3. the three most important Findings, then the remaining Findings grouped by category;
 4. prioritized recommendations with expected measurable impact;
 5. uncertainties, evidence quality, and safety risks;
-6. exact next actions and whether confirmation is required.
+6. one primary next action and whether confirmation is required.
 
 The wording and layout may adapt to the host Agent, language, and conversation. The facts, IDs, Evidence, and confirmation boundary may not be omitted. No HTML report or GUI is generated. Users can ask follow-ups such as “show the 27 duplicates” or “why is this a duplicate”; the Agent resolves them against the same report ID with `report --finding` rather than silently rescanning.
 
-Every summary states whether files were changed. An applied summary also includes the Plan ID, changed-path count, verification status, and Receipt ID. SkillRoster does not invent an aggregate health score or unsupported token/performance savings.
+Every summary states whether files were changed. An applied summary also includes the Plan ID, changed-path count, verification status, and Receipt ID. A Ready Plan is presented with one conversational Apply action; after the user confirms once, the Agent executes the whole approved scope without per-operation prompts. SkillRoster does not invent an aggregate health score or unsupported token/performance savings.
+
+The human terminal surface uses concise headers, aligned facts, semantic color, TTY-only progress, strong final summaries, and explicit confirmation. It supports `NO_COLOR`, non-TTY/plain output, narrow terminals, and Unicode fallback. It is not a full-screen TUI and never changes the Agent JSON contract.
 
 ## 7. Local data and privacy
 
@@ -165,7 +169,7 @@ The complete first release deliberately contains:
 - eight direct Agent adapters;
 - core-logic and high-risk mutation tests.
 
-It does not contain HTML reports, a GUI, MCP, cloud services, accounts, telemetry, a daemon, a plugin SDK, generic Agent adapters, a workflow engine, a second Agent, or built-in model calls. Ponytail is a development experiment only and creates no product dependency or product-specific behavior.
+It does not contain HTML reports, a GUI, an interactive or full-screen TUI, MCP, cloud services, accounts, telemetry, a daemon, a plugin SDK, generic Agent adapters, a workflow engine, a second Agent, or built-in model calls. Ponytail is a development experiment only and creates no product dependency or product-specific behavior.
 
 An abstraction requires at least two real consumers. Otherwise, prefer direct code.
 
