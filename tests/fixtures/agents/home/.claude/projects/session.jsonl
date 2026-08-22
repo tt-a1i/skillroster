@@ -1,0 +1,5 @@
+{"type":"match_skill","matched_skill":"claude-code-fixture"}
+{"type":"read_file","skill_name":"claude-code-fixture","path":"/fixture/claude-code-fixture/SKILL.md"}
+{"type":"invoke_skill","invoked_skill":"claude-code-fixture"}
+{"type":"skill_outcome","outcome_skill":"claude-code-fixture","success":true}
+{"type":"assistant","text":"claude-code-fixture appeared in prose only"}

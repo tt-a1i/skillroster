@@ -1,0 +1,5 @@
+{"event":"match_skill","matched_skill":"pi-fixture"}
+{"event":"read","skill_name":"pi-fixture","path":"/fixture/pi-fixture/SKILL.md"}
+{"event":"invoke_skill","invoked_skill":"pi-fixture"}
+{"event":"skill_outcome","outcome_skill":"pi-fixture","success":true}
+{"event":"message","text":"pi-fixture appeared in prose only"}

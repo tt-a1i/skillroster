@@ -1,0 +1,5 @@
+{"type":"match_skill","matched_skill":"codex-fixture"}
+{"type":"read_file","skill_name":"codex-fixture","path":"/fixture/codex-fixture/SKILL.md"}
+{"type":"invoke_skill","invoked_skill":"codex-fixture"}
+{"type":"skill_outcome","outcome_skill":"codex-fixture","success":true}
+{"type":"tool_result","text":"codex-fixture appeared in prose only"}

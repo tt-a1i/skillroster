@@ -1,0 +1,5 @@
+{"tool_name":"match_skill","matched_skill":"github-copilot-fixture"}
+{"tool_name":"read_file","skill_name":"github-copilot-fixture","path":"/fixture/github-copilot-fixture/SKILL.md"}
+{"tool_name":"invoke_skill","invoked_skill":"github-copilot-fixture"}
+{"tool_name":"skill_outcome","outcome_skill":"github-copilot-fixture","success":true}
+{"tool_name":"message","text":"github-copilot-fixture appeared in prose only"}

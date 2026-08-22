@@ -1,0 +1,5 @@
+{"tool_name":"match_skill","matched_skill":"hermes-fixture"}
+{"tool_name":"read_file","skill_name":"hermes-fixture","path":"/fixture/hermes-fixture/SKILL.md"}
+{"tool_name":"invoke_skill","invoked_skill":"hermes-fixture"}
+{"tool_name":"skill_outcome","outcome_skill":"hermes-fixture","success":true}
+{"tool_name":"message","text":"hermes-fixture appeared in prose only"}

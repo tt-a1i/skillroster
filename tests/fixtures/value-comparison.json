@@ -1,0 +1,9 @@
+{
+  "inventory": {"independent_skills": 120, "placements": 240, "exact_duplicate_placements": 80},
+  "approaches": [
+    {"name": "unmanaged", "default_exposure": 120, "remaining_duplicates": 80, "reversible_receipts": false, "task_successes": 40},
+    {"name": "careful_manual", "default_exposure": 54, "remaining_duplicates": 10, "reversible_receipts": false, "task_successes": 40},
+    {"name": "skillroster", "default_exposure": 36, "remaining_duplicates": 0, "reversible_receipts": true, "task_successes": 40}
+  ],
+  "notes": "Synthetic fixed comparison. It demonstrates the acceptance calculation, not measured human time or production performance."
+}
