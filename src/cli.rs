@@ -75,24 +75,80 @@ pub enum Command {
 
 #[derive(Debug, Args)]
 pub struct ReportArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["findings", "summary"])]
     pub finding: Option<String>,
+
+    /// List compact Finding summaries with pagination and optional filters.
+    #[arg(long, conflicts_with_all = ["finding", "summary", "full"])]
+    pub findings: bool,
 
     /// Show complete IDs, placement records, and Evidence records for one Finding.
     #[arg(long, requires = "finding")]
     pub full: bool,
 
     /// Return core metrics and the three highest-priority Findings.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["finding", "findings", "full"])]
     pub summary: bool,
 
-    /// Maximum Finding detail rows returned per collection.
+    /// Filter a paged Finding list to one category.
+    #[arg(long, value_enum, requires = "findings")]
+    pub category: Option<ReportCategory>,
+
+    /// Filter a paged Finding list to one severity.
+    #[arg(long, value_enum, requires = "findings")]
+    pub severity: Option<ReportSeverity>,
+
+    /// Maximum Finding summaries or detail rows returned.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
     pub limit: u16,
 
-    /// Zero-based offset for Finding detail pagination.
+    /// Zero-based offset for Finding list or detail pagination.
     #[arg(long, default_value_t = 0)]
     pub offset: u32,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ReportCategory {
+    Inventory,
+    Layout,
+    Exposure,
+    Usage,
+    Overlap,
+    Routing,
+    Lifecycle,
+}
+
+impl ReportCategory {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::Layout => "layout",
+            Self::Exposure => "exposure",
+            Self::Usage => "usage",
+            Self::Overlap => "overlap",
+            Self::Routing => "routing",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ReportSeverity {
+    Info,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReportSeverity {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Args)]

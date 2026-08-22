@@ -247,6 +247,10 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
         finding_report(value, lines, width);
         return;
     }
+    if value.get("view").and_then(Value::as_str) == Some("findings") {
+        finding_list(value, lines, width);
+        return;
+    }
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Default exposure", text(value, "default_exposure"));
@@ -285,6 +289,69 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Read-only · no Agent files changed",
         "Review evidence before planning changes",
     ));
+}
+
+fn finding_list(value: &Value, lines: &mut Vec<String>, width: usize) {
+    let offset = value["page"]["offset"].as_u64().unwrap_or_default();
+    let returned = value["page"]["returned"].as_u64().unwrap_or_default();
+    let total = value["page"]["total"].as_u64().unwrap_or_default();
+    let range = if returned == 0 {
+        format!("0 of {total} matching")
+    } else {
+        format!("{}–{} of {total} matching", offset + 1, offset + returned)
+    };
+    fact(lines, "Finding page", range);
+    fact(lines, "All Findings", text(value, "finding_count"));
+    let category = value["filters"]["category"].as_str();
+    let severity = value["filters"]["severity"].as_str();
+    if category.is_some() || severity.is_some() {
+        fact(
+            lines,
+            "Filters",
+            format!(
+                "category {} · severity {}",
+                category.unwrap_or("any"),
+                severity.unwrap_or("any")
+            ),
+        );
+    }
+    lines.push(String::new());
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        for (index, finding) in items.iter().enumerate() {
+            let prefix = format!(
+                "  {:>3}. {:<6} {:<10} ",
+                offset as usize + index + 1,
+                text(finding, "severity"),
+                text(finding, "category")
+            );
+            lines.push(format!(
+                "{prefix}{}",
+                middle_truncate(
+                    &text(finding, "title"),
+                    width.saturating_sub(display_width(&prefix))
+                )
+            ));
+            let detail_prefix = "       ";
+            let detail = format!(
+                "{} · {} Skills · {} placements",
+                text(finding, "id"),
+                text(finding, "affected_skill_count"),
+                text(finding, "affected_placement_count")
+            );
+            lines.push(format!(
+                "{detail_prefix}{}",
+                middle_truncate(&detail, width.saturating_sub(display_width(detail_prefix)))
+            ));
+        }
+        if items.is_empty() {
+            lines.push("  none".into());
+        }
+    }
+    let next = value["page"]["next_offset"].as_u64().map_or_else(
+        || "End of matching Findings".into(),
+        |next| format!("Continue with --offset {next}"),
+    );
+    lines.extend(summary("Read-only · no Agent files changed", &next));
 }
 
 fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
@@ -983,7 +1050,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "bootstrap_version": "1.3.0",
+                "bootstrap_version": "1.4.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -1005,7 +1072,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "bootstrap_version": "1.3.0",
+                "bootstrap_version": "1.4.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -1144,6 +1211,52 @@ mod tests {
             assert!(output.contains("Observed link targets"));
             assert!(output.contains("no automatic change is supported"));
             assert!(!output.contains("Independent Skills     none"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_list_keeps_page_filters_ids_and_width_visible() {
+        let value = json!({
+            "view": "findings",
+            "finding_count": 189,
+            "filters": {"category": "overlap", "severity": "medium"},
+            "page": {"offset": 20, "returned": 2, "total": 150, "next_offset": 22},
+            "items": [
+                {
+                    "id": "finding_00000000000000000000000000000001",
+                    "title": "Exact duplicate Skill placements with an intentionally long title",
+                    "severity": "medium",
+                    "category": "overlap",
+                    "affected_skill_count": 1,
+                    "affected_placement_count": 6
+                },
+                {
+                    "id": "finding_00000000000000000000000000000002",
+                    "title": "Semantic overlap candidate",
+                    "severity": "medium",
+                    "category": "overlap",
+                    "affected_skill_count": 2,
+                    "affected_placement_count": 8
+                }
+            ]
+        });
+        for width in [60, 80, 120] {
+            let output = render(
+                "report",
+                &value,
+                RenderOptions {
+                    width,
+                    styled: false,
+                },
+            );
+            assert!(output.contains("21–22 of 150 matching"));
+            assert!(output.contains("category overlap · severity medium"));
+            assert!(output.contains("Exact dupl"));
+            assert!(output.contains("Continue with --offset 22"));
             assert!(
                 output.lines().all(|line| display_width(line) <= width),
                 "line exceeded {width} columns:\n{output}"

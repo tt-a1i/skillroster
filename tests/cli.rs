@@ -201,6 +201,142 @@ fn finding_drilldown_is_bounded_and_pageable() {
 }
 
 #[test]
+fn finding_list_is_paged_filterable_and_leads_to_evidence() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    for index in 0..30 {
+        let content = format!(
+            "---\nname: duplicate-{index:02}\ndescription: Dedicated duplicate task {index}\n---\n"
+        );
+        for root in [".codex/skills", ".claude/skills"] {
+            let directory = home.join(root).join(format!("duplicate-{index:02}"));
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("SKILL.md"), &content).unwrap();
+        }
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let summary = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert_eq!(summary["suggested_actions"][0]["action"], "list_findings");
+    assert_eq!(
+        summary["suggested_actions"][0]["argv"],
+        json!([
+            "skillroster",
+            "report",
+            "--findings",
+            "--limit",
+            "20",
+            "--offset",
+            "0",
+            "--json"
+        ])
+    );
+
+    let first_output = run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--findings",
+                "--category",
+                "overlap",
+                "--severity",
+                "medium",
+                "--limit",
+                "10",
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(first_output.stdout.len() < 20_000);
+    let first = json_output(&first_output);
+    assert_eq!(first["result"]["view"], "findings");
+    assert_eq!(first["result"]["matched_finding_count"], 30);
+    assert_eq!(first["result"]["page"]["returned"], 10);
+    assert_eq!(first["result"]["page"]["next_offset"], 10);
+    assert_eq!(first["result"]["items"].as_array().unwrap().len(), 10);
+    assert!(
+        first["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding["category"] == "overlap"
+                && finding["severity"] == "medium"
+                && finding.get("evidence_ids").is_none())
+    );
+    assert_eq!(
+        first["suggested_actions"][0]["argv"],
+        json!([
+            "skillroster",
+            "report",
+            "--findings",
+            "--category",
+            "overlap",
+            "--severity",
+            "medium",
+            "--limit",
+            "10",
+            "--offset",
+            "10",
+            "--json"
+        ])
+    );
+
+    let second = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--findings",
+                "--category",
+                "overlap",
+                "--severity",
+                "medium",
+                "--limit",
+                "10",
+                "--offset",
+                "10",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_ne!(
+        first["result"]["items"][0]["id"],
+        second["result"]["items"][0]["id"]
+    );
+
+    let finding_id = first["result"]["items"][0]["id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert!(!detail["result"]["items"].as_array().unwrap().is_empty());
+
+    for invalid in [
+        vec!["report", "--category", "overlap"],
+        vec!["report", "--summary", "--findings"],
+    ] {
+        let output = run(&[&common[..], &invalid].concat(), None);
+        assert!(!output.status.success());
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output["error"]["code"], "invalid_cli_arguments");
+    }
+}
+
+#[test]
 fn public_cli_scans_reports_plans_applies_and_undoes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -692,7 +828,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.3.0"
+        "1.4.0"
     );
 
     let undone = json_output(&run(
@@ -722,7 +858,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     )
     .unwrap();
     fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
-    let legacy = include_str!("fixtures/bootstrap-v1.2.0.md");
+    let legacy = include_str!("fixtures/bootstrap-v1.3.0.md");
     fs::write(&bootstrap, legacy).unwrap();
     let common = [
         "--home",
@@ -744,7 +880,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     );
     assert_eq!(
         upgrade["result"]["targets"][0]["installed_version"],
-        "1.2.0"
+        "1.3.0"
     );
     assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
 
@@ -782,7 +918,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.3.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.4.0");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],

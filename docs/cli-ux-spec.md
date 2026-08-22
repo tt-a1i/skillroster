@@ -91,8 +91,12 @@ Lead with four counts: independent Skills, placements, default exposure, and obs
 
 Agent callers use `report --summary --json` by default. The compact payload
 contains those four metrics, total Finding count, category totals, and at most
-three complete Finding summaries. Full `report --json` is an explicit
-exhaustive view, not the bootstrap workflow default.
+three complete Finding summaries. When the Agent needs another category or an
+exhaustive selection surface, it uses `report --findings --json`, optionally
+filtered by one `--category` and one `--severity`. That mode returns compact
+Finding summaries plus `page.next_offset`; it never suggests planning before a
+Finding is selected. Full `report --json` remains an explicit diagnostic export,
+not the bootstrap workflow default.
 
 `report --finding ID --json` returns at most 20 compact Evidence items. Each
 item combines its stable Evidence ID, subject, path, quality, and decision facts
@@ -110,6 +114,10 @@ trust decision instead of a Plan suggestion.
 Human Finding output shows the issue, severity, affected counts, bounded paths,
 and any required trust decision. It must not render a Finding as an empty
 aggregate report.
+
+Human `report --findings` output shows the matching range, active filters,
+stable IDs, impact counts, and next offset. Every line remains bounded at 60,
+80, and 120 columns.
 
 ### `find`
 

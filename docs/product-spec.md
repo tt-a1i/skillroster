@@ -99,7 +99,7 @@ The first complete command surface is:
 
 ```bash
 skillroster scan [--json]
-skillroster report [--finding <id>] [--full] [--json]
+skillroster report [--summary | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find <task> [--hint <text>]... [--json]
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]

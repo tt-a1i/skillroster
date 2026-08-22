@@ -127,10 +127,28 @@ exposures, and 189 Findings. It changed no Agent files. On that same Snapshot:
 - plain 60-, 80-, and 120-column Finding views preserve the issue, counts,
   Evidence paths, and next decision without exceeding the requested width.
 
+## Agent-led Finding enumeration evidence
+
+The 1.4 discovery run started with the public 1.3.0 macOS arm64 binary and a
+fresh isolated state directory. Its read-only Scan found the same 180 Skills,
+676 placements, 548 default exposures, and 189 Findings in 9.41 seconds, with
+no Agent-file changes. The Agent then measured a 3,179-byte three-Finding
+summary against a 645,511-byte exhaustive report and confirmed there was no
+bounded enumeration path.
+
+On the same immutable Snapshot, the new paged interface returned 20 complete
+Finding summaries in 15,590 bytes. A `usage` category filter selected exactly
+two Findings; combined `overlap` and `medium` filters selected 125. The summary
+now suggests `list_findings`, a partial page preserves its filters in
+`list_more_findings`, and the exhaustive diagnostic export suggests no generic
+Plan. Selected IDs still lead to compact Evidence drilldown. Automated tests
+cover pagination, filtering, action argv, invalid flag combinations, and plain
+60-, 80-, and 120-column rendering.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
 not claim model quality, token or labor savings, production performance, or
 access to arbitrary future Agent log formats. Final support additionally
- requires the official release tag workflow, published artifact checksums, and
+requires the official release tag workflow, published artifact checksums, and
 the installation checks recorded in the Release notes.

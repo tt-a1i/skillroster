@@ -2,7 +2,7 @@
 name: skillroster
 description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
 metadata:
-  bootstrap-version: "1.2.0"
+  bootstrap-version: "1.3.0"
 ---
 
 # SkillRoster
@@ -13,7 +13,7 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 
 1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis; do not request the full report unless exhaustive Finding enumeration is necessary.
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused.
-3. Use stable Finding and Evidence IDs for follow-up questions. The summary exposes one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Exact-duplicate detail includes a bounded `planning.canonical_candidates` list independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
+3. Use stable Finding and Evidence IDs for follow-up questions. The summary exposes one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Its compact `items` combine the Evidence ID, subject, path, and decision facts without repeating complete internal collections. Use `--full` only when an exact complete ID or record is needed. Exact-duplicate detail includes a bounded `planning.canonical_candidates` list independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
 4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. For an exact-duplicate Finding, send `schema_version` plus `finding_library_changes`; SkillRoster derives the current Snapshot, Evidence, Skill, and complete placement set. For other request families, include the latest `scan_id` and relevant `evidence_ids`.
 5. Present the validated summary Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `operation_groups`, bounded `affected` facts, `impact` before/after facts, uncertainty, canonical deletion count, reversibility, and Plan ID. The full immutable representation stays in local state; use `skillroster plan --show PLAN_ID --json` only when an exact operation, path, or complete ID list is needed to answer the user. Do not load it by default.
 
@@ -28,13 +28,14 @@ Keep source updates and Library changes in separate Plans. Cite Evidence returne
 
 State explicitly that inspection and planning changed no Agent files. When evidence cannot justify a change, recommend keeping the current state.
 
-For `Skill links escape an approved root`, load one Finding page and show the
-link targets. Treat each target as unread until the user confirms that its
-source directory is intentional and trusted. After confirmation, rescan with
-one repeatable `--source-root ABSOLUTE_PATH` per canonical source directory;
-this approves reading without adding Agent exposure. Then prefer a reviewed
-Hosted or Managed Library Plan so future Scans no longer depend on the
-temporary source-root arguments. Keep unconfirmed targets unread.
+For `Skill links escape an approved root`, load one compact Finding page and
+show `resolution.observed_link_targets`. Treat each target as unread until the
+user confirms that its canonical source directory is intentional and trusted.
+Do not follow a generic Plan action for this Finding. After confirmation,
+rescan with one repeatable `--source-root ABSOLUTE_PATH` per canonical source
+directory; this approves reading without adding Agent exposure. Then prefer a
+reviewed Hosted or Managed Library Plan so future Scans no longer depend on
+the temporary source-root arguments. Keep unconfirmed targets unread.
 
 ## Apply or undo
 
