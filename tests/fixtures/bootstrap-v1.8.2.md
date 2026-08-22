@@ -2,7 +2,7 @@
 name: skillroster
 description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
 metadata:
-  bootstrap-version: "1.8.3"
+  bootstrap-version: "1.8.2"
 ---
 
 # SkillRoster

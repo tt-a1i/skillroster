@@ -3867,6 +3867,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.1",
         "996891144bca51a654fc51294cd6d63c41df4afb5796af7846480b168f69edc6",
     ),
+    (
+        "1.8.2",
+        "d79be31fe878267d00f21cf8e198443ebf8b95eb6631fc2395f132f12289e3e5",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3938,6 +3942,7 @@ fn setup_command(
             "modified_count": 0,
             "unsupported_count": 0,
             "replace_count": 0,
+            "physical_target_count": 0,
             "canonical_deletion_count": 0,
             "files_changed": false,
             "next": "skillroster scan --json"
@@ -3955,10 +3960,19 @@ fn setup_command(
     let mut modified_count = 0_usize;
     let mut unsupported_count = 0_usize;
     let mut replace_count = 0_usize;
+    let mut physical_targets = BTreeSet::new();
+    let mut planned_directories = BTreeSet::new();
+    let mut planned_entrypoints = BTreeSet::new();
     for roots in harness::known_agent_roots(home) {
         for root in roots.skill_roots.into_iter().filter(|path| path.is_dir()) {
             let directory = root.join("skillroster");
             let entrypoint = directory.join("SKILL.md");
+            let physical_root = std::fs::canonicalize(&root).with_context(|| {
+                format!("failed to resolve Agent Skill root {}", root.display())
+            })?;
+            let physical_directory = physical_root.join("skillroster");
+            let physical_entrypoint = physical_directory.join("SKILL.md");
+            physical_targets.insert(physical_entrypoint.clone());
             detected.push(json!({"agent": roots.agent.id(), "target": entrypoint}));
             let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
@@ -3983,12 +3997,14 @@ fn setup_command(
                             BootstrapContentStatus::OfficialOutdated(_) => {
                                 outdated_count += 1;
                                 replace_count += 1;
-                                operations.push(json!({
-                                    "kind": "replace_file",
-                                    "target": entrypoint,
-                                    "content": &current_content,
-                                    "expected_fingerprint": change::fingerprint(&entrypoint)?
-                                }));
+                                if planned_entrypoints.insert(physical_entrypoint.clone()) {
+                                    operations.push(json!({
+                                        "kind": "replace_file",
+                                        "target": entrypoint,
+                                        "content": &current_content,
+                                        "expected_fingerprint": change::fingerprint(&entrypoint)?
+                                    }));
+                                }
                             }
                             BootstrapContentStatus::Modified => {
                                 modified_count += 1;
@@ -3997,12 +4013,14 @@ fn setup_command(
                                     Some(ModifiedBootstrapChoice::AdoptCurrent)
                                 ) {
                                     replace_count += 1;
-                                    operations.push(json!({
-                                        "kind": "replace_file",
-                                        "target": entrypoint,
-                                        "content": &current_content,
-                                        "expected_fingerprint": change::fingerprint(&entrypoint)?
-                                    }));
+                                    if planned_entrypoints.insert(physical_entrypoint.clone()) {
+                                        operations.push(json!({
+                                            "kind": "replace_file",
+                                            "target": entrypoint,
+                                            "content": &current_content,
+                                            "expected_fingerprint": change::fingerprint(&entrypoint)?
+                                        }));
+                                    }
                                 }
                             }
                         }
@@ -4018,19 +4036,22 @@ fn setup_command(
                         && !directory_is_unsupported =>
                 {
                     missing_count += 1;
-                    if !directory.exists() {
+                    if !directory.exists() && planned_directories.insert(physical_directory.clone())
+                    {
                         operations.push(json!({
                             "kind": "create_directory",
                             "target": directory,
                             "expected_fingerprint": "missing"
                         }));
                     }
-                    operations.push(json!({
-                        "kind": "write_file",
-                        "target": entrypoint,
-                        "content": &current_content,
-                        "expected_fingerprint": "missing"
-                    }));
+                    if planned_entrypoints.insert(physical_entrypoint.clone()) {
+                        operations.push(json!({
+                            "kind": "write_file",
+                            "target": entrypoint,
+                            "content": &current_content,
+                            "expected_fingerprint": "missing"
+                        }));
+                    }
                     ("missing", None)
                 }
                 Err(_) => {
@@ -4041,6 +4062,7 @@ fn setup_command(
             targets.push(json!({
                 "agent": roots.agent.id(),
                 "target": entrypoint,
+                "physical_target": physical_entrypoint,
                 "status": status,
                 "installed_version": installed_version
             }));
@@ -4057,6 +4079,7 @@ fn setup_command(
         "modified_count": modified_count,
         "unsupported_count": unsupported_count,
         "replace_count": replace_count,
+        "physical_target_count": physical_targets.len(),
         "canonical_deletion_count": 0,
         "files_changed": false
     });
