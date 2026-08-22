@@ -93,8 +93,12 @@ pub fn run(cli: Cli) -> Result<Output> {
             ("status", result, vec![], actions)
         }
         Some(Command::Scan) => {
-            let (result, warnings) =
-                scan_command(&store, &home, parse_explicit_roots(&cli.roots)?)?;
+            let (result, warnings) = scan_command(
+                &store,
+                &home,
+                parse_explicit_roots(&cli.roots)?,
+                parse_source_roots(&cli.source_roots)?,
+            )?;
             (
                 "scan",
                 result,
@@ -110,7 +114,13 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
         Some(Command::Report(args)) => (
             "report",
-            report_command(&store, args.finding.as_deref(), args.summary)?,
+            report_command(
+                &store,
+                args.finding.as_deref(),
+                args.summary,
+                usize::from(args.limit),
+                usize::try_from(args.offset)?,
+            )?,
             vec![],
             vec![action(
                 "plan",
@@ -493,6 +503,18 @@ fn parse_explicit_roots(values: &[String]) -> Result<Vec<ExplicitSkillRoot>> {
             Ok(ExplicitSkillRoot { agent, path })
         })
         .collect()
+}
+
+fn parse_source_roots(values: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut roots = values.to_vec();
+    for path in &roots {
+        if !path.is_absolute() {
+            bail!("source root must be absolute: {}", path.display());
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
 }
 
 fn parse_agent_kind(value: &str) -> Result<AgentKind> {
@@ -907,6 +929,7 @@ fn scan_command(
     store: &StateStore,
     home: &Path,
     explicit: Vec<ExplicitSkillRoot>,
+    source_roots: Vec<PathBuf>,
 ) -> Result<(Value, Vec<String>)> {
     let started = Utc::now().timestamp();
     let id = ScanId::new();
@@ -919,6 +942,7 @@ fn scan_command(
     })?;
     let mut options = ScanOptions::for_home(home);
     options.explicit_skill_roots = explicit;
+    options.explicit_source_roots = source_roots;
     options.excluded_session_agents = store
         .evidence_exclusions()?
         .iter()
@@ -971,6 +995,7 @@ fn scan_command(
         .filter_map(|root| root.agent)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let warnings = compact_scan_warnings(result.warnings);
     Ok((
         json!({
             "snapshot_id": id,
@@ -981,11 +1006,33 @@ fn scan_command(
             "coverage": result.coverage,
             "files_changed": false
         }),
-        result.warnings,
+        warnings,
     ))
 }
 
-fn report_command(store: &StateStore, finding: Option<&str>, summary_only: bool) -> Result<Value> {
+fn compact_scan_warnings(warnings: Vec<String>) -> Vec<String> {
+    let (unsafe_links, mut remaining): (Vec<_>, Vec<_>) = warnings
+        .into_iter()
+        .partition(|warning| warning.starts_with("did not read unsafe Skill link "));
+    if !unsafe_links.is_empty() {
+        remaining.insert(
+            0,
+            format!(
+                "{} unsafe Skill links were not read; inspect the layout Finding for paths and link targets",
+                unsafe_links.len()
+            ),
+        );
+    }
+    remaining
+}
+
+fn report_command(
+    store: &StateStore,
+    finding: Option<&str>,
+    summary_only: bool,
+    detail_limit: usize,
+    detail_offset: usize,
+) -> Result<Value> {
     if let Some(id) = finding {
         let id = FindingId::parse(id.to_string())?;
         let stored = store
@@ -994,23 +1041,47 @@ fn report_command(store: &StateStore, finding: Option<&str>, summary_only: bool)
         let mut details = stored.details;
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
-            object.insert("evidence_ids".into(), json!(stored.evidence_ids));
             let report = store
                 .get_report(&stored.report_id)?
                 .ok_or_else(|| anyhow!("Report {} does not exist", stored.report_id))?;
             let scan: ScanResult = store
                 .scan_payload(&report.scan_id)?
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            let affected_skill_ids = object
+                .get("affected_skill_ids")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let affected_placement_ids = object
                 .get("affected_placement_ids")
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let placements = scan
+            let end = detail_offset.saturating_add(detail_limit);
+            let paged_skill_ids = affected_skill_ids
+                .iter()
+                .skip(detail_offset)
+                .take(detail_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            let paged_placement_ids = affected_placement_ids
+                .iter()
+                .skip(detail_offset)
+                .take(detail_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            let paged_evidence_ids = stored
+                .evidence_ids
+                .iter()
+                .skip(detail_offset)
+                .take(detail_limit)
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut placements = scan
                 .placements
                 .iter()
                 .filter(|placement| {
-                    affected_placement_ids
+                    paged_placement_ids
                         .iter()
                         .any(|id| id.as_str() == Some(&placement.id))
                 })
@@ -1028,16 +1099,47 @@ fn report_command(store: &StateStore, finding: Option<&str>, summary_only: bool)
                     })
                 })
                 .collect::<Vec<_>>();
-            let evidence = stored
-                .evidence_ids
+            placements.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+            let evidence = paged_evidence_ids
                 .iter()
                 .map(|id| store.get_evidence(id))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
+            let total = affected_skill_ids
+                .len()
+                .max(affected_placement_ids.len())
+                .max(stored.evidence_ids.len());
+            let next_offset = (end < total).then_some(end);
+            object.insert("affected_skill_ids".into(), json!(paged_skill_ids));
+            object.insert("affected_placement_ids".into(), json!(paged_placement_ids));
+            object.insert("evidence_ids".into(), json!(paged_evidence_ids));
+            object.insert(
+                "primary_evidence_id".into(),
+                json!(stored.evidence_ids.first()),
+            );
             object.insert("placements".into(), json!(placements));
             object.insert("evidence".into(), json!(evidence));
+            object.insert(
+                "page".into(),
+                json!({
+                    "offset": detail_offset,
+                    "limit": detail_limit,
+                    "next_offset": next_offset,
+                    "has_more": next_offset.is_some(),
+                    "totals": {
+                        "affected_skills": affected_skill_ids.len(),
+                        "affected_placements": affected_placement_ids.len(),
+                        "evidence": stored.evidence_ids.len()
+                    },
+                    "returned": {
+                        "affected_skills": object["affected_skill_ids"].as_array().map_or(0, Vec::len),
+                        "affected_placements": object["affected_placement_ids"].as_array().map_or(0, Vec::len),
+                        "evidence": object["evidence_ids"].as_array().map_or(0, Vec::len)
+                    }
+                }),
+            );
         }
         return Ok(details);
     }
@@ -1140,6 +1242,25 @@ fn report_command(store: &StateStore, finding: Option<&str>, summary_only: bool)
 
 fn compact_report(report: &Value) -> Value {
     let findings = report["findings"].as_array().cloned().unwrap_or_default();
+    let compact_findings = findings
+        .iter()
+        .take(3)
+        .map(|finding| {
+            json!({
+                "id": finding["id"],
+                "category": finding["category"],
+                "severity": finding["severity"],
+                "title": finding["title"],
+                "summary": finding["summary"],
+                "evidence_quality": finding["evidence_quality"],
+                "primary_evidence_id": finding["evidence_ids"].as_array().and_then(|ids| ids.first()),
+                "affected_skill_count": finding["affected_skill_count"],
+                "affected_placement_count": finding["affected_placement_count"],
+                "impact": finding["impact"],
+                "coverage": finding["coverage"]
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
         "report_id": report["report_id"],
         "snapshot_id": report["snapshot_id"],
@@ -1150,7 +1271,7 @@ fn compact_report(report: &Value) -> Value {
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
-        "findings": findings.into_iter().take(3).collect::<Vec<_>>(),
+        "findings": compact_findings,
         "category_counts": report["category_counts"],
         "files_changed": false
     })
@@ -3128,6 +3249,35 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn scan_warnings_group_repeated_unsafe_links_for_agent_callers() {
+        let warnings = vec![
+            "did not read unsafe Skill link /one/SKILL.md".into(),
+            "did not read unsafe Skill link /two/SKILL.md".into(),
+            "did not read unsafe Skill link /three/SKILL.md".into(),
+            "session evidence was truncated".into(),
+        ];
+
+        let compact = compact_scan_warnings(warnings);
+
+        assert_eq!(compact.len(), 2);
+        assert_eq!(
+            compact[0],
+            "3 unsafe Skill links were not read; inspect the layout Finding for paths and link targets"
+        );
+        assert_eq!(compact[1], "session evidence was truncated");
+    }
+
+    #[test]
+    fn source_roots_must_be_absolute_and_are_deduplicated() {
+        assert!(parse_source_roots(&[PathBuf::from("relative")]).is_err());
+        let absolute = std::env::current_dir().unwrap().join("source");
+        assert_eq!(
+            parse_source_roots(&[absolute.clone(), absolute.clone()]).unwrap(),
+            vec![absolute]
+        );
+    }
 
     #[test]
     fn readable_skill_path_ignores_stale_alternatives_when_a_valid_copy_exists() {

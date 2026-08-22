@@ -52,6 +52,85 @@ fn assert_find_paths_are_readable(found: &Value) {
 }
 
 #[test]
+fn finding_drilldown_is_bounded_and_pageable() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for index in 0..51 {
+        let directory = skill_root.join(format!("skill-{index:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: skill-{index:02}\ndescription: Dedicated task number {index}\n---\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["category"] == "exposure")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let first_output = run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    );
+    assert!(first_output.stdout.len() < 40_000);
+    let first = json_output(&first_output);
+    assert_eq!(first["result"]["page"]["offset"], 0);
+    assert_eq!(first["result"]["page"]["limit"], 20);
+    assert_eq!(first["result"]["page"]["next_offset"], 20);
+    assert_eq!(first["result"]["placements"].as_array().unwrap().len(), 20);
+    assert_eq!(
+        first["result"]["affected_placement_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+
+    let second = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--offset",
+                "20",
+                "--limit",
+                "20",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(second["result"]["page"]["offset"], 20);
+    assert_ne!(
+        first["result"]["affected_placement_ids"][0],
+        second["result"]["affected_placement_ids"][0]
+    );
+}
+
+#[test]
 fn public_cli_scans_reports_plans_applies_and_undoes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -136,6 +215,14 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
             <= 3
     );
     assert!(summary_report_output_len < report_output_len);
+    for finding in summary_report["result"]["findings"].as_array().unwrap() {
+        assert!(finding.get("affected_skill_ids").is_none());
+        assert!(finding.get("affected_placement_ids").is_none());
+        assert!(finding.get("evidence_ids").is_none());
+        assert!(finding.get("primary_evidence_id").is_some());
+        assert!(finding["affected_skill_count"].is_number());
+        assert!(finding["affected_placement_count"].is_number());
+    }
     let finding_id = report["result"]["findings"]
         .as_array()
         .unwrap()

@@ -28,7 +28,7 @@ The first complete release directly supports:
 
 Supported platforms are macOS, Linux, and Windows. WSL is treated as Linux. A platform or Agent is not declared supported until its adapter passes fixtures and a real-environment acceptance run.
 
-SkillRoster scans only known directories for these eight Agents plus paths explicitly provided by the user. It never crawls the entire home directory by default. Every Scan reports included, excluded, missing, and inaccessible roots.
+SkillRoster scans only known directories for these eight Agents plus paths explicitly provided by the user. It never crawls the entire home directory by default. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the supplied path.
 
 ## 3. Primary interaction
 

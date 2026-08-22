@@ -94,6 +94,12 @@ contains those four metrics, total Finding count, category totals, and at most
 three complete Finding summaries. Full `report --json` is an explicit
 exhaustive view, not the bootstrap workflow default.
 
+`report --finding ID --json` returns at most 20 affected IDs, placements, and
+Evidence records per collection. Its `page.next_offset` is the only pagination
+cursor; callers request another page only when the decision still lacks
+relevant evidence. Counts and `primary_evidence_id` remain available in the
+compact first view.
+
 ### `find`
 
 Show ranked matches with Skill name, current Roster state, source, and concise match reasons. Empty results are calm, successful output. Find never implies activation.
