@@ -638,16 +638,21 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
 
     // Semantic similarity is deliberately candidate evidence only. It never
     // authorizes consolidation, deletion, or an automatic Plan.
+    let vocabularies = scan
+        .skills
+        .iter()
+        .map(|skill| tokens(&skill_search_text(skill)))
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for (index, left) in scan.skills.iter().enumerate() {
-        for right in scan.skills.iter().skip(index + 1) {
+        let left_tokens = &vocabularies[index];
+        for (right_index, right) in scan.skills.iter().enumerate().skip(index + 1) {
             if left.content_digest == right.content_digest {
                 continue;
             }
-            let left_tokens = tokens(&skill_search_text(left));
-            let right_tokens = tokens(&skill_search_text(right));
-            let intersection = left_tokens.intersection(&right_tokens).count();
-            let union = left_tokens.union(&right_tokens).count();
+            let right_tokens = &vocabularies[right_index];
+            let intersection = left_tokens.intersection(right_tokens).count();
+            let union = left_tokens.union(right_tokens).count();
             if intersection < 3 || union == 0 {
                 continue;
             }
@@ -1502,6 +1507,47 @@ mod tests {
         assert!(finding.summary.contains("review-only candidate evidence"));
         assert!(finding.summary.contains("not a confirmed duplicate"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn semantic_overlap_analysis_stays_bounded_for_a_realistic_inventory() {
+        let (_, mut scan) = fixture();
+        let representative = scan.skills[0].clone();
+        let shared_body = std::iter::repeat_n(
+            "shared architecture workflow browser database agent skill governance local evidence",
+            500,
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+        scan.skills = (0..193)
+            .map(|index| {
+                let mut skill = representative.clone();
+                skill.id = format!("realistic-{index:03}");
+                skill.name = format!("realistic-{index:03}");
+                skill.content_digest = format!("digest-{index:03}");
+                skill.normalized_text = format!("{shared_body} unique-{index:03}");
+                skill
+            })
+            .collect();
+        scan.placements.clear();
+        scan.usage.clear();
+
+        let started = std::time::Instant::now();
+        let report = build_report(&scan);
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "semantic overlap analysis took {:?} for 193 Skills",
+            started.elapsed()
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.title == "Semantic overlap candidate")
+                .count(),
+            25
+        );
     }
 
     #[test]
