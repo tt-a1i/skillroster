@@ -94,6 +94,9 @@ fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
 }
 
 fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Option<SessionSignal> {
+    if let Some(signal) = structured_session_signal(value) {
+        return Some(signal);
+    }
     let object = value.as_object()?;
     let record_type = object.get("type").and_then(Value::as_str);
     let payload = object.get("payload").and_then(Value::as_object);
@@ -184,6 +187,110 @@ fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Optio
         Some(SessionSignal::Matched)
     } else {
         None
+    }
+}
+
+fn structured_session_signal(value: &Value) -> Option<SessionSignal> {
+    fn stronger(
+        left: Option<SessionSignal>,
+        right: Option<SessionSignal>,
+    ) -> Option<SessionSignal> {
+        let rank = |signal: SessionSignal| match signal {
+            SessionSignal::Matched => 0,
+            SessionSignal::Loaded => 1,
+            SessionSignal::Applied => 2,
+            SessionSignal::Outcome => 3,
+        };
+        match (left, right) {
+            (Some(left), Some(right)) if rank(left) >= rank(right) => Some(left),
+            (_, Some(right)) => Some(right),
+            (left, None) => left,
+        }
+    }
+
+    fn object_signal(object: &serde_json::Map<String, Value>) -> Option<SessionSignal> {
+        for (field, signal) in [
+            ("outcome_skill", SessionSignal::Outcome),
+            ("applied_skill", SessionSignal::Applied),
+            ("invoked_skill", SessionSignal::Applied),
+            ("loaded_skill", SessionSignal::Loaded),
+            ("selected_skill", SessionSignal::Matched),
+            ("matched_skill", SessionSignal::Matched),
+        ] {
+            if object.get(field).and_then(Value::as_str).is_some() {
+                return Some(signal);
+            }
+        }
+
+        let call_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase);
+        let direct_call = matches!(
+            call_type.as_deref(),
+            Some("tool_use" | "toolcall" | "custom_tool_call")
+        );
+        let function = object.get("function").and_then(Value::as_object);
+        let function_call = call_type.as_deref() == Some("function")
+            && function.is_some_and(|function| function.contains_key("arguments"));
+        if !direct_call && !function_call {
+            return None;
+        }
+        let name = if direct_call {
+            object.get("name").and_then(Value::as_str)
+        } else {
+            function
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+        }?
+        .to_ascii_lowercase();
+        let arguments = if direct_call {
+            object.get("input").or_else(|| object.get("arguments"))
+        } else {
+            function.and_then(|function| function.get("arguments"))
+        };
+        let serialized = arguments
+            .map(Value::to_string)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name == "skill"
+            && arguments
+                .and_then(Value::as_object)
+                .and_then(|arguments| arguments.get("skill"))
+                .and_then(Value::as_str)
+                .is_some_and(|skill| !skill.trim().is_empty())
+        {
+            return Some(SessionSignal::Applied);
+        }
+        if !serialized.contains("skill.md") {
+            return None;
+        }
+        if matches!(
+            name.as_str(),
+            "read" | "read_file" | "open" | "load" | "rg" | "grep"
+        ) {
+            return Some(SessionSignal::Loaded);
+        }
+        if matches!(name.as_str(), "bash" | "exec" | "shell" | "terminal")
+            && ["cat ", "sed ", "rg ", "grep ", "head ", "tail ", "less "]
+                .iter()
+                .any(|marker| serialized.contains(marker))
+        {
+            return Some(SessionSignal::Loaded);
+        }
+        None
+    }
+
+    match value {
+        Value::Object(object) => object
+            .values()
+            .fold(object_signal(object), |signal, child| {
+                stronger(signal, structured_session_signal(child))
+            }),
+        Value::Array(values) => values.iter().fold(None, |signal, child| {
+            stronger(signal, structured_session_signal(child))
+        }),
+        _ => None,
     }
 }
 
@@ -313,5 +420,88 @@ mod tests {
         })
         .to_string();
         assert_eq!(classify_session_record(AgentKind::Codex, &catalog), None);
+    }
+
+    #[test]
+    fn nested_agent_tool_calls_are_normalized_without_reading_message_prose() {
+        let claude = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Skill",
+                    "input": {"skill": "research", "args": ""}
+                }]
+            }
+        });
+        assert_eq!(
+            classify_session_record(AgentKind::ClaudeCode, &claude.to_string()),
+            Some(SessionSignal::Applied)
+        );
+
+        let pi = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "toolCall",
+                    "name": "read",
+                    "arguments": {"path": "/skills/research/SKILL.md"}
+                }]
+            }
+        });
+        assert_eq!(
+            classify_session_record(AgentKind::Pi, &pi.to_string()),
+            Some(SessionSignal::Loaded)
+        );
+
+        let cursor = serde_json::json!({
+            "role": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Read",
+                    "input": {"path": "/skills/review/SKILL.md"}
+                }]
+            }
+        });
+        assert_eq!(
+            classify_session_record(AgentKind::Cursor, &cursor.to_string()),
+            Some(SessionSignal::Loaded)
+        );
+
+        let hermes = serde_json::json!({
+            "request": {"body": {"messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"/skills/research/SKILL.md\"}"
+                    }
+                }]
+            }]}}
+        });
+        assert_eq!(
+            classify_session_record(AgentKind::Hermes, &hermes.to_string()),
+            Some(SessionSignal::Loaded)
+        );
+    }
+
+    #[test]
+    fn tool_declarations_and_skill_catalogs_are_not_usage_events() {
+        let declaration = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a SKILL.md file",
+                "parameters": {"type": "object"}
+            }
+        });
+        assert_eq!(
+            classify_session_record(AgentKind::Hermes, &declaration.to_string()),
+            None
+        );
     }
 }

@@ -1291,6 +1291,14 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
             })
         })
         .collect::<Vec<_>>();
+    let session_coverage = json!({
+        "supported_agents": AgentKind::ALL.len(),
+        "roots_present_agents": report.metrics.agents_with_session_roots,
+        "sampled_agents": report.metrics.agents_with_sampled_session_data,
+        "complete_agents": report.metrics.agents_with_reliable_session_denominator,
+        "limited_agents": report.metrics.agents_with_limited_session_data,
+        "missing_root_agents": report.metrics.agents_missing_session_roots
+    });
     let value = json!({
         "report_id": report_id,
         "snapshot_id": scan_id,
@@ -1299,6 +1307,11 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         "default_exposure": report.metrics.default_exposure,
         "observed_use_agent_count": report.metrics.agents_with_observed_usage,
         "coverage_reliable_agent_count": report.metrics.agents_with_reliable_session_denominator,
+        "coverage_sampled_agent_count": report.metrics.agents_with_sampled_session_data,
+        "coverage_root_agent_count": report.metrics.agents_with_session_roots,
+        "coverage_limited_agent_count": report.metrics.agents_with_limited_session_data,
+        "coverage_missing_agent_count": report.metrics.agents_missing_session_roots,
+        "session_coverage": session_coverage,
         "primary_metrics": {
             "independent_skills": {"value": report.metrics.independent_skills, "unit": "skills"},
             "placements": {"value": report.metrics.placements, "unit": "placements"},
@@ -1308,6 +1321,10 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 "unit": "agents",
                 "coverage": {
                     "reliable_agents": report.metrics.agents_with_reliable_session_denominator,
+                    "sampled_agents": report.metrics.agents_with_sampled_session_data,
+                    "roots_present_agents": report.metrics.agents_with_session_roots,
+                    "limited_agents": report.metrics.agents_with_limited_session_data,
+                    "missing_root_agents": report.metrics.agents_missing_session_roots,
                     "supported_agents": AgentKind::ALL.len()
                 }
             }
@@ -1851,6 +1868,11 @@ fn paged_finding_report(
         "default_exposure": report["default_exposure"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
+        "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
+        "coverage_root_agent_count": report["coverage_root_agent_count"],
+        "coverage_limited_agent_count": report["coverage_limited_agent_count"],
+        "coverage_missing_agent_count": report["coverage_missing_agent_count"],
+        "session_coverage": report["session_coverage"],
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
         "matched_finding_count": total,
@@ -1890,6 +1912,11 @@ fn compact_report(report: &Value) -> Value {
         "default_exposure": report["default_exposure"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
+        "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
+        "coverage_root_agent_count": report["coverage_root_agent_count"],
+        "coverage_limited_agent_count": report["coverage_limited_agent_count"],
+        "coverage_missing_agent_count": report["coverage_missing_agent_count"],
+        "session_coverage": report["session_coverage"],
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
         "findings": compact_findings,
@@ -3740,6 +3767,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.7.0",
         "8b503801efa6a5dd13c8767647654bb9fcd4dcfaf10cdbbb61429dfe29995129",
+    ),
+    (
+        "1.7.1",
+        "f742e5d1af14309e3fa7e95378a207fafed3d09e477b1df9c9e76d65e4eec304",
     ),
 ];
 

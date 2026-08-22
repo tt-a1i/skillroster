@@ -70,7 +70,7 @@ Ambiguous Skills remain separate. SkillRoster never merges based only on a match
 - **Routing:** default exposure, searchability, and missing task-to-Skill routes.
 - **Lifecycle:** update drift, stale sources, management state, and archive candidates.
 
-Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. A usage percentage is emitted only when the observable-session denominator is reliable; otherwise the report shows counts, time range, and coverage limits.
+Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large active files contribute bounded complete-line tails, and the fixed byte budget is spread across multiple recent sessions. Reports distinguish missing session roots, sampled-but-limited roots, and complete observable roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
 
 ### 4.3 Library and Rosters
 

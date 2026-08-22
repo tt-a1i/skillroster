@@ -422,6 +422,16 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(scan["ok"], true);
     assert_eq!(scan["result"]["skill_count"], 1);
     assert_eq!(scan["result"]["files_changed"], false);
+    let codex_coverage = scan["result"]["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|coverage| coverage["agent"] == "codex")
+        .unwrap();
+    assert_eq!(codex_coverage["files_discovered"], 1);
+    assert_eq!(codex_coverage["files_observed"], 1);
+    assert_eq!(codex_coverage["files_partially_observed"], 0);
+    assert_eq!(codex_coverage["denominator_reliable"], true);
     let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     for (table, minimum) in [
@@ -448,6 +458,23 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(report["ok"], true);
     assert!(report["result"]["findings"].is_array());
     assert!(report["result"]["primary_metrics"].is_object());
+    assert_eq!(report["result"]["observed_use_agent_count"], 1);
+    assert_eq!(report["result"]["coverage_root_agent_count"], 1);
+    assert_eq!(report["result"]["coverage_sampled_agent_count"], 1);
+    assert_eq!(report["result"]["coverage_reliable_agent_count"], 1);
+    assert_eq!(report["result"]["coverage_limited_agent_count"], 0);
+    assert_eq!(report["result"]["coverage_missing_agent_count"], 7);
+    assert_eq!(
+        report["result"]["session_coverage"],
+        json!({
+            "supported_agents": 8,
+            "roots_present_agents": 1,
+            "sampled_agents": 1,
+            "complete_agents": 1,
+            "limited_agents": 0,
+            "missing_root_agents": 7
+        })
+    );
     let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
     assert_eq!(
         repeated_report["result"]["report_id"],
@@ -468,6 +495,10 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
             <= 3
     );
     assert!(summary_report_output_len < report_output_len);
+    assert_eq!(
+        summary_report["result"]["session_coverage"],
+        report["result"]["session_coverage"]
+    );
     for finding in summary_report["result"]["findings"].as_array().unwrap() {
         assert!(finding.get("affected_skill_ids").is_none());
         assert!(finding.get("affected_placement_ids").is_none());
@@ -875,7 +906,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.7.1"
+        "1.8.0"
     );
 
     let undone = json_output(&run(
@@ -898,6 +929,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         ("1.5.1", include_str!("fixtures/bootstrap-v1.5.1.md")),
         ("1.6.0", include_str!("fixtures/bootstrap-v1.6.0.md")),
         ("1.7.0", include_str!("fixtures/bootstrap-v1.7.0.md")),
+        ("1.7.1", include_str!("fixtures/bootstrap-v1.7.1.md")),
     ] {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
@@ -972,7 +1004,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.7.1");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.0");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
