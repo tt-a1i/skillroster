@@ -636,16 +636,14 @@ fn usage_finding_overview(overview: &Value, lines: &mut Vec<String>, width: usiz
         for stage in stages {
             let label = title(&text(stage, "stage"));
             let last_seen = stage.get("last_seen_unix").and_then(Value::as_i64);
-            fact_items(
-                lines,
-                &label,
-                vec![
-                    format!("{} {}", text(stage, "count"), text(stage, "unit")),
-                    text(stage, "quality"),
-                    age(last_seen),
-                ],
-                width,
-            );
+            let mut facts = vec![
+                format!("{} {}", text(stage, "count"), text(stage, "unit")),
+                text(stage, "quality"),
+            ];
+            if last_seen.is_some() {
+                facts.push(age(last_seen));
+            }
+            fact_items(lines, &label, facts, width);
         }
     }
 
@@ -737,17 +735,33 @@ fn usage_finding_overview(overview: &Value, lines: &mut Vec<String>, width: usiz
         lines.push("  none beyond default exposure".into());
     } else {
         for signal in observed {
-            let detail = format!(
-                "{} · {} ×{}",
-                text(signal, "skill_name"),
+            let ambiguous_name = observed
+                .iter()
+                .filter(|candidate| {
+                    candidate["agent"] == signal["agent"]
+                        && candidate["skill_name"] == signal["skill_name"]
+                        && candidate["stage"] == signal["stage"]
+                })
+                .count()
+                > 1;
+            let mut suffix = format!(
+                " · {} ×{}",
                 text(signal, "stage"),
                 text(signal, "event_count")
             );
-            fact(
-                lines,
-                &text(signal, "agent"),
-                middle_truncate(&detail, width.saturating_sub(25)),
+            if ambiguous_name {
+                suffix.push_str(&format!(
+                    " · {}",
+                    take_width(&text(signal, "skill_id"), 12, false)
+                ));
+            }
+            let detail_budget = width.saturating_sub(25);
+            let skill_name = middle_truncate(
+                &text(signal, "skill_name"),
+                detail_budget.saturating_sub(display_width(&suffix)),
             );
+            let detail = format!("{skill_name}{suffix}");
+            fact(lines, &text(signal, "agent"), detail);
         }
         let total = overview["observed_signal_count"].as_u64().unwrap_or(0) as usize;
         if total > observed.len() {
@@ -1727,7 +1741,7 @@ mod tests {
             "detail": {"mode": "compact"},
             "usage_overview": {
                 "stages": [
-                    {"stage": "exposed", "count": 548, "unit": "placements", "quality": "observed", "last_seen_unix": 9},
+                    {"stage": "exposed", "count": 548, "unit": "placements", "quality": "observed", "last_seen_unix": null},
                     {"stage": "matched", "count": 3, "unit": "events", "quality": "observed", "last_seen_unix": 9},
                     {"stage": "loaded", "count": 51, "unit": "events", "quality": "observed", "last_seen_unix": 9},
                     {"stage": "applied", "count": 0, "unit": "events", "quality": "unknown", "last_seen_unix": null},
@@ -1751,10 +1765,11 @@ mod tests {
                     "discovery_truncated": false
                 },
                 "observed_skills": [
-                    {"agent": "cursor", "skill_name": "code-review", "stage": "loaded", "event_count": 1},
-                    {"agent": "claude-code", "skill_name": "computer-history", "stage": "matched", "event_count": 2}
+                    {"agent": "cursor", "skill_id": "skill_a111111111111", "skill_name": "code-review", "stage": "loaded", "event_count": 1},
+                    {"agent": "claude-code", "skill_id": "skill_history11111", "skill_name": "computer-history", "stage": "matched", "event_count": 2},
+                    {"agent": "cursor", "skill_id": "skill_b222222222222", "skill_name": "code-review", "stage": "loaded", "event_count": 3}
                 ],
-                "observed_signal_count": 7,
+                "observed_signal_count": 8,
                 "observed_skills_truncated": true
             },
             "items": [{
@@ -1786,8 +1801,9 @@ mod tests {
                 "30057 lines",
                 "Observed Skills",
                 "cursor",
-                "code-review",
                 "loaded ×1",
+                "skill_a11111",
+                "skill_b22222",
                 "+ 5 more observed Skill signals",
                 "Use --full only when exact complete records are needed",
             ] {
@@ -1796,7 +1812,19 @@ mod tests {
                     "{expected} missing at {width}:\n{output}"
                 );
             }
+            if width >= 80 {
+                assert!(
+                    output.contains("code-review"),
+                    "Skill name missing at {width}:\n{output}"
+                );
+            }
             assert!(!output.contains("o…ncated=true"));
+            let exposed = output
+                .lines()
+                .find(|line| line.trim_start().starts_with("Exposed"))
+                .expect("Exposed row");
+            assert!(!exposed.contains("ago"));
+            assert!(!output.contains("unknown · unknown"));
             assert!(!output.contains("/Users/private"));
             assert!(
                 output.lines().all(|line| display_width(line) <= width),

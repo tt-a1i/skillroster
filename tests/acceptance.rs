@@ -365,9 +365,12 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
     let observed_skills = overview["observed_skills"].as_array().unwrap();
     assert!(!observed_skills.is_empty());
     assert!(observed_skills.iter().all(|signal| {
-        signal["skill_name"]
+        signal["skill_id"]
             .as_str()
-            .is_some_and(|name| !name.is_empty())
+            .is_some_and(|id| id.starts_with("skill_"))
+            && signal["skill_name"]
+                .as_str()
+                .is_some_and(|name| !name.is_empty())
             && signal["stage"] != "exposed"
     }));
     assert!(

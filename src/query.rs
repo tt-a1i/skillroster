@@ -82,6 +82,7 @@ pub struct UsageCoverageSummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct ObservedSkillSignal {
     pub agent: String,
+    pub skill_id: String,
     pub skill_name: String,
     pub stage: UsageStage,
     pub quality: EvidenceQuality,
@@ -620,14 +621,22 @@ pub(crate) fn usage_overview(scan: &ScanResult) -> UsageOverview {
                 UsageCountUnit::Events
             },
             quality,
-            first_seen_unix: observations
-                .iter()
-                .filter_map(|usage| usage.first_seen_unix)
-                .min(),
-            last_seen_unix: observations
-                .iter()
-                .filter_map(|usage| usage.last_seen_unix)
-                .max(),
+            first_seen_unix: if stage == UsageStage::Exposed {
+                None
+            } else {
+                observations
+                    .iter()
+                    .filter_map(|usage| usage.first_seen_unix)
+                    .min()
+            },
+            last_seen_unix: if stage == UsageStage::Exposed {
+                None
+            } else {
+                observations
+                    .iter()
+                    .filter_map(|usage| usage.last_seen_unix)
+                    .max()
+            },
         }
     })
     .collect::<Vec<_>>();
@@ -725,11 +734,12 @@ pub(crate) fn usage_overview(scan: &ScanResult) -> UsageOverview {
         let Some(skill_name) = skill_names.get(usage.skill_id.as_str()) else {
             continue;
         };
-        let key = (usage.agent.id().into(), (*skill_name).into(), usage.stage);
+        let key = (usage.agent.id().into(), usage.skill_id.clone(), usage.stage);
         let signal = grouped_signals
             .entry(key)
             .or_insert_with(|| ObservedSkillSignal {
                 agent: usage.agent.id().into(),
+                skill_id: usage.skill_id.clone(),
                 skill_name: (*skill_name).into(),
                 stage: usage.stage,
                 quality: EvidenceQuality::Unknown,
@@ -2097,6 +2107,8 @@ mod tests {
         assert_eq!(overview.stages[0].stage, UsageStage::Exposed);
         assert_eq!(overview.stages[0].count, scan.placements.len() as u64);
         assert_eq!(overview.stages[0].unit, UsageCountUnit::Placements);
+        assert_eq!(overview.stages[0].first_seen_unix, None);
+        assert_eq!(overview.stages[0].last_seen_unix, None);
         assert!(
             overview.stages[1..]
                 .iter()
@@ -2134,18 +2146,40 @@ mod tests {
                 source_path_digest: format!("source-{event_count}"),
             });
         }
+        let mut same_name_variant = scan.skills[0].clone();
+        same_name_variant.id = "skill_distinct-same-name".into();
+        scan.skills.push(same_name_variant.clone());
+        scan.usage.push(crate::scan::UsageEvidence {
+            agent: AgentKind::Codex,
+            skill_id: same_name_variant.id.clone(),
+            stage: UsageStage::Loaded,
+            quality: EvidenceQuality::Observed,
+            event_count: 7,
+            first_seen_unix: Some(2),
+            last_seen_unix: Some(30),
+            source_path_digest: "source-distinct".into(),
+        });
 
         let overview = usage_overview(&scan);
 
-        assert_eq!(overview.observed_signal_count, 1);
-        assert_eq!(overview.observed_skills.len(), 1);
-        assert_eq!(overview.observed_skills[0].skill_name, skill_name);
-        assert_eq!(overview.observed_skills[0].event_count, 5);
-        assert_eq!(
-            overview.observed_skills[0].quality,
-            EvidenceQuality::Observed
-        );
-        assert_eq!(overview.observed_skills[0].last_seen_unix, Some(20));
+        assert_eq!(overview.observed_signal_count, 2);
+        assert_eq!(overview.observed_skills.len(), 2);
+        let repeated_source_signal = overview
+            .observed_skills
+            .iter()
+            .find(|signal| signal.skill_id == skill_id)
+            .expect("original Skill identity");
+        assert_eq!(repeated_source_signal.skill_name, skill_name);
+        assert_eq!(repeated_source_signal.event_count, 5);
+        assert_eq!(repeated_source_signal.quality, EvidenceQuality::Observed);
+        assert_eq!(repeated_source_signal.last_seen_unix, Some(20));
+        let distinct_identity = overview
+            .observed_skills
+            .iter()
+            .find(|signal| signal.skill_id == same_name_variant.id)
+            .expect("same-name distinct Skill identity");
+        assert_eq!(distinct_identity.skill_name, skill_name);
+        assert_eq!(distinct_identity.event_count, 7);
         fs::remove_dir_all(root).unwrap();
     }
 

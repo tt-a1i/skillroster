@@ -348,12 +348,14 @@ Finding reported 53 observed Loaded events across bounded local evidence. Its
 60-, 80-, and 120-column views now separate all five stages, aggregate session
 coverage, and five recent named Agent/Skill signals; Exposed is explicitly
 counted in placements rather than mislabeled as events. Real output contained
-no session paths or ANSI bytes and stayed within every target width. Dogfood
-also exposed duplicate Agent/Skill/stage preview rows from separate evidence
-sources; the final overview groups those rows, sums their event counts, retains
-the strongest evidence quality and latest timestamp, and produced five unique
-preview keys. Compact and full JSON retained the same bounded overview with
-`files_changed=false`; no Apply was run and no Agent file changed.
+no session paths or ANSI bytes and stayed within every target width. Exposed
+inventory omits session timestamps; event stages retain their observed times.
+Dogfood also exposed duplicate Agent/stable-Skill-ID/stage preview rows from
+separate evidence sources; the final overview groups those rows, sums their
+event counts, retains the strongest evidence quality and latest timestamp, and
+produced five unique preview keys. Compact and full JSON retained the same
+bounded overview with `files_changed=false`; no Apply was run and no Agent file
+changed.
 
 ## Evidence boundary
 
