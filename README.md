@@ -13,29 +13,51 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 ## Product principles
 
 - **Agent-first:** one product name, one CLI token, and one bootstrap Skill: `skillroster`.
+- **One-confirmation Apply:** the Agent prepares and explains a complete Plan; the person approves the whole scope once.
+- **Two intentional interfaces:** stable JSON for Agents and a polished, accessible terminal experience for people.
 - **Local-first:** inventory, usage evidence, configuration, plans, and receipts stay on the user's machine by default.
 - **One library, many rosters:** Skills have one canonical local source; each agent receives a curated view instead of the entire catalog.
 - **Evidence before change:** distinguish installed, exposed, invoked, useful, duplicated, stale, and unsafe.
 - **Reversible by default:** mutating operations follow `plan -> apply -> undo` and produce receipts.
 - **No MCP in v1:** the initial product is a Rust CLI plus one thin bootstrap Skill.
 
-## Planned workflow
+## Workflow
 
 ```bash
-skillroster scan
-skillroster report
-skillroster find "database migration"
-skillroster plan --stdin
-skillroster apply <plan-id>
-skillroster undo <receipt-id>
-skillroster status
+skillroster scan --json
+skillroster report --json
+skillroster find "database migration" --json
+skillroster plan --stdin --json
+skillroster apply <plan-id> --json
+skillroster undo <receipt-id> --json
+skillroster setup --json
+skillroster status --json
+skillroster lifecycle inspect --json
+skillroster lifecycle export --output ./skillroster-export.json --json
+skillroster lifecycle exclude codex --json
+skillroster lifecycle purge --raw-days 180 --json
+skillroster lifecycle recovery --json
 ```
 
-These commands describe the intended interface; they are not implemented yet.
+Agents use JSON mode; people can omit it for concise terminal output. Read-only
+commands never change Agent files. Plan stores an immutable preview, while Apply
+and Undo use fingerprints, journals, receipts, and recovery blocking.
+See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
+Plan/Receipt history or deleting the local database.
+
+Agent-authored Plans are declarative: they reference the latest Snapshot and
+Evidence IDs, then request Roster states, managed/hosted Library placement, or a
+source update. Raw filesystem operations are rejected. Library consolidation
+keeps canonical content recoverable and replaces verified duplicate placements
+with links; every applied sequence is bounded by a Receipt and can be undone.
 
 ## Status
 
-Pre-alpha. The repository currently contains the Rust CLI scaffold and the locked product specification. Implementation proceeds through internal checkpoints, but the product is considered complete only when the full governance loop and acceptance gates pass.
+SkillRoster 1.0 implements the complete local governance loop,
+including read-only analysis, versioned immutable Plans, Receipt-bounded
+Apply/Undo, lifecycle controls, recovery, and eight direct Agent adapters.
+Platform support is claimed only after the corresponding release workflow and
+artifact smoke test are recorded in the release acceptance evidence.
 
 See [docs/product-spec.md](docs/product-spec.md) for the complete requirements, [docs/implementation-plan.md](docs/implementation-plan.md) for delivery checkpoints, and [CONTEXT.md](CONTEXT.md) for canonical vocabulary.
 
@@ -44,5 +66,6 @@ See [docs/product-spec.md](docs/product-spec.md) for the complete requirements, 
 ```bash
 cargo fmt --check
 cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --help
 ```

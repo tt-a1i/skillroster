@@ -1,0 +1,5 @@
+{"tool":"match_skill","matched_skill":"cursor-fixture"}
+{"tool":"read_file","skill_name":"cursor-fixture","path":"/fixture/cursor-fixture/SKILL.md"}
+{"tool":"invoke_skill","invoked_skill":"cursor-fixture"}
+{"tool":"skill_outcome","outcome_skill":"cursor-fixture","success":true}
+{"tool":"message","text":"cursor-fixture appeared in prose only"}

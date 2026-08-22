@@ -1,0 +1,5 @@
+[
+  {"name":"small", "independent_skills":5, "copies_per_skill":2, "cross_agent":false},
+  {"name":"large", "independent_skills":120, "copies_per_skill":2, "cross_agent":false},
+  {"name":"cross-agent", "independent_skills":12, "copies_per_skill":2, "cross_agent":true}
+]

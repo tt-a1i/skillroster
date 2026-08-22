@@ -1,0 +1,5 @@
+{"tool_name":"match_skill","matched_skill":"gemini-cli-fixture"}
+{"tool_name":"read_file","skill_name":"gemini-cli-fixture","path":"/fixture/gemini-cli-fixture/SKILL.md"}
+{"tool_name":"invoke_skill","invoked_skill":"gemini-cli-fixture"}
+{"tool_name":"skill_outcome","outcome_skill":"gemini-cli-fixture","success":true}
+{"tool_name":"message","text":"gemini-cli-fixture appeared in prose only"}

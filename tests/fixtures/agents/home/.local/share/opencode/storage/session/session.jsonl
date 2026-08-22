@@ -1,0 +1,5 @@
+{"event":"match_skill","matched_skill":"opencode-fixture"}
+{"event":"open","skill_name":"opencode-fixture","path":"/fixture/opencode-fixture/SKILL.md"}
+{"event":"apply_skill","applied_skill":"opencode-fixture"}
+{"event":"skill_outcome","outcome_skill":"opencode-fixture","success":true}
+{"event":"message","text":"opencode-fixture appeared in prose only"}

@@ -9,6 +9,7 @@ Keep `src/main.rs` limited to CLI parsing and command dispatch. Add focused modu
 ```text
 src/
   cli.rs            command and stable output envelope
+  present.rs        human TTY and plain-text presentation
   app.rs            thin command orchestration
   model.rs          IDs, states, Findings, Plans, Receipts
   fs.rs             safe normalization and filesystem operations
@@ -23,7 +24,7 @@ tests/
   fixtures/         synthetic Agent homes and session samples
 ```
 
-Adapters discover and normalize Agent-specific facts. They do not implement eight separate mutation systems. All writes pass through `change`, and only one Apply or Undo may hold the process-level write lock at a time. Do not add an ORM, repository trait, Tokio runtime, generic plugin interface, vector database, or virtual filesystem. A private filesystem seam inside `change` is allowed for fault-injection tests.
+Adapters discover and normalize Agent-specific facts. They do not implement eight separate mutation systems. All writes pass through `change`, and only one Apply or Undo may hold the process-level write lock at a time. Do not add an ORM, repository trait, Tokio runtime, generic plugin interface, vector database, virtual filesystem, or TUI. A private filesystem seam inside `change` is allowed for fault-injection tests.
 
 ## Persistence model
 
@@ -42,6 +43,7 @@ SQLite uses WAL for concurrent read-only queries. It cannot make filesystem oper
 ## Checkpoint 1: Fact Scan
 
 - Define opaque IDs and the versioned JSON response envelope.
+- Establish the shared TTY/plain presentation grammar, `NO_COLOR`, responsive widths, and JSON isolation.
 - Initialize and migrate `~/.skillroster/skillroster.db`.
 - Implement known-root discovery for the eight Agents.
 - Parse `SKILL.md`, source metadata, symlinks, and exposure configuration.
@@ -101,9 +103,11 @@ SQLite uses WAL for concurrent read-only queries. It cannot make filesystem oper
 ## Checkpoint 7: Complete Acceptance
 
 - Implement `setup` and the one bootstrap Skill.
+- Verify the Agent can complete Scan, report, Plan preparation, one-confirmation Apply, Receipt reporting, and Undo without parsing human CLI output.
 - Verify all eight adapters in representative real environments.
 - Verify macOS, Linux, and Windows release artifacts.
 - Run the three user-value scenarios: discover disorder, confirm a healthy setup, and retrieve an On-demand Skill.
+- Verify the complete human CLI at 60, 80, and 120 columns, plus non-TTY and `NO_COLOR` fallbacks.
 - Compare unmanaged, manual, and relevant manager baselines.
 - Document installation through Homebrew, Cargo, and Windows release binaries.
 
