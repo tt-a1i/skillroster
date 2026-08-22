@@ -61,6 +61,15 @@ source update. Raw filesystem operations are rejected. Library consolidation
 keeps canonical content recoverable and replaces verified duplicate placements
 with links; every applied sequence is bounded by a Receipt and can be undone.
 
+For an exact-duplicate Finding, the Agent submits only the choices it owns:
+
+```json
+{"schema_version":1,"finding_library_changes":[{"finding_id":"finding_...","canonical_placement_id":"placement_...","requested_state":"managed"}]}
+```
+
+SkillRoster resolves the current Snapshot, Evidence, Skill, and complete
+placement set from that immutable Finding and rejects stale or mismatched input.
+
 ## Status
 
 SkillRoster 1.0 implements the complete local governance loop,

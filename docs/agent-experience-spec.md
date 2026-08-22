@@ -144,7 +144,7 @@ Machine results should expose facts, not preformatted prose:
 
 - `primary_metrics` with value, unit, coverage, and comparison baseline;
 - Findings with stable ID, category, severity, Evidence quality, impact fields, and affected IDs;
-- a bounded `report --summary --json` first view with no more than three Findings and one primary Evidence reference, plus paged placement paths and Evidence facts from `report --finding ID --json`;
+- a bounded `report --summary --json` first view with no more than three Findings and one primary Evidence reference, plus paged placement paths and Evidence facts from `report --finding ID --json`; exact-duplicate detail also exposes at most five ranked, owned canonical candidates without requiring pagination;
 - Find results that keep the original task, expose Agent-authored retrieval hints, and collapse same-name identities into one explicitly variant capability result;
 - Plan `change_summary` counts and `impact` deltas for current and proposed state; source-update line details remain in `diff_summary`;
 - affected Agents, Skills, placements, operation groups, exclusions, and deletion count;

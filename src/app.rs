@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -1044,7 +1044,7 @@ fn report_command(
         let stored = store
             .get_finding(&id)?
             .ok_or_else(|| anyhow!("Finding {id} does not exist"))?;
-        let mut details = stored.details;
+        let mut details = stored.details.clone();
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
             let report = store
@@ -1053,6 +1053,15 @@ fn report_command(
             let scan: ScanResult = store
                 .scan_payload(&report.scan_id)?
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            let latest_scan_id = store
+                .latest_completed_scan()?
+                .ok_or_else(|| anyhow!("no completed Snapshot exists"))?
+                .id;
+            if let Some(planning) =
+                finding_library_planning(&stored, &report.scan_id, &latest_scan_id, &scan)
+            {
+                object.insert("planning".into(), planning);
+            }
             let affected_skill_ids = object
                 .get("affected_skill_ids")
                 .and_then(Value::as_array)
@@ -1244,6 +1253,82 @@ fn report_command(
     } else {
         value
     })
+}
+
+fn finding_library_planning(
+    finding: &FindingRecord,
+    scan_id: &ScanId,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Option<Value> {
+    let (_, placement_ids) = exact_duplicate_finding_scope(finding, scan).ok()?;
+    if scan_id != latest_scan_id {
+        return Some(json!({
+            "supported": false,
+            "reason": "stale_finding",
+            "snapshot_id": scan_id,
+            "latest_snapshot_id": latest_scan_id
+        }));
+    }
+    let affected = placement_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut candidates = scan
+        .placements
+        .iter()
+        .filter(|placement| {
+            affected.contains(placement.id.as_str()) && placement.link_target.is_none()
+        })
+        .map(|placement| {
+            let (rank, reason) = if placement.agent.is_none() && !placement.default_exposed {
+                (0_u8, "non_exposed_source")
+            } else if !placement.default_exposed {
+                (1_u8, "non_exposed_owned_placement")
+            } else {
+                (2_u8, "agent_owned_placement")
+            };
+            (
+                rank,
+                placement.entrypoint.display().to_string(),
+                json!({
+                    "placement_id": placement.id,
+                    "path": placement.entrypoint,
+                    "agent": placement.agent.map(AgentKind::id),
+                    "default_exposed": placement.default_exposed,
+                    "reason": reason
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    let candidate_count = candidates.len();
+    let candidates = candidates
+        .into_iter()
+        .take(5)
+        .map(|(_, _, value)| value)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "supported": true,
+        "decision": "consolidate_exact_duplicates",
+        "snapshot_id": scan_id,
+        "request_field": "finding_library_changes",
+        "allowed_requested_states": ["managed", "hosted"],
+        "canonical_candidate_count": candidate_count,
+        "canonical_candidates_truncated": candidate_count > 5,
+        "canonical_candidates": candidates,
+        "plan_request_template": {
+            "schema_version": 1,
+            "finding_library_changes": [{
+                "finding_id": finding.id,
+                "canonical_placement_id": "<choose a canonical_candidates placement_id>",
+                "requested_state": "<managed|hosted>"
+            }]
+        }
+    }))
 }
 
 fn compact_report(report: &Value) -> Value {
@@ -1572,20 +1657,182 @@ struct SourceUpdateRequest {
     choice: Option<SourceUpdateChoice>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RequestedGovernanceState {
     Managed,
     Hosted,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LibraryChangeRequest {
     skill_id: String,
     canonical_placement_id: String,
     placement_ids: Vec<String>,
     requested_state: RequestedGovernanceState,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingLibraryChangeRequest {
+    finding_id: String,
+    canonical_placement_id: String,
+    requested_state: RequestedGovernanceState,
+}
+
+struct FindingPlanProvenance {
+    report_id: ReportId,
+    finding_ids: Vec<FindingId>,
+}
+
+fn exact_duplicate_finding_scope(
+    finding: &FindingRecord,
+    scan: &ScanResult,
+) -> Result<(String, Vec<String>)> {
+    if finding.category != FindingCategory::Overlap {
+        bail!("Finding {} is not an exact-duplicate Finding", finding.id);
+    }
+    let object = finding
+        .details
+        .as_object()
+        .ok_or_else(|| anyhow!("Finding {} has invalid stored details", finding.id))?;
+    let ids = |key: &str| -> Result<Vec<String>> {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Finding {} has no {key}", finding.id))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("Finding {} has an invalid {key}", finding.id))
+            })
+            .collect()
+    };
+    let skill_ids = ids("affected_skill_ids")?;
+    let placement_ids = ids("affected_placement_ids")?;
+    if skill_ids.len() != 1 || placement_ids.len() < 2 {
+        bail!("Finding {} is not an exact-duplicate Finding", finding.id);
+    }
+    let unique_ids = placement_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_ids.len() != placement_ids.len() {
+        bail!(
+            "Finding {} contains duplicate placement references",
+            finding.id
+        );
+    }
+    let skill_id = &skill_ids[0];
+    let all_placements = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == *skill_id)
+        .collect::<Vec<_>>();
+    let all_ids = all_placements
+        .iter()
+        .map(|placement| placement.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_ids != all_ids {
+        bail!(
+            "Finding {} does not cover every placement of Skill {}",
+            finding.id,
+            skill_id
+        );
+    }
+    let digests = all_placements
+        .iter()
+        .map(|placement| placement.content_digest.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if digests.len() != 1 {
+        bail!("Finding {} does not contain exact duplicates", finding.id);
+    }
+    Ok((skill_id.clone(), placement_ids))
+}
+
+fn expand_finding_library_changes(
+    store: &StateStore,
+    mut input: Value,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<(Value, Option<FindingPlanProvenance>)> {
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Plan input must be a JSON object"))?;
+    let raw = object
+        .remove("finding_library_changes")
+        .unwrap_or_else(|| json!([]));
+    let requests: Vec<FindingLibraryChangeRequest> = serde_json::from_value(raw)?;
+    if requests.is_empty() {
+        return Ok((input, None));
+    }
+    if [
+        "scan_id",
+        "evidence_ids",
+        "roster_changes",
+        "source_updates",
+        "library_changes",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        bail!(
+            "finding_library_changes cannot be mixed with CLI-derived IDs or other governance changes"
+        );
+    }
+
+    let mut evidence_ids = std::collections::BTreeSet::new();
+    let mut library_changes = Vec::with_capacity(requests.len());
+    let mut report_id = None;
+    let mut finding_ids = Vec::with_capacity(requests.len());
+    for request in requests {
+        let finding_id = FindingId::parse(request.finding_id)?;
+        let finding = store
+            .get_finding(&finding_id)?
+            .ok_or_else(|| anyhow!("Finding {finding_id} does not exist"))?;
+        let report = store
+            .get_report(&finding.report_id)?
+            .ok_or_else(|| anyhow!("Report {} does not exist", finding.report_id))?;
+        if report.scan_id != *latest_scan_id {
+            bail!("Finding {finding_id} does not belong to the latest Snapshot {latest_scan_id}");
+        }
+        if report_id
+            .as_ref()
+            .is_some_and(|existing| existing != &finding.report_id)
+        {
+            bail!("finding_library_changes must come from one Report");
+        }
+        report_id.get_or_insert_with(|| finding.report_id.clone());
+        let (skill_id, placement_ids) = exact_duplicate_finding_scope(&finding, scan)?;
+        if !placement_ids.contains(&request.canonical_placement_id) {
+            bail!("canonical placement is not part of Finding {finding_id}");
+        }
+        let evidence_id = finding
+            .evidence_ids
+            .first()
+            .ok_or_else(|| anyhow!("Finding {finding_id} has no Evidence"))?;
+        evidence_ids.insert(evidence_id.as_str().to_owned());
+        library_changes.push(LibraryChangeRequest {
+            skill_id,
+            canonical_placement_id: request.canonical_placement_id,
+            placement_ids,
+            requested_state: request.requested_state,
+        });
+        finding_ids.push(finding_id);
+    }
+    input["scan_id"] = json!(latest_scan_id);
+    input["evidence_ids"] = json!(evidence_ids);
+    input["library_changes"] = serde_json::to_value(library_changes)?;
+    Ok((
+        input,
+        Some(FindingPlanProvenance {
+            report_id: report_id.expect("non-empty Finding requests have a Report"),
+            finding_ids,
+        }),
+    ))
 }
 
 fn normalize_agent_plan(
@@ -2111,6 +2358,11 @@ fn prepare_plan(
         bail!("recovery is required before another Plan can be prepared");
     }
     let (scan_id, scan) = latest_scan(store)?;
+    let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
+        expand_finding_library_changes(store, input, &scan_id, &scan)?
+    } else {
+        (input, None)
+    };
     let canonical_state_dir = std::fs::canonicalize(state_dir)?;
     let requested_scan_id = input["scan_id"]
         .as_str()
@@ -2217,6 +2469,9 @@ fn prepare_plan(
         input,
         roster_before.clone(),
         library_before.clone(),
+        finding_provenance
+            .as_ref()
+            .map(|provenance| provenance.report_id.clone()),
     )?)?;
     Ok(json!({
         "plan_id": prepared.id,
@@ -2226,6 +2481,10 @@ fn prepare_plan(
         "operations": prepared.operations,
         "roster_changes": prepared.roster_changes,
         "evidence_ids": prepared.evidence_ids,
+        "finding_ids": finding_provenance
+            .as_ref()
+            .map(|provenance| provenance.finding_ids.clone())
+            .unwrap_or_default(),
         "source_updates": prepared.source_updates,
         "library_changes": prepared.library_changes,
         "change_summary": change_summary,
@@ -3057,6 +3316,7 @@ fn plan_record(
     raw: Value,
     roster_before: Vec<Value>,
     library_before: Vec<Value>,
+    report_id: Option<ReportId>,
 ) -> Result<PlanRecord> {
     let operations = prepared
         .operations
@@ -3096,7 +3356,7 @@ fn plan_record(
     Ok(PlanRecord {
         id: PlanId::parse(prepared.id.clone())?,
         scan_id: ScanId::parse(prepared.scan_id.clone())?,
-        report_id: None,
+        report_id,
         created_at: Utc::now().timestamp(),
         status: PlanStatus::Ready,
         input: json!({
