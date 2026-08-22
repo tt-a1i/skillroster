@@ -1170,7 +1170,7 @@ fn execute(
         Operation::RemoveSymlink { target, .. } => {
             let link_target =
                 fs::read_link(target).map_err(|e| ChangeError::io("read symlink", target, e))?;
-            fs::remove_file(target).map_err(|e| ChangeError::io("remove symlink", target, e))?;
+            remove_symlink(target)?;
             Ok(Some(Compensation::RestoreSymlink {
                 path: target.clone(),
                 target: link_target,
@@ -1634,6 +1634,20 @@ fn create_symlink(source: &Path, target: &Path) -> Result<()> {
         std::os::windows::fs::symlink_file(source, target)
     };
     result.map_err(|e| ChangeError::io("create symlink", target, e))
+}
+
+#[cfg(unix)]
+fn remove_symlink(path: &Path) -> Result<()> {
+    fs::remove_file(path).map_err(|error| ChangeError::io("remove symlink", path, error))
+}
+
+#[cfg(windows)]
+fn remove_symlink(path: &Path) -> Result<()> {
+    let result = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir(path),
+        _ => fs::remove_file(path),
+    };
+    result.map_err(|error| ChangeError::io("remove symlink", path, error))
 }
 
 fn recovery_dir(state_dir: &Path, receipt_id: &str) -> PathBuf {
