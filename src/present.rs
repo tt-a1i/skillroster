@@ -164,7 +164,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         "scan" => scan(result, &mut lines),
         "report" => report(result, &mut lines, options.width),
         "find" => find(result, &mut lines, options.width),
-        "plan" => plan(result, &mut lines),
+        "plan" => plan(result, &mut lines, options.width),
         "apply" | "undo" => mutation(result, &mut lines),
         "lifecycle" => lifecycle(result, &mut lines),
         "setup" => setup(result, &mut lines, options.width),
@@ -196,6 +196,36 @@ fn title(value: &str) -> String {
 
 fn fact(lines: &mut Vec<String>, label: &str, value: impl std::fmt::Display) {
     lines.push(format!("  {:<22} {value}", label));
+}
+
+fn fact_items(lines: &mut Vec<String>, label: &str, items: Vec<String>, width: usize) {
+    if items.is_empty() {
+        fact(lines, label, "none");
+        return;
+    }
+    let value_budget = width.saturating_sub(25).max(1);
+    let mut current = String::new();
+    let mut first = true;
+    for item in items {
+        let candidate = if current.is_empty() {
+            item.clone()
+        } else {
+            format!("{current} · {item}")
+        };
+        if !current.is_empty() && display_width(&candidate) > value_budget {
+            fact(lines, if first { label } else { "" }, current);
+            first = false;
+            current = item;
+        } else {
+            current = candidate;
+        }
+    }
+    if display_width(&current) <= value_budget {
+        fact(lines, if first { label } else { "" }, current);
+    } else {
+        fact(lines, if first { label } else { "" }, "");
+        lines.push(format!("    {current}"));
+    }
 }
 
 fn status(value: &Value, lines: &mut Vec<String>) {
@@ -676,7 +706,7 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
     ));
 }
 
-fn plan(value: &Value, lines: &mut Vec<String>) {
+fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Plan", text(value, "plan_id"));
     let operation_count = value
         .pointer("/change_summary/operation_count")
@@ -692,7 +722,6 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
                 .iter()
                 .map(|(kind, count)| format!("{kind} {}", count.as_u64().unwrap_or_default()))
                 .collect::<Vec<_>>()
-                .join(" · ")
         })
         .unwrap_or_else(|| {
             let counts = value
@@ -708,9 +737,12 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
                         counts
                     },
                 );
-            map_counts(&counts)
+            counts
+                .iter()
+                .map(|(kind, count)| format!("{kind} {count}"))
+                .collect::<Vec<_>>()
         });
-    fact(lines, "Operation categories", operation_categories);
+    fact_items(lines, "Operation categories", operation_categories, width);
     let roster_changes = value
         .get("roster_changes")
         .and_then(Value::as_array)
@@ -816,6 +848,40 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
                 .unwrap_or(skills.len() as u64)
         ),
     );
+    if let Some(selection) = value.get("selection_evidence") {
+        let positive = selection
+            .get("positive_signal_core_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        fact(
+            lines,
+            "Core selection",
+            format!(
+                "{} {} · {} forced · {} fallback",
+                positive,
+                if positive == 1 { "signal" } else { "signals" },
+                selection
+                    .get("forced_core_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                selection
+                    .get("stable_fallback_core_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            ),
+        );
+    }
+    if value
+        .pointer("/uncertainty/review_required")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        fact(
+            lines,
+            "Review required",
+            "fallback-dominated Core selection",
+        );
+    }
     fact(lines, "Risk", risk);
     fact(lines, "Reversible", text(value, "reversible"));
     fact(
@@ -1475,6 +1541,58 @@ mod tests {
             assert!(output.contains("category overlap · severity medium"));
             assert!(output.contains("Exact dupl"));
             assert!(output.contains("Continue with --offset 22"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_wraps_operation_groups_and_keeps_selection_uncertainty_visible() {
+        let value = json!({
+            "plan_id": "plan_01M0NKH3KS880PP0P4QQDS7W93",
+            "change_summary": {"operation_count": 310},
+            "operation_groups": {
+                "create_directory": 2,
+                "create_symlink": 1,
+                "move_recoverable": 307
+            },
+            "affected": {"agent_count": 5, "skill_count": 137},
+            "impact": {
+                "before_default_exposure": 548,
+                "after_default_exposure": 242,
+                "blocked_precondition_count": 0
+            },
+            "selection_evidence": {
+                "positive_signal_core_count": 1,
+                "forced_core_count": 0,
+                "stable_fallback_core_count": 199
+            },
+            "uncertainty": {"review_required": true},
+            "risk": "roster_change",
+            "reversible": true,
+            "canonical_deletion_count": 0,
+            "state": "ready"
+        });
+        for width in [60, 80, 120] {
+            let output = render(
+                "plan",
+                &value,
+                RenderOptions {
+                    width,
+                    styled: false,
+                },
+            );
+            for expected in [
+                "create_directory 2",
+                "create_symlink 1",
+                "move_recoverable 307",
+                "1 signal · 0 forced · 199 fallback",
+                "fallback-dominated Core selection",
+            ] {
+                assert!(output.contains(expected), "{expected} missing at {width}");
+            }
             assert!(
                 output.lines().all(|line| display_width(line) <= width),
                 "line exceeded {width} columns:\n{output}"
