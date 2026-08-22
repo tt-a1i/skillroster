@@ -472,6 +472,8 @@ mod tests {
                 link_target: None,
                 link_status: LinkStatus::NotLink,
                 default_exposed: true,
+                governable: true,
+                provider: None,
                 executable_files: Vec::new(),
                 declared_name_matches_directory: Some(true),
             })

@@ -167,6 +167,9 @@ pub fn derive(
         if placements.is_empty() {
             bail!("Skill {skill_id} has no verified placement");
         }
+        if !placements.iter().any(|placement| placement.governable) {
+            bail!("Skill {skill_id} is provider-managed and read-only");
+        }
         let desired = requests
             .iter()
             .map(|request| Ok((agent(&request.agent)?, request.state.as_str())))
@@ -455,7 +458,8 @@ fn verified_real_source(
 }
 
 fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
-    placement.content_digest == digest
+    placement.governable
+        && placement.content_digest == digest
         && placement.link_target.is_none()
         && std::fs::symlink_metadata(&placement.directory)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -650,6 +654,49 @@ mod tests {
             operation["kind"] == "create_symlink"
                 && operation["target"] == codex_root.join("shared").to_string_lossy().as_ref()
         }));
+    }
+
+    #[test]
+    fn core_request_refuses_a_provider_only_skill_source() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let codex_root = home.join(".codex/skills");
+        let plugin_skill = home
+            .join(".codex/plugins/cache/openai-bundled/browser/1.0.0/skills")
+            .join("control-browser");
+        fs::create_dir_all(&codex_root).unwrap();
+        fs::create_dir_all(&plugin_skill).unwrap();
+        fs::write(
+            plugin_skill.join("SKILL.md"),
+            "---\nname: control-browser\n---\nprovider body\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"browser@openai-bundled\"]\nenabled = true\n",
+        )
+        .unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = match derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "codex".into(),
+                skill_id: snapshot.skills[0].id.clone(),
+                state: "core".into(),
+            }],
+        ) {
+            Ok(_) => panic!("provider-only Skill unexpectedly produced a Roster Plan"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("provider-managed and read-only"));
+        assert!(!codex_root.join("control-browser").exists());
     }
 
     #[cfg(unix)]

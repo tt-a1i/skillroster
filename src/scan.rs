@@ -103,6 +103,13 @@ pub struct SkillPlacement {
     pub link_target: Option<PathBuf>,
     pub link_status: LinkStatus,
     pub default_exposed: bool,
+    /// Whether SkillRoster may include this placement in a mutating governance Plan.
+    /// External provider caches are observed and searchable, but never governable.
+    #[serde(default = "default_true")]
+    pub governable: bool,
+    /// External provider identity when the placement comes from an enabled plugin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub executable_files: Vec<PathBuf>,
     #[serde(default)]
@@ -182,14 +189,217 @@ pub struct ScanResult {
 struct EntryCandidate {
     agent: Option<AgentKind>,
     root: PathBuf,
+    governable: bool,
+    provider: Option<String>,
     entrypoint: PathBuf,
     link_target: Option<PathBuf>,
     link_status: LinkStatus,
 }
 
+#[derive(Clone, Debug)]
+struct SkillRootPolicy {
+    agent: Option<AgentKind>,
+    explicit: bool,
+    governable: bool,
+    detail: Option<String>,
+    provider: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexPluginSkillRoot {
+    plugin_id: String,
+    path: PathBuf,
+}
+
+#[derive(Default)]
+struct PluginConfigState {
+    sections: usize,
+    enabled_values: Vec<bool>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn codex_enabled_plugin_skill_roots(
+    home: &Path,
+    warnings: &mut Vec<String>,
+) -> Vec<CodexPluginSkillRoot> {
+    let config_path = home.join(".codex/config.toml");
+    let config = match fs::read_to_string(&config_path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            warnings.push(format!(
+                "could not read Codex plugin configuration {}: {error}",
+                config_path.display()
+            ));
+            return Vec::new();
+        }
+    };
+    let enabled_plugins = parse_enabled_codex_plugins(&config, warnings);
+    let cache_root = home.join(".codex/plugins/cache");
+    let mut roots = Vec::new();
+    for (plugin, marketplace) in enabled_plugins {
+        let plugin_id = format!("{plugin}@{marketplace}");
+        let unresolved_plugin_cache = cache_root.join(&marketplace).join(&plugin);
+        let Some(plugin_cache) = contained_directory(&cache_root, &unresolved_plugin_cache) else {
+            warnings.push(format!(
+                "enabled Codex plugin {plugin_id} has no contained local cache; skipped"
+            ));
+            continue;
+        };
+        let latest = plugin_cache.join("latest/skills");
+        if let Some(path) = contained_directory(&plugin_cache, &latest) {
+            roots.push(CodexPluginSkillRoot { plugin_id, path });
+            continue;
+        }
+        let mut candidates = match fs::read_dir(&plugin_cache) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name() != "latest")
+                .filter_map(|entry| {
+                    contained_directory(&plugin_cache, &entry.path().join("skills"))
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                warnings.push(format!(
+                    "could not inspect enabled Codex plugin cache {}: {error}",
+                    plugin_cache.display()
+                ));
+                continue;
+            }
+        };
+        candidates.sort();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [path] => roots.push(CodexPluginSkillRoot {
+                plugin_id,
+                path: path.clone(),
+            }),
+            [] => {}
+            _ => warnings.push(format!(
+                "enabled Codex plugin {plugin_id} has multiple cached Skill versions and no unique latest version; skipped"
+            )),
+        }
+    }
+    roots.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    roots
+}
+
+fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+    let mut sections = BTreeMap::<String, PluginConfigState>::new();
+    let mut current_plugin = None::<String>;
+    for line in config.lines() {
+        let line = strip_toml_comment(line).trim();
+        if line.starts_with('[') {
+            current_plugin = parse_plugin_section(line);
+            if let Some(plugin_id) = &current_plugin {
+                sections.entry(plugin_id.clone()).or_default().sections += 1;
+            }
+            continue;
+        }
+        let Some(plugin_id) = &current_plugin else {
+            continue;
+        };
+        let value = line;
+        let enabled = value
+            .split_once('=')
+            .filter(|(key, _)| key.trim() == "enabled")
+            .map(|(_, value)| value.trim());
+        if enabled == Some("true") {
+            sections
+                .entry(plugin_id.clone())
+                .or_default()
+                .enabled_values
+                .push(true);
+        } else if enabled == Some("false") {
+            sections
+                .entry(plugin_id.clone())
+                .or_default()
+                .enabled_values
+                .push(false);
+        }
+    }
+
+    let mut enabled = Vec::new();
+    for (plugin_id, state) in sections {
+        if state.sections != 1 || state.enabled_values.len() != 1 {
+            warnings.push(format!(
+                "Codex plugin {plugin_id} has ambiguous configuration; skipped"
+            ));
+            continue;
+        }
+        if !state.enabled_values[0] {
+            continue;
+        }
+        let Some((plugin, marketplace)) = plugin_id.split_once('@') else {
+            warnings.push(format!(
+                "Codex plugin identifier {plugin_id} is invalid; skipped"
+            ));
+            continue;
+        };
+        if plugin.is_empty()
+            || marketplace.is_empty()
+            || marketplace.contains('@')
+            || !safe_path_component(plugin)
+            || !safe_path_component(marketplace)
+        {
+            warnings.push(format!(
+                "Codex plugin identifier {plugin_id} is unsafe; skipped"
+            ));
+            continue;
+        }
+        enabled.push((plugin.to_owned(), marketplace.to_owned()));
+    }
+    enabled.sort();
+    enabled
+}
+
+fn parse_plugin_section(line: &str) -> Option<String> {
+    line.strip_prefix("[plugins.\"")
+        .and_then(|value| value.strip_suffix("\"]"))
+        .map(str::to_owned)
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '#' && !quoted {
+            return &line[..index];
+        }
+    }
+    line
+}
+
+fn safe_path_component(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_dir() {
+        return None;
+    }
+    let base = fs::canonicalize(base).ok()?;
+    let candidate = fs::canonicalize(candidate).ok()?;
+    candidate.starts_with(&base).then_some(candidate)
+}
+
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     let mut result = ScanResult::default();
     let known = known_agent_roots(&options.home);
+    let plugin_roots = codex_enabled_plugin_skill_roots(&options.home, &mut result.warnings);
     let shared_roots = [
         options.home.join(".agents_skills"),
         options.home.join(".skillroster/library"),
@@ -198,6 +408,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         .iter()
         .flat_map(|roots| roots.skill_roots.iter().cloned())
         .chain(shared_roots.iter().cloned())
+        .chain(plugin_roots.iter().map(|root| root.path.clone()))
         .chain(
             options
                 .explicit_skill_roots
@@ -211,9 +422,14 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     for roots in &known {
         for root in &roots.skill_roots {
             observe_skill_root(
-                Some(roots.agent),
                 root,
-                false,
+                SkillRootPolicy {
+                    agent: Some(roots.agent),
+                    explicit: false,
+                    governable: true,
+                    detail: None,
+                    provider: None,
+                },
                 &approved_roots,
                 options.max_depth,
                 &mut result,
@@ -223,9 +439,14 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     }
     for root in shared_roots.iter().filter(|path| path.exists()) {
         observe_skill_root(
-            None,
             root,
-            false,
+            SkillRootPolicy {
+                agent: None,
+                explicit: false,
+                governable: true,
+                detail: None,
+                provider: None,
+            },
             &approved_roots,
             options.max_depth,
             &mut result,
@@ -234,9 +455,14 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     }
     for root in &options.explicit_source_roots {
         observe_skill_root(
-            None,
             root,
-            true,
+            SkillRootPolicy {
+                agent: None,
+                explicit: true,
+                governable: true,
+                detail: None,
+                provider: None,
+            },
             &approved_roots,
             options.max_depth,
             &mut result,
@@ -245,9 +471,33 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     }
     for root in &options.explicit_skill_roots {
         observe_skill_root(
-            Some(root.agent),
             &root.path,
-            true,
+            SkillRootPolicy {
+                agent: Some(root.agent),
+                explicit: true,
+                governable: true,
+                detail: None,
+                provider: None,
+            },
+            &approved_roots,
+            options.max_depth,
+            &mut result,
+            &mut candidates,
+        );
+    }
+    for root in &plugin_roots {
+        observe_skill_root(
+            &root.path,
+            SkillRootPolicy {
+                agent: None,
+                explicit: false,
+                governable: false,
+                detail: Some(format!(
+                    "Codex enabled plugin source {}; observed and searchable; not Roster-managed",
+                    root.plugin_id
+                )),
+                provider: Some(root.plugin_id.clone()),
+            },
             &approved_roots,
             options.max_depth,
             &mut result,
@@ -305,9 +555,8 @@ fn observe_excluded_session_roots(
 }
 
 fn observe_skill_root(
-    agent: Option<AgentKind>,
     root: &Path,
-    explicit: bool,
+    policy: SkillRootPolicy,
     approved_roots: &[PathBuf],
     max_depth: usize,
     result: &mut ScanResult,
@@ -319,20 +568,26 @@ fn observe_skill_root(
         Err(_) => RootStatus::Inaccessible,
     };
     result.roots.push(RootObservation {
-        agent,
+        agent: policy.agent,
         kind: RootKind::Skills,
         path: root.to_path_buf(),
         status,
-        explicit,
-        detail: None,
+        explicit: policy.explicit,
+        detail: policy.detail.clone(),
     });
     if status != RootStatus::Included {
         return;
     }
 
-    if let Err(error) =
-        discover_entrypoints(agent, root, approved_roots, root, 0, max_depth, candidates)
-    {
+    if let Err(error) = discover_entrypoints(
+        &policy,
+        root,
+        approved_roots,
+        root,
+        0,
+        max_depth,
+        candidates,
+    ) {
         result.warnings.push(format!(
             "could not completely inspect skill root {}: {error}",
             root.display()
@@ -345,7 +600,7 @@ fn observe_skill_root(
 }
 
 fn discover_entrypoints(
-    agent: Option<AgentKind>,
+    policy: &SkillRootPolicy,
     placement_root: &Path,
     approved_roots: &[PathBuf],
     directory: &Path,
@@ -365,15 +620,17 @@ fn discover_entrypoints(
         if file_name == "SKILL.md" {
             let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
             output.push(EntryCandidate {
-                agent,
+                agent: policy.agent,
                 root: placement_root.to_path_buf(),
+                governable: policy.governable,
+                provider: policy.provider.clone(),
                 entrypoint: path,
                 link_target: target,
                 link_status,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
             discover_entrypoints(
-                agent,
+                policy,
                 placement_root,
                 approved_roots,
                 &path,
@@ -388,8 +645,10 @@ fn discover_entrypoints(
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
                 output.push(EntryCandidate {
-                    agent,
+                    agent: policy.agent,
                     root: placement_root.to_path_buf(),
+                    governable: policy.governable,
+                    provider: policy.provider.clone(),
                     entrypoint: linked_entrypoint,
                     link_target: target,
                     link_status: status,
@@ -563,6 +822,8 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             link_target: candidate.link_target,
             link_status: candidate.link_status,
             default_exposed: candidate.agent.is_some(),
+            governable: candidate.governable,
+            provider: candidate.provider,
             executable_files,
             declared_name_matches_directory,
         });
@@ -1197,6 +1458,153 @@ mod tests {
         let path = std::env::temp_dir().join(format!("skillroster-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn plugin_config_requires_one_safe_explicitly_enabled_section() {
+        let mut warnings = Vec::new();
+        let plugins = parse_enabled_codex_plugins(
+            r#"
+[plugins."browser@openai-bundled"] # enabled browser provider
+enabled  =  true
+[plugins."disabled@openai-bundled"]
+enabled	=	false
+[plugins."../escape@openai-bundled"]
+enabled = true
+[plugins."duplicate@openai-bundled"]
+enabled = true
+[plugins."duplicate@openai-bundled"]
+enabled = true
+"#,
+            &mut warnings,
+        );
+
+        assert_eq!(
+            plugins,
+            vec![("browser".to_owned(), "openai-bundled".to_owned())]
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("unsafe")));
+        assert!(warnings.iter().any(|warning| warning.contains("ambiguous")));
+    }
+
+    #[test]
+    fn enabled_codex_plugin_skills_are_searchable_but_not_governable() {
+        let home = temp_directory("enabled-plugin");
+        let skill = home
+            .join(".codex/plugins/cache/openai-bundled/browser/1.0.0/skills")
+            .join("control-browser");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: control-browser\ndescription: Use an authenticated browser session\n---\n",
+        )
+        .unwrap();
+        let disabled = home
+            .join(".codex/plugins/cache/openai-bundled/disabled/1.0.0/skills")
+            .join("not-visible");
+        fs::create_dir_all(&disabled).unwrap();
+        fs::write(
+            disabled.join("SKILL.md"),
+            "---\nname: not-visible\ndescription: Must stay hidden\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"browser@openai-bundled\"]\nenabled = true\n\n[plugins.\"disabled@openai-bundled\"]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "control-browser");
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(result.placements[0].agent, None);
+        assert!(!result.placements[0].default_exposed);
+        assert!(!result.placements[0].governable);
+        assert_eq!(
+            result.placements[0].provider.as_deref(),
+            Some("browser@openai-bundled")
+        );
+        assert!(result.roots.iter().any(|root| {
+            root.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("browser@openai-bundled"))
+        }));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_plugin_cache_versions_fail_closed() {
+        let home = temp_directory("ambiguous-plugin");
+        for version in ["1.0.0", "2.0.0"] {
+            let skill = home
+                .join(".codex/plugins/cache/openai-bundled/browser")
+                .join(version)
+                .join("skills/control-browser");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(skill.join("SKILL.md"), "---\nname: control-browser\n---\n").unwrap();
+        }
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"browser@openai-bundled\"]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple cached Skill versions"))
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_cache_link_cannot_escape_the_codex_cache_root() {
+        let home = temp_directory("escaping-plugin-cache");
+        let outside = temp_directory("outside-plugin-cache");
+        let outside_skill = outside.join("1.0.0/skills/escape");
+        fs::create_dir_all(&outside_skill).unwrap();
+        fs::write(
+            outside_skill.join("SKILL.md"),
+            "---\nname: escaped-plugin-skill\n---\n",
+        )
+        .unwrap();
+        let marketplace = home.join(".codex/plugins/cache/openai-bundled");
+        fs::create_dir_all(&marketplace).unwrap();
+        std::os::unix::fs::symlink(&outside, marketplace.join("browser")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"browser@openai-bundled\"]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no contained local cache"))
+        );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]

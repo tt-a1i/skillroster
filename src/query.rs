@@ -70,12 +70,33 @@ pub struct FindMatch {
     /// The scanner can prove source metadata, but Roster state is stored separately.
     pub roster_state: String,
     pub source: Option<String>,
+    /// Provider identities for externally managed plugin placements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    /// True when at least one placement may participate in a governance Plan.
+    pub governable: bool,
     pub match_reasons: Vec<String>,
     pub evidence_quality: EvidenceQuality,
     /// Same declared name with distinct Skill identities is one ambiguous capability result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variant_skill_ids: Vec<String>,
+    /// Same-name identities with provider and path facts kept correctly associated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<FindVariant>,
     pub variant_count: usize,
+    pub variants_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindVariant {
+    pub skill_id: String,
+    pub paths: Vec<String>,
+    pub agents: Vec<String>,
+    pub roster_state: String,
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    pub governable: bool,
 }
 
 pub fn build_report(scan: &ScanResult) -> Report {
@@ -1017,7 +1038,7 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    find_matching(scan, task, limit, None)
+    find_matching(scan, task, limit, None, None)
 }
 
 pub(crate) fn find_matching(
@@ -1025,6 +1046,7 @@ pub(crate) fn find_matching(
     task: &str,
     limit: usize,
     candidate_ids: Option<&BTreeSet<String>>,
+    variant_eligible_ids: Option<&BTreeSet<String>>,
 ) -> Vec<FindMatch> {
     let query = task.trim().to_lowercase();
     if query.is_empty() || limit == 0 {
@@ -1033,7 +1055,11 @@ pub(crate) fn find_matching(
     let query_tokens = tokens(&query);
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
-    for skill in &scan.skills {
+    for skill in scan
+        .skills
+        .iter()
+        .filter(|skill| variant_eligible_ids.is_none_or(|ids| ids.contains(&skill.id)))
+    {
         variants_by_name
             .entry(skill.name.trim().to_lowercase())
             .or_default()
@@ -1103,14 +1129,23 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
-            let mut variant_skill_ids = variants_by_name
-                .get(&name.trim().to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| vec![skill.id.clone()]);
-            let variant_count = variant_skill_ids.len();
-            if variant_count == 1 {
-                variant_skill_ids.clear();
-            }
+            let all_variant_skill_ids = variants_by_name.get(&name.trim().to_lowercase());
+            let variant_count = all_variant_skill_ids.map_or(1, Vec::len);
+            let variants_truncated = variant_count > 10;
+            let variant_skill_ids = if variant_count > 1 {
+                std::iter::once(skill.id.clone())
+                    .chain(
+                        all_variant_skill_ids
+                            .into_iter()
+                            .flat_map(|variant_ids| variant_ids.iter())
+                            .filter(|variant_id| *variant_id != &skill.id)
+                            .cloned(),
+                    )
+                    .take(10)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let placements = placement_groups
                 .get(skill.id.as_str())
                 .cloned()
@@ -1128,6 +1163,60 @@ pub(crate) fn find_matching(
                 .collect::<Vec<_>>();
             agents.sort();
             agents.dedup();
+            let mut providers = placements
+                .iter()
+                .filter_map(|placement| placement.provider.clone())
+                .collect::<Vec<_>>();
+            providers.sort();
+            providers.dedup();
+            let governable = placements.iter().any(|placement| placement.governable);
+            let variants = if variant_count > 1 {
+                variant_skill_ids
+                    .iter()
+                    .filter_map(|variant_id| {
+                        let variant_skill = scan
+                            .skills
+                            .iter()
+                            .find(|candidate| candidate.id == *variant_id)?;
+                        let variant_placements = placement_groups
+                            .get(variant_id.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut paths = variant_placements
+                            .iter()
+                            .map(|placement| placement.entrypoint.display().to_string())
+                            .collect::<Vec<_>>();
+                        paths.sort();
+                        paths.dedup();
+                        let mut agents = variant_placements
+                            .iter()
+                            .filter_map(|placement| placement.agent.map(AgentKind::id))
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        agents.sort();
+                        agents.dedup();
+                        let mut providers = variant_placements
+                            .iter()
+                            .filter_map(|placement| placement.provider.clone())
+                            .collect::<Vec<_>>();
+                        providers.sort();
+                        providers.dedup();
+                        Some(FindVariant {
+                            skill_id: variant_id.clone(),
+                            paths,
+                            agents,
+                            roster_state: "unknown".into(),
+                            source: variant_skill.metadata.source.clone(),
+                            providers,
+                            governable: variant_placements
+                                .iter()
+                                .any(|placement| placement.governable),
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Some(FindMatch {
                 rank: 0,
                 skill_id: skill.id.clone(),
@@ -1137,6 +1226,8 @@ pub(crate) fn find_matching(
                 agents,
                 roster_state: "unknown".into(),
                 source: skill.metadata.source.clone(),
+                providers,
+                governable,
                 match_reasons: reasons,
                 evidence_quality: if observed_usage {
                     EvidenceQuality::Observed
@@ -1144,7 +1235,9 @@ pub(crate) fn find_matching(
                     EvidenceQuality::Inferred
                 },
                 variant_skill_ids,
+                variants,
                 variant_count,
+                variants_truncated,
             })
         })
         .collect::<Vec<_>>();
@@ -1160,12 +1253,7 @@ pub(crate) fn find_matching(
     let mut capabilities: Vec<FindMatch> = Vec::new();
     for matched in matches {
         let capability = matched.name.trim().to_lowercase();
-        if let Some(index) = capability_indexes.get(&capability).copied() {
-            let existing = &mut capabilities[index];
-            existing.variant_skill_ids.push(matched.skill_id);
-            existing.variant_skill_ids.sort();
-            existing.variant_skill_ids.dedup();
-            existing.variant_count = existing.variant_skill_ids.len();
+        if capability_indexes.contains_key(&capability) {
             continue;
         }
         capability_indexes.insert(capability, capabilities.len());
@@ -1523,7 +1611,83 @@ mod tests {
             .unwrap();
         assert_eq!(matched.variant_count, 2);
         assert_eq!(matched.variant_skill_ids.len(), 2);
+        assert_eq!(matched.variants.len(), 2);
+        assert!(
+            matched
+                .variants
+                .iter()
+                .all(|variant| variant.paths.len() == 1)
+        );
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
+
+        let eligible = BTreeSet::from([matched.skill_id.clone()]);
+        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&eligible));
+        let filtered_match = filtered
+            .iter()
+            .find(|candidate| candidate.name == "tech-essay-writer")
+            .unwrap();
+        assert_eq!(filtered_match.variant_count, 1);
+        assert!(!filtered_match.variants_truncated);
+        assert!(filtered_match.variant_skill_ids.is_empty());
+        assert!(filtered_match.variants.is_empty());
+
+        let all_routable = scan
+            .skills
+            .iter()
+            .map(|skill| skill.id.clone())
+            .collect::<BTreeSet<_>>();
+        let partial_match =
+            find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&all_routable)).remove(0);
+        assert_eq!(partial_match.variant_count, 2);
+        assert_eq!(partial_match.variants.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_name_variant_details_are_bounded_and_keep_the_representative() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-bounded-variants-{nonce}"));
+        for index in 0..12 {
+            let path = root.join(format!("variant-{index:02}"));
+            fs::create_dir_all(&path).unwrap();
+            let body = if index == 11 {
+                "diagram specialist"
+            } else {
+                "unrelated capability"
+            };
+            fs::write(
+                path.join("SKILL.md"),
+                format!(
+                    "---\nname: shared-capability\ndescription: variant {index}\n---\n{body}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let matched = find(&scan, "diagram specialist", 1).remove(0);
+
+        assert_eq!(matched.variant_count, 12);
+        assert!(matched.variants_truncated);
+        assert_eq!(matched.variant_skill_ids.len(), 10);
+        assert_eq!(matched.variants.len(), 10);
+        assert!(
+            matched
+                .variant_skill_ids
+                .iter()
+                .any(|skill_id| skill_id == &matched.skill_id)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1623,6 +1787,8 @@ mod tests {
                     link_target: None,
                     link_status: crate::scan::LinkStatus::NotLink,
                     default_exposed: true,
+                    governable: true,
+                    provider: None,
                     executable_files: Vec::new(),
                     declared_name_matches_directory: Some(true),
                 }));

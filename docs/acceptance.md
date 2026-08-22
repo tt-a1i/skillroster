@@ -65,6 +65,14 @@ gate. A real PTY run also verified:
   summary in `TERM=dumb`;
 - confirmed Apply and Undo both verify and leave recovery clear.
 
+The 1.6 read-only dogfood scan added only Skill roots from Codex plugins marked
+`enabled = true` in local configuration. It found 193 independent Skills and
+689 placements while leaving default Agent-directory exposure at 548. Browser,
+presentation, and spreadsheet tasks ranked their current plugin Skills first;
+the terminal and JSON results identified each plugin provider and its read-only
+governance boundary. Disabled plugins stayed absent, ambiguous cache versions
+failed closed, and exact-duplicate planning refused provider-managed placements.
+
 ## Release-candidate platform evidence
 
 The 2026-08-22 release gates use actual hosted operating systems and the packaged
