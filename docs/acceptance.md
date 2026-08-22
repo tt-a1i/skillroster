@@ -99,17 +99,21 @@ preserve those results.
 ## Agent-led first-report performance evidence
 
 The 1.7.1 dogfood run used a fresh isolated state directory against the same
-reference home: eight Agents, 193 independent Skills, and 689 placements. The
-public 1.7.0 behavior took 34.26 seconds to produce the first 3,237-byte
-`report --summary --json`; the cached response took 0.04 seconds. Timing each
-Finding family showed semantic-overlap analysis consumed 34.59 seconds while
-all other report analysis completed in under 8 milliseconds.
+reference home: eight Agents, 193 independent Skills, and 689 placements. An
+unoptimized 1.7.0 build took 34.26 seconds to produce the first 3,237-byte
+`report --summary --json`; the cached response took 0.04 seconds. The official
+optimized 1.7.0 binary produced the complete 626,759-byte report in 4.85
+seconds. Timing the unoptimized build showed semantic-overlap analysis consumed
+34.59 seconds while all other report analysis completed in under 8
+milliseconds.
 
 The analyzer now tokenizes each complete Skill search document once and reuses
 those vocabularies for pair comparison. On the unchanged real Snapshot the
-first report fell to 2.22 seconds with identical Finding counts, category
-counts, and first-view facts. A 193-Skill core regression that previously took
-75.32 seconds now completes in under one second and enforces a five-second
+unoptimized first report fell to 2.22 seconds and the optimized 1.7.1 build
+produced the complete report in 0.84 seconds. Normalized complete reports from
+the official 1.7.0 binary and the 1.7.1 build were byte-identical after removing
+random Run, Report, and Finding IDs. A 193-Skill core regression that previously
+took 75.32 seconds now completes in under one second and enforces a five-second
 upper bound in the unoptimized test profile. These measurements describe the
 recorded reference run, not a universal machine-performance guarantee.
 
