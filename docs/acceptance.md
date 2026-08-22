@@ -65,14 +65,55 @@ gate. A real PTY run also verified:
   summary in `TERM=dumb`;
 - confirmed Apply and Undo both verify and leave recovery clear.
 
-## Evidence boundaries
+## Release-candidate platform evidence
 
-Automated fixtures validate adapters and presentation facts, but cannot certify a real Agent conversation, terminal rendering, or OS integration. Before declaring a release platform-supported, record these independently:
+The 2026-08-22 release gates use actual hosted operating systems and the packaged
+release binaries, always against synthetic temporary homes:
 
-1. a real-environment run on macOS, Linux, and Windows using the release binary;
-2. a human review of the first viewport for small, large, and cross-Agent scenarios;
-3. an Agent conversation confirming one visible Plan, one confirmation, Apply verification, Receipt, and Undo;
-4. accessibility checks in representative terminals, including narrow CJK output;
-5. release-artifact checksums and installation smoke tests.
+- [four-platform CI](https://github.com/tt-a1i/skillroster/actions/runs/32548259913)
+  passed Rust 1.85 formatting, Clippy, and 78 core/high-risk tests on Linux x86_64,
+  Windows x86_64, macOS arm64, and macOS x86_64;
+- [release candidate 8](https://github.com/tt-a1i/skillroster/actions/runs/32548259787)
+  built all four archives and ran `--version`, `--help`, Scan, Setup preview,
+  Apply verification, Receipt-bounded Undo, and recovery-clear Status on every
+  corresponding operating system;
+- all four candidate checksums were downloaded and independently verified; each
+  archive contained only the binary and README, and the macOS arm64 archive
+  passed the same governance smoke after extraction;
+- `cargo install --locked --path .` into an isolated prefix passed version and
+  governance smoke checks.
 
-CI results are evidence for the automated layer only. A skipped or simulated platform run remains unexecuted acceptance.
+WSL is tested as Linux in the release workflow by importing a checksum-pinned
+Canonical Ubuntu 24.04 image into WSL1 on the Windows runner, then executing the
+packaged Linux binary through the same governance loop. The final successful
+candidate and official tag run are the release record; a failed or skipped WSL
+job does not count as support.
+
+## Human and Agent presentation review
+
+A human review of plain first viewports found the intended hierarchy intact:
+
+- the eight-Agent fixture at 60 and 120 columns showed the four key metrics,
+  top Findings, category totals, read-only boundary, and next action without
+  wrapping or ANSI noise;
+- the real 180-Skill/676-placement environment at 80 columns surfaced 548
+  default exposures and the escaping-link and exact-duplicate Findings in the
+  first viewport, with no Agent-file changes;
+- automated 60/80/120-column, `NO_COLOR`, `TERM=dumb`, non-TTY, CJK-width, and
+  styled/plain semantic-equivalence checks cover the remaining repeatable cases;
+- the PTY acceptance above covers visible impact, confirmation, cancellation,
+  SIGINT, progress timing, verification, Receipt, Undo, and recovery states.
+
+In this Agent-led release run, the Agent consumed only JSON, inspected the Setup
+Plan preview and mutation boundary, used the user's explicit execution
+authorization for the synthetic scope, then verified Apply, Receipt, Undo, and
+recovery-clear Status. The bootstrap Skill separately requires an explicit user
+confirmation before any real Apply or Undo and never asks per-file questions.
+
+## Evidence boundary
+
+These checks establish deterministic routing and safe local governance; they do
+not claim model quality, token or labor savings, production performance, or
+access to arbitrary future Agent log formats. Final support additionally
+requires the official `v1.0.0` tag workflow, published artifact checksums, and
+the installation checks recorded in the Release notes.

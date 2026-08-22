@@ -53,7 +53,7 @@ with links; every applied sequence is bounded by a Receipt and can be undone.
 
 ## Status
 
-1.0 release candidate. The complete local governance loop is implemented,
+SkillRoster 1.0 implements the complete local governance loop,
 including read-only analysis, versioned immutable Plans, Receipt-bounded
 Apply/Undo, lifecycle controls, recovery, and eight direct Agent adapters.
 Platform support is claimed only after the corresponding release workflow and

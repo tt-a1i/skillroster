@@ -11,12 +11,14 @@ other user data.
 2. Run `cargo fmt --all --check`,
    `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
    `cargo test --locked --all-targets --all-features` locally.
-3. Run the **Release candidate** workflow manually with a value such as
-   `1.0.0-rc.1`. It builds Linux x86_64, Windows x86_64, macOS arm64, and macOS
-   x86_64 archives without creating a GitHub Release.
+3. Push an annotated pre-release tag such as `v1.0.0-rc.1`, or dispatch the
+   **Release candidate** workflow after it exists on the default branch. It
+   builds Linux x86_64, Windows x86_64, macOS arm64, and macOS x86_64 archives
+   without creating a GitHub Release.
 4. Download all four workflow artifacts and verify every adjacent `.sha256`
-   file. Smoke-test `skillroster --version`, `scan --json`, and a fixture-backed
-   Plan/Apply/Undo cycle on the corresponding operating system.
+   file. The workflow smoke-tests `skillroster --version` and a fixture-backed
+   Plan/Apply/Undo cycle on each operating system, then runs the Linux archive
+   inside checksum-pinned Ubuntu WSL. Review all five successful jobs.
 
 Candidate artifacts expire after 14 days. The workflow token has only
 `contents: read`; checkout credentials are not persisted.

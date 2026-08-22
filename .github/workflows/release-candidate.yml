@@ -155,8 +155,7 @@ jobs:
             $archive = (Resolve-Path "dist/skillroster-*-x86_64-unknown-linux-gnu.tar.gz").Path
             $archiveWsl = Convert-ToWslPath $archive
             $repoWsl = Convert-ToWslPath $env:GITHUB_WORKSPACE
-            $command = 'set -euo pipefail; mkdir -p /tmp/skillroster-release; tar -xzf "$1" -C /tmp/skillroster-release; binary="$(find /tmp/skillroster-release -type f -name skillroster -print -quit)"; chmod +x "$binary"; "$2/scripts/release/smoke.sh" "$binary"'
-            wsl -d SkillRosterAcceptance --user root -- bash -lc $command bash $archiveWsl $repoWsl
+            wsl -d SkillRosterAcceptance --user root -- bash "$repoWsl/scripts/release/smoke-wsl.sh" $archiveWsl $repoWsl
             if ($LASTEXITCODE -ne 0) { throw "WSL governance smoke failed with exit code $LASTEXITCODE" }
           }
           finally {
