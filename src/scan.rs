@@ -798,7 +798,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
         }
         for entrypoint in entrypoints {
             skill_ids_by_reference
-                .entry(entrypoint.to_string_lossy().to_ascii_lowercase())
+                .entry(normalize_reference_text(&entrypoint.to_string_lossy()))
                 .or_default()
                 .insert(placement.skill_id.clone());
         }
@@ -1013,13 +1013,16 @@ fn observed_reference_skill_ids(
     let Some(matcher) = matcher else {
         return BTreeSet::new();
     };
-    let searchable = decoded_record_text(line)
-        .unwrap_or_else(|| line.to_owned())
-        .to_ascii_lowercase();
+    let decoded = decoded_record_text(line).unwrap_or_else(|| line.to_owned());
+    let searchable = normalize_reference_text(&decoded);
     matcher
         .find_iter(&searchable)
         .map(|matched| reference_lookup[matched.pattern().as_usize()].0.clone())
         .collect()
+}
+
+fn normalize_reference_text(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
 }
 
 fn decoded_record_text(line: &str) -> Option<String> {
@@ -1433,9 +1436,10 @@ mod tests {
     #[test]
     fn json_escaped_windows_reference_binds_observed_usage() {
         let windows_path = r"C:\Users\tester\.codex\skills\research\SKILL.md";
+        let session_path = r"C:\Users\tester\.codex/skills/research\SKILL.md";
         let reference_lookup = vec![(
             "skill_windows".to_owned(),
-            windows_path.to_ascii_lowercase(),
+            normalize_reference_text(windows_path),
         )];
         let matcher = AhoCorasickBuilder::new()
             .ascii_case_insensitive(true)
@@ -1452,7 +1456,7 @@ mod tests {
                 "name": "exec",
                 "input": format!(
                     "await tools.exec_command({{cmd: \"rg -n name {}\"}})",
-                    windows_path
+                    session_path
                 )
             }
         })
