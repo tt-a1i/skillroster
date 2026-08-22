@@ -341,6 +341,20 @@ canonical public Agent ID while preserving stage, quality, count, timestamps,
 and the source-path digest. An eight-Agent fixture verifies the same facts in
 compact and full JSON; no real Agent file was changed.
 
+The v1.8.14 plain-usage dogfood used a fresh isolated state store and release
+build against the current real home. The read-only Scan found 244 independent
+Skills, 740 placements, 548 default exposure, and 174 Findings. The usage
+Finding reported 53 observed Loaded events across bounded local evidence. Its
+60-, 80-, and 120-column views now separate all five stages, aggregate session
+coverage, and five recent named Agent/Skill signals; Exposed is explicitly
+counted in placements rather than mislabeled as events. Real output contained
+no session paths or ANSI bytes and stayed within every target width. Dogfood
+also exposed duplicate Agent/Skill/stage preview rows from separate evidence
+sources; the final overview groups those rows, sums their event counts, retains
+the strongest evidence quality and latest timestamp, and produced five unique
+preview keys. Compact and full JSON retained the same bounded overview with
+`files_changed=false`; no Apply was run and no Agent file changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

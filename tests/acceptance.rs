@@ -357,6 +357,24 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         })
         .expect("compact Claude Code Loaded evidence");
     assert_eq!(compact_claude["facts"]["skill_name"], "claude-code-fixture");
+    let overview = &compact["result"]["usage_overview"];
+    assert_eq!(overview["stages"].as_array().unwrap().len(), 5);
+    assert_eq!(overview["coverage"]["supported_agent_count"], 8);
+    assert_eq!(overview["coverage"]["roots_present_agent_count"], 8);
+    assert_eq!(overview["coverage"]["sampled_agent_count"], 8);
+    let observed_skills = overview["observed_skills"].as_array().unwrap();
+    assert!(!observed_skills.is_empty());
+    assert!(observed_skills.iter().all(|signal| {
+        signal["skill_name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+            && signal["stage"] != "exposed"
+    }));
+    assert!(
+        observed_skills
+            .iter()
+            .any(|signal| signal["stage"] == "loaded")
+    );
 
     let full = cli_json(
         &home,
@@ -382,6 +400,10 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         })
         .expect("full Claude Code Loaded evidence");
     assert_eq!(full_claude["details"]["skill_name"], "claude-code-fixture");
+    assert_eq!(
+        compact["result"]["usage_overview"],
+        full["result"]["usage_overview"]
+    );
 }
 
 #[test]

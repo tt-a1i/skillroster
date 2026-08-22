@@ -43,6 +43,61 @@ pub struct Finding {
     pub evidence_quality: EvidenceQuality,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageCountUnit {
+    Placements,
+    Events,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageStageSummary {
+    pub stage: UsageStage,
+    pub count: u64,
+    pub unit: UsageCountUnit,
+    pub quality: EvidenceQuality,
+    pub first_seen_unix: Option<u64>,
+    pub last_seen_unix: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageCoverageSummary {
+    pub supported_agent_count: usize,
+    pub roots_present_agent_count: usize,
+    pub sampled_agent_count: usize,
+    pub complete_agent_count: usize,
+    pub limited_agent_count: usize,
+    pub missing_agent_count: usize,
+    pub inaccessible_agent_count: usize,
+    pub files_discovered: usize,
+    pub files_observed: usize,
+    pub files_partially_observed: usize,
+    pub files_skipped: usize,
+    pub bytes_observed: u64,
+    pub lines_observed: usize,
+    pub truncated: bool,
+    pub discovery_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ObservedSkillSignal {
+    pub agent: String,
+    pub skill_name: String,
+    pub stage: UsageStage,
+    pub quality: EvidenceQuality,
+    pub event_count: u64,
+    pub last_seen_unix: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageOverview {
+    pub stages: Vec<UsageStageSummary>,
+    pub coverage: UsageCoverageSummary,
+    pub observed_skills: Vec<ObservedSkillSignal>,
+    pub observed_signal_count: usize,
+    pub observed_skills_truncated: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PrimaryMetrics {
     pub independent_skills: usize,
@@ -519,59 +574,243 @@ fn exposure_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     );
 }
 
-fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
-    let exposed = scan
-        .placements
-        .iter()
-        .filter(|placement| placement.default_exposed)
-        .count() as u64;
-    let mut stage_summaries = Vec::new();
-    for stage in [
+pub(crate) fn usage_overview(scan: &ScanResult) -> UsageOverview {
+    let stages = [
         UsageStage::Exposed,
         UsageStage::Matched,
         UsageStage::Loaded,
         UsageStage::Applied,
         UsageStage::Outcome,
-    ] {
+    ]
+    .into_iter()
+    .map(|stage| {
         let observations = scan
             .usage
             .iter()
             .filter(|usage| usage.stage == stage)
             .collect::<Vec<_>>();
         let count = if stage == UsageStage::Exposed {
-            exposed
+            scan.placements
+                .iter()
+                .filter(|placement| placement.default_exposed)
+                .count() as u64
         } else {
             observations.iter().map(|usage| usage.event_count).sum()
         };
-        let first = observations
-            .iter()
-            .filter_map(|usage| usage.first_seen_unix)
-            .min()
-            .map_or_else(|| "unknown".into(), |value| value.to_string());
-        let last = observations
-            .iter()
-            .filter_map(|usage| usage.last_seen_unix)
-            .max()
-            .map_or_else(|| "unknown".into(), |value| value.to_string());
         let quality = if stage == UsageStage::Exposed
             || observations
                 .iter()
                 .any(|usage| usage.quality == EvidenceQuality::Observed)
         {
-            "observed"
+            EvidenceQuality::Observed
         } else if observations
             .iter()
             .any(|usage| usage.quality == EvidenceQuality::Inferred)
         {
-            "inferred"
+            EvidenceQuality::Inferred
         } else {
-            "unknown"
+            EvidenceQuality::Unknown
         };
-        stage_summaries.push(format!(
-            "{}={count} [{first}..{last}; {quality}]",
-            usage_stage_name(stage)
-        ));
+        UsageStageSummary {
+            stage,
+            count,
+            unit: if stage == UsageStage::Exposed {
+                UsageCountUnit::Placements
+            } else {
+                UsageCountUnit::Events
+            },
+            quality,
+            first_seen_unix: observations
+                .iter()
+                .filter_map(|usage| usage.first_seen_unix)
+                .min(),
+            last_seen_unix: observations
+                .iter()
+                .filter_map(|usage| usage.last_seen_unix)
+                .max(),
+        }
+    })
+    .collect::<Vec<_>>();
+
+    let coverage = UsageCoverageSummary {
+        supported_agent_count: AgentKind::ALL.len(),
+        roots_present_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_present > 0)
+            .count(),
+        sampled_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.files_observed > 0)
+            .count(),
+        complete_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.denominator_reliable)
+            .count(),
+        limited_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
+            .count(),
+        missing_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| {
+                coverage.roots_present == 0
+                    && coverage.roots_missing > 0
+                    && coverage.roots_inaccessible == 0
+            })
+            .count(),
+        inaccessible_agent_count: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_inaccessible > 0)
+            .count(),
+        files_discovered: scan
+            .coverage
+            .iter()
+            .map(|coverage| {
+                coverage.files_discovered.max(
+                    coverage
+                        .files_observed
+                        .saturating_add(coverage.files_skipped),
+                )
+            })
+            .sum(),
+        files_observed: scan
+            .coverage
+            .iter()
+            .map(|coverage| coverage.files_observed)
+            .sum(),
+        files_partially_observed: scan
+            .coverage
+            .iter()
+            .map(|coverage| coverage.files_partially_observed)
+            .sum(),
+        files_skipped: scan
+            .coverage
+            .iter()
+            .map(|coverage| coverage.files_skipped)
+            .sum(),
+        bytes_observed: scan
+            .coverage
+            .iter()
+            .map(|coverage| coverage.bytes_observed)
+            .sum(),
+        lines_observed: scan
+            .coverage
+            .iter()
+            .map(|coverage| coverage.lines_observed)
+            .sum(),
+        truncated: scan.coverage.iter().any(|coverage| coverage.truncated),
+        discovery_truncated: scan
+            .coverage
+            .iter()
+            .any(|coverage| coverage.discovery_truncated),
+    };
+
+    let skill_names = scan
+        .skills
+        .iter()
+        .map(|skill| (skill.id.as_str(), skill.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut grouped_signals = BTreeMap::<(String, String, UsageStage), ObservedSkillSignal>::new();
+    for usage in scan
+        .usage
+        .iter()
+        .filter(|usage| usage.stage != UsageStage::Exposed)
+    {
+        let Some(skill_name) = skill_names.get(usage.skill_id.as_str()) else {
+            continue;
+        };
+        let key = (usage.agent.id().into(), (*skill_name).into(), usage.stage);
+        let signal = grouped_signals
+            .entry(key)
+            .or_insert_with(|| ObservedSkillSignal {
+                agent: usage.agent.id().into(),
+                skill_name: (*skill_name).into(),
+                stage: usage.stage,
+                quality: EvidenceQuality::Unknown,
+                event_count: 0,
+                last_seen_unix: None,
+            });
+        signal.quality = stronger_evidence_quality(signal.quality, usage.quality);
+        signal.event_count = signal.event_count.saturating_add(usage.event_count);
+        signal.last_seen_unix = signal.last_seen_unix.max(usage.last_seen_unix);
     }
+    let mut observed_skills = grouped_signals.into_values().collect::<Vec<_>>();
+    observed_skills.sort_by(|left, right| {
+        usage_preview_priority(right.stage)
+            .cmp(&usage_preview_priority(left.stage))
+            .then_with(|| right.last_seen_unix.cmp(&left.last_seen_unix))
+            .then_with(|| right.event_count.cmp(&left.event_count))
+            .then_with(|| left.agent.cmp(&right.agent))
+            .then_with(|| left.skill_name.cmp(&right.skill_name))
+    });
+    let observed_signal_count = observed_skills.len();
+    let observed_skills = observed_skills.into_iter().take(5).collect::<Vec<_>>();
+
+    UsageOverview {
+        stages,
+        coverage,
+        observed_skills,
+        observed_signal_count,
+        observed_skills_truncated: observed_signal_count > 5,
+    }
+}
+
+fn usage_preview_priority(stage: UsageStage) -> u8 {
+    match stage {
+        UsageStage::Loaded => 4,
+        UsageStage::Applied => 3,
+        UsageStage::Outcome => 2,
+        UsageStage::Matched => 1,
+        UsageStage::Exposed => 0,
+    }
+}
+
+fn evidence_quality_name(quality: EvidenceQuality) -> &'static str {
+    match quality {
+        EvidenceQuality::Observed => "observed",
+        EvidenceQuality::Inferred => "inferred",
+        EvidenceQuality::Unknown => "unknown",
+    }
+}
+
+fn stronger_evidence_quality(left: EvidenceQuality, right: EvidenceQuality) -> EvidenceQuality {
+    match (left, right) {
+        (EvidenceQuality::Observed, _) | (_, EvidenceQuality::Observed) => {
+            EvidenceQuality::Observed
+        }
+        (EvidenceQuality::Inferred, _) | (_, EvidenceQuality::Inferred) => {
+            EvidenceQuality::Inferred
+        }
+        _ => EvidenceQuality::Unknown,
+    }
+}
+
+fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
+    let overview = usage_overview(scan);
+    let stage_summaries = overview
+        .stages
+        .iter()
+        .map(|stage| {
+            let first = stage
+                .first_seen_unix
+                .map_or_else(|| "unknown".into(), |value| value.to_string());
+            let last = stage
+                .last_seen_unix
+                .map_or_else(|| "unknown".into(), |value| value.to_string());
+            format!(
+                "{}={} [{first}..{last}; {}]",
+                usage_stage_name(stage.stage),
+                stage.count,
+                evidence_quality_name(stage.quality)
+            )
+        })
+        .collect::<Vec<_>>();
     let evidence = scan
         .usage
         .iter()
@@ -590,90 +829,29 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 .map(|coverage| format!("coverage:{}", coverage.agent.id())),
         )
         .collect();
-    let reliable_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.denominator_reliable)
-        .count();
-    let roots_present_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.roots_present > 0)
-        .count();
-    let sampled_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.files_observed > 0)
-        .count();
-    let missing_root_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| {
-            coverage.roots_present == 0
-                && coverage.roots_missing > 0
-                && coverage.roots_inaccessible == 0
-        })
-        .count();
-    let inaccessible_root_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.roots_inaccessible > 0)
-        .count();
-    let limited_root_count = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
-        .count();
-    let coverage_discovered = scan
-        .coverage
-        .iter()
-        .map(|coverage| {
-            coverage.files_discovered.max(
-                coverage
-                    .files_observed
-                    .saturating_add(coverage.files_skipped),
-            )
-        })
-        .sum::<usize>();
-    let coverage_observed = scan
-        .coverage
-        .iter()
-        .map(|coverage| coverage.files_observed)
-        .sum::<usize>();
-    let coverage_partial = scan
-        .coverage
-        .iter()
-        .map(|coverage| coverage.files_partially_observed)
-        .sum::<usize>();
-    let coverage_skipped = scan
-        .coverage
-        .iter()
-        .map(|coverage| coverage.files_skipped)
-        .sum::<usize>();
-    let coverage_bytes = scan
-        .coverage
-        .iter()
-        .map(|coverage| coverage.bytes_observed)
-        .sum::<u64>();
-    let coverage_lines = scan
-        .coverage
-        .iter()
-        .map(|coverage| coverage.lines_observed)
-        .sum::<usize>();
-    let coverage_truncated = scan.coverage.iter().any(|coverage| coverage.truncated);
-    let discovery_truncated = scan
-        .coverage
-        .iter()
-        .any(|coverage| coverage.discovery_truncated);
+    let coverage = &overview.coverage;
     push_finding(
         findings,
         FindingCategory::Usage,
         Severity::Info,
         "Five-stage usage evidence",
         format!(
-            "{}. Coverage: roots {roots_present_count}/{supported}, sampled {sampled_count}/{supported}, complete {reliable_count}/{supported}, missing {missing_root_count}/{supported}, inaccessible {inaccessible_root_count}/{supported}; files discovered={coverage_discovered}, observed={coverage_observed}, partial={coverage_partial}, skipped={coverage_skipped}; bytes={coverage_bytes}, lines={coverage_lines}, truncated={coverage_truncated}, discovery_truncated={discovery_truncated}.",
+            "{}. Coverage: roots {}/{supported}, sampled {}/{supported}, complete {}/{supported}, missing {}/{supported}, inaccessible {}/{supported}; files discovered={}, observed={}, partial={}, skipped={}; bytes={}, lines={}, truncated={}, discovery_truncated={}.",
             stage_summaries.join("; "),
-            supported = AgentKind::ALL.len(),
+            coverage.roots_present_agent_count,
+            coverage.sampled_agent_count,
+            coverage.complete_agent_count,
+            coverage.missing_agent_count,
+            coverage.inaccessible_agent_count,
+            coverage.files_discovered,
+            coverage.files_observed,
+            coverage.files_partially_observed,
+            coverage.files_skipped,
+            coverage.bytes_observed,
+            coverage.lines_observed,
+            coverage.truncated,
+            coverage.discovery_truncated,
+            supported = coverage.supported_agent_count,
         ),
         scan.usage
             .iter()
@@ -681,7 +859,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             .collect(),
         Vec::new(),
         evidence,
-        if reliable_count == AgentKind::ALL.len() {
+        if coverage.complete_agent_count == coverage.supported_agent_count {
             EvidenceQuality::Observed
         } else {
             EvidenceQuality::Unknown
@@ -693,7 +871,9 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .iter()
         .filter(|coverage| !coverage.denominator_reliable)
         .collect::<Vec<_>>();
-    let incomplete_count = AgentKind::ALL.len().saturating_sub(reliable_count);
+    let incomplete_count = coverage
+        .supported_agent_count
+        .saturating_sub(coverage.complete_agent_count);
     if incomplete_count != 0 {
         push_finding(
             findings,
@@ -701,8 +881,11 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             Severity::Info,
             "Usage coverage is incomplete",
             format!(
-                "A complete observable-session denominator is unavailable for {incomplete_count}/{} supported Agents: {missing_root_count} session roots are missing, {inaccessible_root_count} are inaccessible, and {limited_root_count} present roots have bounded or incomplete samples. Recent observed events remain usable; absence of evidence is not evidence of non-use.",
-                AgentKind::ALL.len(),
+                "A complete observable-session denominator is unavailable for {incomplete_count}/{} supported Agents: {} session roots are missing, {} are inaccessible, and {} present roots have bounded or incomplete samples. Recent observed events remain usable; absence of evidence is not evidence of non-use.",
+                coverage.supported_agent_count,
+                coverage.missing_agent_count,
+                coverage.inaccessible_agent_count,
+                coverage.limited_agent_count,
             ),
             Vec::new(),
             Vec::new(),
@@ -1909,11 +2092,60 @@ mod tests {
         for stage in ["Matched", "Loaded", "Applied", "Outcome"] {
             assert!(usage.summary.contains(&format!("{stage}=0")));
         }
+        let overview = usage_overview(&scan);
+        assert_eq!(overview.stages.len(), 5);
+        assert_eq!(overview.stages[0].stage, UsageStage::Exposed);
+        assert_eq!(overview.stages[0].count, scan.placements.len() as u64);
+        assert_eq!(overview.stages[0].unit, UsageCountUnit::Placements);
+        assert!(
+            overview.stages[1..]
+                .iter()
+                .all(|stage| stage.unit == UsageCountUnit::Events)
+        );
+        assert_eq!(
+            overview.coverage.supported_agent_count,
+            AgentKind::ALL.len()
+        );
         assert!(report.findings.iter().any(|finding| {
             finding.title == "Archive candidacy is unknown"
                 && finding.evidence_quality == EvidenceQuality::Unknown
         }));
         assert!(!report.files_changed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn usage_overview_groups_repeated_agent_skill_stage_signals() {
+        let (root, mut scan) = fixture();
+        let skill_id = scan.skills[0].id.clone();
+        let skill_name = scan.skills[0].name.clone();
+        for (event_count, quality, last_seen_unix) in [
+            (2, EvidenceQuality::Inferred, Some(10)),
+            (3, EvidenceQuality::Observed, Some(20)),
+        ] {
+            scan.usage.push(crate::scan::UsageEvidence {
+                agent: AgentKind::Codex,
+                skill_id: skill_id.clone(),
+                stage: UsageStage::Loaded,
+                quality,
+                event_count,
+                first_seen_unix: Some(1),
+                last_seen_unix,
+                source_path_digest: format!("source-{event_count}"),
+            });
+        }
+
+        let overview = usage_overview(&scan);
+
+        assert_eq!(overview.observed_signal_count, 1);
+        assert_eq!(overview.observed_skills.len(), 1);
+        assert_eq!(overview.observed_skills[0].skill_name, skill_name);
+        assert_eq!(overview.observed_skills[0].event_count, 5);
+        assert_eq!(
+            overview.observed_skills[0].quality,
+            EvidenceQuality::Observed
+        );
+        assert_eq!(overview.observed_skills[0].last_seen_unix, Some(20));
         fs::remove_dir_all(root).unwrap();
     }
 

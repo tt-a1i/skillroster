@@ -180,6 +180,12 @@ Usage Evidence includes the human-readable `skill_name` beside the opaque
 `skill_id`, and serializes `agent` with the same canonical public identifier
 used by planning commands. Compact and full detail therefore support usage
 summaries without a caller-side Skill lookup or Agent-name rewrite.
+The usage Finding also exposes one bounded `usage_overview`: five typed stage
+counts with explicit units, the complete aggregate session-coverage boundary,
+and up to five recent high-signal named Skills. `Exposed` counts placements;
+Matched, Loaded, Applied, and Outcome count events. The ordinary terminal view
+renders this structure as separate stage, coverage, and observed-Skill blocks
+at 60, 80, and 120 columns without printing session paths.
 
 `plan --stdin --json` returns a bounded decision-complete summary: total change counts, operation groups, affected-scope counts with at most ten Skill IDs, before/after impact, risk, reversibility, and the immutable Plan ID. A Finding-derived Roster Plan also persists `selection_evidence`, including forced, positive-signal, and stable-fallback Core counts. When fallback selection dominates any affected Agent, the Plan carries typed `uncertainty` with `review_required: true`; absence of usage evidence remains explicitly non-negative. It does not inline filesystem operations or complete large ID collections. `plan --show PLAN_ID --json` is the explicit full-detail path; it reads the stored Plan and never mutates files.
 
