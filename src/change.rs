@@ -351,13 +351,15 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
             if input.operations.iter().any(|operation| {
                 !matches!(
                     operation,
-                    OperationInput::CreateDirectory { .. } | OperationInput::WriteFile { .. }
+                    OperationInput::CreateDirectory { .. }
+                        | OperationInput::WriteFile { .. }
+                        | OperationInput::ReplaceFile { .. }
                 )
             }) =>
         {
             return Err(ChangeError::new(
                 "invalid_setup_operation",
-                "bootstrap setup may only create its package directory and SKILL.md",
+                "bootstrap setup may only create or replace its package directory and SKILL.md",
             ));
         }
         OperationPolicy::SourceUpdate

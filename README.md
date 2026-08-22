@@ -51,6 +51,13 @@ Plan/Receipt history or deleting the local database.
 See [docs/installation.md](docs/installation.md) for verified Release, Cargo,
 and Homebrew installation paths.
 
+Run `setup` after the first Scan and after each CLI upgrade. Missing or exact
+official older bootstrap Skills become a recoverable Plan. A locally modified
+copy is never replaced implicitly: the Agent must show the affected targets and
+ask the user before retrying with `--modified-choice retain-local` or
+`--modified-choice adopt-current`. Links, non-files, and unreadable targets are
+preserved and reported as blocked.
+
 `--root AGENT=PATH` adds an Agent placement root and therefore contributes to
 that Agent's default exposure. `--source-root PATH` approves a non-exposed
 canonical source directory for the current Scan. Neither option crawls outside

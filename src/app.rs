@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::change::{
     self, ChangeReceipt, Operation, OperationPolicy, PrepareContext, PreparedPlan,
 };
-use crate::cli::{Cli, Command, LifecycleCommand};
+use crate::cli::{Cli, Command, LifecycleCommand, ModifiedBootstrapChoice};
 use crate::harness::{self, AgentKind};
 use crate::model::{
     AgentId, AgentRecord, ApiError, EvidenceId, EvidenceKind, EvidenceQuality, EvidenceRecord,
@@ -273,12 +273,44 @@ pub fn run(cli: Cli) -> Result<Output> {
             ),
             LifecycleCommand::Delete(_) => unreachable!("handled before opening SQLite"),
         },
-        Some(Command::Setup) => (
-            "setup",
-            setup_command(&store, &home, &state_dir)?,
-            vec![],
-            vec![],
-        ),
+        Some(Command::Setup(args)) => {
+            let result = setup_command(&store, &home, &state_dir, args.modified_choice)?;
+            let mut actions = Vec::new();
+            if result["state"].as_str() == Some("scan_required") {
+                actions.push(action(
+                    "scan",
+                    &["scan", "--json"],
+                    false,
+                    false,
+                    "setup_requires_snapshot",
+                ));
+            } else if result["state"].as_str() == Some("modified_choice_required") {
+                actions.push(action(
+                    "retain_modified_bootstrap",
+                    &["setup", "--modified-choice", "retain-local", "--json"],
+                    false,
+                    false,
+                    "bootstrap_modified_choice_required",
+                ));
+                actions.push(action(
+                    "adopt_current_bootstrap",
+                    &["setup", "--modified-choice", "adopt-current", "--json"],
+                    false,
+                    false,
+                    "bootstrap_modified_choice_required",
+                ));
+            }
+            if let Some(plan_id) = result["plan_id"].as_str() {
+                actions.push(action(
+                    "apply",
+                    &["apply", plan_id, "--json"],
+                    true,
+                    true,
+                    "setup_plan_ready",
+                ));
+            }
+            ("setup", result, vec![], actions)
+        }
     };
 
     let mut envelope = JsonEnvelope::success(command, result.clone());
@@ -2911,51 +2943,240 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
     Ok(mutation_result(&outcome, &receipt, Some(id)))
 }
 
-fn setup_command(store: &StateStore, home: &Path, state_dir: &Path) -> Result<Value> {
+const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
+    (
+        "1.0.0",
+        "08440a4a3e10489eae2484d0a5bf8f4b0451d22c43edaa90c75fcd0b66fd4a74",
+    ),
+    (
+        "1.0.1",
+        "2e18b702cbe61660aafff0b4c01538b51561cd0ce979cc4cce914f539b8c755e",
+    ),
+    (
+        "1.0.2",
+        "4a6c9de673948dbccfe719973395b7712fe09706ae22b2119e4a8ed8c5446a73",
+    ),
+    (
+        "1.0.3",
+        "1c0ffe7e1ef65d88e5c42a8978d92de81353c69072d8e610dce0c33d3938290c",
+    ),
+    (
+        "1.0.4",
+        "629d2d959c5b4277398e48f7b10c29c6c2adb0c0415723938ad7bbe4f8fec1c8",
+    ),
+    (
+        "1.1.0",
+        "d463d28295055fde8012e5c2424a754bf93e8c84c9fd6b48b7194bbaff0b27c2",
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapContentStatus {
+    Current,
+    OfficialOutdated(&'static str),
+    Modified,
+}
+
+impl BootstrapContentStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::OfficialOutdated(_) => "official_outdated",
+            Self::Modified => "modified",
+        }
+    }
+
+    fn installed_version(self) -> Option<&'static str> {
+        match self {
+            Self::Current => Some(env!("CARGO_PKG_VERSION")),
+            Self::OfficialOutdated(version) => Some(version),
+            Self::Modified => None,
+        }
+    }
+}
+
+fn bootstrap_content_status(digest: &str, current_digest: &str) -> BootstrapContentStatus {
+    if digest == current_digest {
+        BootstrapContentStatus::Current
+    } else if let Some((version, _)) = LEGACY_BOOTSTRAPS
+        .iter()
+        .find(|(_, official_digest)| *official_digest == digest)
+    {
+        BootstrapContentStatus::OfficialOutdated(version)
+    } else {
+        BootstrapContentStatus::Modified
+    }
+}
+
+fn setup_command(
+    store: &StateStore,
+    home: &Path,
+    state_dir: &Path,
+    modified_choice: Option<ModifiedBootstrapChoice>,
+) -> Result<Value> {
     let Some(snapshot) = store.latest_completed_scan()? else {
         return Ok(json!({
             "detected_agents": [],
+            "targets": [],
             "plan_id": Value::Null,
             "state": "scan_required",
             "bootstrap_skill": "skillroster",
+            "bootstrap_version": env!("CARGO_PKG_VERSION"),
+            "missing_count": 0,
+            "current_count": 0,
+            "outdated_count": 0,
+            "modified_count": 0,
+            "unsupported_count": 0,
+            "replace_count": 0,
+            "canonical_deletion_count": 0,
             "files_changed": false,
             "next": "skillroster scan --json"
         }));
     };
+    let current_content = include_str!("../skill/skillroster/SKILL.md");
+    let current_digest = content_digest(current_content.as_bytes());
     let mut detected = Vec::new();
+    let mut targets = Vec::new();
     let mut operations = Vec::new();
+    let mut missing_count = 0_usize;
+    let mut current_count = 0_usize;
+    let mut outdated_count = 0_usize;
+    let mut modified_count = 0_usize;
+    let mut unsupported_count = 0_usize;
+    let mut replace_count = 0_usize;
     for roots in harness::known_agent_roots(home) {
         for root in roots.skill_roots.into_iter().filter(|path| path.is_dir()) {
             let directory = root.join("skillroster");
             let entrypoint = directory.join("SKILL.md");
             detected.push(json!({"agent": roots.agent.id(), "target": entrypoint}));
-            if entrypoint.exists() {
-                continue;
-            }
-            if !directory.exists() {
-                operations.push(json!({
-                    "kind": "create_directory",
-                    "target": directory,
-                    "expected_fingerprint": "missing"
-                }));
-            }
-            operations.push(json!({
-                "kind": "write_file",
+            let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
+            };
+            let (status, installed_version) = match std::fs::symlink_metadata(&entrypoint) {
+                Ok(metadata)
+                    if directory_is_unsupported
+                        || metadata.file_type().is_symlink()
+                        || !metadata.file_type().is_file() =>
+                {
+                    unsupported_count += 1;
+                    ("unsupported", None)
+                }
+                Ok(_) => match std::fs::read(&entrypoint) {
+                    Ok(content) => {
+                        let digest = content_digest(&content);
+                        let content_status = bootstrap_content_status(&digest, &current_digest);
+                        match content_status {
+                            BootstrapContentStatus::Current => current_count += 1,
+                            BootstrapContentStatus::OfficialOutdated(_) => {
+                                outdated_count += 1;
+                                replace_count += 1;
+                                operations.push(json!({
+                                    "kind": "replace_file",
+                                    "target": entrypoint,
+                                    "content": current_content,
+                                    "expected_fingerprint": change::fingerprint(&entrypoint)?
+                                }));
+                            }
+                            BootstrapContentStatus::Modified => {
+                                modified_count += 1;
+                                if matches!(
+                                    modified_choice,
+                                    Some(ModifiedBootstrapChoice::AdoptCurrent)
+                                ) {
+                                    replace_count += 1;
+                                    operations.push(json!({
+                                        "kind": "replace_file",
+                                        "target": entrypoint,
+                                        "content": current_content,
+                                        "expected_fingerprint": change::fingerprint(&entrypoint)?
+                                    }));
+                                }
+                            }
+                        }
+                        (content_status.as_str(), content_status.installed_version())
+                    }
+                    Err(_) => {
+                        unsupported_count += 1;
+                        ("unsupported", None)
+                    }
+                },
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && !directory_is_unsupported =>
+                {
+                    missing_count += 1;
+                    if !directory.exists() {
+                        operations.push(json!({
+                            "kind": "create_directory",
+                            "target": directory,
+                            "expected_fingerprint": "missing"
+                        }));
+                    }
+                    operations.push(json!({
+                        "kind": "write_file",
+                        "target": entrypoint,
+                        "content": current_content,
+                        "expected_fingerprint": "missing"
+                    }));
+                    ("missing", None)
+                }
+                Err(_) => {
+                    unsupported_count += 1;
+                    ("unsupported", None)
+                }
+            };
+            targets.push(json!({
+                "agent": roots.agent.id(),
                 "target": entrypoint,
-                "content": include_str!("../skill/skillroster/SKILL.md"),
-                "expected_fingerprint": "missing"
+                "status": status,
+                "installed_version": installed_version
             }));
         }
     }
+    let base = json!({
+        "detected_agents": detected,
+        "targets": targets,
+        "bootstrap_skill": "skillroster",
+        "bootstrap_version": env!("CARGO_PKG_VERSION"),
+        "missing_count": missing_count,
+        "current_count": current_count,
+        "outdated_count": outdated_count,
+        "modified_count": modified_count,
+        "unsupported_count": unsupported_count,
+        "replace_count": replace_count,
+        "canonical_deletion_count": 0,
+        "files_changed": false
+    });
+    if unsupported_count > 0 {
+        let mut result = base;
+        result["plan_id"] = Value::Null;
+        result["state"] = json!("unsupported_targets");
+        return Ok(result);
+    }
+    if modified_count > 0 && modified_choice.is_none() {
+        let mut result = base;
+        result["plan_id"] = Value::Null;
+        result["state"] = json!("modified_choice_required");
+        result["allowed_modified_choices"] = json!(["retain-local", "adopt-current"]);
+        return Ok(result);
+    }
+    if matches!(modified_choice, Some(ModifiedBootstrapChoice::RetainLocal)) {
+        replace_count = outdated_count;
+    }
     if operations.is_empty() {
-        return Ok(json!({
-            "detected_agents": detected,
-            "plan_id": Value::Null,
-            "state": "already_installed_or_no_supported_agent",
-            "bootstrap_skill": "skillroster",
-            "canonical_deletion_count": 0,
-            "files_changed": false
-        }));
+        let mut result = base;
+        result["replace_count"] = json!(replace_count);
+        result["plan_id"] = Value::Null;
+        result["state"] = json!(if modified_count > 0 {
+            "local_modifications_retained"
+        } else if current_count > 0 {
+            "up_to_date"
+        } else {
+            "no_supported_agent"
+        });
+        return Ok(result);
     }
     let plan = prepare_plan(
         store,
@@ -2966,16 +3187,13 @@ fn setup_command(store: &StateStore, home: &Path, state_dir: &Path) -> Result<Va
     let operation_count = plan["change_summary"]["operation_count"]
         .as_u64()
         .unwrap_or_default();
-    Ok(json!({
-        "detected_agents": detected,
-        "plan_id": plan["plan_id"],
-        "state": "preview_ready",
-        "bootstrap_skill": "skillroster",
-        "operation_count": operation_count,
-        "canonical_deletion_count": 0,
-        "confirmation_required": true,
-        "files_changed": false
-    }))
+    let mut result = base;
+    result["replace_count"] = json!(replace_count);
+    result["plan_id"] = plan["plan_id"].clone();
+    result["state"] = json!("preview_ready");
+    result["operation_count"] = json!(operation_count);
+    result["confirmation_required"] = json!(true);
+    Ok(result)
 }
 
 fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Result<()> {
@@ -3799,6 +4017,30 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn bootstrap_digest_classification_distinguishes_release_content_from_local_edits() {
+        let current = content_digest(include_bytes!("../skill/skillroster/SKILL.md"));
+        assert_eq!(
+            bootstrap_content_status(&current, &current),
+            BootstrapContentStatus::Current
+        );
+        assert!(
+            !LEGACY_BOOTSTRAPS
+                .iter()
+                .any(|(_, digest)| *digest == current)
+        );
+        for (version, digest) in LEGACY_BOOTSTRAPS {
+            assert_eq!(
+                bootstrap_content_status(digest, &current),
+                BootstrapContentStatus::OfficialOutdated(version)
+            );
+        }
+        assert_eq!(
+            bootstrap_content_status("sha256:local-edit", &current),
+            BootstrapContentStatus::Modified
+        );
+    }
 
     #[test]
     fn scan_warnings_group_repeated_unsafe_links_for_agent_callers() {

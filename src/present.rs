@@ -167,7 +167,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         "plan" => plan(result, &mut lines),
         "apply" | "undo" => mutation(result, &mut lines),
         "lifecycle" => lifecycle(result, &mut lines),
-        "setup" => setup(result, &mut lines),
+        "setup" => setup(result, &mut lines, options.width),
         _ => home(result, &mut lines),
     }
     if styled {
@@ -537,17 +537,79 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
     }
 }
 
-fn setup(value: &Value, lines: &mut Vec<String>) {
+fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
+    fact(lines, "State", text(value, "state"));
+    fact(lines, "Bootstrap version", text(value, "bootstrap_version"));
     fact(
         lines,
         "Detected Agents",
         array_len(value, "detected_agents"),
     );
+    fact(lines, "Current", text(value, "current_count"));
+    fact(lines, "Missing", text(value, "missing_count"));
+    fact(lines, "Official outdated", text(value, "outdated_count"));
+    fact(lines, "Locally modified", text(value, "modified_count"));
+    fact(lines, "Unsupported", text(value, "unsupported_count"));
     fact(lines, "Plan", text(value, "plan_id"));
-    lines.extend(summary(
-        "Preview only · no files changed",
-        "Apply the Plan after review",
-    ));
+    let attention = value
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|target| target.get("status").and_then(Value::as_str) != Some("current"))
+        .collect::<Vec<_>>();
+    if !attention.is_empty() {
+        lines.push(String::new());
+        lines.push("Targets needing attention".into());
+        for target in attention {
+            let status = text(target, "status");
+            let agent = text(target, "agent");
+            let prefix = format!("  {status:<18} {agent:<10} ");
+            let path = middle_truncate(
+                &text(target, "target"),
+                width.saturating_sub(display_width(&prefix)),
+            );
+            lines.push(format!("{prefix}{path}"));
+        }
+    }
+    match value
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "preview_ready" => lines.extend(summary(
+            "Preview only · no files changed",
+            "Review the recoverable Plan before Apply",
+        )),
+        "modified_choice_required" => lines.extend(summary(
+            "Blocked · local bootstrap changes need a decision",
+            "Choose retain-local or adopt-current; setup will not decide",
+        )),
+        "unsupported_targets" => lines.extend(summary(
+            "Blocked · unsupported bootstrap targets were preserved",
+            "Inspect links, non-files, or unreadable targets before retrying",
+        )),
+        "local_modifications_retained" => lines.extend(summary(
+            "No change · local bootstrap modifications retained",
+            "Use adopt-current only after the user approves replacement",
+        )),
+        "up_to_date" => lines.extend(summary(
+            "Healthy · bootstrap Skill is current",
+            "No setup action is needed",
+        )),
+        "no_supported_agent" => lines.extend(summary(
+            "No change · no supported Agent target found",
+            "Run Scan after configuring a supported Agent Skill root",
+        )),
+        "scan_required" => lines.extend(summary(
+            "Blocked · no completed Scan is available",
+            "Run skillroster scan before setup",
+        )),
+        _ => lines.extend(summary(
+            "Preview only · no files changed",
+            "Follow the reported setup state",
+        )),
+    }
 }
 
 fn lifecycle(value: &Value, lines: &mut Vec<String>) {
@@ -814,6 +876,52 @@ mod tests {
         );
         assert!(output.contains("Verified · no files changed"));
         assert!(!output.contains("Changed · bounded"));
+    }
+
+    #[test]
+    fn setup_output_makes_modified_and_unsupported_targets_actionable() {
+        let modified = render(
+            "setup",
+            &json!({
+                "state": "modified_choice_required",
+                "bootstrap_version": "1.2.0",
+                "detected_agents": [{"agent": "codex"}],
+                "current_count": 0,
+                "missing_count": 0,
+                "outdated_count": 0,
+                "modified_count": 1,
+                "unsupported_count": 0,
+                "plan_id": null
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(modified.contains("local bootstrap changes need a decision"));
+        assert!(modified.contains("retain-local or adopt-current"));
+        assert!(modified.contains("Locally modified       1"));
+
+        let unsupported = render(
+            "setup",
+            &json!({
+                "state": "unsupported_targets",
+                "bootstrap_version": "1.2.0",
+                "detected_agents": [{"agent": "codex"}],
+                "current_count": 0,
+                "missing_count": 0,
+                "outdated_count": 0,
+                "modified_count": 0,
+                "unsupported_count": 1,
+                "plan_id": null
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(unsupported.contains("unsupported bootstrap targets were preserved"));
+        assert!(unsupported.contains("Unsupported            1"));
     }
 
     #[test]

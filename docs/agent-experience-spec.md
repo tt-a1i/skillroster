@@ -48,6 +48,8 @@ The Agent selects one primary action from current state:
 | Applied | Show verification and Receipt | 完成 |
 | Undo available | Show reverse impact on request | 撤销上次应用 |
 | Recovery required | Stop unrelated writes | 处理恢复 |
+| Bootstrap modified | Show affected targets and ask retain/adopt | 保留本地 or 采用当前版 |
+| Bootstrap target unsupported | Explain the preserved link/non-file | 检查目标 |
 
 The Agent never manufactures a problem so that an Apply action exists.
 
@@ -162,6 +164,13 @@ The Agent discovers 100+ Skills, creates a Plan in the same read-only turn, make
 ### Healthy setup
 
 The Agent reports that no change is justified and does not create artificial archive or consolidation work.
+
+### Bootstrap upgrade
+
+After a CLI upgrade, the Agent runs `setup`. Exact official older bootstrap
+content produces a recoverable upgrade Plan. Locally modified content produces
+no Plan until the person explicitly chooses retain or adopt; unsupported
+targets remain untouched.
 
 ### Partial Evidence
 

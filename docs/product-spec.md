@@ -106,10 +106,16 @@ skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
 skillroster undo <receipt-id> [--json]
 skillroster status [--json]
-skillroster setup [--json]
+skillroster setup [--modified-choice retain-local|adopt-current] [--json]
 ```
 
-`setup` detects supported Agents and returns a preview for installing the single bootstrap Skill. In JSON mode it never prompts or mutates; the installation is represented by a Plan and completed through the normal Apply path.
+`setup` detects supported Agents and returns a preview for installing or
+upgrading the single bootstrap Skill. Exact official older copies are eligible
+for automatic planning. Unknown content is treated as a local modification and
+requires an explicit retain/adopt choice before any Plan is created. Links,
+non-files, and unreadable targets are blocked. In JSON mode setup never prompts
+or mutates; every write remains a normal Plan completed through Apply and
+recoverable through Undo.
 
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or

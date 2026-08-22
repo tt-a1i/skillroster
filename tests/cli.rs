@@ -577,6 +577,249 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
 }
 
 #[test]
+fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let ordinary = root.join("ordinary");
+    let bootstrap = root.join("skillroster/SKILL.md");
+    fs::create_dir_all(&ordinary).unwrap();
+    fs::write(
+        ordinary.join("SKILL.md"),
+        "---\nname: ordinary\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+    let modified =
+        "---\nname: skillroster\ndescription: locally customized\n---\ncustom instructions\n";
+    fs::write(&bootstrap, modified).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let blocked = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(blocked["result"]["state"], "modified_choice_required");
+    assert_eq!(blocked["result"]["modified_count"], 1);
+    assert!(blocked["result"]["plan_id"].is_null());
+    assert_eq!(blocked["result"]["targets"][0]["status"], "modified");
+    assert!(blocked["result"]["targets"][0]["installed_version"].is_null());
+    assert_eq!(blocked["suggested_actions"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        blocked["suggested_actions"][0]["argv"],
+        serde_json::json!([
+            "skillroster",
+            "setup",
+            "--modified-choice",
+            "retain-local",
+            "--json"
+        ])
+    );
+    assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        blocked["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+    assert_eq!(
+        blocked["suggested_actions"][1]["argv"],
+        serde_json::json!([
+            "skillroster",
+            "setup",
+            "--modified-choice",
+            "adopt-current",
+            "--json"
+        ])
+    );
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), modified);
+
+    let retained = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_eq!(retained["result"]["state"], "local_modifications_retained");
+    assert!(retained["result"]["plan_id"].is_null());
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), modified);
+
+    let upgrade = json_output(&run(
+        &[
+            &common[..],
+            &["setup", "--modified-choice", "adopt-current"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(upgrade["result"]["state"], "preview_ready");
+    assert_eq!(upgrade["result"]["replace_count"], 1);
+    assert_eq!(upgrade["result"]["modified_count"], 1);
+    assert_eq!(upgrade["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(upgrade["suggested_actions"][0]["action"], "apply");
+    assert_eq!(upgrade["suggested_actions"][0]["mutates"], true);
+    assert_eq!(
+        upgrade["suggested_actions"][0]["requires_confirmation"],
+        true
+    );
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), modified);
+    let plan_id = upgrade["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["operations"][0]["kind"], "replace_file");
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(
+        fs::read_to_string(&bootstrap).unwrap(),
+        include_str!("../skill/skillroster/SKILL.md")
+    );
+    let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(current["result"]["state"], "up_to_date");
+    assert!(current["result"]["plan_id"].is_null());
+    assert_eq!(
+        current["result"]["targets"][0]["installed_version"],
+        "1.2.0"
+    );
+
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), modified);
+}
+
+#[test]
+fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let ordinary = root.join("ordinary");
+    let bootstrap = root.join("skillroster/SKILL.md");
+    fs::create_dir_all(&ordinary).unwrap();
+    fs::write(
+        ordinary.join("SKILL.md"),
+        "---\nname: ordinary\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+    let legacy = include_str!("fixtures/bootstrap-v1.1.0.md");
+    fs::write(&bootstrap, legacy).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let upgrade = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(upgrade["result"]["state"], "preview_ready");
+    assert_eq!(upgrade["result"]["outdated_count"], 1);
+    assert_eq!(upgrade["result"]["modified_count"], 0);
+    assert_eq!(upgrade["result"]["replace_count"], 1);
+    assert_eq!(
+        upgrade["result"]["targets"][0]["status"],
+        "official_outdated"
+    );
+    assert_eq!(
+        upgrade["result"]["targets"][0]["installed_version"],
+        "1.1.0"
+    );
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+
+    let plan_id = upgrade["result"]["plan_id"].as_str().unwrap();
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert_eq!(
+        fs::read_to_string(&bootstrap).unwrap(),
+        include_str!("../skill/skillroster/SKILL.md")
+    );
+    let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(current["result"]["state"], "up_to_date");
+
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+}
+
+#[test]
+fn setup_without_a_snapshot_returns_a_typed_scan_action() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let output = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+            "setup",
+        ],
+        None,
+    ));
+
+    assert_eq!(output["result"]["state"], "scan_required");
+    assert_eq!(output["result"]["bootstrap_version"], "1.2.0");
+    assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        output["suggested_actions"][0]["argv"],
+        serde_json::json!(["skillroster", "scan", "--json"])
+    );
+}
+
+#[test]
+fn setup_preserves_unsupported_bootstrap_targets_without_creating_a_plan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let ordinary = root.join("ordinary");
+    fs::create_dir_all(&ordinary).unwrap();
+    fs::write(
+        ordinary.join("SKILL.md"),
+        "---\nname: ordinary\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    let blocked_parent = root.join("skillroster");
+    fs::write(&blocked_parent, "user-owned non-directory target\n").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    for setup_args in [
+        vec!["setup"],
+        vec!["setup", "--modified-choice", "adopt-current"],
+    ] {
+        let output = json_output(&run(&[&common[..], &setup_args].concat(), None));
+        assert_eq!(output["result"]["state"], "unsupported_targets");
+        assert_eq!(output["result"]["unsupported_count"], 1);
+        assert!(output["result"]["plan_id"].is_null());
+        assert_eq!(output["result"]["targets"][0]["status"], "unsupported");
+        assert_eq!(
+            fs::read_to_string(&blocked_parent).unwrap(),
+            "user-owned non-directory target\n"
+        );
+    }
+}
+
+#[test]
 fn agent_plan_refuses_arbitrary_skill_root_write_file() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

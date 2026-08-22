@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Local Skill governance for AI Agents.
 #[derive(Debug, Parser)]
@@ -45,7 +45,7 @@ impl Cli {
             Some(Command::Undo(_)) => "undo",
             Some(Command::Status) => "status",
             Some(Command::Lifecycle(_)) => "lifecycle",
-            Some(Command::Setup) => "setup",
+            Some(Command::Setup(_)) => "setup",
             None => "home",
         }
     }
@@ -69,8 +69,8 @@ pub enum Command {
     Status,
     /// Inspect, export, or prune retained local lifecycle data.
     Lifecycle(LifecycleArgs),
-    /// Preview bootstrap Skill installation for detected Agents.
-    Setup,
+    /// Preview bootstrap Skill installation or upgrade for detected Agents.
+    Setup(SetupArgs),
 }
 
 #[derive(Debug, Args)]
@@ -116,6 +116,19 @@ pub struct PlanArgs {
 #[derive(Debug, Args)]
 pub struct IdArgs {
     pub id: String,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ModifiedBootstrapChoice {
+    RetainLocal,
+    AdoptCurrent,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Decide how setup handles locally modified bootstrap Skill files.
+    #[arg(long, value_enum)]
+    pub modified_choice: Option<ModifiedBootstrapChoice>,
 }
 
 #[derive(Debug, Args)]
