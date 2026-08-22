@@ -105,6 +105,31 @@ pub struct FindVariant {
     pub governable: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RetrievalQuery {
+    text: String,
+    phrases: Vec<String>,
+}
+
+impl RetrievalQuery {
+    pub(crate) fn from_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Self {
+        let phrases = parts
+            .into_iter()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        Self {
+            text: phrases.join(" "),
+            phrases,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 pub fn build_report(scan: &ScanResult) -> Report {
     let metrics = PrimaryMetrics {
         independent_skills: scan.skills.len(),
@@ -1172,23 +1197,24 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    find_matching(scan, task, &[task], limit, None, None)
+    let query = RetrievalQuery::from_parts([task]);
+    find_matching(scan, &query, limit, None, None)
 }
 
 pub(crate) fn find_matching(
     scan: &ScanResult,
-    task: &str,
-    retrieval_parts: &[&str],
+    query: &RetrievalQuery,
     limit: usize,
     candidate_ids: Option<&BTreeSet<String>>,
     variant_eligible_ids: Option<&BTreeSet<String>>,
 ) -> Vec<FindMatch> {
-    let query = task.trim().to_lowercase();
-    if query.is_empty() || limit == 0 {
+    let query_text = query.text().trim().to_lowercase();
+    if query_text.is_empty() || limit == 0 {
         return Vec::new();
     }
-    let query_tokens = tokens(&query);
-    let query_phrases = retrieval_parts
+    let query_tokens = tokens(&query_text);
+    let query_phrases = query
+        .phrases
         .iter()
         .map(|part| part.trim().to_lowercase())
         .filter(|part| !part.is_empty())
@@ -1914,14 +1940,8 @@ mod tests {
     #[test]
     fn find_keeps_hint_phrases_separate_from_the_preserved_task() {
         let (root, scan) = fixture();
-        let matches = find_matching(
-            &scan,
-            "调查事实 verify",
-            &["调查事实", "verify"],
-            3,
-            None,
-            None,
-        );
+        let query = RetrievalQuery::from_parts(["调查事实", "verify"]);
+        let matches = find_matching(&scan, &query, 3, None, None);
 
         assert_eq!(matches[0].name, "research");
         assert!(
@@ -2205,14 +2225,8 @@ mod tests {
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
 
         let eligible = BTreeSet::from([matched.skill_id.clone()]);
-        let filtered = find_matching(
-            &scan,
-            "diagrams",
-            &["diagrams"],
-            10,
-            Some(&eligible),
-            Some(&eligible),
-        );
+        let query = RetrievalQuery::from_parts(["diagrams"]);
+        let filtered = find_matching(&scan, &query, 10, Some(&eligible), Some(&eligible));
         let filtered_match = filtered
             .iter()
             .find(|candidate| candidate.name == "tech-essay-writer")
@@ -2227,15 +2241,8 @@ mod tests {
             .iter()
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
-        let partial_match = find_matching(
-            &scan,
-            "diagrams",
-            &["diagrams"],
-            10,
-            Some(&eligible),
-            Some(&all_routable),
-        )
-        .remove(0);
+        let partial_match =
+            find_matching(&scan, &query, 10, Some(&eligible), Some(&all_routable)).remove(0);
         assert_eq!(partial_match.variant_count, 2);
         assert_eq!(partial_match.variants.len(), 2);
         fs::remove_dir_all(root).unwrap();

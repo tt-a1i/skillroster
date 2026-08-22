@@ -1067,13 +1067,14 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
     let lines = frontmatter;
     let mut list_key: Option<String> = None;
     let mut top_level_key: Option<String> = None;
+    let mut metadata_child_indentation: Option<usize> = None;
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
         let indentation = leading_whitespace(line);
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("- ") {
-            if matches!(list_key.as_deref(), Some("triggers" | "routing-triggers")) {
+            if list_key.as_deref() == Some("triggers") {
                 metadata.triggers.push(unquote(value));
             }
             index += 1;
@@ -1085,11 +1086,16 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
                     index += 1;
                     continue;
                 };
+                let child_indentation = *metadata_child_indentation.get_or_insert(indentation);
+                if indentation != child_indentation {
+                    index += 1;
+                    continue;
+                }
                 let key = key.trim();
                 let value = value.trim();
                 list_key = Some(key.to_owned());
-                if key == "routing-triggers" && !value.is_empty() {
-                    extend_trigger_values(&mut metadata, value);
+                if key == "skillroster-routing-triggers" && !value.is_empty() {
+                    extend_routing_trigger_values(&mut metadata, value);
                 }
             }
             index += 1;
@@ -1102,6 +1108,7 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
         let key = key.trim();
         let value = value.trim();
         top_level_key = Some(key.to_owned());
+        metadata_child_indentation = None;
         list_key = Some(key.to_owned());
         if value.is_empty() {
             index += 1;
@@ -1141,6 +1148,15 @@ fn extend_trigger_values(metadata: &mut SkillMetadata, value: &str) {
         value
             .trim_matches(['[', ']'])
             .split(',')
+            .map(unquote)
+            .filter(|value| !value.is_empty()),
+    );
+}
+
+fn extend_routing_trigger_values(metadata: &mut SkillMetadata, value: &str) {
+    metadata.triggers.extend(
+        unquote(value)
+            .split(';')
             .map(unquote)
             .filter(|value| !value.is_empty()),
     );
@@ -2243,7 +2259,7 @@ enabled = true
     #[test]
     fn parses_standard_metadata_routing_triggers() {
         let metadata = parse_skill_markdown(
-            "---\nname: skillroster\ndescription: Govern Skills\nmetadata:\n  bootstrap-version: 1.8.6\n  routing-triggers:\n    - inventory installed Agent Skills\n    - create Skill Receipt\n---\nBody",
+            "---\nname: skillroster\ndescription: Govern Skills\nmetadata:\n  bootstrap-version: 1.8.6\n  skillroster-routing-triggers: \"inventory installed Agent Skills; create Skill Receipt\"\n---\nBody",
         );
 
         assert_eq!(
@@ -2251,6 +2267,16 @@ enabled = true
             ["inventory installed Agent Skills", "create Skill Receipt"]
         );
         assert!(metadata.version.is_none());
+    }
+
+    #[test]
+    fn ignores_nested_or_non_string_metadata_routing_triggers() {
+        for markdown in [
+            "---\nname: nested\nmetadata:\n  custom:\n    skillroster-routing-triggers: \"nested trigger\"\n---\n",
+            "---\nname: sequence\nmetadata:\n  skillroster-routing-triggers:\n    - sequence trigger\n---\n",
+        ] {
+            assert!(parse_skill_markdown(markdown).triggers.is_empty());
+        }
     }
 
     #[test]

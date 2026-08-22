@@ -270,7 +270,8 @@ could combine with `skill` to trigger a false two-token exclusion penalty for
 CJK task and English hint also discarded exact phrase and declared-trigger
 evidence. Search scoring now removes a bounded English stopword set before
 field overlap and exclusion evaluation, keeps task and hint phrase boundaries,
-and accepts standard-compatible `metadata.routing-triggers`. The Bootstrap
+and accepts standard-compatible string-valued
+`metadata.skillroster-routing-triggers`. The Bootstrap
 pointer and routing metadata state the governance boundary against installation
 and shared-directory management.
 
