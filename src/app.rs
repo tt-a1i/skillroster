@@ -59,6 +59,11 @@ pub fn run(cli: Cli) -> Result<Output> {
     }
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    // Every command opens the same SQLite database, so even nominally read-only
+    // commands must serialize with lifecycle delete on platforms that forbid
+    // deleting an open database handle. Mutating change APIs use their locked
+    // variants below because this guard covers the full SQLite/filesystem unit.
+    let _write_lock = change::WriteLock::acquire(&state_dir)?;
     let store = StateStore::open(&database_path)?;
 
     let (command, result, warnings, actions) = match cli.command {
@@ -615,7 +620,9 @@ fn lifecycle_purge_command(
     raw_days: Option<u16>,
     plans_receipts: bool,
 ) -> Result<Value> {
-    let _write_lock = change::WriteLock::acquire(state_dir)?;
+    if plans_receipts && recovery_text(store, state_dir)? == "required" {
+        bail!("recovery is required before Plans and Receipts can be purged");
+    }
     let (cutoff, usage_result) = if let Some(raw_days) = raw_days {
         let cutoff = Utc::now().timestamp() - i64::from(raw_days) * 24 * 60 * 60;
         (Some(cutoff), Some(store.purge_usage_before(cutoff)?))
@@ -629,11 +636,8 @@ fn lifecycle_purge_command(
             || result.deleted_payload_usage_summaries > 0
     });
     let (plan_receipt_result, plans_or_receipts_changed) = if plans_receipts {
-        if recovery_text(store, state_dir)? == "required" {
-            bail!("recovery is required before Plans and Receipts can be purged");
-        }
-        let removed_journals = remove_receipt_journals(state_dir)?;
         let result = store.purge_plans_and_receipts()?;
+        let removed_journals = remove_receipt_journals(state_dir)?;
         let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
         let changed = result.plans > 0
             || result.receipts > 0
@@ -680,8 +684,6 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
     } else if !journals.is_empty() {
         bail!("recovery is required before the local state database can be deleted");
     }
-    let removed_journals = remove_receipt_journals(state_dir)?;
-    let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
     let mut removed_database_files = Vec::new();
     for path in [
         database_path.to_path_buf(),
@@ -696,6 +698,11 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
             }
         }
     }
+    // Once SQLite is gone, leftover journals or recovery backups are harmless
+    // extra local state and can be retried. Deleting them first could destroy
+    // the only recovery material before a database deletion error.
+    let removed_journals = remove_receipt_journals(state_dir)?;
+    let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
     let files_changed = !removed_database_files.is_empty()
         || removed_journals > 0
         || removed_recovery_directories > 0;
@@ -1991,7 +1998,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
         bail!("Plan {id} is stale; Library governance state has drifted");
     }
     store.update_plan_status(&id, PlanStatus::Applying)?;
-    let mut outcome = match change::apply(&prepared) {
+    let mut outcome = match change::apply_locked(&prepared) {
         Ok(outcome) => outcome,
         Err(error) => {
             let next = if journal_issues(store, &prepared.state_dir)?.is_empty() {
@@ -2016,7 +2023,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
                 restore_roster_state(store, &Value::Array(roster_before.clone())).is_ok();
             let library_restored =
                 restore_library_state(store, &Value::Array(library_before.clone())).is_ok();
-            let filesystem_rollback = change::rollback_apply(&outcome.receipt)?;
+            let filesystem_rollback = change::rollback_apply_locked(&outcome.receipt)?;
             let recovered =
                 roster_restored && library_restored && filesystem_rollback.verification_passed;
             outcome.receipt = filesystem_rollback.receipt;
@@ -2090,7 +2097,7 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
     let original: ChangeReceipt =
         serde_json::from_value(record.verification["change_receipt"].clone())?;
     require_clear_journals(store, &original.state_dir)?;
-    let mut outcome = change::undo(&original)?;
+    let mut outcome = change::undo_locked(&original)?;
     if outcome.verification_passed {
         if let Err(error) =
             restore_roster_state(store, &record.verification["roster_state"]["before"]).and_then(
@@ -3138,6 +3145,61 @@ mod recovery_tests {
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::RecoveryRequired
         );
+    }
+
+    #[test]
+    fn combined_lifecycle_purge_checks_recovery_before_mutating_usage() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(state_dir.join("receipts")).unwrap();
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = ScanRun {
+            id: ScanId::new(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        store.save_scan(&scan).unwrap();
+        store
+            .save_scan_payload(
+                &scan.id,
+                &json!({
+                    "usage": [{
+                        "agent": "codex",
+                        "skill_id": "skill_fixture",
+                        "stage": "loaded",
+                        "quality": "observed",
+                        "event_count": 1,
+                        "first_seen_unix": 1,
+                        "last_seen_unix": 1
+                    }]
+                }),
+            )
+            .unwrap();
+        let orphan = ChangeReceipt {
+            id: ReceiptId::new().to_string(),
+            plan_id: PlanId::new().to_string(),
+            status: change::ReceiptStatus::Applied,
+            changed_paths: vec![temp.path().join("agent-skill")],
+            compensations: vec![],
+            approved_roots: vec![temp.path().to_path_buf()],
+            state_dir: state_dir.clone(),
+            error: None,
+            reverses_receipt_id: None,
+            operation_results: vec![],
+        };
+        std::fs::write(
+            state_dir
+                .join("receipts")
+                .join(format!("{}.json", orphan.id)),
+            serde_json::to_vec(&orphan).unwrap(),
+        )
+        .unwrap();
+
+        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true).is_err());
+        let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
+        assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
     }
 }
 

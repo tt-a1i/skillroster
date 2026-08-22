@@ -71,7 +71,7 @@ The 2026-08-22 release gates use actual hosted operating systems and the package
 release binaries, always against synthetic temporary homes:
 
 - [four-platform CI](https://github.com/tt-a1i/skillroster/actions/runs/32548259913)
-  passed Rust 1.85 formatting, Clippy, and 78 core/high-risk tests on Linux x86_64,
+  passed Rust 1.85 formatting, Clippy, and 79 core/high-risk tests on Linux x86_64,
   Windows x86_64, macOS arm64, and macOS x86_64;
 - [release candidate 8](https://github.com/tt-a1i/skillroster/actions/runs/32548259787)
   built all four archives and ran `--version`, `--help`, Scan, Setup preview,

@@ -472,6 +472,11 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
 pub fn apply(plan: &PreparedPlan) -> Result<ApplyOutcome> {
     validate_prepared_plan(plan)?;
     let _lock = WriteLock::acquire(&plan.state_dir)?;
+    apply_locked(plan)
+}
+
+pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
+    validate_prepared_plan(plan)?;
     reject_unresolved_recovery(&plan.state_dir)?;
     validate_operation_sequence(&plan.operations, &plan.approved_roots)?;
 
@@ -621,6 +626,16 @@ pub fn undo(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
         ));
     }
     let _lock = WriteLock::acquire(&receipt.state_dir)?;
+    undo_locked(receipt)
+}
+
+pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
+    if receipt.status != ReceiptStatus::Applied {
+        return Err(ChangeError::new(
+            "receipt_not_undoable",
+            "only an applied receipt can be undone",
+        ));
+    }
     reject_unresolved_recovery_except(&receipt.state_dir, &receipt.id)?;
     if reverse_receipt_exists(&receipt.state_dir, &receipt.id)? {
         return Err(ChangeError::new(
@@ -697,6 +712,16 @@ pub fn rollback_apply(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
         ));
     }
     let _lock = WriteLock::acquire(&receipt.state_dir)?;
+    rollback_apply_locked(receipt)
+}
+
+pub(crate) fn rollback_apply_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
+    if receipt.status != ReceiptStatus::Applied {
+        return Err(ChangeError::new(
+            "receipt_not_rollbackable",
+            "only an applied receipt can be rolled back",
+        ));
+    }
     let mut rolled_back = receipt.clone();
     match compensate_all(receipt) {
         Ok(()) => {

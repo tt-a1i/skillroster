@@ -273,6 +273,10 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert!(!locked_purge.status.success());
     let locked_purge: Value = serde_json::from_slice(&locked_purge.stdout).unwrap();
     assert_eq!(locked_purge["error"]["code"], "write_locked");
+    let locked_status = run(&[&common[..], &["status"]].concat(), None);
+    assert!(!locked_status.status.success());
+    let locked_status: Value = serde_json::from_slice(&locked_status.stdout).unwrap();
+    assert_eq!(locked_status["error"]["code"], "write_locked");
     let locked_delete = run(
         &[
             &common[..],
