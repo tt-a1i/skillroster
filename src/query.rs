@@ -84,6 +84,7 @@ pub struct FindMatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<FindVariant>,
     pub variant_count: usize,
+    pub variants_truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1053,7 +1054,11 @@ pub(crate) fn find_matching(
     let query_tokens = tokens(&query);
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
-    for skill in &scan.skills {
+    for skill in scan
+        .skills
+        .iter()
+        .filter(|skill| candidate_ids.is_none_or(|ids| ids.contains(&skill.id)))
+    {
         variants_by_name
             .entry(skill.name.trim().to_lowercase())
             .or_default()
@@ -1123,14 +1128,24 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
-            let mut variant_skill_ids = variants_by_name
+            let all_variant_skill_ids = variants_by_name
                 .get(&name.trim().to_lowercase())
                 .cloned()
                 .unwrap_or_else(|| vec![skill.id.clone()]);
-            let variant_count = variant_skill_ids.len();
-            if variant_count == 1 {
-                variant_skill_ids.clear();
-            }
+            let variant_count = all_variant_skill_ids.len();
+            let variants_truncated = variant_count > 10;
+            let variant_skill_ids = if variant_count > 1 {
+                std::iter::once(skill.id.clone())
+                    .chain(
+                        all_variant_skill_ids
+                            .into_iter()
+                            .filter(|variant_id| variant_id != &skill.id),
+                    )
+                    .take(10)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             let placements = placement_groups
                 .get(skill.id.as_str())
                 .cloned()
@@ -1222,6 +1237,7 @@ pub(crate) fn find_matching(
                 variant_skill_ids,
                 variants,
                 variant_count,
+                variants_truncated,
             })
         })
         .collect::<Vec<_>>();
@@ -1237,12 +1253,7 @@ pub(crate) fn find_matching(
     let mut capabilities: Vec<FindMatch> = Vec::new();
     for matched in matches {
         let capability = matched.name.trim().to_lowercase();
-        if let Some(index) = capability_indexes.get(&capability).copied() {
-            let existing = &mut capabilities[index];
-            existing.variant_skill_ids.push(matched.skill_id);
-            existing.variant_skill_ids.sort();
-            existing.variant_skill_ids.dedup();
-            existing.variant_count = existing.variant_skill_ids.len();
+        if capability_indexes.contains_key(&capability) {
             continue;
         }
         capability_indexes.insert(capability, capabilities.len());
@@ -1608,6 +1619,65 @@ mod tests {
                 .all(|variant| variant.paths.len() == 1)
         );
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
+
+        let eligible = BTreeSet::from([matched.skill_id.clone()]);
+        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible));
+        let filtered_match = filtered
+            .iter()
+            .find(|candidate| candidate.name == "tech-essay-writer")
+            .unwrap();
+        assert_eq!(filtered_match.variant_count, 1);
+        assert!(!filtered_match.variants_truncated);
+        assert!(filtered_match.variant_skill_ids.is_empty());
+        assert!(filtered_match.variants.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_name_variant_details_are_bounded_and_keep_the_representative() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-bounded-variants-{nonce}"));
+        for index in 0..12 {
+            let path = root.join(format!("variant-{index:02}"));
+            fs::create_dir_all(&path).unwrap();
+            let body = if index == 11 {
+                "diagram specialist"
+            } else {
+                "unrelated capability"
+            };
+            fs::write(
+                path.join("SKILL.md"),
+                format!(
+                    "---\nname: shared-capability\ndescription: variant {index}\n---\n{body}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let matched = find(&scan, "diagram specialist", 1).remove(0);
+
+        assert_eq!(matched.variant_count, 12);
+        assert!(matched.variants_truncated);
+        assert_eq!(matched.variant_skill_ids.len(), 10);
+        assert_eq!(matched.variants.len(), 10);
+        assert!(
+            matched
+                .variant_skill_ids
+                .iter()
+                .any(|skill_id| skill_id == &matched.skill_id)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

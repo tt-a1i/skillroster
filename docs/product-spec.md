@@ -122,6 +122,8 @@ retrieval hints. Hints let the semantic caller supply a cross-language or
 capability paraphrase while the CLI remains a deterministic local lexical
 index. Same-name Skill identities occupy one ranked capability result and are
 reported as explicit variants rather than silently treated as equivalent.
+Variant details keep provider, governance, and path facts bound to one identity;
+the response preserves the total count and marks bounded detail truncation.
 Provider-managed results include their plugin identity and a non-governable
 marker so Agents can route to them without proposing filesystem governance.
 
