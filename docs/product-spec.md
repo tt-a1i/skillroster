@@ -124,7 +124,10 @@ index. Without hints, Find uses one lexical channel. With hints, it ranks the
 original task and the task-plus-hints expansion independently, then applies
 deterministic reciprocal-rank fusion over a bounded candidate pool. The JSON
 `ranking_strategy`, `task_channel_rank`, and `augmented_channel_rank` facts make
-that decision inspectable. A hint can therefore surface English metadata
+that decision inspectable. Rank position remains discriminating within these
+small candidate pools: a high-ranked Agent hint match outranks weak lexical
+overlap that merely appears in both channels, while a strong original-task
+match remains protected in the bounded result. A hint can therefore surface English metadata
 without letting its raw token count set one global cutoff that discards a
 strong native-task result. Each task or hint also remains a separate phrase for
 exact name, description, and declared-trigger evidence. The scanner reads

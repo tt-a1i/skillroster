@@ -357,6 +357,19 @@ produced five unique preview keys. Compact and full JSON retained the same
 bounded overview with `files_changed=false`; no Apply was run and no Agent file
 changed.
 
+The v1.8.15 Agent-hint dogfood reused the official v1.8.14 real-home Snapshot:
+244 independent Skills and 740 placements. For the Chinese task `把产品想法压力
+测试成明确规格`, the positive English capability hint found `grilling` at
+augmented rank two, but the previous large reciprocal-rank offset still placed
+the unrelated `x-post-writer` first from weak task-rank-six and
+augmented-rank-fourteen overlap. The small-pool fusion now preserves rank
+discrimination: `plan`, `grilling`, and `product-business-analysis` form the
+Top-3 and the unrelated writer is removed from the bounded result. Three other
+real read-only probes ranked `code-review`, `computer-history`, and
+`analyze-data-quality` first; the maintained routing baseline and the strong
+native-task preservation regression remained green. Every Find response kept
+both channel ranks and `files_changed=false`.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
