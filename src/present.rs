@@ -313,32 +313,32 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
             lines.push("  none".into());
         }
     }
-    if let Some(rollups) = value.get("finding_rollups").and_then(Value::as_array)
-        && !rollups.is_empty()
-    {
-        const VISIBLE_ROLLUPS: usize = 5;
-        lines.push(String::new());
-        lines.push("  Finding groups".into());
-        for rollup in rollups.iter().take(VISIBLE_ROLLUPS) {
-            let prefix = format!(
-                "  {} × {} Skills · {} placements · ",
-                text(rollup, "finding_count"),
-                text(rollup, "affected_skill_count"),
-                text(rollup, "affected_placement_count")
-            );
-            lines.push(format!(
-                "{prefix}{}",
-                middle_truncate(
-                    &text(rollup, "title"),
-                    width.saturating_sub(display_width(&prefix))
-                )
-            ));
-        }
-        if rollups.len() > VISIBLE_ROLLUPS {
-            lines.push(format!(
-                "  … {} more groups in JSON",
-                rollups.len() - VISIBLE_ROLLUPS
-            ));
+    if let Some(rollups) = value.get("finding_rollups").and_then(Value::as_array) {
+        if !rollups.is_empty() {
+            const VISIBLE_ROLLUPS: usize = 5;
+            lines.push(String::new());
+            lines.push("  Finding groups".into());
+            for rollup in rollups.iter().take(VISIBLE_ROLLUPS) {
+                let prefix = format!(
+                    "  {} × {} Skills · {} placements · ",
+                    text(rollup, "finding_count"),
+                    text(rollup, "affected_skill_count"),
+                    text(rollup, "affected_placement_count")
+                );
+                lines.push(format!(
+                    "{prefix}{}",
+                    middle_truncate(
+                        &text(rollup, "title"),
+                        width.saturating_sub(display_width(&prefix))
+                    )
+                ));
+            }
+            if rollups.len() > VISIBLE_ROLLUPS {
+                lines.push(format!(
+                    "  … {} more groups in JSON",
+                    rollups.len() - VISIBLE_ROLLUPS
+                ));
+            }
         }
     }
     if let Some(counts) = value.get("category_counts").and_then(Value::as_object) {
