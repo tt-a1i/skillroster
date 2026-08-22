@@ -1070,7 +1070,10 @@ fn stage_compensation(
     require_missing(&backup)?;
     fs::copy(target, &backup)
         .map_err(|error| ChangeError::io("persist replacement backup", target, error))?;
-    File::open(&backup)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&backup)
         .and_then(|file| file.sync_all())
         .map_err(|error| ChangeError::io("sync replacement backup", &backup, error))?;
     let backup_fingerprint = fingerprint(&backup)?;
@@ -1312,7 +1315,10 @@ fn compensate(
             require_missing(&restore)?;
             fs::copy(backup, &restore)
                 .map_err(|error| ChangeError::io("stage restored file", backup, error))?;
-            File::open(&restore)
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&restore)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| ChangeError::io("sync restored file", &restore, error))?;
             if actual != "missing" {
