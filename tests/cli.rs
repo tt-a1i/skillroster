@@ -1997,6 +1997,23 @@ fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_source
         }]
     });
 
+    let codex_root = home.join(".codex/skills");
+    let drifted_root = home.join("drifted-shared-root");
+    fs::create_dir_all(drifted_root.join("shared")).unwrap();
+    fs::write(drifted_root.join("shared/SKILL.md"), content).unwrap();
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&drifted_root, &codex_root).unwrap();
+    let drifted_output = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!drifted_output.status.success());
+    let drifted: Value = serde_json::from_slice(&drifted_output.stdout).unwrap();
+    assert_eq!(drifted["ok"], false);
+    assert_eq!(drifted["error"]["code"], "state_drift");
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&shared_root, &codex_root).unwrap();
+
     let plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
@@ -2047,6 +2064,120 @@ fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_source
     }
     assert_eq!(
         fs::read_to_string(shared_skill.join("SKILL.md")).unwrap(),
+        content
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn exact_duplicate_plan_moves_the_real_source_instead_of_its_alias() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex_skill = home.join(".codex/skills/shared");
+    let opencode_real = home.join(".config/opencode/skills/z-real");
+    let opencode_alias = home.join(".config/opencode/skills/a-alias");
+    let hermes_skill = home.join(".hermes/skills/shared");
+    let content = "---\nname: shared\ndescription: shared fixture\n---\nbody\n";
+    for directory in [&codex_skill, &opencode_real, &hermes_skill] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    symlink(&opencode_real, &opencode_alias).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Exact duplicate Skill placements")
+        .unwrap();
+    let finding_id = finding["id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["canonical_candidate_count"], 3);
+    assert!(
+        planning["canonical_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate["path"] != opencode_alias.join("SKILL.md").to_str().unwrap())
+    );
+    let canonical_placement_id = planning["canonical_candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["path"] == codex_skill.join("SKILL.md").to_str().unwrap())
+        .unwrap()["placement_id"]
+        .as_str()
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": finding_id,
+            "canonical_placement_id": canonical_placement_id,
+            "requested_state": "managed"
+        }]
+    });
+
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    assert_eq!(plan["result"]["change_summary"]["operation_count"], 5);
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let full = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    let moved_sources = full["result"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|operation| operation["kind"] == "move_recoverable")
+        .map(|operation| operation["source"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        moved_sources
+            .iter()
+            .any(|source| Path::new(source).file_name().unwrap() == "z-real")
+    );
+    assert!(
+        moved_sources
+            .iter()
+            .all(|source| Path::new(source).file_name().unwrap() != "a-alias")
+    );
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert!(
+        fs::symlink_metadata(&opencode_real)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::canonicalize(&opencode_alias).unwrap(),
+        fs::canonicalize(&codex_skill).unwrap()
+    );
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(opencode_real.join("SKILL.md").is_file());
+    assert_eq!(
+        fs::read_to_string(opencode_alias.join("SKILL.md")).unwrap(),
         content
     );
 }

@@ -1530,6 +1530,31 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
     }
 }
 
+fn placement_owns_physical_source(placement: &scan::SkillPlacement) -> bool {
+    if placement.link_target.is_some() {
+        return false;
+    }
+    let Some(physical_directory) = placement.physical_directory.as_ref() else {
+        return false;
+    };
+    let Some(root_parent) = placement.root.parent() else {
+        return false;
+    };
+    let Some(root_name) = placement.root.file_name() else {
+        return false;
+    };
+    let Ok(relative_directory) = placement.directory.strip_prefix(&placement.root) else {
+        return false;
+    };
+    let Ok(physical_root_parent) = std::fs::canonicalize(root_parent) else {
+        return false;
+    };
+    physical_root_parent
+        .join(root_name)
+        .join(relative_directory)
+        == *physical_directory
+}
+
 fn finding_library_planning(
     finding: &FindingRecord,
     scan_id: &ScanId,
@@ -1563,15 +1588,24 @@ fn finding_library_planning(
             "next_step": "Keep provider-managed plugin Skills read-only; govern only Agent-owned placements."
         }));
     }
-    let mut candidates = scan
+    let mut physical_groups =
+        std::collections::BTreeMap::<PathBuf, Vec<&scan::SkillPlacement>>::new();
+    for placement in scan
         .placements
         .iter()
-        .filter(|placement| {
-            affected.contains(placement.id.as_str())
-                && placement.link_target.is_none()
-                && placement.governable
-        })
-        .map(|placement| {
+        .filter(|placement| affected.contains(placement.id.as_str()) && placement.governable)
+    {
+        physical_groups
+            .entry(placement.physical_directory_or_logical().to_path_buf())
+            .or_default()
+            .push(placement);
+    }
+    let mut candidates = physical_groups
+        .into_values()
+        .filter_map(|placements| {
+            let placement = placements
+                .into_iter()
+                .find(|placement| placement_owns_physical_source(placement))?;
             let (rank, reason) = if placement.agent.is_none() && !placement.default_exposed {
                 (0_u8, "non_exposed_source")
             } else if !placement.default_exposed {
@@ -1579,10 +1613,9 @@ fn finding_library_planning(
             } else {
                 (2_u8, "agent_owned_placement")
             };
-            (
+            Some((
                 rank,
                 placement.entrypoint.display().to_string(),
-                placement.physical_directory_or_logical().to_path_buf(),
                 json!({
                     "placement_id": placement.id,
                     "path": placement.entrypoint,
@@ -1591,17 +1624,15 @@ fn finding_library_planning(
                     "governable": placement.governable,
                     "reason": reason
                 }),
-            )
+            ))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-    let mut physical_sources = std::collections::BTreeSet::new();
-    candidates.retain(|candidate| physical_sources.insert(candidate.2.clone()));
     let candidate_count = candidates.len();
     let candidates = candidates
         .into_iter()
         .take(5)
-        .map(|(_, _, _, value)| value)
+        .map(|(_, _, value)| value)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
@@ -3188,6 +3219,36 @@ fn normalized_digest(value: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
+fn validated_physical_directory(placement: &scan::SkillPlacement) -> Result<PathBuf> {
+    let expected = placement.physical_directory.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Placement {} has no captured physical source; state may have drifted, run skillroster scan",
+            placement.id
+        )
+    })?;
+    let current_entrypoint = std::fs::canonicalize(&placement.entrypoint).map_err(|error| {
+        anyhow!(
+            "Placement {} physical source drifted; run skillroster scan: {error}",
+            placement.id
+        )
+    })?;
+    let current = current_entrypoint.parent().ok_or_else(|| {
+        anyhow!(
+            "Placement {} physical source drifted; run skillroster scan",
+            placement.id
+        )
+    })?;
+    if current != expected {
+        bail!(
+            "Placement {} physical source drifted from {} to {}; run skillroster scan",
+            placement.id,
+            expected.display(),
+            current.display()
+        );
+    }
+    Ok(expected.clone())
+}
+
 fn normalize_library_plan(
     mut input: Value,
     scan: &ScanResult,
@@ -3258,6 +3319,18 @@ fn normalize_library_plan(
         {
             bail!("all placements must have the canonical placement's exact digest");
         }
+        let mut physical_groups =
+            std::collections::BTreeMap::<PathBuf, Vec<&scan::SkillPlacement>>::new();
+        for placement in &all_placements {
+            physical_groups
+                .entry(validated_physical_directory(placement)?)
+                .or_default()
+                .push(*placement);
+        }
+        let canonical_physical = validated_physical_directory(canonical)?;
+        if !placement_owns_physical_source(canonical) {
+            bail!("canonical placement must be the owned physical source directory");
+        }
         let state_name = match request.requested_state {
             RequestedGovernanceState::Managed => "managed",
             RequestedGovernanceState::Hosted => "hosted",
@@ -3265,7 +3338,6 @@ fn normalize_library_plan(
         let safe_name = safe_skill_directory_name(&skill.name)?;
         let library_path = library_root.join(safe_name);
         let canonical_fingerprint = change::fingerprint(&canonical.directory)?;
-        let canonical_physical = canonical.physical_directory_or_logical().to_path_buf();
         let link_source = match request.requested_state {
             RequestedGovernanceState::Managed => canonical.directory.clone(),
             RequestedGovernanceState::Hosted => {
@@ -3293,24 +3365,26 @@ fn normalize_library_plan(
         };
 
         let mut relinked = 0_usize;
-        let mut physical_groups =
-            std::collections::BTreeMap::<PathBuf, Vec<&scan::SkillPlacement>>::new();
-        for placement in &all_placements {
-            physical_groups
-                .entry(placement.physical_directory_or_logical().to_path_buf())
-                .or_default()
-                .push(*placement);
-        }
         for (physical_source, mut placements) in physical_groups {
             if physical_source == canonical_physical {
                 continue;
             }
             placements.sort_by(|left, right| left.directory.cmp(&right.directory));
-            let placement = placements[0];
-            if placement.link_target.as_deref() == Some(link_source.as_path())
-                && placement.link_status == scan::LinkStatus::Valid
-            {
-                continue;
+            let placement = placements
+                .iter()
+                .copied()
+                .find(|placement| placement_owns_physical_source(placement))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Physical source {} has no owned real placement; state may have drifted, run skillroster scan",
+                        physical_source.display()
+                    )
+                })?;
+            if !std::fs::symlink_metadata(&placement.directory)?.is_dir() {
+                bail!(
+                    "Physical source {} drifted from an owned real directory; run skillroster scan",
+                    physical_source.display()
+                );
             }
             needs_backup_root |= !backup_root.exists();
             let backup = backup_root.join(format!("{nonce}-{}", placement.id));
