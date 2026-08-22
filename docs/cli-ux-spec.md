@@ -98,7 +98,10 @@ exhaustive view, not the bootstrap workflow default.
 Evidence records per collection. Its `page.next_offset` is the only pagination
 cursor; callers request another page only when the decision still lacks
 relevant evidence. Counts and `primary_evidence_id` remain available in the
-compact first view.
+compact first view. An actionable exact-duplicate Finding also returns a
+bounded `planning` object with at most five owned canonical candidates and the
+semantic `finding_library_changes` request shape; the complete placement set
+remains CLI-owned rather than Agent-copied.
 
 ### `find`
 

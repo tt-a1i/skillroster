@@ -83,7 +83,7 @@ Each Agent Roster classifies Skills as Core, On-demand, Explicit-only, or Archiv
 
 ### 4.4 Planning, mutation, and recovery
 
-Read-only commands never mutate Agent configuration or Skill contents. Agent recommendations enter the CLI through `plan --stdin` as structured data referencing Scan IDs, Skill IDs, Evidence IDs, and requested target states.
+Read-only commands never mutate Agent configuration or Skill contents. Agent recommendations enter the CLI through `plan --stdin` as structured target states. Most requests cite current Scan, Skill, and Evidence IDs directly. Exact-duplicate consolidation instead cites the immutable Finding plus the Agent's two semantic choices; the CLI derives the bound Snapshot, Evidence, Skill, and complete placement set.
 
 The CLI validates targets, ownership, conflicts, and current fingerprints, then stores an immutable Plan. `apply <plan-id>` executes only the approved scope. Cross-filesystem operations use a journal and compensating steps; the CLI never claims atomicity it cannot provide.
 

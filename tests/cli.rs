@@ -1378,6 +1378,177 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
 }
 
 #[test]
+fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let source_root = temp.path().join("sources");
+    let source_skill = source_root.join("shared");
+    let codex_skill = home.join(".codex/skills/shared");
+    let claude_skill = home.join(".claude/skills/shared");
+    let content = "---\nname: shared\ndescription: shared fixture\n---\nbody\n";
+    for directory in [&source_skill, &codex_skill, &claude_skill] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source_root.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Exact duplicate Skill placements")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], true);
+    assert_eq!(planning["snapshot_id"], report["result"]["snapshot_id"]);
+    assert_eq!(planning["request_field"], "finding_library_changes");
+    let candidates = planning["canonical_candidates"].as_array().unwrap();
+    assert_eq!(planning["canonical_candidate_count"], 3);
+    assert_eq!(planning["canonical_candidates_truncated"], false);
+    assert_eq!(
+        candidates[0]["path"],
+        source_skill.join("SKILL.md").to_str().unwrap()
+    );
+    assert_eq!(candidates[0]["reason"], "non_exposed_source");
+    let canonical_placement_id = candidates[0]["placement_id"].as_str().unwrap();
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": finding_id,
+            "canonical_placement_id": canonical_placement_id,
+            "requested_state": "managed"
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    assert_eq!(plan["result"]["risk"], "library_governance");
+    assert_eq!(plan["result"]["finding_ids"], json!([finding_id]));
+    assert_eq!(
+        plan["result"]["library_changes"][0]["placement_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(plan["result"]["evidence_ids"].as_array().unwrap().len(), 1);
+    assert_eq!(plan["result"]["files_changed"], false);
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let stored_report_id: String = database
+        .query_row(
+            "SELECT report_id FROM plans WHERE id = ?1",
+            [plan["result"]["plan_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_report_id, report["result"]["report_id"]);
+    assert!(
+        !fs::symlink_metadata(&codex_skill)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !fs::symlink_metadata(&claude_skill)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    let invalid_canonical = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": finding_id,
+            "canonical_placement_id": "placement_not_in_finding",
+            "requested_state": "managed"
+        }]
+    });
+    let rejected = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&invalid_canonical.to_string()),
+    );
+    assert!(!rejected.status.success());
+    let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("canonical placement is not part of Finding")
+    );
+
+    let non_overlap_finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["category"] != "overlap")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let wrong_finding_type = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": non_overlap_finding,
+            "canonical_placement_id": canonical_placement_id,
+            "requested_state": "managed"
+        }]
+    });
+    let rejected = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&wrong_finding_type.to_string()),
+    );
+    assert!(!rejected.status.success());
+    let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is not an exact-duplicate Finding")
+    );
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let stale = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!stale.status.success());
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not belong to the latest Snapshot")
+    );
+    let stale_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(stale_detail["result"]["planning"]["supported"], false);
+    assert_eq!(
+        stale_detail["result"]["planning"]["reason"],
+        "stale_finding"
+    );
+}
+
+#[test]
 fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
