@@ -908,7 +908,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.0"
+        "1.8.1"
     );
 
     let undone = json_output(&run(
@@ -1006,7 +1006,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.1");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -2345,6 +2345,116 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
     assert!(!state.join("library").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn roster_plan_keeps_summary_detail_and_confirmation_scope_consistent() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex_root = home.join(".codex/skills");
+    let opencode_root = home.join(".config/opencode/skills");
+    fs::create_dir_all(&codex_root).unwrap();
+    fs::create_dir_all(&opencode_root).unwrap();
+
+    for index in 0..51 {
+        let name = format!("skill-{index:03}");
+        let directory = codex_root.join(&name);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let canonical = codex_root.join("zzz-canonical");
+    fs::create_dir(&canonical).unwrap();
+    fs::write(
+        canonical.join("SKILL.md"),
+        "---\nname: zzz-canonical\n---\nfixture\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&canonical, opencode_root.join("zzz-canonical")).unwrap();
+
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+
+    assert_eq!(plan["result"]["risk"], "roster_change");
+    assert_eq!(detail["result"]["risk"], plan["result"]["risk"]);
+    assert_eq!(
+        plan["result"]["affected"]["agents"],
+        json!(["codex", "opencode"])
+    );
+    assert_eq!(detail["result"]["affected"], plan["result"]["affected"]);
+    assert_eq!(
+        detail["result"]["change_summary"],
+        plan["result"]["change_summary"]
+    );
+    assert_eq!(detail["result"]["impact"], plan["result"]["impact"]);
+    assert_eq!(
+        detail["result"]["diff_summary"],
+        plan["result"]["diff_summary"]
+    );
+    assert_eq!(plan["result"]["diff_summary"]["item_count"], 3);
+    assert_eq!(plan["result"]["diff_summary"]["items"][0]["kind"], "roster");
+    assert_eq!(
+        plan["result"]["diff_summary"]["items"][1]["kind"],
+        "library"
+    );
+    assert_eq!(
+        plan["result"]["diff_summary"]["items"][2]["kind"],
+        "filesystem"
+    );
+
+    let human = run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "plan",
+            "--show",
+            plan_id,
+        ],
+        None,
+    );
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("default exposure 53 → 51"));
+    assert!(human.contains("2 Agents · 52 Skills"), "{human}");
+    assert!(human.contains("Risk                   roster_change"));
 }
 
 #[test]
