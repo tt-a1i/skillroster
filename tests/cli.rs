@@ -133,6 +133,10 @@ fn finding_drilldown_is_bounded_and_pageable() {
         state.to_str().unwrap(),
         "--json",
     ];
+    let invalid_full = run(&[&common[..], &["report", "--full"]].concat(), None);
+    assert!(!invalid_full.status.success());
+    let invalid_full: Value = serde_json::from_slice(&invalid_full.stdout).unwrap();
+    assert_eq!(invalid_full["error"]["code"], "invalid_cli_arguments");
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let report = json_output(&run(
         &[&common[..], &["report", "--summary"]].concat(),
@@ -151,19 +155,16 @@ fn finding_drilldown_is_bounded_and_pageable() {
         &[&common[..], &["report", "--finding", finding_id]].concat(),
         None,
     );
-    assert!(first_output.stdout.len() < 40_000);
+    assert!(first_output.stdout.len() < 20_000);
     let first = json_output(&first_output);
     assert_eq!(first["result"]["page"]["offset"], 0);
     assert_eq!(first["result"]["page"]["limit"], 20);
     assert_eq!(first["result"]["page"]["next_offset"], 20);
-    assert_eq!(first["result"]["placements"].as_array().unwrap().len(), 20);
-    assert_eq!(
-        first["result"]["affected_placement_ids"]
-            .as_array()
-            .unwrap()
-            .len(),
-        20
-    );
+    assert_eq!(first["result"]["items"].as_array().unwrap().len(), 20);
+    assert_eq!(first["result"]["detail"]["mode"], "compact");
+    assert!(first["result"].get("placements").is_none());
+    assert!(first["result"].get("affected_placement_ids").is_none());
+    assert!(first["result"].get("evidence_ids").is_none());
 
     let second = json_output(&run(
         &[
@@ -183,9 +184,20 @@ fn finding_drilldown_is_bounded_and_pageable() {
     ));
     assert_eq!(second["result"]["page"]["offset"], 20);
     assert_ne!(
-        first["result"]["affected_placement_ids"][0],
-        second["result"]["affected_placement_ids"][0]
+        first["result"]["items"][0]["evidence_id"],
+        second["result"]["items"][0]["evidence_id"]
     );
+
+    let full_output = run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    );
+    let full = json_output(&full_output);
+    assert_eq!(full["result"]["detail"]["mode"], "full");
+    assert!(full["result"]["placements"].is_array());
+    assert!(full["result"]["evidence"].is_array());
+    assert!(full["result"]["affected_placement_ids"].is_array());
+    assert!(full_output.stdout.len() > first_output.stdout.len());
 }
 
 #[test]
@@ -299,24 +311,23 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         None,
     ));
     assert_eq!(finding["result"]["id"], finding_id);
-    assert!(finding["result"]["affected_skill_ids"].is_array());
-    assert!(finding["result"]["affected_placement_ids"].is_array());
+    assert!(finding["result"].get("affected_skill_ids").is_none());
+    assert!(finding["result"].get("affected_placement_ids").is_none());
     assert!(finding["result"]["impact"].is_object());
     assert!(finding["result"]["coverage"].is_object());
     assert!(
-        finding["result"]["placements"]
+        finding["result"]["items"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|placement| placement["path"].as_str()
-                == Some(skill.join("SKILL.md").to_str().unwrap()))
+            .any(|item| item["path"].as_str() == Some(skill.join("SKILL.md").to_str().unwrap()))
     );
-    assert!(!finding["result"]["evidence"].as_array().unwrap().is_empty());
-    for evidence_id in finding["result"]["evidence_ids"].as_array().unwrap() {
+    assert!(!finding["result"]["items"].as_array().unwrap().is_empty());
+    for item in finding["result"]["items"].as_array().unwrap() {
         let exists: i64 = database
             .query_row(
                 "SELECT COUNT(*) FROM evidence WHERE id = ?1",
-                [evidence_id.as_str().unwrap()],
+                [item["evidence_id"].as_str().unwrap()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -681,7 +692,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.2.0"
+        "1.3.0"
     );
 
     let undone = json_output(&run(
@@ -711,7 +722,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     )
     .unwrap();
     fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
-    let legacy = include_str!("fixtures/bootstrap-v1.1.0.md");
+    let legacy = include_str!("fixtures/bootstrap-v1.2.0.md");
     fs::write(&bootstrap, legacy).unwrap();
     let common = [
         "--home",
@@ -733,7 +744,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     );
     assert_eq!(
         upgrade["result"]["targets"][0]["installed_version"],
-        "1.1.0"
+        "1.2.0"
     );
     assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
 
@@ -771,7 +782,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.2.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.3.0");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -2292,4 +2303,71 @@ fn find_rejects_a_skill_symlink_that_now_escapes_approved_roots() {
     ));
     assert_eq!(found["result"]["matches"][0]["paths"], json!([]));
     assert_eq!(found["result"]["rescan_required"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source = temp.path().join("trusted-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: external\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&source, root.join("external")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        detail["result"]["resolution"]["decision"],
+        "confirm_trusted_source_roots"
+    );
+    assert_eq!(
+        detail["result"]["resolution"]["observed_link_targets"],
+        json!([source])
+    );
+    assert_eq!(
+        detail["result"]["resolution"]["automatic_change_supported"],
+        false
+    );
+    assert_eq!(detail["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        detail["suggested_actions"][0]["action"],
+        "show_full_finding"
+    );
+    assert!(
+        detail["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["facts"]["link_target"] == json!(source))
+    );
 }

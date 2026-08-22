@@ -88,10 +88,10 @@ fn plan_evidence_id(home: &Path, state: &Path) -> String {
         .and_then(|finding| finding["id"].as_str())
         .expect("fixture report must expose a traceable Finding");
     let detail = cli_json(home, state, &["report", "--finding", finding], None);
-    detail["result"]["evidence_ids"]
+    detail["result"]["items"]
         .as_array()
-        .and_then(|ids| ids.first())
-        .and_then(Value::as_str)
+        .and_then(|items| items.first())
+        .and_then(|item| item["evidence_id"].as_str())
         .expect("Finding must expose Evidence through the public CLI")
         .to_string()
 }

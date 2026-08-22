@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -112,24 +113,19 @@ pub fn run(cli: Cli) -> Result<Output> {
                 )],
             )
         }
-        Some(Command::Report(args)) => (
-            "report",
-            report_command(
+        Some(Command::Report(args)) => {
+            let finding_id = args.finding.as_deref();
+            let result = report_command(
                 &store,
-                args.finding.as_deref(),
+                finding_id,
                 args.summary,
+                args.full,
                 usize::from(args.limit),
                 usize::try_from(args.offset)?,
-            )?,
-            vec![],
-            vec![action(
-                "plan",
-                &["plan", "--stdin", "--json"],
-                false,
-                false,
-                "findings_available",
-            )],
-        ),
+            )?;
+            let actions = report_actions(&result, finding_id, args.full, args.limit, args.offset);
+            ("report", result, vec![], actions)
+        }
         Some(Command::Find(args)) => (
             "find",
             find_command(
@@ -1065,6 +1061,7 @@ fn report_command(
     store: &StateStore,
     finding: Option<&str>,
     summary_only: bool,
+    full_detail: bool,
     detail_limit: usize,
     detail_offset: usize,
 ) -> Result<Value> {
@@ -1184,8 +1181,20 @@ fn report_command(
                     }
                 }),
             );
+            add_finding_resolution(object);
+            object.insert(
+                "detail".into(),
+                json!({
+                    "mode": if full_detail { "full" } else { "compact" },
+                    "full_available": !full_detail
+                }),
+            );
         }
-        return Ok(details);
+        return Ok(if full_detail {
+            details
+        } else {
+            compact_finding_detail(details)
+        });
     }
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
     if let Some(existing) = store.latest_report()? {
@@ -1282,6 +1291,132 @@ fn report_command(
     } else {
         value
     })
+}
+
+fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
+    if object.get("title").and_then(Value::as_str) != Some("Skill links escape an approved root") {
+        return;
+    }
+    let observed_link_targets = object
+        .get("placements")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|placement| placement.get("link_target").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    object.insert(
+        "resolution".into(),
+        json!({
+            "decision": "confirm_trusted_source_roots",
+            "automatic_change_supported": false,
+            "observed_link_targets": observed_link_targets,
+            "after_confirmation": {
+                "repeatable_option": "--source-root",
+                "value": "absolute canonical source directory",
+                "argv_template": [
+                    "skillroster",
+                    "--source-root",
+                    "<confirmed-canonical-source-directory>",
+                    "scan",
+                    "--json"
+                ]
+            }
+        }),
+    );
+}
+
+fn compact_finding_detail(mut details: Value) -> Value {
+    let Some(object) = details.as_object_mut() else {
+        return details;
+    };
+    let items = object
+        .remove("evidence")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|evidence| {
+            let mut facts = evidence
+                .get("details")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            if let Some(facts) = facts.as_object_mut() {
+                facts.remove("root_id");
+            }
+            json!({
+                "evidence_id": evidence["id"],
+                "kind": evidence["kind"],
+                "quality": evidence["quality"],
+                "subject_type": evidence["subject_type"],
+                "subject_id": evidence["subject_id"],
+                "path": evidence["path"],
+                "facts": facts
+            })
+        })
+        .collect::<Vec<_>>();
+    object.remove("affected_skill_ids");
+    object.remove("affected_placement_ids");
+    object.remove("evidence_ids");
+    object.remove("placements");
+    if let Some(page) = object.get_mut("page").and_then(Value::as_object_mut) {
+        if let Some(returned) = page.get_mut("returned").and_then(Value::as_object_mut) {
+            returned.insert("items".into(), json!(items.len()));
+        }
+    }
+    object.insert("items".into(), json!(items));
+    details
+}
+
+fn report_actions(
+    result: &Value,
+    finding_id: Option<&str>,
+    full_detail: bool,
+    limit: u16,
+    offset: u32,
+) -> Vec<SuggestedAction> {
+    let Some(finding_id) = finding_id else {
+        return vec![action(
+            "plan",
+            &["plan", "--stdin", "--json"],
+            false,
+            false,
+            "findings_available",
+        )];
+    };
+    let requires_trust_decision =
+        result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
+    let mut actions = Vec::new();
+    if !requires_trust_decision {
+        actions.push(action(
+            "plan",
+            &["plan", "--stdin", "--json"],
+            false,
+            false,
+            "finding_action_available",
+        ));
+    }
+    if !full_detail {
+        let limit = limit.to_string();
+        let offset = offset.to_string();
+        actions.push(action(
+            "show_full_finding",
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--full",
+                "--limit",
+                &limit,
+                "--offset",
+                &offset,
+                "--json",
+            ],
+            false,
+            false,
+            "finding_full_detail_available",
+        ));
+    }
+    actions
 }
 
 fn finding_library_planning(
@@ -2968,6 +3103,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.1.0",
         "d463d28295055fde8012e5c2424a754bf93e8c84c9fd6b48b7194bbaff0b27c2",
     ),
+    (
+        "1.2.0",
+        "a12e3bbf45e4a3d51b8075dd2b56a410f113fb27cd803676fb614bd88f278f9c",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4053,13 +4192,13 @@ mod recovery_tests {
             BootstrapContentStatus::Modified
         );
         let windows_legacy =
-            include_str!("../tests/fixtures/bootstrap-v1.1.0.md").replace('\n', "\r\n");
+            include_str!("../tests/fixtures/bootstrap-v1.2.0.md").replace('\n', "\r\n");
         assert_eq!(
             bootstrap_content_status(
                 &bootstrap_content_digest(windows_legacy.as_bytes()),
                 &current
             ),
-            BootstrapContentStatus::OfficialOutdated("1.1.0")
+            BootstrapContentStatus::OfficialOutdated("1.2.0")
         );
     }
 

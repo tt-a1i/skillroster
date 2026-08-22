@@ -28,6 +28,7 @@ skillroster scan --json
 skillroster --source-root /absolute/trusted/source scan --json
 skillroster report --summary --json
 skillroster report --finding <finding-id> --limit 20 --json
+skillroster report --finding <finding-id> --full --json
 skillroster find "database migration" --json
 skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
 skillroster plan --stdin --json
@@ -81,6 +82,13 @@ For an exact-duplicate Finding, the Agent submits only the choices it owns:
 
 SkillRoster resolves the current Snapshot, Evidence, Skill, and complete
 placement set from that immutable Finding and rejects stale or mismatched input.
+
+Finding drilldown is compact by default: each paged `item` carries one
+traceable Evidence ID, subject, path, and decision facts. Complete duplicate ID
+collections, placement records, and Evidence records stay behind explicit
+`report --finding ID --full --json`. Unsafe escaping links return a trust
+decision and observed targets instead of suggesting an automatic filesystem
+Plan.
 
 ## Status
 
