@@ -1094,8 +1094,10 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
                 let key = key.trim();
                 let value = value.trim();
                 list_key = Some(key.to_owned());
-                if key == "skillroster-routing-triggers" && !value.is_empty() {
-                    extend_routing_trigger_values(&mut metadata, value);
+                if key == "skillroster-routing-triggers" {
+                    if let Some(value) = quoted_metadata_string(value) {
+                        extend_routing_trigger_values(&mut metadata, value);
+                    }
                 }
             }
             index += 1;
@@ -1155,11 +1157,22 @@ fn extend_trigger_values(metadata: &mut SkillMetadata, value: &str) {
 
 fn extend_routing_trigger_values(metadata: &mut SkillMetadata, value: &str) {
     metadata.triggers.extend(
-        unquote(value)
+        value
             .split(';')
             .map(unquote)
             .filter(|value| !value.is_empty()),
     );
+}
+
+fn quoted_metadata_string(value: &str) -> Option<&str> {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
 }
 
 fn leading_whitespace(value: &str) -> usize {
@@ -2274,6 +2287,10 @@ enabled = true
         for markdown in [
             "---\nname: nested\nmetadata:\n  custom:\n    skillroster-routing-triggers: \"nested trigger\"\n---\n",
             "---\nname: sequence\nmetadata:\n  skillroster-routing-triggers:\n    - sequence trigger\n---\n",
+            "---\nname: flow-sequence\nmetadata:\n  skillroster-routing-triggers: [inventory, apply]\n---\n",
+            "---\nname: flow-map\nmetadata:\n  skillroster-routing-triggers: {route: inventory}\n---\n",
+            "---\nname: boolean\nmetadata:\n  skillroster-routing-triggers: true\n---\n",
+            "---\nname: unquoted\nmetadata:\n  skillroster-routing-triggers: inventory installed Skills\n---\n",
         ] {
             assert!(parse_skill_markdown(markdown).triggers.is_empty());
         }

@@ -125,8 +125,9 @@ boundaries for exact name, description, and declared-trigger evidence. The
 scanner reads ordinary and folded YAML description scalars. Ranking uses
 top-level `triggers` and the semicolon-separated string
 `metadata.skillroster-routing-triggers` as the same declared retrieval
-evidence. The latter remains valid under the Agent Skills metadata string-value
-contract. Ranking
+evidence. The latter must be explicitly quoted and remains valid under the
+Agent Skills metadata string-value contract; non-string and nested forms are
+ignored. Ranking
 normalizes conservative ASCII plurals, treats explicit use and do-not-use
 description clauses as positive and exclusion evidence, and removes the
 low-confidence tail relative to the strongest result. Same-name Skill
