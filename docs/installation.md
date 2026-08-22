@@ -52,7 +52,7 @@ brew install --formula ./Formula/skillroster.rb
 brew test skillroster
 ```
 
-The repository is currently private, so GitHub access must already be
-configured for the clone performed by Homebrew. This is a verified Formula,
-not a public tap; users without repository access should use an authorized
-Release archive. Never paste a GitHub token into the Formula or a command line.
+The repository is public, so cloning the source and downloading Release
+archives do not require GitHub authentication. This is a checked-in Formula,
+not yet a published Homebrew tap. Never paste a GitHub token into the Formula
+or a command line.
