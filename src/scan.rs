@@ -1286,6 +1286,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 lines_observed += physical_lines;
                 let observations = session_record_observations(agent, &line);
                 if !observations.is_empty() {
+                    let mut seen_event_skill_stages = BTreeSet::new();
                     for observation in observations {
                         let stage = usage_stage(observation.signal);
                         let quality = EvidenceQuality::Observed;
@@ -1311,6 +1312,13 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                             }
                         }
                         for skill_id in observed_skill_ids {
+                            if !seen_event_skill_stages.insert((
+                                observation.event_index,
+                                stage,
+                                skill_id.clone(),
+                            )) {
+                                continue;
+                            }
                             let key = (skill_id.clone(), stage, source_path_digest.clone());
                             let event = events.entry(key).or_insert_with(|| UsageEvidence {
                                 agent,
@@ -2214,8 +2222,8 @@ enabled = true
         fs::write(
             sessions.join("session.json"),
             serde_json::json!([
-                {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"},
-                {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"}
+                {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"},
+                {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"}
             ])
             .to_string(),
         )

@@ -80,6 +80,7 @@ pub enum SessionSignal {
 /// event from being attributed to every Skill mentioned by the parent record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionObservation {
+    pub event_index: usize,
     pub signal: SessionSignal,
     pub record_text: String,
     pub explicit_references: Vec<String>,
@@ -97,7 +98,8 @@ pub fn session_record_observations(agent: AgentKind, record: &str) -> Vec<Sessio
         return Vec::new();
     };
     let mut observations = Vec::new();
-    collect_observations(agent, &value, &mut observations);
+    let mut next_event_index = 0;
+    collect_observations(agent, &value, &mut next_event_index, &mut observations);
     observations
 }
 
@@ -123,18 +125,25 @@ fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
     }
 }
 
-fn collect_observations(agent: AgentKind, value: &Value, output: &mut Vec<SessionObservation>) {
+fn collect_observations(
+    agent: AgentKind,
+    value: &Value,
+    next_event_index: &mut usize,
+    output: &mut Vec<SessionObservation>,
+) {
     match value {
         Value::Object(object) => {
-            if collect_object_observations(agent, object, output) {
+            let event_index = *next_event_index;
+            *next_event_index = next_event_index.saturating_add(1);
+            if collect_object_observations(agent, object, event_index, output) {
                 for child in object.values() {
-                    collect_observations(agent, child, output);
+                    collect_observations(agent, child, next_event_index, output);
                 }
             }
         }
         Value::Array(values) => {
             for child in values {
-                collect_observations(agent, child, output);
+                collect_observations(agent, child, next_event_index, output);
             }
         }
         _ => {}
@@ -144,6 +153,7 @@ fn collect_observations(agent: AgentKind, value: &Value, output: &mut Vec<Sessio
 fn collect_object_observations(
     agent: AgentKind,
     object: &serde_json::Map<String, Value>,
+    event_index: usize,
     output: &mut Vec<SessionObservation>,
 ) -> bool {
     let record_text = Value::Object(object.clone()).to_string();
@@ -158,6 +168,7 @@ fn collect_object_observations(
     ] {
         if let Some(reference) = object.get(field).and_then(Value::as_str) {
             object_observations.push(SessionObservation {
+                event_index,
                 signal,
                 record_text: record_text.clone(),
                 explicit_references: vec![reference.to_owned()],
@@ -165,7 +176,7 @@ fn collect_object_observations(
         }
     }
 
-    if let Some(observation) = structured_tool_observation(object, &record_text) {
+    if let Some(observation) = structured_tool_observation(object, event_index, &record_text) {
         object_observations.push(observation);
         append_unique_observations(output, object_observations);
         return false;
@@ -196,10 +207,12 @@ fn collect_object_observations(
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join(" ");
-    let generic_references = ["skill_id", "skill_name"]
+    let mut generic_references = ["skill_id", "skill_name"]
         .into_iter()
         .filter_map(|field| object.get(field).and_then(Value::as_str).map(str::to_owned))
         .collect::<Vec<_>>();
+    generic_references.sort();
+    generic_references.dedup();
     let serialized = record_text.to_ascii_lowercase();
     let reads_skill_file = serialized.contains("skill.md")
         && ["read_file", "read", "load", "open"]
@@ -244,6 +257,7 @@ fn collect_object_observations(
     };
     if let Some(signal) = signal {
         object_observations.push(SessionObservation {
+            event_index,
             signal,
             record_text,
             explicit_references: generic_references,
@@ -268,6 +282,7 @@ fn append_unique_observations(
 
 fn structured_tool_observation(
     object: &serde_json::Map<String, Value>,
+    event_index: usize,
     record_text: &str,
 ) -> Option<SessionObservation> {
     let call_type = object
@@ -318,6 +333,7 @@ fn structured_tool_observation(
         return None;
     };
     Some(SessionObservation {
+        event_index,
         signal,
         record_text: record_text.to_owned(),
         explicit_references,
@@ -447,8 +463,8 @@ mod tests {
     #[test]
     fn identical_sibling_events_remain_distinct_observations() {
         let record = serde_json::json!([
-            {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"},
-            {"type": "load_skill", "skill_name": "research", "loaded_skill": "research"}
+            {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"},
+            {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"}
         ])
         .to_string();
         let observations = session_record_observations(AgentKind::Hermes, &record);
@@ -465,6 +481,7 @@ mod tests {
     fn overlapping_schemas_count_one_object_once() {
         let record = serde_json::json!({
             "type": "load_skill",
+            "skill_id": "research",
             "skill_name": "research",
             "loaded_skill": "research"
         })
