@@ -1,15 +1,8 @@
 ---
 name: skillroster
-description: >
-  Inspect and govern locally installed Agent Skills with the SkillRoster CLI.
-  Use for inventory and usage evidence, duplicate or broken-link analysis,
-  smaller Core and On-demand Rosters, capability search, approved Plans,
-  Receipts, Apply, or Undo. Not for installing Skills or migrating,
-  distributing, synchronizing, or repairing shared Skill directories and
-  symlinks.
+description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
 metadata:
-  bootstrap-version: "1.8.6"
-  skillroster-routing-triggers: "scan analyze duplicate unused local Agent Skills; inventory installed Agent Skills; analyze duplicate Agent Skills; evaluate possible unused local Agent Skills from usage evidence; govern a Skill Roster; prepare a Skill governance Plan; apply approved Skill Plan; create Skill Receipt; undo Skill organization"
+  bootstrap-version: "1.8.5"
 ---
 
 # SkillRoster

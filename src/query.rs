@@ -105,6 +105,31 @@ pub struct FindVariant {
     pub governable: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RetrievalQuery {
+    text: String,
+    phrases: Vec<String>,
+}
+
+impl RetrievalQuery {
+    pub(crate) fn from_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Self {
+        let phrases = parts
+            .into_iter()
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        Self {
+            text: phrases.join(" "),
+            phrases,
+        }
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 pub fn build_report(scan: &ScanResult) -> Report {
     let metrics = PrimaryMetrics {
         independent_skills: scan.skills.len(),
@@ -1172,21 +1197,28 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    find_matching(scan, task, limit, None, None)
+    let query = RetrievalQuery::from_parts([task]);
+    find_matching(scan, &query, limit, None, None)
 }
 
 pub(crate) fn find_matching(
     scan: &ScanResult,
-    task: &str,
+    query: &RetrievalQuery,
     limit: usize,
     candidate_ids: Option<&BTreeSet<String>>,
     variant_eligible_ids: Option<&BTreeSet<String>>,
 ) -> Vec<FindMatch> {
-    let query = task.trim().to_lowercase();
-    if query.is_empty() || limit == 0 {
+    let query_text = query.text().trim().to_lowercase();
+    if query_text.is_empty() || limit == 0 {
         return Vec::new();
     }
-    let query_tokens = tokens(&query);
+    let query_tokens = tokens(&query_text);
+    let query_phrases = query
+        .phrases
+        .iter()
+        .map(|part| part.trim().to_lowercase())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
     for skill in scan
@@ -1239,18 +1271,23 @@ pub(crate) fn find_matching(
                 + overlap as f64 * 3.0
                 - exclusion_penalty_tokens as f64 * 18.0;
             let mut reasons = Vec::new();
-            if name == query {
+            if query_phrases.contains(&name) {
                 score += 100.0;
                 reasons.push("exact_name".into());
-            } else if name.contains(&query) {
+            } else if query_phrases.iter().any(|phrase| name.contains(phrase)) {
                 score += 45.0;
                 reasons.push("name_phrase".into());
             }
-            if !triggers.is_empty() && triggers.contains(&query) {
+            if !triggers.is_empty() && query_phrases.iter().any(|phrase| triggers.contains(phrase))
+            {
                 score += 35.0;
                 reasons.push("declared_trigger".into());
             }
-            if !positive_description.is_empty() && positive_description.contains(&query) {
+            if !positive_description.is_empty()
+                && query_phrases
+                    .iter()
+                    .any(|phrase| positive_description.contains(phrase))
+            {
                 score += 25.0;
                 reasons.push("description_phrase".into());
             }
@@ -1431,7 +1468,37 @@ fn tokens(text: &str) -> BTreeSet<String> {
         .map(str::trim)
         .filter(|token| token.len() >= 2)
         .map(normalize_token)
+        .filter(|token| !is_search_stopword(token))
         .collect()
+}
+
+fn is_search_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "an" | "and"
+            | "are"
+            | "as"
+            | "at"
+            | "be"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "into"
+            | "is"
+            | "it"
+            | "not"
+            | "of"
+            | "on"
+            | "or"
+            | "that"
+            | "the"
+            | "this"
+            | "to"
+            | "use"
+            | "using"
+            | "with"
+    )
 }
 
 pub(crate) fn candidate_search_text(text: &str) -> String {
@@ -1871,6 +1938,21 @@ mod tests {
     }
 
     #[test]
+    fn find_keeps_hint_phrases_separate_from_the_preserved_task() {
+        let (root, scan) = fixture();
+        let query = RetrievalQuery::from_parts(["调查事实", "verify"]);
+        let matches = find_matching(&scan, &query, 3, None, None);
+
+        assert_eq!(matches[0].name, "research");
+        assert!(
+            matches[0]
+                .match_reasons
+                .contains(&"declared_trigger".into())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn find_prefers_task_terms_in_name_over_incidental_body_mentions() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2006,6 +2088,16 @@ mod tests {
                 "spreadsheet".to_owned(),
             ])
         );
+        assert_eq!(
+            tokens("inspect and govern Skills for Agents with evidence"),
+            BTreeSet::from([
+                "agent".to_owned(),
+                "evidence".to_owned(),
+                "govern".to_owned(),
+                "inspect".to_owned(),
+                "skill".to_owned(),
+            ])
+        );
         assert_eq!(candidate_search_text("publish blogs"), "publish blogs blog");
     }
 
@@ -2053,6 +2145,22 @@ mod tests {
 
         assert_eq!(desired, "use for standalone spreadsheet files");
         assert_eq!(excluded, "not for a live excel session");
+    }
+
+    #[test]
+    fn exclusion_evidence_ignores_shared_stopwords() {
+        let query = tokens("govern a Skill roster into Core and On-demand states");
+        let excluded = tokens(
+            "not for installing Skills or migrating, distributing, synchronizing, or repairing shared Skill directories and symlinks",
+        );
+
+        assert_eq!(
+            query
+                .intersection(&excluded)
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["skill".to_owned()])
+        );
     }
 
     #[test]
@@ -2117,7 +2225,8 @@ mod tests {
         assert!(matched.match_reasons.contains(&"name_variants:2".into()));
 
         let eligible = BTreeSet::from([matched.skill_id.clone()]);
-        let filtered = find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&eligible));
+        let query = RetrievalQuery::from_parts(["diagrams"]);
+        let filtered = find_matching(&scan, &query, 10, Some(&eligible), Some(&eligible));
         let filtered_match = filtered
             .iter()
             .find(|candidate| candidate.name == "tech-essay-writer")
@@ -2133,7 +2242,7 @@ mod tests {
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
         let partial_match =
-            find_matching(&scan, "diagrams", 10, Some(&eligible), Some(&all_routable)).remove(0);
+            find_matching(&scan, &query, 10, Some(&eligible), Some(&all_routable)).remove(0);
         assert_eq!(partial_match.variant_count, 2);
         assert_eq!(partial_match.variants.len(), 2);
         fs::remove_dir_all(root).unwrap();

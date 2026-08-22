@@ -2037,12 +2037,10 @@ fn find_command(
 ) -> Result<Value> {
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
-    let retrieval_query = std::iter::once(task.trim())
-        .chain(retrieval_hints.iter().map(String::as_str))
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let candidate_search_text = crate::query::candidate_search_text(&retrieval_query);
+    let retrieval_query = crate::query::RetrievalQuery::from_parts(
+        std::iter::once(task).chain(retrieval_hints.iter().map(String::as_str)),
+    );
+    let candidate_search_text = crate::query::candidate_search_text(retrieval_query.text());
     let mut candidate_ids = store
         .search_skill_ids(&candidate_search_text, scan.skills.len())?
         .into_iter()
@@ -3966,6 +3964,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.4",
         "2758bed89792128c47d01f613a4df277dd32c9641cb036e7ed1f03c0c94e8381",
+    ),
+    (
+        "1.8.5",
+        "9f25609e002ad63e750214c54d7138f6e877849e46626aef441e00eaca8738d1",
     ),
 ];
 
