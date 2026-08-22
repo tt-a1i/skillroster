@@ -833,13 +833,23 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
 
 pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
     let mut metadata = SkillMetadata::default();
-    let Some(frontmatter) = markdown.strip_prefix("---\n") else {
+    let mut markdown_lines = markdown.lines();
+    if markdown_lines.next() != Some("---") {
         return metadata;
-    };
-    let Some((frontmatter, _)) = frontmatter.split_once("\n---") else {
+    }
+    let mut frontmatter = Vec::new();
+    let mut closed = false;
+    for line in markdown_lines.by_ref() {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        frontmatter.push(line);
+    }
+    if !closed {
         return metadata;
-    };
-    let lines = frontmatter.lines().collect::<Vec<_>>();
+    }
+    let lines = frontmatter;
     let mut list_key: Option<String> = None;
     let mut index = 0;
     while index < lines.len() {
@@ -929,16 +939,25 @@ fn unquote(value: &str) -> String {
 }
 
 fn summarize_markdown(markdown: &str, limit: usize) -> String {
-    let body = if let Some(frontmatter) = markdown.strip_prefix("---\n") {
-        frontmatter
-            .split_once("\n---")
-            .map(|(_, body)| body)
-            .unwrap_or(markdown)
+    let mut lines = markdown.lines();
+    let body = if lines.next() == Some("---") {
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line == "---" {
+                closed = true;
+                break;
+            }
+        }
+        if closed {
+            lines.collect::<Vec<_>>()
+        } else {
+            markdown.lines().collect::<Vec<_>>()
+        }
     } else {
-        markdown
+        markdown.lines().collect::<Vec<_>>()
     };
     let summary = body
-        .lines()
+        .into_iter()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect::<Vec<_>>()
@@ -1665,19 +1684,21 @@ enabled = true
 
     #[test]
     fn parses_folded_skill_descriptions_without_treating_nested_metadata_as_top_level() {
-        let metadata = parse_skill_markdown(
-            "---\nname: agent-skills-manager\ndescription: >\n  Manage skills across AI coding agents with one shared library.\n  Use for migration, distribution, and symlink repair.\nmetadata:\n  version: nested-value-must-not-win\ntriggers:\n- migrate skills\n- repair symlinks\nversion: 1.7.0\n---\nBody",
-        );
+        let markdown = "---\nname: agent-skills-manager\ndescription: >\n  Manage skills across AI coding agents with one shared library.\n  Use for migration, distribution, and symlink repair.\nmetadata:\n  version: nested-value-must-not-win\ntriggers:\n- migrate skills\n- repair symlinks\nversion: 1.7.0\n---\nBody";
+        for markdown in [markdown.to_owned(), markdown.replace('\n', "\r\n")] {
+            let metadata = parse_skill_markdown(&markdown);
 
-        assert_eq!(metadata.name.as_deref(), Some("agent-skills-manager"));
-        assert_eq!(
-            metadata.description.as_deref(),
-            Some(
-                "Manage skills across AI coding agents with one shared library. Use for migration, distribution, and symlink repair."
-            )
-        );
-        assert_eq!(metadata.triggers, ["migrate skills", "repair symlinks"]);
-        assert_eq!(metadata.version.as_deref(), Some("1.7.0"));
+            assert_eq!(metadata.name.as_deref(), Some("agent-skills-manager"));
+            assert_eq!(
+                metadata.description.as_deref(),
+                Some(
+                    "Manage skills across AI coding agents with one shared library. Use for migration, distribution, and symlink repair."
+                )
+            );
+            assert_eq!(metadata.triggers, ["migrate skills", "repair symlinks"]);
+            assert_eq!(metadata.version.as_deref(), Some("1.7.0"));
+            assert_eq!(summarize_markdown(&markdown, 320), "Body");
+        }
     }
 
     #[test]
