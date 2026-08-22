@@ -839,30 +839,54 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
     let Some((frontmatter, _)) = frontmatter.split_once("\n---") else {
         return metadata;
     };
-    let mut list_key: Option<&str> = None;
-    for line in frontmatter.lines() {
+    let lines = frontmatter.lines().collect::<Vec<_>>();
+    let mut list_key: Option<String> = None;
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        let indentation = leading_whitespace(line);
         let trimmed = line.trim();
         if let Some(value) = trimmed.strip_prefix("- ") {
-            if list_key == Some("triggers") {
+            if list_key.as_deref() == Some("triggers") {
                 metadata.triggers.push(unquote(value));
             }
+            index += 1;
+            continue;
+        }
+        if indentation > 0 {
+            index += 1;
             continue;
         }
         let Some((key, value)) = trimmed.split_once(':') else {
+            index += 1;
             continue;
         };
         let key = key.trim();
         let value = value.trim();
-        list_key = Some(key);
+        list_key = Some(key.to_owned());
         if value.is_empty() {
+            index += 1;
+            continue;
+        }
+        if value.starts_with(['>', '|']) {
+            let mut block = Vec::new();
+            index += 1;
+            while index < lines.len() {
+                let continuation = lines[index];
+                if !continuation.trim().is_empty()
+                    && leading_whitespace(continuation) <= indentation
+                {
+                    break;
+                }
+                if !continuation.trim().is_empty() {
+                    block.push(continuation.trim());
+                }
+                index += 1;
+            }
+            set_metadata_scalar(&mut metadata, key, block.join(" "));
             continue;
         }
         match key {
-            "name" => metadata.name = Some(unquote(value)),
-            "description" => metadata.description = Some(unquote(value)),
-            "source" | "repository" => metadata.source = Some(unquote(value)),
-            "version" => metadata.version = Some(unquote(value)),
-            "revision" | "rev" | "commit" => metadata.revision = Some(unquote(value)),
             "triggers" => {
                 metadata.triggers.extend(
                     value
@@ -872,10 +896,32 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
                         .filter(|value| !value.is_empty()),
                 );
             }
-            _ => {}
+            _ => set_metadata_scalar(&mut metadata, key, unquote(value)),
         }
+        index += 1;
     }
     metadata
+}
+
+fn leading_whitespace(value: &str) -> usize {
+    value
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .count()
+}
+
+fn set_metadata_scalar(metadata: &mut SkillMetadata, key: &str, value: String) {
+    if value.is_empty() {
+        return;
+    }
+    match key {
+        "name" => metadata.name = Some(value),
+        "description" => metadata.description = Some(value),
+        "source" | "repository" => metadata.source = Some(value),
+        "version" => metadata.version = Some(value),
+        "revision" | "rev" | "commit" => metadata.revision = Some(value),
+        _ => {}
+    }
 }
 
 fn unquote(value: &str) -> String {
@@ -1615,6 +1661,23 @@ enabled = true
         assert_eq!(metadata.name.as_deref(), Some("research"));
         assert_eq!(metadata.revision.as_deref(), Some("abc"));
         assert_eq!(metadata.triggers, ["search", "verify"]);
+    }
+
+    #[test]
+    fn parses_folded_skill_descriptions_without_treating_nested_metadata_as_top_level() {
+        let metadata = parse_skill_markdown(
+            "---\nname: agent-skills-manager\ndescription: >\n  Manage skills across AI coding agents with one shared library.\n  Use for migration, distribution, and symlink repair.\nmetadata:\n  version: nested-value-must-not-win\ntriggers:\n- migrate skills\n- repair symlinks\nversion: 1.7.0\n---\nBody",
+        );
+
+        assert_eq!(metadata.name.as_deref(), Some("agent-skills-manager"));
+        assert_eq!(
+            metadata.description.as_deref(),
+            Some(
+                "Manage skills across AI coding agents with one shared library. Use for migration, distribution, and symlink repair."
+            )
+        );
+        assert_eq!(metadata.triggers, ["migrate skills", "repair symlinks"]);
+        assert_eq!(metadata.version.as_deref(), Some("1.7.0"));
     }
 
     #[test]

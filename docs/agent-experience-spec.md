@@ -131,6 +131,8 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 - validate `schema_version` and `ok` before reading `result`;
 - set `schema_version: 1` on every declarative Plan request;
 - never parse human terminal output or TUI frames;
+- preserve a non-English Find task verbatim and supply a positive English
+  target-surface, object, operation, and state paraphrase through `--hint`;
 - treat `suggested_actions` as typed options, not authorization;
 - automatically prepare a read-only Plan when evidence is sufficient;
 - show the complete Plan impact before Apply;

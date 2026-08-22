@@ -19,6 +19,10 @@ struct RouteCase {
     skill: String,
     #[serde(default)]
     hints: Vec<String>,
+    #[serde(default)]
+    rank_first: bool,
+    #[serde(default)]
+    max_matches: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,14 +123,33 @@ fn evaluate_capabilities(home: &Path, state: &Path, routes: &[RouteCase]) -> (us
         for hint in &case.hints {
             arguments.extend(["--hint", hint.as_str()]);
         }
-        arguments.extend(["--limit", "3"]);
+        arguments.extend([
+            "--limit",
+            if case.max_matches.is_some() {
+                "10"
+            } else {
+                "3"
+            },
+        ]);
         let found = cli_json(home, state, &arguments, None);
-        let Some(matched) = found["result"]["matches"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|matched| matched["name"] == case.skill)
-        else {
+        let matches = found["result"]["matches"].as_array().unwrap();
+        if case.rank_first {
+            assert_eq!(
+                matches.first().and_then(|matched| matched["name"].as_str()),
+                Some(case.skill.as_str()),
+                "dedicated capability must rank first for {:?}",
+                case.task
+            );
+        }
+        if let Some(max_matches) = case.max_matches {
+            assert!(
+                matches.len() <= max_matches,
+                "low-confidence tail for {:?} had {} matches",
+                case.task,
+                matches.len()
+            );
+        }
+        let Some(matched) = matches.iter().find(|matched| matched["name"] == case.skill) else {
             continue;
         };
         routed += 1;
@@ -320,8 +343,9 @@ fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_succes
     let scan_result = cli_json(&home, &state, &["scan"], None);
     let scan_id = scan_result["result"]["snapshot_id"].as_str().unwrap();
     let (before_routed, before_succeeded) = evaluate_capabilities(&home, &state, &routes);
-    assert!(
-        before_routed * 100 >= routes.len() * 95,
+    assert_eq!(
+        before_routed,
+        routes.len(),
         "Top-3 recall was {before_routed}/{}",
         routes.len()
     );

@@ -120,7 +120,11 @@ recoverable through Undo.
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or
 capability paraphrase while the CLI remains a deterministic local lexical
-index. Same-name Skill identities occupy one ranked capability result and are
+index. The scanner reads ordinary and folded YAML description scalars. Ranking
+normalizes conservative ASCII plurals, treats explicit use and do-not-use
+description clauses as positive and exclusion evidence, and removes the
+low-confidence tail relative to the strongest result. Same-name Skill
+identities occupy one ranked capability result and are
 reported as explicit variants rather than silently treated as equivalent.
 Variant details keep provider, governance, and path facts bound to one identity;
 the response preserves the total count and marks bounded detail truncation.

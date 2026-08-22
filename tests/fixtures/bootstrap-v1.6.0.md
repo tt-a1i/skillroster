@@ -2,7 +2,7 @@
 name: skillroster
 description: Inspect, search, organize, apply, or undo governance for locally installed Agent Skills with the SkillRoster CLI. Use when the user asks which Skills are installed or used, wants duplicates or broken links analyzed, needs a smaller default Skill roster, wants an on-demand Skill found, or asks to apply or undo an approved Skill organization plan.
 metadata:
-  bootstrap-version: "1.7.0"
+  bootstrap-version: "1.6.0"
 ---
 
 # SkillRoster
@@ -54,7 +54,7 @@ Use `skillroster status --json` for pending Plans, the last Receipt, retention, 
 
 ## Find an on-demand Skill
 
-Run `skillroster find "TASK" --json`, keeping the user's task verbatim. For a non-English or mixed-language task, include one concise English capability paraphrase through `--hint "TEXT"` on the first call. Build the hint entirely from the desired target surface, object, operation, and state—for example, `control existing logged-in Chrome tabs` or `analyze standalone spreadsheet file workbook data`. Use terms implied by the task rather than a guessed Skill name. Retry once with a refined target description only when the result is empty or clearly about another domain. Explain the top matches and evidence. A `variant_count` above one is unresolved same-name content ambiguity: keep each returned variant's path and provider facts together, respect `variants_truncated`, show the warning, and inspect the corresponding layout Finding before choosing content. Otherwise read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
+Run `skillroster find "TASK" --json`, keeping the user's task verbatim. For a non-English or mixed-language task, include one concise English capability paraphrase through `--hint "TEXT"` on the first call; use tool and operation terms implied by the task, not a guessed Skill name. Retry once with a refined hint only when the result is empty or clearly about another domain. Explain the top matches and evidence. A `variant_count` above one is unresolved same-name content ambiguity: keep each returned variant's path and provider facts together, respect `variants_truncated`, show the warning, and inspect the corresponding layout Finding before choosing content. Otherwise read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
 
 Treat `providers` with `governable: false` as enabled provider-managed Skills: they are valid read-only search results, but must not be moved, updated, consolidated, or added to a governance Plan.
 
