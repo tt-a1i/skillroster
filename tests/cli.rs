@@ -908,7 +908,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.3"
+        "1.8.4"
     );
 
     let undone = json_output(&run(
@@ -935,6 +935,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         ("1.8.0", include_str!("fixtures/bootstrap-v1.8.0.md")),
         ("1.8.1", include_str!("fixtures/bootstrap-v1.8.1.md")),
         ("1.8.2", include_str!("fixtures/bootstrap-v1.8.2.md")),
+        ("1.8.3", include_str!("fixtures/bootstrap-v1.8.3.md")),
     ] {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
@@ -1076,7 +1077,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.3");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.4");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -1922,6 +1923,131 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_sources() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let shared_root = home.join(".agents_skills");
+    let shared_skill = shared_root.join("shared");
+    let opencode_skill = home.join(".config/opencode/skills/shared");
+    let hermes_skill = home.join(".hermes/skills/shared");
+    let content = "---\nname: shared\ndescription: shared fixture\n---\nbody\n";
+    for directory in [&shared_skill, &opencode_skill, &hermes_skill] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    for (parent, logical_root) in [
+        (home.join(".codex"), home.join(".codex/skills")),
+        (home.join(".claude"), home.join(".claude/skills")),
+        (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+    ] {
+        fs::create_dir_all(parent).unwrap();
+        symlink(&shared_root, logical_root).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Exact duplicate Skill placements")
+        .unwrap();
+    assert!(
+        finding["summary"]
+            .as_str()
+            .unwrap()
+            .contains("6 placements across 3 distinct physical sources")
+    );
+    let finding_id = finding["id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["canonical_candidate_count"], 3);
+    assert_eq!(planning["canonical_candidates_truncated"], false);
+    assert_eq!(
+        planning["canonical_candidates"][0]["path"],
+        shared_skill.join("SKILL.md").to_str().unwrap()
+    );
+    let canonical_placement_id = planning["canonical_candidates"][0]["placement_id"]
+        .as_str()
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": finding_id,
+            "canonical_placement_id": canonical_placement_id,
+            "requested_state": "managed"
+        }]
+    });
+
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    assert_eq!(plan["result"]["change_summary"]["operation_count"], 5);
+    assert_eq!(plan["result"]["affected"]["placement_count"], 6);
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let full = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    let targets = full["result"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| operation["target"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(targets.len(), 5);
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    for directory in [&opencode_skill, &hermes_skill] {
+        assert!(
+            fs::symlink_metadata(directory)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::canonicalize(directory).unwrap(),
+            fs::canonicalize(&shared_skill).unwrap()
+        );
+    }
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    for directory in [&opencode_skill, &hermes_skill] {
+        assert!(directory.join("SKILL.md").is_file());
+        assert!(
+            !fs::symlink_metadata(directory)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join("SKILL.md")).unwrap(),
+            content
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(shared_skill.join("SKILL.md")).unwrap(),
+        content
     );
 }
 

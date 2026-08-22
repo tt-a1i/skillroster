@@ -468,6 +468,7 @@ mod tests {
                 entrypoint: PathBuf::from(format!(
                     "/tmp/home/.codex/skills/skill-{index:03}/SKILL.md"
                 )),
+                physical_directory: None,
                 content_digest: skill.content_digest.clone(),
                 link_target: None,
                 link_status: LinkStatus::NotLink,

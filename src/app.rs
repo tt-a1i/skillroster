@@ -1582,6 +1582,7 @@ fn finding_library_planning(
             (
                 rank,
                 placement.entrypoint.display().to_string(),
+                placement.physical_directory_or_logical().to_path_buf(),
                 json!({
                     "placement_id": placement.id,
                     "path": placement.entrypoint,
@@ -1594,11 +1595,13 @@ fn finding_library_planning(
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    let mut physical_sources = std::collections::BTreeSet::new();
+    candidates.retain(|candidate| physical_sources.insert(candidate.2.clone()));
     let candidate_count = candidates.len();
     let candidates = candidates
         .into_iter()
         .take(5)
-        .map(|(_, _, value)| value)
+        .map(|(_, _, _, value)| value)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
@@ -3262,6 +3265,7 @@ fn normalize_library_plan(
         let safe_name = safe_skill_directory_name(&skill.name)?;
         let library_path = library_root.join(safe_name);
         let canonical_fingerprint = change::fingerprint(&canonical.directory)?;
+        let canonical_physical = canonical.physical_directory_or_logical().to_path_buf();
         let link_source = match request.requested_state {
             RequestedGovernanceState::Managed => canonical.directory.clone(),
             RequestedGovernanceState::Hosted => {
@@ -3289,10 +3293,20 @@ fn normalize_library_plan(
         };
 
         let mut relinked = 0_usize;
+        let mut physical_groups =
+            std::collections::BTreeMap::<PathBuf, Vec<&scan::SkillPlacement>>::new();
         for placement in &all_placements {
-            if placement.id == canonical.id {
+            physical_groups
+                .entry(placement.physical_directory_or_logical().to_path_buf())
+                .or_default()
+                .push(*placement);
+        }
+        for (physical_source, mut placements) in physical_groups {
+            if physical_source == canonical_physical {
                 continue;
             }
+            placements.sort_by(|left, right| left.directory.cmp(&right.directory));
+            let placement = placements[0];
             if placement.link_target.as_deref() == Some(link_source.as_path())
                 && placement.link_status == scan::LinkStatus::Valid
             {
@@ -3313,7 +3327,7 @@ fn normalize_library_plan(
                 "expected_fingerprint": "missing",
                 "expected_source_fingerprint": canonical_fingerprint
             }));
-            relinked += 1;
+            relinked += placements.len();
         }
         actions.push(json!({
             "skill_id": request.skill_id,
@@ -3870,6 +3884,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.2",
         "d79be31fe878267d00f21cf8e198443ebf8b95eb6631fc2395f132f12289e3e5",
+    ),
+    (
+        "1.8.3",
+        "3eba54753cfe8cdf987a8a4fe1ab1337317aef9b72e55b9be49b3158117470b1",
     ),
 ];
 
@@ -4976,6 +4994,7 @@ mod recovery_tests {
             }),
             directory: PathBuf::from(format!("/fixture/{id}")),
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
+            physical_directory: None,
             content_digest: "digest_shared".into(),
             link_target: None,
             link_status: scan::LinkStatus::NotLink,

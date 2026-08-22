@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 
 const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_AGENT: usize = 10_000;
 const MAX_SESSION_FILES_PER_AGENT: usize = 250;
 const MAX_SESSION_BYTES_PER_AGENT: u64 = 4 * 1024 * 1024;
@@ -100,6 +101,10 @@ pub struct SkillPlacement {
     pub root: PathBuf,
     pub directory: PathBuf,
     pub entrypoint: PathBuf,
+    /// Resolved package directory captured during Scan. Logical Agent roots may
+    /// be symlink aliases of the same physical source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_directory: Option<PathBuf>,
     pub content_digest: String,
     pub link_target: Option<PathBuf>,
     pub link_status: LinkStatus,
@@ -108,13 +113,21 @@ pub struct SkillPlacement {
     /// External provider caches are observed and searchable, but never governable.
     #[serde(default = "default_true")]
     pub governable: bool,
-    /// External provider identity when the placement comes from an enabled plugin.
+    /// External provider identity when the placement comes from a discovered plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(default)]
     pub executable_files: Vec<PathBuf>,
     #[serde(default)]
     pub declared_name_matches_directory: Option<bool>,
+}
+
+impl SkillPlacement {
+    pub fn physical_directory_or_logical(&self) -> &Path {
+        self.physical_directory
+            .as_deref()
+            .unwrap_or(&self.directory)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,6 +233,7 @@ struct SkillRootPolicy {
 struct CodexPluginSkillRoot {
     plugin_id: String,
     path: PathBuf,
+    detail: String,
 }
 
 #[derive(Default)]
@@ -228,18 +242,27 @@ struct PluginConfigState {
     enabled_values: Vec<bool>,
 }
 
+#[derive(Default)]
+struct CodexPluginConfig {
+    enabled: BTreeSet<(String, String)>,
+    blocked: BTreeSet<(String, String)>,
+}
+
+#[derive(Deserialize)]
+struct RemotePluginInstallMarker {
+    schema_version: u64,
+    remote_plugin_id: String,
+}
+
 fn default_true() -> bool {
     true
 }
 
-fn codex_enabled_plugin_skill_roots(
-    home: &Path,
-    warnings: &mut Vec<String>,
-) -> Vec<CodexPluginSkillRoot> {
+fn codex_plugin_skill_roots(home: &Path, warnings: &mut Vec<String>) -> Vec<CodexPluginSkillRoot> {
     let config_path = home.join(".codex/config.toml");
     let config = match fs::read_to_string(&config_path) {
-        Ok(config) => config,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Vec::new(),
+        Ok(config) => parse_codex_plugin_config(&config, warnings),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => CodexPluginConfig::default(),
         Err(error) => {
             warnings.push(format!(
                 "could not read Codex plugin configuration {}: {error}",
@@ -248,57 +271,206 @@ fn codex_enabled_plugin_skill_roots(
             return Vec::new();
         }
     };
-    let enabled_plugins = parse_enabled_codex_plugins(&config, warnings);
     let cache_root = home.join(".codex/plugins/cache");
-    let mut roots = Vec::new();
-    for (plugin, marketplace) in enabled_plugins {
+    let mut roots = BTreeMap::<String, CodexPluginSkillRoot>::new();
+
+    for (plugin, marketplace) in &config.enabled {
         let plugin_id = format!("{plugin}@{marketplace}");
-        let unresolved_plugin_cache = cache_root.join(&marketplace).join(&plugin);
-        let Some(plugin_cache) = contained_directory(&cache_root, &unresolved_plugin_cache) else {
+        let unresolved_plugin_cache = cache_root.join(marketplace).join(plugin);
+        if let Some(root) = resolve_codex_plugin_skill_root(
+            &cache_root,
+            &unresolved_plugin_cache,
+            &plugin_id,
+            format!(
+                "Codex enabled plugin source {plugin_id}; observed and searchable; not Roster-managed"
+            ),
+            warnings,
+        ) {
+            roots.insert(plugin_id, root);
+        }
+    }
+
+    let marketplaces = match fs::read_dir(&cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return roots.into_values().collect();
+        }
+        Err(error) => {
             warnings.push(format!(
-                "enabled Codex plugin {plugin_id} has no contained local cache; skipped"
+                "could not inspect Codex plugin cache {}: {error}",
+                cache_root.display()
             ));
+            return roots.into_values().collect();
+        }
+    };
+    for marketplace_entry in marketplaces.filter_map(Result::ok) {
+        let Some(marketplace) = marketplace_entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let latest = plugin_cache.join("latest/skills");
-        if let Some(path) = contained_directory(&plugin_cache, &latest) {
-            roots.push(CodexPluginSkillRoot { plugin_id, path });
+        if !safe_path_component(&marketplace) {
             continue;
         }
-        let mut candidates = match fs::read_dir(&plugin_cache) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name() != "latest")
-                .filter_map(|entry| {
-                    contained_directory(&plugin_cache, &entry.path().join("skills"))
-                })
-                .collect::<Vec<_>>(),
+        let Some(marketplace_cache) = contained_directory(&cache_root, &marketplace_entry.path())
+        else {
+            continue;
+        };
+        let plugins = match fs::read_dir(&marketplace_cache) {
+            Ok(entries) => entries,
             Err(error) => {
                 warnings.push(format!(
-                    "could not inspect enabled Codex plugin cache {}: {error}",
-                    plugin_cache.display()
+                    "could not inspect Codex plugin marketplace cache {}: {error}",
+                    marketplace_cache.display()
                 ));
                 continue;
             }
         };
-        candidates.sort();
-        candidates.dedup();
-        match candidates.as_slice() {
-            [path] => roots.push(CodexPluginSkillRoot {
-                plugin_id,
-                path: path.clone(),
-            }),
-            [] => {}
-            _ => warnings.push(format!(
-                "enabled Codex plugin {plugin_id} has multiple cached Skill versions and no unique latest version; skipped"
-            )),
+        for plugin_entry in plugins.filter_map(Result::ok) {
+            let Some(plugin) = plugin_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !safe_path_component(&plugin) {
+                continue;
+            }
+            let identity = (plugin.clone(), marketplace.clone());
+            let plugin_id = format!("{plugin}@{marketplace}");
+            if config.blocked.contains(&identity) || roots.contains_key(&plugin_id) {
+                continue;
+            }
+            let Some(plugin_cache) = contained_directory(&cache_root, &plugin_entry.path()) else {
+                continue;
+            };
+            if !valid_remote_plugin_install_marker(&plugin_cache, &plugin_id, warnings) {
+                continue;
+            }
+            if let Some(root) = resolve_codex_plugin_skill_root(
+                &cache_root,
+                &plugin_cache,
+                &plugin_id,
+                format!(
+                    "Codex installed remote plugin source {plugin_id}; observed and searchable; not Roster-managed"
+                ),
+                warnings,
+            ) {
+                roots.insert(plugin_id, root);
+            }
         }
     }
-    roots.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
-    roots
+
+    roots.into_values().collect()
 }
 
-fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<(String, String)> {
+fn resolve_codex_plugin_skill_root(
+    cache_root: &Path,
+    unresolved_plugin_cache: &Path,
+    plugin_id: &str,
+    detail: String,
+    warnings: &mut Vec<String>,
+) -> Option<CodexPluginSkillRoot> {
+    let Some(plugin_cache) = contained_directory(cache_root, unresolved_plugin_cache) else {
+        warnings.push(format!(
+            "Codex plugin {plugin_id} has no contained local cache; skipped"
+        ));
+        return None;
+    };
+    let latest = plugin_cache.join("latest/skills");
+    if let Some(path) = contained_directory(&plugin_cache, &latest) {
+        return Some(CodexPluginSkillRoot {
+            plugin_id: plugin_id.to_owned(),
+            path,
+            detail,
+        });
+    }
+    let mut candidates = match fs::read_dir(&plugin_cache) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "latest")
+            .filter_map(|entry| contained_directory(&plugin_cache, &entry.path().join("skills")))
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            warnings.push(format!(
+                "could not inspect Codex plugin cache {}: {error}",
+                plugin_cache.display()
+            ));
+            return None;
+        }
+    };
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [path] => Some(CodexPluginSkillRoot {
+            plugin_id: plugin_id.to_owned(),
+            path: path.clone(),
+            detail,
+        }),
+        [] => None,
+        _ => {
+            warnings.push(format!(
+                "Codex plugin {plugin_id} has multiple cached Skill versions and no unique latest version; skipped"
+            ));
+            None
+        }
+    }
+}
+
+fn valid_remote_plugin_install_marker(
+    plugin_cache: &Path,
+    plugin_id: &str,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let marker = plugin_cache.join(".codex-remote-plugin-install.json");
+    if !marker.exists() {
+        return false;
+    }
+    let canonical_marker = match fs::canonicalize(&marker) {
+        Ok(path) if path.starts_with(plugin_cache) => path,
+        Ok(_) => {
+            warnings.push(format!(
+                "Codex remote plugin {plugin_id} install marker escapes its cache; skipped"
+            ));
+            return false;
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "could not resolve Codex remote plugin {plugin_id} install marker: {error}"
+            ));
+            return false;
+        }
+    };
+    let content = match read_bounded(&canonical_marker, MAX_REMOTE_PLUGIN_INSTALL_BYTES) {
+        Ok((content, _)) => content,
+        Err(error) => {
+            warnings.push(format!(
+                "could not read Codex remote plugin {plugin_id} install marker: {error}"
+            ));
+            return false;
+        }
+    };
+    let marker = match serde_json::from_str::<RemotePluginInstallMarker>(&content) {
+        Ok(marker) => marker,
+        Err(error) => {
+            warnings.push(format!(
+                "Codex remote plugin {plugin_id} has an invalid install marker: {error}"
+            ));
+            return false;
+        }
+    };
+    if marker.schema_version != 1
+        || marker.remote_plugin_id.is_empty()
+        || marker.remote_plugin_id.len() > 256
+        || !marker
+            .remote_plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        warnings.push(format!(
+            "Codex remote plugin {plugin_id} has an unsupported install marker; skipped"
+        ));
+        return false;
+    }
+    true
+}
+
+fn parse_codex_plugin_config(config: &str, warnings: &mut Vec<String>) -> CodexPluginConfig {
     let mut sections = BTreeMap::<String, PluginConfigState>::new();
     let mut current_plugin = None::<String>;
     for line in config.lines() {
@@ -333,38 +505,50 @@ fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<
         }
     }
 
-    let mut enabled = Vec::new();
+    let mut parsed = CodexPluginConfig::default();
     for (plugin_id, state) in sections {
         if state.sections != 1 || state.enabled_values.len() != 1 {
             warnings.push(format!(
                 "Codex plugin {plugin_id} has ambiguous configuration; skipped"
             ));
+            if let Ok(identity) = parse_codex_plugin_identifier(&plugin_id) {
+                parsed.blocked.insert(identity);
+            }
             continue;
         }
-        if !state.enabled_values[0] {
-            continue;
-        }
-        let Some((plugin, marketplace)) = plugin_id.split_once('@') else {
-            warnings.push(format!(
-                "Codex plugin identifier {plugin_id} is invalid; skipped"
-            ));
-            continue;
+        let identity = match parse_codex_plugin_identifier(&plugin_id) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                if state.enabled_values[0] {
+                    warnings.push(format!(
+                        "Codex plugin identifier {plugin_id} is {reason}; skipped"
+                    ));
+                }
+                continue;
+            }
         };
-        if plugin.is_empty()
-            || marketplace.is_empty()
-            || marketplace.contains('@')
-            || !safe_path_component(plugin)
-            || !safe_path_component(marketplace)
-        {
-            warnings.push(format!(
-                "Codex plugin identifier {plugin_id} is unsafe; skipped"
-            ));
-            continue;
+        if state.enabled_values[0] {
+            parsed.enabled.insert(identity);
+        } else {
+            parsed.blocked.insert(identity);
         }
-        enabled.push((plugin.to_owned(), marketplace.to_owned()));
     }
-    enabled.sort();
-    enabled
+    parsed
+}
+
+fn parse_codex_plugin_identifier(plugin_id: &str) -> Result<(String, String), &'static str> {
+    let Some((plugin, marketplace)) = plugin_id.split_once('@') else {
+        return Err("invalid");
+    };
+    if plugin.is_empty()
+        || marketplace.is_empty()
+        || marketplace.contains('@')
+        || !safe_path_component(plugin)
+        || !safe_path_component(marketplace)
+    {
+        return Err("unsafe");
+    }
+    Ok((plugin.to_owned(), marketplace.to_owned()))
 }
 
 fn parse_plugin_section(line: &str) -> Option<String> {
@@ -410,7 +594,7 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     let mut result = ScanResult::default();
     let known = known_agent_roots(&options.home);
-    let plugin_roots = codex_enabled_plugin_skill_roots(&options.home, &mut result.warnings);
+    let plugin_roots = codex_plugin_skill_roots(&options.home, &mut result.warnings);
     let shared_roots = [
         options.home.join(".agents_skills"),
         options.home.join(".skillroster/library"),
@@ -503,10 +687,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
                 agent: None,
                 explicit: false,
                 governable: false,
-                detail: Some(format!(
-                    "Codex enabled plugin source {}; observed and searchable; not Roster-managed",
-                    root.plugin_id
-                )),
+                detail: Some(root.detail.clone()),
                 provider: Some(root.plugin_id.clone()),
             },
             &approved_roots,
@@ -799,6 +980,13 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
         } else {
             Vec::new()
         };
+        let physical_directory = safe_to_read.then(|| {
+            fs::canonicalize(&candidate.entrypoint)
+                .ok()
+                .and_then(|entrypoint| entrypoint.parent().map(Path::to_path_buf))
+                .or_else(|| fs::canonicalize(&directory).ok())
+                .unwrap_or_else(|| directory.clone())
+        });
         let declared_name_matches_directory = metadata.name.as_ref().and_then(|declared| {
             directory.file_name().map(|directory_name| {
                 declared.eq_ignore_ascii_case(&directory_name.to_string_lossy())
@@ -829,6 +1017,7 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             root: candidate.root,
             directory,
             entrypoint: candidate.entrypoint,
+            physical_directory,
             content_digest: digest,
             link_target: candidate.link_target,
             link_status: candidate.link_status,
@@ -1682,7 +1871,7 @@ mod tests {
     #[test]
     fn plugin_config_requires_one_safe_explicitly_enabled_section() {
         let mut warnings = Vec::new();
-        let plugins = parse_enabled_codex_plugins(
+        let config = parse_codex_plugin_config(
             r#"
 [plugins."browser@openai-bundled"] # enabled browser provider
 enabled  =  true
@@ -1699,11 +1888,174 @@ enabled = true
         );
 
         assert_eq!(
-            plugins,
-            vec![("browser".to_owned(), "openai-bundled".to_owned())]
+            config.enabled,
+            BTreeSet::from([("browser".to_owned(), "openai-bundled".to_owned())])
+        );
+        assert!(
+            config
+                .blocked
+                .contains(&("disabled".to_owned(), "openai-bundled".to_owned()))
         );
         assert!(warnings.iter().any(|warning| warning.contains("unsafe")));
         assert!(warnings.iter().any(|warning| warning.contains("ambiguous")));
+    }
+
+    #[test]
+    fn installed_remote_plugin_skills_are_searchable_but_not_governable() {
+        let home = temp_directory("remote-plugin");
+        let plugin = home.join(".codex/plugins/cache/openai-curated-remote/data-analytics");
+        let skill = plugin.join("0.2.8/skills/design-kpis");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: design-kpis\ndescription: Design KPI frameworks and guardrails\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            plugin.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":1,"remote_plugin_id":"Plugin_fc9843a6"}"#,
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "design-kpis");
+        assert_eq!(result.placements.len(), 1);
+        assert!(!result.placements[0].governable);
+        assert_eq!(
+            result.placements[0].provider.as_deref(),
+            Some("data-analytics@openai-curated-remote")
+        );
+        assert!(result.roots.iter().any(|root| {
+            root.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("installed remote plugin"))
+        }));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn explicit_disable_hides_an_installed_remote_plugin() {
+        let home = temp_directory("disabled-remote-plugin");
+        let plugin = home.join(".codex/plugins/cache/openai-curated-remote/data-analytics");
+        let skill = plugin.join("0.2.8/skills/design-kpis");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: design-kpis\n---\n").unwrap();
+        fs::write(
+            plugin.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":1,"remote_plugin_id":"Plugin_fc9843a6"}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "[plugins.\"data-analytics@openai-curated-remote\"]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(result.placements.is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn invalid_remote_plugin_install_marker_fails_closed() {
+        let home = temp_directory("invalid-remote-plugin");
+        let plugin = home.join(".codex/plugins/cache/openai-curated-remote/data-analytics");
+        let skill = plugin.join("0.2.8/skills/design-kpis");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: design-kpis\n---\n").unwrap();
+        fs::write(
+            plugin.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":2,"remote_plugin_id":"Plugin_fc9843a6"}"#,
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unsupported install marker"))
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_plugin_install_marker_link_cannot_escape_its_cache() {
+        let home = temp_directory("escaping-remote-plugin-marker");
+        let outside = temp_directory("outside-remote-plugin-marker");
+        let plugin = home.join(".codex/plugins/cache/openai-curated-remote/data-analytics");
+        let skill = plugin.join("0.2.8/skills/design-kpis");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: design-kpis\n---\n").unwrap();
+        let outside_marker = outside.join("install.json");
+        fs::write(
+            &outside_marker,
+            r#"{"schema_version":1,"remote_plugin_id":"Plugin_fc9843a6"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &outside_marker,
+            plugin.join(".codex-remote-plugin-install.json"),
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("install marker escapes its cache"))
+        );
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_installed_remote_plugin_versions_fail_closed() {
+        let home = temp_directory("ambiguous-remote-plugin");
+        let plugin = home.join(".codex/plugins/cache/openai-curated-remote/data-analytics");
+        for version in ["0.2.7", "0.2.8"] {
+            let skill = plugin.join(version).join("skills/design-kpis");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(skill.join("SKILL.md"), "---\nname: design-kpis\n---\n").unwrap();
+        }
+        fs::write(
+            plugin.join(".codex-remote-plugin-install.json"),
+            r#"{"schema_version":1,"remote_plugin_id":"Plugin_fc9843a6"}"#,
+        )
+        .unwrap();
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("multiple cached Skill versions"))
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
