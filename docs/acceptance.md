@@ -328,6 +328,19 @@ A process-level regression closes the stdout reader before write, and the real
 large-response replay exits zero with empty stderr. Connected JSON responses
 remain one complete versioned document.
 
+The v1.8.13 usage-evidence dogfood started from a freshly rebuilt release
+binary after rejecting a stale v1.8.6 build artifact as invalid evidence. The
+current read-only real-home Scan again found 232 independent Skills, 744
+placements, 548 default exposure, and 169 Findings with `files_changed=false`.
+The `Five-stage usage evidence` Finding reported observed Loaded events, but
+both compact and full drill-down exposed only opaque Skill IDs and serialized
+Claude Code as the internal `claude_code` enum spelling. Agent callers could
+not directly answer which Skills were observed without an out-of-band lookup
+and identifier rewrite. Usage Evidence now carries `skill_name` and the
+canonical public Agent ID while preserving stage, quality, count, timestamps,
+and the source-path digest. An eight-Agent fixture verifies the same facts in
+compact and full JSON; no real Agent file was changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

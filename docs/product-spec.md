@@ -176,6 +176,10 @@ it does not repeat complete affected-ID, placement, and Evidence collections.
 `--full` explicitly requests those complete paged records. For escaping links,
 the Finding returns a trust-confirmation resolution and observed link targets;
 it must not advertise an automatic Plan before the source is confirmed.
+Usage Evidence includes the human-readable `skill_name` beside the opaque
+`skill_id`, and serializes `agent` with the same canonical public identifier
+used by planning commands. Compact and full detail therefore support usage
+summaries without a caller-side Skill lookup or Agent-name rewrite.
 
 `plan --stdin --json` returns a bounded decision-complete summary: total change counts, operation groups, affected-scope counts with at most ten Skill IDs, before/after impact, risk, reversibility, and the immutable Plan ID. A Finding-derived Roster Plan also persists `selection_evidence`, including forced, positive-signal, and stable-fallback Core counts. When fallback selection dominates any affected Agent, the Plan carries typed `uncertainty` with `review_required: true`; absence of usage evidence remains explicitly non-negative. It does not inline filesystem operations or complete large ID collections. `plan --show PLAN_ID --json` is the explicit full-detail path; it reads the stored Plan and never mutates files.
 
