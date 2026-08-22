@@ -33,6 +33,7 @@ skillroster report --finding <finding-id> --limit 20 --json
 skillroster report --finding <finding-id> --full --json
 skillroster find "database migration" --json
 skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
+skillroster find "分析本地表格" --hint "analyze standalone spreadsheet file workbook data" --json
 skillroster plan --stdin --json
 skillroster plan --show <plan-id> --json
 skillroster apply <plan-id> --json

@@ -127,7 +127,10 @@ Show ranked matches with Skill name, current Roster state, source, concise match
 reasons, and same-name variant count. Preserve the original task separately
 from repeatable `--hint` retrieval text. A CJK task without hints receives an
 actionable lexical-retrieval warning when English metadata may be missed.
-Empty results are calm, successful output. Find never implies activation.
+Hints describe the desired surface, object, operation, and state. Results below
+the deterministic confidence floor are omitted instead of filling the first
+view with incidental body-token matches. Empty results are calm, successful
+output. Find never implies activation.
 
 ### `plan`
 

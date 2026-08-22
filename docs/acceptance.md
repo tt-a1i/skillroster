@@ -73,6 +73,29 @@ the terminal and JSON results identified each plugin provider and its read-only
 governance boundary. Disabled plugins stayed absent, ambiguous cache versions
 failed closed, and exact-duplicate planning refused provider-managed placements.
 
+## Agent-led retrieval precision evidence
+
+The 1.7 pre-release dogfood started from the public 1.6 behavior reported in
+[Issue #31](https://github.com/tt-a1i/skillroster/issues/31), then rescanned the
+same reference macOS home into fresh isolated state. It again found 193 Skills,
+689 placements, and eight Agents with `files_changed=false`. The source build:
+
+- ranked the dedicated browser, presentation, standalone-spreadsheet,
+  live-Excel, session-mining, and cross-Agent Skill-management capabilities
+  first for seven English tasks and five Chinese tasks with Agent-authored
+  English hints;
+- returned no more than three results for each of those 12 decisions instead
+  of filling a ten-result response with incidental body-token matches;
+- read folded YAML descriptions such as the real `agent-skills-manager`
+  metadata, which moved that capability from rank four to rank one;
+- reduced an unhinted CJK miss to one actionable warning while preserving the
+  original task and requiring no cloud model or embedded translation table.
+
+The maintained routing fixture now contains 59 English and cross-language
+cases. All 59 route within Top-3, all 12 surface-disambiguation cases require
+the dedicated capability at rank one, and the Apply/Undo governance loop must
+preserve those results.
+
 ## Release-candidate platform evidence
 
 The 2026-08-22 release gates use actual hosted operating systems and the packaged

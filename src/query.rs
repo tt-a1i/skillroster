@@ -1081,16 +1081,29 @@ pub(crate) fn find_matching(
                 .as_deref()
                 .unwrap_or_default()
                 .to_lowercase();
+            let (positive_description, excluded_description) =
+                description_routing_sections(&description);
             let triggers = skill.metadata.triggers.join(" ").to_lowercase();
             let all_text = skill_search_text(skill).to_lowercase();
             let name_overlap = query_tokens.intersection(&tokens(&name)).count();
             let trigger_overlap = query_tokens.intersection(&tokens(&triggers)).count();
-            let description_overlap = query_tokens.intersection(&tokens(&description)).count();
+            let description_overlap = query_tokens
+                .intersection(&tokens(&positive_description))
+                .count();
+            let excluded_description_overlap = query_tokens
+                .intersection(&tokens(&excluded_description))
+                .count();
+            let exclusion_penalty_tokens = if excluded_description_overlap >= 2 {
+                excluded_description_overlap
+            } else {
+                0
+            };
             let overlap = query_tokens.intersection(&tokens(&all_text)).count();
             let mut score = name_overlap as f64 * 24.0
                 + trigger_overlap as f64 * 18.0
                 + description_overlap as f64 * 12.0
-                + overlap as f64 * 3.0;
+                + overlap as f64 * 3.0
+                - exclusion_penalty_tokens as f64 * 18.0;
             let mut reasons = Vec::new();
             if name == query {
                 score += 100.0;
@@ -1103,7 +1116,7 @@ pub(crate) fn find_matching(
                 score += 35.0;
                 reasons.push("declared_trigger".into());
             }
-            if !description.is_empty() && description.contains(&query) {
+            if !positive_description.is_empty() && positive_description.contains(&query) {
                 score += 25.0;
                 reasons.push("description_phrase".into());
             }
@@ -1115,6 +1128,11 @@ pub(crate) fn find_matching(
             }
             if description_overlap > 0 {
                 reasons.push(format!("description_tokens:{description_overlap}"));
+            }
+            if exclusion_penalty_tokens > 0 {
+                reasons.push(format!(
+                    "excluded_description_tokens:{exclusion_penalty_tokens}"
+                ));
             }
             if overlap > 0 {
                 reasons.push(format!("all_text_tokens:{overlap}"));
@@ -1266,6 +1284,7 @@ pub(crate) fn find_matching(
                 .push(format!("name_variants:{}", matched.variant_count));
         }
     }
+    trim_low_confidence_tail(&mut capabilities, query_tokens.len());
     capabilities.truncate(limit);
     for (index, matched) in capabilities.iter_mut().enumerate() {
         matched.rank = index + 1;
@@ -1277,8 +1296,102 @@ fn tokens(text: &str) -> BTreeSet<String> {
     text.split(|character: char| !character.is_alphanumeric())
         .map(str::trim)
         .filter(|token| token.len() >= 2)
-        .map(str::to_lowercase)
+        .map(normalize_token)
         .collect()
+}
+
+pub(crate) fn candidate_search_text(text: &str) -> String {
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    for term in text
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        let original = term.to_lowercase();
+        if seen.insert(original.clone()) {
+            terms.push(original.clone());
+        }
+        let normalized = normalize_token(&original);
+        if seen.insert(normalized.clone()) {
+            terms.push(normalized);
+        }
+    }
+    terms.join(" ")
+}
+
+fn normalize_token(token: &str) -> String {
+    let mut normalized = token.to_lowercase();
+    if normalized.is_ascii()
+        && normalized.len() > 3
+        && normalized.ends_with('s')
+        && !normalized.ends_with("ss")
+        && !normalized.ends_with("us")
+        && !normalized.ends_with("is")
+    {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn description_routing_sections(description: &str) -> (String, String) {
+    const EXCLUSION_MARKERS: &[&str] = &[
+        "do not use",
+        "don't use",
+        "never use",
+        "must not use",
+        "should not use",
+        "not for",
+    ];
+    let description = description.to_lowercase();
+    let mut positive = Vec::new();
+    let mut excluded = Vec::new();
+    for section in description.split(['.', '!', '?', ';', '\n']) {
+        let section = section.trim();
+        if section.is_empty() {
+            continue;
+        }
+        if let Some(boundary) = EXCLUSION_MARKERS
+            .iter()
+            .filter_map(|marker| section.find(marker))
+            .min()
+        {
+            let desired = section[..boundary].trim().trim_end_matches(',').trim();
+            if !desired.is_empty() {
+                positive.push(desired);
+            }
+            excluded.push(section[boundary..].trim());
+        } else {
+            positive.push(section);
+        }
+    }
+    (positive.join(" "), excluded.join(" "))
+}
+
+fn trim_low_confidence_tail(matches: &mut Vec<FindMatch>, query_token_count: usize) {
+    if matches.is_empty() {
+        return;
+    }
+    let cutoff = (matches[0].score * 0.5).max(3.0);
+    matches.retain(|matched| matched.score >= cutoff);
+    if query_token_count == 1
+        && matches
+            .first()
+            .is_some_and(|matched| !has_strong_lexical_evidence(matched))
+    {
+        matches.truncate(3);
+    }
+}
+
+fn has_strong_lexical_evidence(matched: &FindMatch) -> bool {
+    matched.match_reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "exact_name" | "name_phrase" | "declared_trigger" | "description_phrase"
+        ) || reason.starts_with("name_tokens:")
+            || reason.starts_with("trigger_tokens:")
+            || reason.starts_with("description_tokens:")
+    })
 }
 
 fn fnv1a64(bytes: &[u8]) -> String {
@@ -1560,6 +1673,143 @@ mod tests {
     }
 
     #[test]
+    fn find_prefers_dedicated_surfaces_and_removes_a_low_confidence_tail() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-routing-quality-{nonce}"));
+        for (directory, contents) in [
+            (
+                "presentations",
+                "---\nname: Presentations\ndescription: Read, create, or edit PowerPoint and Google Slides decks. Use for presentation and slide requests.\n---\nDedicated deck workflow.",
+            ),
+            (
+                "template-creator",
+                "---\nname: template-creator\ndescription: Create a reusable template from a reference presentation or spreadsheet. Do not use for one-off creation.\n---\nGeneric artifact template workflow.",
+            ),
+            (
+                "spreadsheets",
+                "---\nname: Spreadsheets\ndescription: Create, edit, and analyze standalone spreadsheet files and workbooks. Do not use for a live Microsoft Excel session.\n---\nDedicated file workflow.",
+            ),
+            (
+                "excel-live-control",
+                "---\nname: excel-live-control\ndescription: Control an open Microsoft Excel workbook in a connected live session. Do not use for standalone spreadsheet files.\n---\nDedicated live application workflow.",
+            ),
+            (
+                "control-browser",
+                "---\nname: control-browser\ndescription: Control browser automation in an existing logged-in session.\n---\nInspect and operate web pages.",
+            ),
+            (
+                "agent-session-miner",
+                "---\nname: agent-session-miner\ndescription: Mine local agent session history.\n---\nA browser can appear incidentally in session logs.",
+            ),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("SKILL.md"), contents).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let presentation = find(&scan, "create product release presentation slides", 10);
+        assert_eq!(presentation[0].name, "Presentations");
+
+        let spreadsheet = find(
+            &scan,
+            "analyze a standalone spreadsheet file and workbook",
+            10,
+        );
+        assert_eq!(spreadsheet[0].name, "Spreadsheets");
+        assert!(
+            spreadsheet
+                .iter()
+                .all(|matched| matched.name != "excel-live-control")
+        );
+
+        let browser = find(
+            &scan,
+            "control browser automation in a logged-in session",
+            10,
+        );
+        assert_eq!(browser[0].name, "control-browser");
+        assert!(
+            browser
+                .iter()
+                .all(|matched| matched.name != "agent-session-miner")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn token_matching_normalizes_common_ascii_plurals() {
+        assert_eq!(
+            tokens("presentations slides spreadsheets skills agents"),
+            BTreeSet::from([
+                "agent".to_owned(),
+                "presentation".to_owned(),
+                "skill".to_owned(),
+                "slide".to_owned(),
+                "spreadsheet".to_owned(),
+            ])
+        );
+        assert_eq!(candidate_search_text("publish blogs"), "publish blogs blog");
+    }
+
+    #[test]
+    fn single_token_body_only_matches_have_a_bounded_low_confidence_tail() {
+        let (_, mut scan) = fixture();
+        let representative = scan.skills[0].clone();
+        scan.skills = (0..8)
+            .map(|index| {
+                let mut skill = representative.clone();
+                skill.id = format!("incidental-{index}");
+                skill.name = format!("incidental-{index}");
+                skill.metadata.description = Some("generic helper".into());
+                skill.normalized_text = "mentions archive incidentally".into();
+                skill
+            })
+            .collect();
+        scan.usage.push(crate::scan::UsageEvidence {
+            agent: AgentKind::Codex,
+            skill_id: "incidental-0".into(),
+            stage: UsageStage::Loaded,
+            quality: EvidenceQuality::Observed,
+            event_count: 1,
+            first_seen_unix: Some(1),
+            last_seen_unix: Some(1),
+            source_path_digest: "fixture".into(),
+        });
+
+        let matches = find(&scan, "archive", 100);
+
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].score, 5.0);
+        assert!(
+            matches[0]
+                .match_reasons
+                .contains(&"observed_local_usage".into())
+        );
+    }
+
+    #[test]
+    fn description_boundaries_keep_the_desired_clause_and_separate_the_exclusion() {
+        let (desired, excluded) = description_routing_sections(
+            "Use for standalone spreadsheet files, not for a live Excel session.",
+        );
+
+        assert_eq!(desired, "use for standalone spreadsheet files");
+        assert_eq!(excluded, "not for a live excel session");
+    }
+
+    #[test]
     fn find_returns_one_ranked_capability_for_same_name_variants() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1804,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn maintained_routing_set_has_at_least_ninety_five_percent_top_three_recall() {
+    fn maintained_routing_set_has_complete_top_three_recall() {
         #[derive(serde::Deserialize)]
         struct Case {
             task: String,
@@ -1837,10 +2087,6 @@ mod tests {
                     .any(|item| item.name == case.skill)
             })
             .count();
-        assert!(
-            hits * 100 >= cases.len() * 95,
-            "Top-3 recall was {hits}/{}",
-            cases.len()
-        );
+        assert_eq!(hits, cases.len(), "Top-3 recall was {hits}/{}", cases.len());
     }
 }

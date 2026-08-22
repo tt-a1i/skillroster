@@ -1972,8 +1972,9 @@ fn find_command(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let candidate_search_text = crate::query::candidate_search_text(&retrieval_query);
     let mut candidate_ids = store
-        .search_skill_ids(&retrieval_query, scan.skills.len())?
+        .search_skill_ids(&candidate_search_text, scan.skills.len())?
         .into_iter()
         .map(|id| id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
@@ -2047,13 +2048,14 @@ fn find_command(
             ));
         }
     }
-    if retrieval_hints.is_empty() && contains_cjk(task) {
+    let cjk_hint_required = retrieval_hints.is_empty() && contains_cjk(task);
+    if cjk_hint_required {
         warnings.push(
             "Find is lexical and the task contains CJK text; retry with one concise English capability paraphrase via --hint if relevant Skills use English metadata"
                 .into(),
         );
     }
-    if matches.is_empty() {
+    if matches.is_empty() && !cjk_hint_required {
         warnings.push(
             "No lexical Skill match was found; retry once with concrete capability, tool, or operation terms via --hint"
                 .into(),
@@ -3730,6 +3732,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.5.1",
         "abb33e147e1b092ff70a2b02c5a8f89fc70d0c73eed2d8ec5ea88bba1ae58221",
+    ),
+    (
+        "1.6.0",
+        "c5f05692527bb2b8c45012ba6a464268b6a91a683a429a11dbe67022bbcc2aa5",
     ),
 ];
 

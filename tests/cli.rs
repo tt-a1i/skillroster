@@ -77,6 +77,7 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
         None,
     ));
     assert!(unhinted["result"]["matches"].as_array().unwrap().is_empty());
+    assert_eq!(unhinted["result"]["warnings"].as_array().unwrap().len(), 1);
     assert!(
         unhinted["result"]["warnings"]
             .as_array()
@@ -107,6 +108,52 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
         json!(["interactive architecture workflow diagram"])
     );
     assert_eq!(found["result"]["matches"][0]["name"], "archify");
+}
+
+#[test]
+fn public_find_expands_plural_candidates_and_bounds_incidental_single_token_matches() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    let blog = skill_root.join("blog");
+    fs::create_dir_all(&blog).unwrap();
+    fs::write(
+        blog.join("SKILL.md"),
+        "---\nname: blog\ndescription: Publish a technical article\n---\n",
+    )
+    .unwrap();
+    for index in 0..8 {
+        let skill = skill_root.join(format!("incidental-{index}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: incidental-{index}\ndescription: Generic helper\n---\nMentions archive incidentally.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let plural = json_output(&run(
+        &[&common[..], &["find", "blogs", "--limit", "10"]].concat(),
+        None,
+    ));
+    assert_eq!(plural["result"]["matches"][0]["name"], "blog");
+
+    let incidental = json_output(&run(
+        &[&common[..], &["find", "archive", "--limit", "100"]].concat(),
+        None,
+    ));
+    assert_eq!(incidental["result"]["matches"].as_array().unwrap().len(), 3);
 }
 
 #[test]
@@ -828,7 +875,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.6.0"
+        "1.7.0"
     );
 
     let undone = json_output(&run(
@@ -849,6 +896,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         ("1.4.0", include_str!("fixtures/bootstrap-v1.4.0.md")),
         ("1.5.0", include_str!("fixtures/bootstrap-v1.5.0.md")),
         ("1.5.1", include_str!("fixtures/bootstrap-v1.5.1.md")),
+        ("1.6.0", include_str!("fixtures/bootstrap-v1.6.0.md")),
     ] {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
@@ -923,7 +971,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.6.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.7.0");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
