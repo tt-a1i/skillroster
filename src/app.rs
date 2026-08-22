@@ -1177,6 +1177,8 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                         "link_target": placement.link_target,
                         "link_status": placement.link_status,
                         "default_exposed": placement.default_exposed,
+                        "governable": placement.governable,
+                        "provider": placement.provider,
                         "content_digest": placement.content_digest
                     })
                 })
@@ -1523,11 +1525,27 @@ fn finding_library_planning(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
+    let protected_count = scan
+        .placements
+        .iter()
+        .filter(|placement| affected.contains(placement.id.as_str()) && !placement.governable)
+        .count();
+    if protected_count > 0 {
+        return Some(json!({
+            "supported": false,
+            "reason": "external_observed_placements",
+            "snapshot_id": scan_id,
+            "protected_placement_count": protected_count,
+            "next_step": "Keep provider-managed plugin Skills read-only; govern only Agent-owned placements."
+        }));
+    }
     let mut candidates = scan
         .placements
         .iter()
         .filter(|placement| {
-            affected.contains(placement.id.as_str()) && placement.link_target.is_none()
+            affected.contains(placement.id.as_str())
+                && placement.link_target.is_none()
+                && placement.governable
         })
         .map(|placement| {
             let (rank, reason) = if placement.agent.is_none() && !placement.default_exposed {
@@ -1545,6 +1563,7 @@ fn finding_library_planning(
                     "path": placement.entrypoint,
                     "agent": placement.agent.map(AgentKind::id),
                     "default_exposed": placement.default_exposed,
+                    "governable": placement.governable,
                     "reason": reason
                 }),
             )
@@ -2809,6 +2828,12 @@ fn normalize_agent_plan(
                 request.skill_id
             );
         }
+        if !placement.governable {
+            bail!(
+                "Placement {} is provider-managed and read-only; source updates are not allowed",
+                request.placement_id
+            );
+        }
         if placement.content_digest != request.current_fingerprint {
             bail!(
                 "Placement {} fingerprint drifted from the submitted current_fingerprint",
@@ -3026,6 +3051,12 @@ fn normalize_library_plan(
             .iter()
             .filter(|placement| placement.skill_id == request.skill_id)
             .collect::<Vec<_>>();
+        if all_placements.iter().any(|placement| !placement.governable) {
+            bail!(
+                "Library change for {} includes provider-managed read-only placements",
+                request.skill_id
+            );
+        }
         let expected_ids = all_placements
             .iter()
             .map(|placement| placement.id.as_str())
@@ -3656,6 +3687,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.5.0",
         "0afb58572bf602024f78e0f8c7312cc3485abb184746898945d1f7501a5425b5",
     ),
+    (
+        "1.5.1",
+        "abb33e147e1b092ff70a2b02c5a8f89fc70d0c73eed2d8ec5ea88bba1ae58221",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4078,6 +4113,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
+                "governable": placement.governable,
+                "provider": placement.provider,
             }),
             observed_at,
         )?;
@@ -4717,6 +4754,57 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn exact_duplicate_planning_never_governs_provider_managed_placements() {
+        let placement = |id: &str, governable: bool| scan::SkillPlacement {
+            id: id.into(),
+            skill_id: "skill_shared".into(),
+            agent: governable.then_some(AgentKind::Codex),
+            root: PathBuf::from(if governable {
+                "/home/test/.codex/skills"
+            } else {
+                "/home/test/.codex/plugins/cache/market/plugin/1/skills"
+            }),
+            directory: PathBuf::from(format!("/fixture/{id}")),
+            entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
+            content_digest: "digest_shared".into(),
+            link_target: None,
+            link_status: scan::LinkStatus::NotLink,
+            default_exposed: governable,
+            governable,
+            provider: (!governable).then(|| "plugin@market".into()),
+            executable_files: Vec::new(),
+            declared_name_matches_directory: Some(true),
+        };
+        let scan = ScanResult {
+            placements: vec![
+                placement("placement_agent", true),
+                placement("placement_plugin", false),
+            ],
+            ..ScanResult::default()
+        };
+        let finding = FindingRecord {
+            id: FindingId::parse("finding_external-duplicate").unwrap(),
+            report_id: ReportId::parse("report_external-duplicate").unwrap(),
+            category: FindingCategory::Overlap,
+            severity: Severity::Warning,
+            title: "Exact duplicate".into(),
+            summary: String::new(),
+            details: json!({
+                "affected_skill_ids": ["skill_shared"],
+                "affected_placement_ids": ["placement_agent", "placement_plugin"]
+            }),
+            evidence_ids: vec![EvidenceId::parse("evidence_external-duplicate").unwrap()],
+        };
+        let scan_id = ScanId::parse("scan_external-duplicate").unwrap();
+
+        let planning = finding_library_planning(&finding, &scan_id, &scan_id, &scan).unwrap();
+
+        assert_eq!(planning["supported"], false);
+        assert_eq!(planning["reason"], "external_observed_placements");
+        assert_eq!(planning["protected_placement_count"], 1);
+    }
 
     #[test]
     fn bootstrap_digest_classification_distinguishes_release_content_from_local_edits() {

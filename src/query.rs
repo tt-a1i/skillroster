@@ -70,6 +70,11 @@ pub struct FindMatch {
     /// The scanner can prove source metadata, but Roster state is stored separately.
     pub roster_state: String,
     pub source: Option<String>,
+    /// Provider identities for externally managed plugin placements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    /// True when at least one placement may participate in a governance Plan.
+    pub governable: bool,
     pub match_reasons: Vec<String>,
     pub evidence_quality: EvidenceQuality,
     /// Same declared name with distinct Skill identities is one ambiguous capability result.
@@ -1128,6 +1133,13 @@ pub(crate) fn find_matching(
                 .collect::<Vec<_>>();
             agents.sort();
             agents.dedup();
+            let mut providers = placements
+                .iter()
+                .filter_map(|placement| placement.provider.clone())
+                .collect::<Vec<_>>();
+            providers.sort();
+            providers.dedup();
+            let governable = placements.iter().any(|placement| placement.governable);
             Some(FindMatch {
                 rank: 0,
                 skill_id: skill.id.clone(),
@@ -1137,6 +1149,8 @@ pub(crate) fn find_matching(
                 agents,
                 roster_state: "unknown".into(),
                 source: skill.metadata.source.clone(),
+                providers,
+                governable,
                 match_reasons: reasons,
                 evidence_quality: if observed_usage {
                     EvidenceQuality::Observed
@@ -1166,6 +1180,10 @@ pub(crate) fn find_matching(
             existing.variant_skill_ids.sort();
             existing.variant_skill_ids.dedup();
             existing.variant_count = existing.variant_skill_ids.len();
+            existing.providers.extend(matched.providers);
+            existing.providers.sort();
+            existing.providers.dedup();
+            existing.governable |= matched.governable;
             continue;
         }
         capability_indexes.insert(capability, capabilities.len());
@@ -1623,6 +1641,8 @@ mod tests {
                     link_target: None,
                     link_status: crate::scan::LinkStatus::NotLink,
                     default_exposed: true,
+                    governable: true,
+                    provider: None,
                     executable_files: Vec::new(),
                     declared_name_matches_directory: Some(true),
                 }));

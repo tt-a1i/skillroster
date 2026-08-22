@@ -479,6 +479,17 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                 .unwrap_or("unknown");
             let source = text(item, "source");
             let roster = text(item, "roster_state");
+            let providers = item
+                .get("providers")
+                .and_then(Value::as_array)
+                .map(|providers| {
+                    providers
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|providers| !providers.is_empty());
             let reasons = item
                 .get("match_reasons")
                 .and_then(Value::as_array)
@@ -493,7 +504,20 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "not provided".into());
             lines.push(format!("  {}. {}", index + 1, text(item, "name")));
-            lines.push(format!("     roster {roster} · source {source}"));
+            if let Some(providers) = providers {
+                let management = if item
+                    .get("governable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    "mixed ownership"
+                } else {
+                    "provider-managed · read-only"
+                };
+                lines.push(format!("     Codex plugin {providers} · {management}"));
+            } else {
+                lines.push(format!("     roster {roster} · source {source}"));
+            }
             if item
                 .get("variant_count")
                 .and_then(Value::as_u64)
@@ -1355,6 +1379,24 @@ mod tests {
         assert!(found.contains("variants 2 · inspect layout Finding"));
         assert!(found.contains("declared_trigger"));
         assert!(found.contains("Retrieval notes"));
+
+        let provider = render(
+            "find",
+            &json!({"matches": [{
+                "name": "control-chrome",
+                "providers": ["browser@openai-bundled"],
+                "governable": false,
+                "match_reasons": ["description_tokens:3"],
+                "paths": ["/plugins/browser/skills/control-chrome/SKILL.md"]
+            }]}),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(
+            provider.contains("Codex plugin browser@openai-bundled · provider-managed · read-only")
+        );
 
         let planned = render(
             "plan",
