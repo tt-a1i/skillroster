@@ -1530,17 +1530,24 @@ fn normalize_reference_text(value: &str) -> String {
 }
 
 fn decoded_record_text(line: &str) -> Option<String> {
-    fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    fn collect_strings(value: &serde_json::Value, depth: usize, output: &mut Vec<String>) {
         match value {
-            serde_json::Value::String(value) => output.push(value.clone()),
+            serde_json::Value::String(value) => {
+                output.push(value.clone());
+                if depth < 4 {
+                    if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(value) {
+                        collect_strings(&decoded, depth + 1, output);
+                    }
+                }
+            }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    collect_strings(value, output);
+                    collect_strings(value, depth, output);
                 }
             }
             serde_json::Value::Object(values) => {
                 for value in values.values() {
-                    collect_strings(value, output);
+                    collect_strings(value, depth, output);
                 }
             }
             _ => {}
@@ -1549,7 +1556,7 @@ fn decoded_record_text(line: &str) -> Option<String> {
 
     let value = serde_json::from_str(line).ok()?;
     let mut strings = Vec::new();
-    collect_strings(&value, &mut strings);
+    collect_strings(&value, 0, &mut strings);
     Some(strings.join("\n"))
 }
 
@@ -2565,6 +2572,19 @@ enabled = true
         );
         assert_eq!(
             observed_reference_skill_ids(&line, Some(&matcher), &reference_lookup),
+            BTreeSet::from(["skill_windows".to_owned()])
+        );
+
+        let nested_arguments = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": serde_json::json!({"path": session_path}).to_string()
+            }
+        })
+        .to_string();
+        assert_eq!(
+            observed_reference_skill_ids(&nested_arguments, Some(&matcher), &reference_lookup),
             BTreeSet::from(["skill_windows".to_owned()])
         );
     }
