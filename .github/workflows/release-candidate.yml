@@ -146,9 +146,15 @@ jobs:
           wsl --import SkillRosterAcceptance $install $image --version 1
           if ($LASTEXITCODE -ne 0) { throw "WSL import failed with exit code $LASTEXITCODE" }
           try {
+            function Convert-ToWslPath([string]$Path) {
+              $full = [System.IO.Path]::GetFullPath($Path)
+              $drive = $full.Substring(0, 1).ToLowerInvariant()
+              $relative = $full.Substring(2).Replace('\', '/')
+              return "/mnt/$drive$relative"
+            }
             $archive = (Resolve-Path "dist/skillroster-*-x86_64-unknown-linux-gnu.tar.gz").Path
-            $archiveWsl = (wsl -d SkillRosterAcceptance -- wslpath -a $archive).Trim()
-            $repoWsl = (wsl -d SkillRosterAcceptance -- wslpath -a $env:GITHUB_WORKSPACE).Trim()
+            $archiveWsl = Convert-ToWslPath $archive
+            $repoWsl = Convert-ToWslPath $env:GITHUB_WORKSPACE
             $command = 'set -euo pipefail; mkdir -p /tmp/skillroster-release; tar -xzf "$1" -C /tmp/skillroster-release; binary="$(find /tmp/skillroster-release -type f -name skillroster -print -quit)"; chmod +x "$binary"; "$2/scripts/release/smoke.sh" "$binary"'
             wsl -d SkillRosterAcceptance --user root -- bash -lc $command bash $archiveWsl $repoWsl
             if ($LASTEXITCODE -ne 0) { throw "WSL governance smoke failed with exit code $LASTEXITCODE" }
