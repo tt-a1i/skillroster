@@ -1297,7 +1297,8 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         "sampled_agents": report.metrics.agents_with_sampled_session_data,
         "complete_agents": report.metrics.agents_with_reliable_session_denominator,
         "limited_agents": report.metrics.agents_with_limited_session_data,
-        "missing_root_agents": report.metrics.agents_missing_session_roots
+        "missing_root_agents": report.metrics.agents_missing_session_roots,
+        "inaccessible_agents": report.metrics.agents_with_inaccessible_session_roots
     });
     let value = json!({
         "report_id": report_id,
@@ -1311,6 +1312,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         "coverage_root_agent_count": report.metrics.agents_with_session_roots,
         "coverage_limited_agent_count": report.metrics.agents_with_limited_session_data,
         "coverage_missing_agent_count": report.metrics.agents_missing_session_roots,
+        "coverage_inaccessible_agent_count": report.metrics.agents_with_inaccessible_session_roots,
         "session_coverage": session_coverage,
         "primary_metrics": {
             "independent_skills": {"value": report.metrics.independent_skills, "unit": "skills"},
@@ -1325,6 +1327,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                     "roots_present_agents": report.metrics.agents_with_session_roots,
                     "limited_agents": report.metrics.agents_with_limited_session_data,
                     "missing_root_agents": report.metrics.agents_missing_session_roots,
+                    "inaccessible_agents": report.metrics.agents_with_inaccessible_session_roots,
                     "supported_agents": AgentKind::ALL.len()
                 }
             }
@@ -1872,6 +1875,7 @@ fn paged_finding_report(
         "coverage_root_agent_count": report["coverage_root_agent_count"],
         "coverage_limited_agent_count": report["coverage_limited_agent_count"],
         "coverage_missing_agent_count": report["coverage_missing_agent_count"],
+        "coverage_inaccessible_agent_count": report["coverage_inaccessible_agent_count"],
         "session_coverage": report["session_coverage"],
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
@@ -1916,6 +1920,7 @@ fn compact_report(report: &Value) -> Value {
         "coverage_root_agent_count": report["coverage_root_agent_count"],
         "coverage_limited_agent_count": report["coverage_limited_agent_count"],
         "coverage_missing_agent_count": report["coverage_missing_agent_count"],
+        "coverage_inaccessible_agent_count": report["coverage_inaccessible_agent_count"],
         "session_coverage": report["session_coverage"],
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),

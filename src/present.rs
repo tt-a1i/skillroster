@@ -259,11 +259,17 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Observed-use Agents",
         if let Some(coverage) = value.get("session_coverage") {
             format!(
-                "{} · sampled {}/{} · complete {}/{}",
+                "{} · sampled {}/{} · complete {}/{} · limited {}/{} · missing {}/{} · inaccessible {}/{}",
                 text(value, "observed_use_agent_count"),
                 text(coverage, "sampled_agents"),
                 text(coverage, "supported_agents"),
                 text(coverage, "complete_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "limited_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "missing_root_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "inaccessible_agents"),
                 text(coverage, "supported_agents")
             )
         } else {
@@ -1273,7 +1279,8 @@ mod tests {
                 "sampled_agents": 5,
                 "complete_agents": 3,
                 "limited_agents": 3,
-                "missing_root_agents": 2
+                "missing_root_agents": 2,
+                "inaccessible_agents": 0
             },
             "findings": [
                 {"severity": "high", "category": "layout", "title": "Broken links"},
@@ -1305,7 +1312,9 @@ mod tests {
                 assert!(output.contains(expected), "{expected} missing at {width}");
             }
             assert!(!output.contains("Coverage\n"));
-            assert!(output.contains("sampled 5/8 · complete 3/8"));
+            assert!(output.contains(
+                "sampled 5/8 · complete 3/8 · limited 3/8 · missing 2/8 · inaccessible 0/8"
+            ));
         }
     }
 

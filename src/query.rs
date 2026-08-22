@@ -53,6 +53,7 @@ pub struct PrimaryMetrics {
     pub agents_with_sampled_session_data: usize,
     pub agents_with_limited_session_data: usize,
     pub agents_missing_session_roots: usize,
+    pub agents_with_inaccessible_session_roots: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -136,7 +137,16 @@ pub fn build_report(scan: &ScanResult) -> Report {
         agents_missing_session_roots: scan
             .coverage
             .iter()
-            .filter(|coverage| coverage.roots_present == 0)
+            .filter(|coverage| {
+                coverage.roots_present == 0
+                    && coverage.roots_missing > 0
+                    && coverage.roots_inaccessible == 0
+            })
+            .count(),
+        agents_with_inaccessible_session_roots: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_inaccessible > 0)
             .count(),
     };
     let mut findings = Vec::new();
@@ -261,7 +271,13 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             Vec::new(),
             unavailable
                 .iter()
-                .map(|root| format!("path:{}", root.path.display()))
+                .map(|root| {
+                    format!(
+                        "path:{}:{}",
+                        root.agent.map(AgentKind::id).unwrap_or("shared"),
+                        root.path.display()
+                    )
+                })
                 .collect(),
             EvidenceQuality::Observed,
         );
@@ -1692,6 +1708,8 @@ mod tests {
         scan.coverage.push(crate::scan::SessionCoverage {
             agent: AgentKind::Codex,
             roots_present: 1,
+            roots_missing: 0,
+            roots_inaccessible: 0,
             files_discovered: 2,
             files_observed: 2,
             files_partially_observed: 0,

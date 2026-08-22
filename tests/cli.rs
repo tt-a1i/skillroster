@@ -464,6 +464,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(report["result"]["coverage_reliable_agent_count"], 1);
     assert_eq!(report["result"]["coverage_limited_agent_count"], 0);
     assert_eq!(report["result"]["coverage_missing_agent_count"], 7);
+    assert_eq!(report["result"]["coverage_inaccessible_agent_count"], 0);
     assert_eq!(
         report["result"]["session_coverage"],
         json!({
@@ -472,7 +473,8 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
             "sampled_agents": 1,
             "complete_agents": 1,
             "limited_agents": 0,
-            "missing_root_agents": 7
+            "missing_root_agents": 7,
+            "inaccessible_agents": 0
         })
     );
     let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
@@ -2976,5 +2978,46 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
             .unwrap()
             .iter()
             .any(|item| item["facts"]["link_target"] == json!(source))
+    );
+}
+
+#[test]
+fn report_distinguishes_inaccessible_and_missing_session_roots() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    fs::write(home.join(".codex/sessions"), "not a directory").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ];
+    let mut json_common = common.to_vec();
+    json_common.push("--json");
+    json_output(&run(&[&json_common[..], &["scan"]].concat(), None));
+
+    let report = json_output(&run(
+        &[&json_common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert_eq!(report["result"]["coverage_missing_agent_count"], 7);
+    assert_eq!(report["result"]["coverage_inaccessible_agent_count"], 1);
+    assert_eq!(
+        report["result"]["session_coverage"]["missing_root_agents"],
+        7
+    );
+    assert_eq!(
+        report["result"]["session_coverage"]["inaccessible_agents"],
+        1
+    );
+
+    let human = run(&[&common[..], &["report", "--summary"]].concat(), None);
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains("missing 7/8 · inaccessible 1/8"),
+        "{stdout}"
     );
 }

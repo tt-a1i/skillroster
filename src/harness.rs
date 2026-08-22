@@ -74,10 +74,47 @@ pub enum SessionSignal {
     Outcome,
 }
 
+/// One atomic usage event extracted from a structured session record.
+///
+/// Keeping the signal and references together prevents a stronger sibling
+/// event from being attributed to every Skill mentioned by the parent record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionObservation {
+    pub signal: SessionSignal,
+    pub record_text: String,
+    pub explicit_references: Vec<String>,
+}
+
 pub fn classify_session_record(agent: AgentKind, line: &str) -> Option<SessionSignal> {
-    let value: Value = serde_json::from_str(line).ok()?;
-    let keys = adapter_event_keys(agent);
-    classify_value(agent, &value, keys)
+    session_record_observations(agent, line)
+        .into_iter()
+        .map(|observation| observation.signal)
+        .max_by_key(|signal| signal_rank(*signal))
+}
+
+pub fn session_record_observations(agent: AgentKind, record: &str) -> Vec<SessionObservation> {
+    let Ok(value) = serde_json::from_str::<Value>(record) else {
+        return Vec::new();
+    };
+    let mut observations = Vec::new();
+    collect_observations(agent, &value, &mut observations);
+    observations.sort_by(|left, right| {
+        signal_rank(left.signal)
+            .cmp(&signal_rank(right.signal))
+            .then_with(|| left.record_text.cmp(&right.record_text))
+            .then_with(|| left.explicit_references.cmp(&right.explicit_references))
+    });
+    observations.dedup();
+    observations
+}
+
+const fn signal_rank(signal: SessionSignal) -> u8 {
+    match signal {
+        SessionSignal::Matched => 0,
+        SessionSignal::Loaded => 1,
+        SessionSignal::Applied => 2,
+        SessionSignal::Outcome => 3,
+    }
 }
 
 fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
@@ -93,29 +130,69 @@ fn adapter_event_keys(agent: AgentKind) -> &'static [&'static str] {
     }
 }
 
-fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Option<SessionSignal> {
-    if let Some(signal) = structured_session_signal(value) {
-        return Some(signal);
+fn collect_observations(agent: AgentKind, value: &Value, output: &mut Vec<SessionObservation>) {
+    match value {
+        Value::Object(object) => {
+            if collect_object_observations(agent, object, output) {
+                for child in object.values() {
+                    collect_observations(agent, child, output);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                collect_observations(agent, child, output);
+            }
+        }
+        _ => {}
     }
-    let object = value.as_object()?;
-    let record_type = object.get("type").and_then(Value::as_str);
-    let payload = object.get("payload").and_then(Value::as_object);
-    let active = if matches!(record_type, Some("response_item" | "event_msg")) {
-        payload.unwrap_or(object)
-    } else {
-        object
-    };
+}
+
+fn collect_object_observations(
+    agent: AgentKind,
+    object: &serde_json::Map<String, Value>,
+    output: &mut Vec<SessionObservation>,
+) -> bool {
+    let record_text = Value::Object(object.clone()).to_string();
+    for (field, signal) in [
+        ("outcome_skill", SessionSignal::Outcome),
+        ("applied_skill", SessionSignal::Applied),
+        ("invoked_skill", SessionSignal::Applied),
+        ("loaded_skill", SessionSignal::Loaded),
+        ("selected_skill", SessionSignal::Matched),
+        ("matched_skill", SessionSignal::Matched),
+    ] {
+        if let Some(reference) = object.get(field).and_then(Value::as_str) {
+            output.push(SessionObservation {
+                signal,
+                record_text: record_text.clone(),
+                explicit_references: vec![reference.to_owned()],
+            });
+        }
+    }
+
+    if let Some(observation) = structured_tool_observation(object, &record_text) {
+        output.push(observation);
+        return false;
+    }
+    if object.get("type").and_then(Value::as_str) == Some("function")
+        && object
+            .get("function")
+            .and_then(Value::as_object)
+            .is_some_and(|function| !function.contains_key("arguments"))
+    {
+        return false;
+    }
+
+    let event_keys = adapter_event_keys(agent);
     let mut event_parts = Vec::new();
     for key in event_keys {
-        event_parts.extend([
-            object.get(*key).and_then(Value::as_str),
-            active.get(*key).and_then(Value::as_str),
-        ]);
+        event_parts.push(object.get(*key).and_then(Value::as_str));
     }
     event_parts.extend(
         ["type", "name", "event", "tool", "tool_name", "subtype"]
             .into_iter()
-            .map(|key| active.get(key).and_then(Value::as_str)),
+            .map(|key| object.get(key).and_then(Value::as_str)),
     );
     let event = event_parts
         .into_iter()
@@ -123,30 +200,19 @@ fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Optio
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join(" ");
-    let contains_field = |key: &str| object.contains_key(key) || active.contains_key(key);
-    let explicit_skill_field = [
-        "skill_id",
-        "skill_name",
-        "selected_skill",
-        "matched_skill",
-        "loaded_skill",
-        "applied_skill",
-        "invoked_skill",
-        "outcome_skill",
-    ]
-    .iter()
-    .any(|key| contains_field(key));
-    let serialized = Value::Object(active.clone())
-        .to_string()
-        .to_ascii_lowercase();
+    let generic_references = ["skill_id", "skill_name"]
+        .into_iter()
+        .filter_map(|field| object.get(field).and_then(Value::as_str).map(str::to_owned))
+        .collect::<Vec<_>>();
+    let serialized = record_text.to_ascii_lowercase();
     let reads_skill_file = serialized.contains("skill.md")
         && ["read_file", "read", "load", "open"]
             .iter()
             .any(|marker| event.contains(marker));
     let codex_shell_read = agent == AgentKind::Codex
-        && active.get("type").and_then(Value::as_str) == Some("custom_tool_call")
-        && active.get("name").and_then(Value::as_str) == Some("exec")
-        && active
+        && object.get("type").and_then(Value::as_str) == Some("custom_tool_call")
+        && object.get("name").and_then(Value::as_str) == Some("exec")
+        && object
             .get("input")
             .and_then(Value::as_str)
             .is_some_and(|input| {
@@ -158,140 +224,112 @@ fn classify_value(agent: AgentKind, value: &Value, event_keys: &[&str]) -> Optio
                         .any(|marker| input.contains(marker))
             });
     let codex_user_skill_reference = agent == AgentKind::Codex
-        && record_type == Some("response_item")
-        && active.get("type").and_then(Value::as_str) == Some("message")
-        && active.get("role").and_then(Value::as_str) == Some("user")
+        && object.get("type").and_then(Value::as_str) == Some("message")
+        && object.get("role").and_then(Value::as_str) == Some("user")
         && serialized.contains("skill.md");
 
-    if explicit_skill_field && (contains_field("outcome_skill") || event.contains("skill_outcome"))
-    {
+    let signal = if !generic_references.is_empty() && event.contains("skill_outcome") {
         Some(SessionSignal::Outcome)
-    } else if explicit_skill_field
-        && (contains_field("applied_skill")
-            || contains_field("invoked_skill")
-            || event.contains("invoke_skill")
-            || event.contains("apply_skill"))
+    } else if !generic_references.is_empty()
+        && (event.contains("invoke_skill") || event.contains("apply_skill"))
     {
         Some(SessionSignal::Applied)
     } else if reads_skill_file
         || codex_shell_read
-        || contains_field("loaded_skill")
-        || (explicit_skill_field && event.contains("load_skill"))
+        || (!generic_references.is_empty() && event.contains("load_skill"))
     {
         Some(SessionSignal::Loaded)
     } else if codex_user_skill_reference
-        || contains_field("selected_skill")
-        || contains_field("matched_skill")
-        || (explicit_skill_field && event.contains("match_skill"))
+        || (!generic_references.is_empty() && event.contains("match_skill"))
     {
         Some(SessionSignal::Matched)
     } else {
         None
+    };
+    if let Some(signal) = signal {
+        output.push(SessionObservation {
+            signal,
+            record_text,
+            explicit_references: generic_references,
+        });
     }
+    true
 }
 
-fn structured_session_signal(value: &Value) -> Option<SessionSignal> {
-    fn stronger(
-        left: Option<SessionSignal>,
-        right: Option<SessionSignal>,
-    ) -> Option<SessionSignal> {
-        let rank = |signal: SessionSignal| match signal {
-            SessionSignal::Matched => 0,
-            SessionSignal::Loaded => 1,
-            SessionSignal::Applied => 2,
-            SessionSignal::Outcome => 3,
-        };
-        match (left, right) {
-            (Some(left), Some(right)) if rank(left) >= rank(right) => Some(left),
-            (_, Some(right)) => Some(right),
-            (left, None) => left,
-        }
+fn structured_tool_observation(
+    object: &serde_json::Map<String, Value>,
+    record_text: &str,
+) -> Option<SessionObservation> {
+    let call_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let direct_call = matches!(
+        call_type.as_deref(),
+        Some("tool_use" | "toolcall" | "custom_tool_call")
+    );
+    let function = object.get("function").and_then(Value::as_object);
+    let function_call = call_type.as_deref() == Some("function")
+        && function.is_some_and(|function| function.contains_key("arguments"));
+    if !direct_call && !function_call {
+        return None;
     }
-
-    fn object_signal(object: &serde_json::Map<String, Value>) -> Option<SessionSignal> {
-        for (field, signal) in [
-            ("outcome_skill", SessionSignal::Outcome),
-            ("applied_skill", SessionSignal::Applied),
-            ("invoked_skill", SessionSignal::Applied),
-            ("loaded_skill", SessionSignal::Loaded),
-            ("selected_skill", SessionSignal::Matched),
-            ("matched_skill", SessionSignal::Matched),
-        ] {
-            if object.get(field).and_then(Value::as_str).is_some() {
-                return Some(signal);
-            }
-        }
-
-        let call_type = object
-            .get("type")
+    let name = if direct_call {
+        object.get("name").and_then(Value::as_str)
+    } else {
+        function
+            .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
-            .map(str::to_ascii_lowercase);
-        let direct_call = matches!(
-            call_type.as_deref(),
-            Some("tool_use" | "toolcall" | "custom_tool_call")
-        );
-        let function = object.get("function").and_then(Value::as_object);
-        let function_call = call_type.as_deref() == Some("function")
-            && function.is_some_and(|function| function.contains_key("arguments"));
-        if !direct_call && !function_call {
-            return None;
-        }
-        let name = if direct_call {
-            object.get("name").and_then(Value::as_str)
-        } else {
-            function
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-        }?
+    }?
+    .to_ascii_lowercase();
+    let arguments = if direct_call {
+        object.get("input").or_else(|| object.get("arguments"))
+    } else {
+        function.and_then(|function| function.get("arguments"))
+    };
+    let serialized = arguments
+        .map(Value::to_string)
+        .unwrap_or_default()
         .to_ascii_lowercase();
-        let arguments = if direct_call {
-            object.get("input").or_else(|| object.get("arguments"))
-        } else {
-            function.and_then(|function| function.get("arguments"))
-        };
-        let serialized = arguments
-            .map(Value::to_string)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if name == "skill"
-            && arguments
-                .and_then(Value::as_object)
-                .and_then(|arguments| arguments.get("skill"))
-                .and_then(Value::as_str)
-                .is_some_and(|skill| !skill.trim().is_empty())
-        {
-            return Some(SessionSignal::Applied);
-        }
-        if !serialized.contains("skill.md") {
-            return None;
-        }
-        if matches!(
+    let explicit_references = argument_skill_references(arguments);
+    let reads_skill_file = serialized.contains("skill.md")
+        && (matches!(
             name.as_str(),
             "read" | "read_file" | "open" | "load" | "rg" | "grep"
-        ) {
-            return Some(SessionSignal::Loaded);
-        }
-        if matches!(name.as_str(), "bash" | "exec" | "shell" | "terminal")
+        ) || (matches!(name.as_str(), "bash" | "exec" | "shell" | "terminal")
             && ["cat ", "sed ", "rg ", "grep ", "head ", "tail ", "less "]
                 .iter()
-                .any(|marker| serialized.contains(marker))
-        {
-            return Some(SessionSignal::Loaded);
-        }
-        None
-    }
+                .any(|marker| serialized.contains(marker))));
+    let signal = if name == "skill" && !explicit_references.is_empty() {
+        SessionSignal::Applied
+    } else if reads_skill_file {
+        SessionSignal::Loaded
+    } else {
+        return None;
+    };
+    Some(SessionObservation {
+        signal,
+        record_text: record_text.to_owned(),
+        explicit_references,
+    })
+}
 
-    match value {
-        Value::Object(object) => object
-            .values()
-            .fold(object_signal(object), |signal, child| {
-                stronger(signal, structured_session_signal(child))
-            }),
-        Value::Array(values) => values.iter().fold(None, |signal, child| {
-            stronger(signal, structured_session_signal(child))
-        }),
-        _ => None,
-    }
+fn argument_skill_references(arguments: Option<&Value>) -> Vec<String> {
+    let parsed;
+    let value = match arguments {
+        Some(Value::String(text)) => {
+            parsed = serde_json::from_str::<Value>(text).ok();
+            parsed.as_ref()
+        }
+        value => value,
+    };
+    value
+        .and_then(Value::as_object)
+        .and_then(|arguments| arguments.get("skill"))
+        .and_then(Value::as_str)
+        .filter(|skill| !skill.trim().is_empty())
+        .map(|skill| vec![skill.to_owned()])
+        .unwrap_or_default()
 }
 
 /// Return the conservative, documented layouts SkillRoster knows about.
@@ -374,6 +412,26 @@ mod tests {
             ),
             Some(SessionSignal::Applied)
         );
+    }
+
+    #[test]
+    fn sibling_skill_events_keep_their_own_stage_and_reference() {
+        let record = serde_json::json!({
+            "events": [
+                {"selected_skill": "research"},
+                {"applied_skill": "review"}
+            ]
+        })
+        .to_string();
+        let observations = session_record_observations(AgentKind::ClaudeCode, &record);
+        assert!(observations.iter().any(|observation| {
+            observation.signal == SessionSignal::Matched
+                && observation.explicit_references == ["research"]
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.signal == SessionSignal::Applied
+                && observation.explicit_references == ["review"]
+        }));
     }
 
     #[test]

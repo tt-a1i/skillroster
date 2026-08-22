@@ -128,21 +128,23 @@ budget. Claude Code consequently had a present session root but zero observed
 bytes.
 
 The scanner now discovers before selecting the newest bounded set, samples
-complete-line tails from large files, and spreads the byte budget across recent
-sessions. Representative nested Claude Code, Pi, Cursor, and Hermes tool-call
-fixtures bind Skill names or `SKILL.md` paths while tool declarations and Skill
-catalog text remain non-events. Complete JSON session dumps are parsed as one
-structured record when they fit the remaining budget.
+complete-line tails from large JSONL files and complete nested objects from
+large monolithic JSON tails, and spreads the byte budget across recent sessions.
+Representative nested Claude Code, Pi, Cursor, and Hermes tool-call fixtures
+bind Skill names or `SKILL.md` paths while tool declarations and Skill catalog
+text remain non-events. Complete JSON session dumps are parsed as one structured
+record when they fit the per-file budget.
 
 The repaired real Scan found the same 193 Skills and 689 placements with
 `files_changed=false`. It reported five roots present, five sampled, five
-limited, three missing, and zero complete denominators. Observed-use coverage
-increased from one Agent to two, and recent structured `Loaded` evidence
-increased from 8 to 63 events, including 53 Cursor records. The result still
-emits no unsupported usage percentage: bounded samples support positive event
-counts, while absence remains unknown. Scan output reports discovered,
-observed, partially observed, skipped, and discovery-truncation facts per Agent;
-no raw conversation text is persisted.
+limited, three missing, zero inaccessible, and zero complete denominators.
+Observed-use coverage increased from one Agent to two, and recent structured
+`Loaded` evidence increased from 8 to 61 observed events across 56 Evidence
+records, including 53 Cursor records. The result still emits no unsupported
+usage percentage: bounded samples support positive event counts, while absence
+remains unknown. Scan output reports discovered, observed, partially observed,
+skipped, and discovery-truncation facts per Agent; no raw conversation text is
+persisted.
 
 ## Release-candidate platform evidence
 

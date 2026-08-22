@@ -5,7 +5,7 @@ supported Agent sessions in place and stores only derived evidence summaries;
 exports do not contain raw prompts or responses.
 
 Session sampling is bounded in memory. Large active files contribute only a
-recent complete-line tail, and the byte budget is spread across multiple recent
+recent complete-line or structurally complete nested-object tail, and the byte budget is spread across multiple recent
 files. The database stores event stage, quality, time, Skill identity, Agent,
 and a source-path digest; it does not store the sampled conversation text.
 

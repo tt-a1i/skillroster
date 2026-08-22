@@ -58,7 +58,7 @@ The Agent never manufactures a problem so that an Apply action exists.
 The initial response should fit roughly one conversation viewport. It contains:
 
 1. **One-sentence diagnosis** with only evidence-backed numbers.
-2. **Four core metrics:** independent Skills, placements, default exposure, and observed-use coverage. Usage coverage names sampled, complete, and missing-root Agent counts separately.
+2. **Four core metrics:** independent Skills, placements, default exposure, and observed-use coverage. Usage coverage names sampled, complete, limited, missing-root, and inaccessible Agent counts separately.
 3. **Top three Findings:** fact, impact, and Evidence quality.
 4. **Proposed change:** current → proposed counts and affected Agents.
 5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty.
