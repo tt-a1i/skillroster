@@ -1972,8 +1972,9 @@ fn find_command(
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
+    let candidate_search_text = crate::query::candidate_search_text(&retrieval_query);
     let mut candidate_ids = store
-        .search_skill_ids(&retrieval_query, scan.skills.len())?
+        .search_skill_ids(&candidate_search_text, scan.skills.len())?
         .into_iter()
         .map(|id| id.to_string())
         .collect::<std::collections::BTreeSet<_>>();

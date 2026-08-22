@@ -111,6 +111,52 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
 }
 
 #[test]
+fn public_find_expands_plural_candidates_and_bounds_incidental_single_token_matches() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    let blog = skill_root.join("blog");
+    fs::create_dir_all(&blog).unwrap();
+    fs::write(
+        blog.join("SKILL.md"),
+        "---\nname: blog\ndescription: Publish a technical article\n---\n",
+    )
+    .unwrap();
+    for index in 0..8 {
+        let skill = skill_root.join(format!("incidental-{index}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: incidental-{index}\ndescription: Generic helper\n---\nMentions archive incidentally.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let plural = json_output(&run(
+        &[&common[..], &["find", "blogs", "--limit", "10"]].concat(),
+        None,
+    ));
+    assert_eq!(plural["result"]["matches"][0]["name"], "blog");
+
+    let incidental = json_output(&run(
+        &[&common[..], &["find", "archive", "--limit", "100"]].concat(),
+        None,
+    ));
+    assert_eq!(incidental["result"]["matches"].as_array().unwrap().len(), 3);
+}
+
+#[test]
 fn finding_drilldown_is_bounded_and_pageable() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

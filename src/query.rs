@@ -1300,6 +1300,26 @@ fn tokens(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+pub(crate) fn candidate_search_text(text: &str) -> String {
+    let mut seen = BTreeSet::new();
+    let mut terms = Vec::new();
+    for term in text
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+    {
+        let original = term.to_lowercase();
+        if seen.insert(original.clone()) {
+            terms.push(original.clone());
+        }
+        let normalized = normalize_token(&original);
+        if seen.insert(normalized.clone()) {
+            terms.push(normalized);
+        }
+    }
+    terms.join(" ")
+}
+
 fn normalize_token(token: &str) -> String {
     let mut normalized = token.to_lowercase();
     if normalized.is_ascii()
@@ -1349,11 +1369,29 @@ fn description_routing_sections(description: &str) -> (String, String) {
 }
 
 fn trim_low_confidence_tail(matches: &mut Vec<FindMatch>, query_token_count: usize) {
-    if matches.is_empty() || query_token_count < 2 {
+    if matches.is_empty() {
         return;
     }
     let cutoff = (matches[0].score * 0.5).max(3.0);
     matches.retain(|matched| matched.score >= cutoff);
+    if query_token_count == 1
+        && matches
+            .first()
+            .is_some_and(|matched| !has_strong_lexical_evidence(matched))
+    {
+        matches.truncate(3);
+    }
+}
+
+fn has_strong_lexical_evidence(matched: &FindMatch) -> bool {
+    matched.match_reasons.iter().any(|reason| {
+        matches!(
+            reason.as_str(),
+            "exact_name" | "name_phrase" | "declared_trigger" | "description_phrase"
+        ) || reason.starts_with("name_tokens:")
+            || reason.starts_with("trigger_tokens:")
+            || reason.starts_with("description_tokens:")
+    })
 }
 
 fn fnv1a64(bytes: &[u8]) -> String {
@@ -1721,6 +1759,43 @@ mod tests {
                 "slide".to_owned(),
                 "spreadsheet".to_owned(),
             ])
+        );
+        assert_eq!(candidate_search_text("publish blogs"), "publish blogs blog");
+    }
+
+    #[test]
+    fn single_token_body_only_matches_have_a_bounded_low_confidence_tail() {
+        let (_, mut scan) = fixture();
+        let representative = scan.skills[0].clone();
+        scan.skills = (0..8)
+            .map(|index| {
+                let mut skill = representative.clone();
+                skill.id = format!("incidental-{index}");
+                skill.name = format!("incidental-{index}");
+                skill.metadata.description = Some("generic helper".into());
+                skill.normalized_text = "mentions archive incidentally".into();
+                skill
+            })
+            .collect();
+        scan.usage.push(crate::scan::UsageEvidence {
+            agent: AgentKind::Codex,
+            skill_id: "incidental-0".into(),
+            stage: UsageStage::Loaded,
+            quality: EvidenceQuality::Observed,
+            event_count: 1,
+            first_seen_unix: Some(1),
+            last_seen_unix: Some(1),
+            source_path_digest: "fixture".into(),
+        });
+
+        let matches = find(&scan, "archive", 100);
+
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].score, 5.0);
+        assert!(
+            matches[0]
+                .match_reasons
+                .contains(&"observed_local_usage".into())
         );
     }
 
