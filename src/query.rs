@@ -49,6 +49,11 @@ pub struct PrimaryMetrics {
     pub default_exposure: usize,
     pub agents_with_observed_usage: usize,
     pub agents_with_reliable_session_denominator: usize,
+    pub agents_with_session_roots: usize,
+    pub agents_with_sampled_session_data: usize,
+    pub agents_with_limited_session_data: usize,
+    pub agents_missing_session_roots: usize,
+    pub agents_with_inaccessible_session_roots: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,6 +118,35 @@ pub fn build_report(scan: &ScanResult) -> Report {
             .coverage
             .iter()
             .filter(|coverage| coverage.denominator_reliable)
+            .count(),
+        agents_with_session_roots: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_present > 0)
+            .count(),
+        agents_with_sampled_session_data: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.files_observed > 0)
+            .count(),
+        agents_with_limited_session_data: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
+            .count(),
+        agents_missing_session_roots: scan
+            .coverage
+            .iter()
+            .filter(|coverage| {
+                coverage.roots_present == 0
+                    && coverage.roots_missing > 0
+                    && coverage.roots_inaccessible == 0
+            })
+            .count(),
+        agents_with_inaccessible_session_roots: scan
+            .coverage
+            .iter()
+            .filter(|coverage| coverage.roots_inaccessible > 0)
             .count(),
     };
     let mut findings = Vec::new();
@@ -237,7 +271,13 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             Vec::new(),
             unavailable
                 .iter()
-                .map(|root| format!("path:{}", root.path.display()))
+                .map(|root| {
+                    format!(
+                        "path:{}:{}",
+                        root.agent.map(AgentKind::id).unwrap_or("shared"),
+                        root.path.display()
+                    )
+                })
                 .collect(),
             EvidenceQuality::Observed,
         );
@@ -515,10 +555,55 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .iter()
         .filter(|coverage| coverage.denominator_reliable)
         .count();
-    let coverage_files = scan
+    let roots_present_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.roots_present > 0)
+        .count();
+    let sampled_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.files_observed > 0)
+        .count();
+    let missing_root_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| {
+            coverage.roots_present == 0
+                && coverage.roots_missing > 0
+                && coverage.roots_inaccessible == 0
+        })
+        .count();
+    let inaccessible_root_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.roots_inaccessible > 0)
+        .count();
+    let limited_root_count = scan
+        .coverage
+        .iter()
+        .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
+        .count();
+    let coverage_discovered = scan
+        .coverage
+        .iter()
+        .map(|coverage| {
+            coverage.files_discovered.max(
+                coverage
+                    .files_observed
+                    .saturating_add(coverage.files_skipped),
+            )
+        })
+        .sum::<usize>();
+    let coverage_observed = scan
         .coverage
         .iter()
         .map(|coverage| coverage.files_observed)
+        .sum::<usize>();
+    let coverage_partial = scan
+        .coverage
+        .iter()
+        .map(|coverage| coverage.files_partially_observed)
         .sum::<usize>();
     let coverage_skipped = scan
         .coverage
@@ -536,15 +621,19 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .map(|coverage| coverage.lines_observed)
         .sum::<usize>();
     let coverage_truncated = scan.coverage.iter().any(|coverage| coverage.truncated);
+    let discovery_truncated = scan
+        .coverage
+        .iter()
+        .any(|coverage| coverage.discovery_truncated);
     push_finding(
         findings,
         FindingCategory::Usage,
         Severity::Info,
         "Five-stage usage evidence",
         format!(
-            "{}. Coverage: reliable {reliable_count}/{} Agents, files={coverage_files}, skipped={coverage_skipped}, bytes={coverage_bytes}, lines={coverage_lines}, truncated={coverage_truncated}.",
+            "{}. Coverage: roots {roots_present_count}/{supported}, sampled {sampled_count}/{supported}, complete {reliable_count}/{supported}, missing {missing_root_count}/{supported}, inaccessible {inaccessible_root_count}/{supported}; files discovered={coverage_discovered}, observed={coverage_observed}, partial={coverage_partial}, skipped={coverage_skipped}; bytes={coverage_bytes}, lines={coverage_lines}, truncated={coverage_truncated}, discovery_truncated={discovery_truncated}.",
             stage_summaries.join("; "),
-            AgentKind::ALL.len(),
+            supported = AgentKind::ALL.len(),
         ),
         scan.usage
             .iter()
@@ -564,23 +653,16 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .iter()
         .filter(|coverage| !coverage.denominator_reliable)
         .collect::<Vec<_>>();
-    let reliable_agents = scan
-        .coverage
-        .iter()
-        .filter(|coverage| coverage.denominator_reliable)
-        .map(|coverage| coverage.agent)
-        .collect::<BTreeSet<_>>();
-    let missing_count = AgentKind::ALL.len().saturating_sub(reliable_agents.len());
-    if missing_count != 0 {
+    let incomplete_count = AgentKind::ALL.len().saturating_sub(reliable_count);
+    if incomplete_count != 0 {
         push_finding(
             findings,
             FindingCategory::Usage,
             Severity::Info,
             "Usage coverage is incomplete",
             format!(
-                "A reliable session denominator is unavailable for {}/{} supported Agents; absence of evidence is not evidence of non-use.",
-                missing_count,
-                AgentKind::ALL.len()
+                "A complete observable-session denominator is unavailable for {incomplete_count}/{} supported Agents: {missing_root_count} session roots are missing, {inaccessible_root_count} are inaccessible, and {limited_root_count} present roots have bounded or incomplete samples. Recent observed events remain usable; absence of evidence is not evidence of non-use.",
+                AgentKind::ALL.len(),
             ),
             Vec::new(),
             Vec::new(),
@@ -1635,12 +1717,17 @@ mod tests {
         scan.coverage.push(crate::scan::SessionCoverage {
             agent: AgentKind::Codex,
             roots_present: 1,
+            roots_missing: 0,
+            roots_inaccessible: 0,
+            files_discovered: 2,
             files_observed: 2,
+            files_partially_observed: 0,
             files_skipped: 0,
             denominator_reliable: true,
             bytes_observed: 100,
             lines_observed: 10,
             truncated: false,
+            discovery_truncated: false,
             first_seen_unix: Some(10),
             last_seen_unix: Some(20),
         });

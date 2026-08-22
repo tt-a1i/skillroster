@@ -1,10 +1,10 @@
-use crate::harness::{AgentKind, SessionSignal, classify_session_record, known_agent_roots};
+use crate::harness::{AgentKind, SessionSignal, known_agent_roots, session_record_observations};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::time::SystemTime;
@@ -12,9 +12,10 @@ use std::time::UNIX_EPOCH;
 
 const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_SESSION_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SESSION_DISCOVERY_FILES_PER_AGENT: usize = 10_000;
 const MAX_SESSION_FILES_PER_AGENT: usize = 250;
 const MAX_SESSION_BYTES_PER_AGENT: u64 = 4 * 1024 * 1024;
+const MAX_SESSION_BYTES_PER_FILE: u64 = 512 * 1024;
 const MAX_SESSION_LINES_PER_AGENT: usize = 20_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,12 +166,22 @@ pub struct UsageEvidence {
 pub struct SessionCoverage {
     pub agent: AgentKind,
     pub roots_present: usize,
+    #[serde(default)]
+    pub roots_missing: usize,
+    #[serde(default)]
+    pub roots_inaccessible: usize,
+    #[serde(default)]
+    pub files_discovered: usize,
     pub files_observed: usize,
+    #[serde(default)]
+    pub files_partially_observed: usize,
     pub files_skipped: usize,
     pub denominator_reliable: bool,
     pub bytes_observed: u64,
     pub lines_observed: usize,
     pub truncated: bool,
+    #[serde(default)]
+    pub discovery_truncated: bool,
     pub first_seen_unix: Option<u64>,
     pub last_seen_unix: Option<u64>,
 }
@@ -1077,12 +1088,17 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     let mut coverage = SessionCoverage {
         agent,
         roots_present: 0,
+        roots_missing: 0,
+        roots_inaccessible: 0,
+        files_discovered: 0,
         files_observed: 0,
+        files_partially_observed: 0,
         files_skipped: 0,
         denominator_reliable: false,
         bytes_observed: 0,
         lines_observed: 0,
         truncated: false,
+        discovery_truncated: false,
         first_seen_unix: None,
         last_seen_unix: None,
     };
@@ -1156,6 +1172,11 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => RootStatus::Missing,
             Err(_) => RootStatus::Inaccessible,
         };
+        match status {
+            RootStatus::Missing => coverage.roots_missing += 1,
+            RootStatus::Inaccessible => coverage.roots_inaccessible += 1,
+            RootStatus::Included | RootStatus::Excluded => {}
+        }
         result.roots.push(RootObservation {
             agent: Some(agent),
             kind: RootKind::Sessions,
@@ -1168,9 +1189,15 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             continue;
         }
         let mut files = Vec::new();
-        match collect_session_files(root, 0, 6, MAX_SESSION_FILES_PER_AGENT + 1, &mut files) {
+        match collect_session_files(
+            root,
+            0,
+            6,
+            MAX_SESSION_DISCOVERY_FILES_PER_AGENT + 1,
+            &mut files,
+        ) {
             Ok(true) => {
-                coverage.files_skipped += 1;
+                coverage.discovery_truncated = true;
                 coverage.truncated = true;
             }
             Ok(false) => {}
@@ -1179,39 +1206,55 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 continue;
             }
         }
-        files.sort_by_key(|path| {
-            std::cmp::Reverse(
-                fs::metadata(path)
-                    .ok()
-                    .and_then(|metadata| modified_unix(&metadata))
-                    .unwrap_or_default(),
-            )
+        let discovered_count = files.len();
+        coverage.files_discovered = coverage.files_discovered.saturating_add(discovered_count);
+        files.sort_by_cached_key(|path| {
+            (std::cmp::Reverse(session_file_modified(path)), path.clone())
         });
+        files.truncate(MAX_SESSION_DISCOVERY_FILES_PER_AGENT);
+        if files.len() > MAX_SESSION_FILES_PER_AGENT {
+            coverage.files_skipped = coverage
+                .files_skipped
+                .saturating_add(discovered_count - MAX_SESSION_FILES_PER_AGENT);
+            coverage.truncated = true;
+        }
         files.truncate(MAX_SESSION_FILES_PER_AGENT);
-        for file in files {
-            let metadata = match fs::metadata(&file) {
-                Ok(metadata) if metadata.len() <= MAX_SESSION_FILE_BYTES => metadata,
+        for (index, file) in files.iter().enumerate() {
+            let remaining_bytes = MAX_SESSION_BYTES_PER_AGENT.saturating_sub(bytes_observed);
+            if remaining_bytes == 0 || lines_observed >= MAX_SESSION_LINES_PER_AGENT {
+                coverage.files_skipped = coverage
+                    .files_skipped
+                    .saturating_add(files.len().saturating_sub(index));
+                coverage.truncated = true;
+                break;
+            }
+            let metadata = match fs::metadata(file) {
+                Ok(metadata) => metadata,
                 _ => {
                     coverage.files_skipped += 1;
                     continue;
                 }
             };
-            if bytes_observed.saturating_add(metadata.len()) > MAX_SESSION_BYTES_PER_AGENT
-                || lines_observed >= MAX_SESSION_LINES_PER_AGENT
-            {
-                coverage.files_skipped += 1;
+            let is_json = file.extension().and_then(|extension| extension.to_str()) == Some("json");
+            let sample_limit = remaining_bytes.min(MAX_SESSION_BYTES_PER_FILE);
+            let (sample, sample_bytes) =
+                match read_session_tail(file, metadata.len(), sample_limit, !is_json) {
+                    Ok(sample) => sample,
+                    Err(_) => {
+                        coverage.files_skipped += 1;
+                        continue;
+                    }
+                };
+            let mut file_partially_observed = sample_bytes < metadata.len();
+            if file_partially_observed {
                 coverage.truncated = true;
-                break;
             }
-            bytes_observed = bytes_observed.saturating_add(metadata.len());
+            if sample_bytes == 0 && metadata.len() != 0 {
+                coverage.files_skipped += 1;
+                continue;
+            }
+            bytes_observed = bytes_observed.saturating_add(sample_bytes);
             let timestamp = modified_unix(&metadata);
-            let reader = match File::open(&file).map(BufReader::new) {
-                Ok(reader) => reader,
-                Err(_) => {
-                    coverage.files_skipped += 1;
-                    continue;
-                }
-            };
             coverage.files_observed += 1;
             update_window(
                 &mut coverage.first_seen_unix,
@@ -1219,46 +1262,80 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 timestamp,
             );
             let source_path_digest = stable_digest(file.to_string_lossy().as_bytes());
-            for line in reader.lines().map_while(Result::ok) {
-                if lines_observed >= MAX_SESSION_LINES_PER_AGENT {
-                    coverage.files_skipped += 1;
+            let sample = String::from_utf8_lossy(&sample);
+            let complete_json = is_json
+                && sample_bytes == metadata.len()
+                && serde_json::from_str::<serde_json::Value>(&sample).is_ok();
+            let records = if complete_json {
+                let physical_lines = sample.lines().count().max(1);
+                vec![(sample.into_owned(), physical_lines)]
+            } else if is_json {
+                extract_complete_json_objects(&sample)
+            } else {
+                sample
+                    .lines()
+                    .map(|line| (line.to_owned(), 1))
+                    .collect::<Vec<_>>()
+            };
+            for (line, physical_lines) in records {
+                if lines_observed.saturating_add(physical_lines) > MAX_SESSION_LINES_PER_AGENT {
+                    file_partially_observed = true;
                     coverage.truncated = true;
                     break;
                 }
-                lines_observed += 1;
-                let lower = line.to_lowercase();
-                if let Some((stage, quality)) = classify_usage_line(agent, &line) {
-                    let mut observed_skill_ids = observed_reference_skill_ids(
-                        &line,
-                        reference_matcher.as_ref(),
-                        &reference_lookup,
-                    );
-                    for reference in explicit_skill_field_values(&line) {
-                        if result.skills.iter().any(|skill| skill.id == reference) {
-                            observed_skill_ids.insert(reference.clone());
-                        }
-                        if let Some(ids) = skill_ids_by_name.get(&reference.to_ascii_lowercase()) {
-                            if ids.len() == 1 {
-                                observed_skill_ids.extend(ids.iter().cloned());
+                lines_observed += physical_lines;
+                let observations = session_record_observations(agent, &line);
+                if !observations.is_empty() {
+                    let mut seen_event_skill_stages = BTreeSet::new();
+                    for observation in observations {
+                        let stage = usage_stage(observation.signal);
+                        let quality = EvidenceQuality::Observed;
+                        let mut observed_skill_ids = if observation.explicit_references.is_empty() {
+                            observed_reference_skill_ids(
+                                &observation.record_text,
+                                reference_matcher.as_ref(),
+                                &reference_lookup,
+                            )
+                        } else {
+                            BTreeSet::new()
+                        };
+                        for reference in observation.explicit_references {
+                            if result.skills.iter().any(|skill| skill.id == reference) {
+                                observed_skill_ids.insert(reference.clone());
+                            }
+                            if let Some(ids) =
+                                skill_ids_by_name.get(&reference.to_ascii_lowercase())
+                            {
+                                if ids.len() == 1 {
+                                    observed_skill_ids.extend(ids.iter().cloned());
+                                }
                             }
                         }
-                    }
-                    for skill_id in observed_skill_ids {
-                        let key = (skill_id.clone(), stage, source_path_digest.clone());
-                        let event = events.entry(key).or_insert_with(|| UsageEvidence {
-                            agent,
-                            skill_id,
-                            stage,
-                            quality,
-                            event_count: 0,
-                            first_seen_unix: timestamp,
-                            last_seen_unix: timestamp,
-                            source_path_digest: source_path_digest.clone(),
-                        });
-                        event.event_count += 1;
+                        for skill_id in observed_skill_ids {
+                            if !seen_event_skill_stages.insert((
+                                observation.event_index,
+                                stage,
+                                skill_id.clone(),
+                            )) {
+                                continue;
+                            }
+                            let key = (skill_id.clone(), stage, source_path_digest.clone());
+                            let event = events.entry(key).or_insert_with(|| UsageEvidence {
+                                agent,
+                                skill_id,
+                                stage,
+                                quality,
+                                event_count: 0,
+                                first_seen_unix: timestamp,
+                                last_seen_unix: timestamp,
+                                source_path_digest: source_path_digest.clone(),
+                            });
+                            event.event_count += 1;
+                        }
                     }
                     continue;
                 }
+                let lower = line.to_ascii_lowercase();
                 let Some(matcher) = &matcher else { continue };
                 for matched in matcher.find_iter(&lower) {
                     let (skill_id, _) = &skill_lookup[matched.pattern().as_usize()];
@@ -1278,13 +1355,115 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     event.event_count += 1;
                 }
             }
+            if file_partially_observed {
+                coverage.files_partially_observed += 1;
+            }
         }
     }
     coverage.bytes_observed = bytes_observed;
     coverage.lines_observed = lines_observed;
-    coverage.denominator_reliable = coverage.roots_present > 0 && coverage.files_skipped == 0;
+    coverage.denominator_reliable = coverage.roots_present > 0
+        && coverage.files_skipped == 0
+        && coverage.files_partially_observed == 0
+        && !coverage.discovery_truncated;
     result.usage.extend(events.into_values());
     result.coverage.push(coverage);
+}
+
+fn session_file_modified(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| modified_unix(&metadata))
+        .unwrap_or_default()
+}
+
+fn read_session_tail(
+    path: &Path,
+    file_bytes: u64,
+    maximum: u64,
+    align_to_line: bool,
+) -> io::Result<(Vec<u8>, u64)> {
+    let mut file = File::open(path)?;
+    let offset = file_bytes.saturating_sub(maximum);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut sample = Vec::with_capacity(maximum as usize);
+    file.take(maximum).read_to_end(&mut sample)?;
+    let bytes_read = sample.len() as u64;
+    if offset != 0 && align_to_line {
+        if let Some(newline) = sample.iter().position(|byte| *byte == b'\n') {
+            sample.drain(..=newline);
+        } else {
+            sample.clear();
+        }
+    }
+    Ok((sample, bytes_read))
+}
+
+fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
+    let bytes = sample.as_bytes();
+    let mut candidates = Vec::<(usize, usize)>::new();
+    // A tail can begin either inside or outside a JSON string. Try both bounded
+    // parser states, then retain only the largest non-overlapping valid values.
+    for initial_in_string in [false, true] {
+        let mut stack = Vec::new();
+        let mut in_string = initial_in_string;
+        let mut escaped = false;
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => stack.push(index),
+                b'}' => {
+                    let Some(start) = stack.pop() else {
+                        continue;
+                    };
+                    candidates.push((start, index + 1));
+                }
+                _ => {}
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.sort_by_key(|(start, end)| (*start, std::cmp::Reverse(*end)));
+    let mut selected = Vec::<(usize, usize)>::new();
+    let mut covered_until = 0;
+    let mut parse_bytes = 0_u64;
+    for (start, end) in candidates {
+        if end <= covered_until {
+            continue;
+        }
+        let candidate_bytes = (end - start) as u64;
+        if parse_bytes.saturating_add(candidate_bytes) > 8 * MAX_SESSION_BYTES_PER_FILE {
+            continue;
+        }
+        parse_bytes += candidate_bytes;
+        if serde_json::from_slice::<serde_json::Value>(&bytes[start..end]).is_ok() {
+            selected.push((start, end));
+            covered_until = covered_until.max(end);
+        }
+    }
+    selected.sort_by_key(|(start, _)| *start);
+    if selected.len() > MAX_SESSION_LINES_PER_AGENT {
+        selected.drain(..selected.len() - MAX_SESSION_LINES_PER_AGENT);
+    }
+    selected
+        .into_iter()
+        .map(|(start, end)| {
+            let value = sample[start..end].to_owned();
+            let lines = value.lines().count().max(1);
+            (value, lines)
+        })
+        .collect()
 }
 
 fn collect_session_files(
@@ -1321,13 +1500,12 @@ fn collect_session_files(
     Ok(false)
 }
 
-fn classify_usage_line(agent: AgentKind, line: &str) -> Option<(UsageStage, EvidenceQuality)> {
-    match classify_session_record(agent, line) {
-        Some(SessionSignal::Outcome) => Some((UsageStage::Outcome, EvidenceQuality::Observed)),
-        Some(SessionSignal::Applied) => Some((UsageStage::Applied, EvidenceQuality::Observed)),
-        Some(SessionSignal::Loaded) => Some((UsageStage::Loaded, EvidenceQuality::Observed)),
-        Some(SessionSignal::Matched) => Some((UsageStage::Matched, EvidenceQuality::Observed)),
-        None => None,
+const fn usage_stage(signal: SessionSignal) -> UsageStage {
+    match signal {
+        SessionSignal::Outcome => UsageStage::Outcome,
+        SessionSignal::Applied => UsageStage::Applied,
+        SessionSignal::Loaded => UsageStage::Loaded,
+        SessionSignal::Matched => UsageStage::Matched,
     }
 }
 
@@ -1352,17 +1530,24 @@ fn normalize_reference_text(value: &str) -> String {
 }
 
 fn decoded_record_text(line: &str) -> Option<String> {
-    fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+    fn collect_strings(value: &serde_json::Value, depth: usize, output: &mut Vec<String>) {
         match value {
-            serde_json::Value::String(value) => output.push(value.clone()),
+            serde_json::Value::String(value) => {
+                output.push(value.clone());
+                if depth < 4 {
+                    if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(value) {
+                        collect_strings(&decoded, depth + 1, output);
+                    }
+                }
+            }
             serde_json::Value::Array(values) => {
                 for value in values {
-                    collect_strings(value, output);
+                    collect_strings(value, depth, output);
                 }
             }
             serde_json::Value::Object(values) => {
                 for value in values.values() {
-                    collect_strings(value, output);
+                    collect_strings(value, depth, output);
                 }
             }
             _ => {}
@@ -1371,39 +1556,8 @@ fn decoded_record_text(line: &str) -> Option<String> {
 
     let value = serde_json::from_str(line).ok()?;
     let mut strings = Vec::new();
-    collect_strings(&value, &mut strings);
+    collect_strings(&value, 0, &mut strings);
     Some(strings.join("\n"))
-}
-
-fn explicit_skill_field_values(line: &str) -> Vec<String> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
-    };
-    let Some(object) = value.as_object() else {
-        return Vec::new();
-    };
-    let payload = object.get("payload").and_then(serde_json::Value::as_object);
-    [
-        "skill_id",
-        "skill_name",
-        "selected_skill",
-        "matched_skill",
-        "loaded_skill",
-        "applied_skill",
-        "invoked_skill",
-        "outcome_skill",
-    ]
-    .into_iter()
-    .flat_map(|field| {
-        [
-            object.get(field),
-            payload.and_then(|payload| payload.get(field)),
-        ]
-    })
-    .flatten()
-    .filter_map(serde_json::Value::as_str)
-    .map(str::to_owned)
-    .collect()
 }
 
 fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Option<u64>) {
@@ -1926,6 +2080,462 @@ enabled = true
     }
 
     #[test]
+    fn large_current_session_tail_contributes_observed_usage() {
+        let home = temp_directory("large-current-session");
+        let skill = home.join(".codex/skills/research");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Research workflow\n---\n",
+        )
+        .unwrap();
+
+        let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_AGENT as usize + 1];
+        records.push(b'\n');
+        records.extend_from_slice(br#"{"type":"load_skill","loaded_skill":"research"}"#);
+        records.push(b'\n');
+        fs::write(sessions.join("current.jsonl"), records).unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let skill_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "research")
+            .unwrap()
+            .id;
+
+        assert!(result.usage.iter().any(|usage| {
+            usage.skill_id == *skill_id
+                && usage.agent == AgentKind::Codex
+                && usage.stage == UsageStage::Loaded
+                && usage.quality == EvidenceQuality::Observed
+        }));
+        assert_eq!(result.coverage[0].files_observed, 1);
+        assert_eq!(result.coverage[0].files_partially_observed, 1);
+        assert!(result.coverage[0].truncated);
+        assert!(!result.coverage[0].denominator_reliable);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn bounded_session_budget_is_spread_across_large_recent_files() {
+        let home = temp_directory("large-recent-sessions");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for name in ["research", "review"] {
+            let skill = home.join(".codex/skills").join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} workflow\n---\n"),
+            )
+            .unwrap();
+            let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_AGENT as usize + 1];
+            records.push(b'\n');
+            records.extend_from_slice(
+                format!(r#"{{"type":"load_skill","loaded_skill":"{name}"}}"#).as_bytes(),
+            );
+            records.push(b'\n');
+            fs::write(sessions.join(format!("{name}.jsonl")), records).unwrap();
+        }
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let loaded = result
+            .usage
+            .iter()
+            .filter(|usage| {
+                usage.agent == AgentKind::Codex
+                    && usage.stage == UsageStage::Loaded
+                    && usage.quality == EvidenceQuality::Observed
+            })
+            .map(|usage| usage.skill_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected = result
+            .skills
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(loaded, expected);
+        assert_eq!(result.coverage[0].files_observed, 2);
+        assert_eq!(result.coverage[0].files_partially_observed, 2);
+        assert!(result.coverage[0].bytes_observed <= MAX_SESSION_BYTES_PER_AGENT);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn large_monolithic_json_tail_is_bounded_and_contributes_usage() {
+        let home = temp_directory("large-monolithic-json");
+        let sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        for (name, padding_bytes) in [("research", 5 * 1024 * 1024), ("review", 700 * 1024)] {
+            let skill = home.join(".hermes/skills").join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} workflow\n---\n"),
+            )
+            .unwrap();
+            let document = format!(
+                r#"{{"padding":"{}","event":{{"type":"load_skill","loaded_skill":"{name}"}}}}"#,
+                "x".repeat(padding_bytes)
+            );
+            fs::write(sessions.join(format!("{name}.json")), document).unwrap();
+        }
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let loaded = result
+            .usage
+            .iter()
+            .filter(|usage| usage.stage == UsageStage::Loaded)
+            .filter_map(|usage| {
+                result
+                    .skills
+                    .iter()
+                    .find(|skill| skill.id == usage.skill_id)
+                    .map(|skill| skill.name.as_str())
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(loaded, BTreeSet::from(["research", "review"]));
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|coverage| coverage.agent == AgentKind::Hermes)
+            .unwrap();
+        assert_eq!(coverage.files_observed, 2);
+        assert_eq!(coverage.files_partially_observed, 2);
+        assert!(coverage.bytes_observed <= 2 * MAX_SESSION_BYTES_PER_FILE);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn repeated_events_in_one_json_document_keep_their_count() {
+        let home = temp_directory("repeated-json-events");
+        let skill = home.join(".hermes/skills/research");
+        let sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Research workflow\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("session.json"),
+            serde_json::json!([
+                {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"},
+                {"type": "load_skill", "skill_id": "research", "skill_name": "research", "loaded_skill": "research"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let loaded = result
+            .usage
+            .iter()
+            .find(|usage| usage.agent == AgentKind::Hermes && usage.stage == UsageStage::Loaded)
+            .unwrap();
+        assert_eq!(loaded.event_count, 2);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn json_object_extraction_is_bounded_for_many_siblings() {
+        let sample = format!("[{}]", vec!["{}"; 100_000].join(","));
+        let records = extract_complete_json_objects(&sample);
+        assert_eq!(records.len(), MAX_SESSION_LINES_PER_AGENT);
+        assert!(
+            records
+                .iter()
+                .all(|(record, lines)| record == "{}" && *lines == 1)
+        );
+    }
+
+    #[test]
+    fn realistic_nested_agent_records_bind_observed_usage() {
+        let home = temp_directory("nested-agent-records");
+        let placements = [
+            (AgentKind::ClaudeCode, home.join(".claude/skills/research")),
+            (AgentKind::Pi, home.join(".pi/agent/skills/research")),
+            (AgentKind::Hermes, home.join(".hermes/skills/research")),
+            (AgentKind::Cursor, home.join(".cursor/skills/research")),
+        ];
+        for (_, placement) in &placements {
+            fs::create_dir_all(placement).unwrap();
+            fs::write(
+                placement.join("SKILL.md"),
+                "---\nname: research\ndescription: Research workflow\n---\n",
+            )
+            .unwrap();
+        }
+
+        let claude_sessions = home.join(".claude/projects");
+        fs::create_dir_all(&claude_sessions).unwrap();
+        fs::write(
+            claude_sessions.join("session.jsonl"),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "name": "Skill",
+                    "input": {"skill": "research", "args": ""}
+                }]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        for (agent, root, placement) in [
+            (
+                AgentKind::Pi,
+                home.join(".pi/agent/sessions"),
+                home.join(".pi/agent/skills/research"),
+            ),
+            (
+                AgentKind::Cursor,
+                home.join(".cursor/projects"),
+                home.join(".cursor/skills/research"),
+            ),
+        ] {
+            fs::create_dir_all(&root).unwrap();
+            let record = match agent {
+                AgentKind::Pi => serde_json::json!({
+                    "type": "message",
+                    "message": {"role": "assistant", "content": [{
+                        "type": "toolCall",
+                        "name": "read",
+                        "arguments": {"path": placement.join("SKILL.md")}
+                    }]}
+                }),
+                AgentKind::Cursor => serde_json::json!({
+                    "role": "assistant",
+                    "message": {"role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {"path": placement.join("SKILL.md")}
+                    }]}
+                }),
+                _ => unreachable!(),
+            };
+            fs::write(root.join("session.jsonl"), record.to_string()).unwrap();
+        }
+
+        let hermes_sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&hermes_sessions).unwrap();
+        fs::write(
+            hermes_sessions.join("session.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "request": {"body": {"messages": [{
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": serde_json::json!({
+                                "path": home.join(".hermes/skills/research/SKILL.md")
+                            }).to_string()
+                        }
+                    }]
+                }]}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let observed = result
+            .usage
+            .iter()
+            .filter(|usage| usage.quality == EvidenceQuality::Observed)
+            .map(|usage| (usage.agent, usage.stage))
+            .collect::<BTreeSet<_>>();
+
+        assert!(observed.contains(&(AgentKind::ClaudeCode, UsageStage::Applied)));
+        for agent in [AgentKind::Pi, AgentKind::Hermes, AgentKind::Cursor] {
+            assert!(observed.contains(&(agent, UsageStage::Loaded)));
+        }
+        for agent in [
+            AgentKind::ClaudeCode,
+            AgentKind::Pi,
+            AgentKind::Hermes,
+            AgentKind::Cursor,
+        ] {
+            assert!(
+                result
+                    .coverage
+                    .iter()
+                    .find(|coverage| coverage.agent == agent)
+                    .unwrap()
+                    .denominator_reliable
+            );
+        }
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn explicit_skill_invocation_does_not_elevate_other_paths_in_the_same_record() {
+        let home = temp_directory("mixed-skill-record");
+        for name in ["research", "review"] {
+            let skill = home.join(".claude/skills").join(name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name} workflow\n---\n"),
+            )
+            .unwrap();
+        }
+        let sessions = home.join(".claude/projects");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"role": "assistant", "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Skill",
+                        "input": {"skill": "research", "args": ""}
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Read",
+                        "input": {
+                            "path": home.join(".claude/skills/review/SKILL.md")
+                        }
+                    }
+                ]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let research_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "research")
+            .unwrap()
+            .id;
+        let review_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "review")
+            .unwrap()
+            .id;
+
+        assert!(
+            result.usage.iter().any(|usage| {
+                usage.skill_id == *research_id && usage.stage == UsageStage::Applied
+            })
+        );
+        assert!(
+            !result.usage.iter().any(|usage| {
+                usage.skill_id == *review_id && usage.stage == UsageStage::Applied
+            })
+        );
+        assert!(
+            result
+                .usage
+                .iter()
+                .any(|usage| usage.skill_id == *review_id && usage.stage == UsageStage::Loaded)
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_session_root_is_not_reported_as_missing() {
+        let home = temp_directory("inaccessible-session-root");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(home.join(".codex/sessions"), "not a directory").unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|coverage| coverage.agent == AgentKind::Codex)
+            .unwrap();
+        assert_eq!(coverage.roots_present, 0);
+        assert_eq!(coverage.roots_missing, 0);
+        assert_eq!(coverage.roots_inaccessible, 1);
+        assert!(result.roots.iter().any(|root| {
+            root.agent == Some(AgentKind::Codex)
+                && root.kind == RootKind::Sessions
+                && root.status == RootStatus::Inaccessible
+        }));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn newest_session_is_selected_after_discovering_more_than_file_sample_limit() {
+        let home = temp_directory("newest-session-selection");
+        let skill = home.join(".codex/skills/research");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: research\ndescription: Research workflow\n---\n",
+        )
+        .unwrap();
+        let old_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        for index in 0..=MAX_SESSION_FILES_PER_AGENT {
+            let path = sessions.join(format!("old-{index:03}.jsonl"));
+            fs::write(&path, "{}\n").unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+        let latest = sessions.join("latest.jsonl");
+        fs::write(
+            &latest,
+            "{\"type\":\"load_skill\",\"loaded_skill\":\"research\"}\n",
+        )
+        .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(latest)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(20)),
+            )
+            .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+
+        assert!(result.usage.iter().any(|usage| {
+            usage.agent == AgentKind::Codex
+                && usage.stage == UsageStage::Loaded
+                && usage.quality == EvidenceQuality::Observed
+        }));
+        assert_eq!(
+            result.coverage[0].files_discovered,
+            MAX_SESSION_FILES_PER_AGENT + 2
+        );
+        assert_eq!(
+            result.coverage[0].files_observed,
+            MAX_SESSION_FILES_PER_AGENT
+        );
+        assert_eq!(result.coverage[0].files_skipped, 2);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn json_escaped_windows_reference_binds_observed_usage() {
         let windows_path = r"C:\Users\tester\.codex\skills\research\SKILL.md";
         let session_path = r"C:\Users\tester\.codex/skills/research\SKILL.md";
@@ -1955,12 +2565,26 @@ enabled = true
         .to_string();
 
         assert!(line.contains(r"C:\\Users\\tester"));
-        assert_eq!(
-            classify_usage_line(AgentKind::Codex, &line),
-            Some((UsageStage::Loaded, EvidenceQuality::Observed))
+        assert!(
+            session_record_observations(AgentKind::Codex, &line)
+                .iter()
+                .any(|observation| observation.signal == SessionSignal::Loaded)
         );
         assert_eq!(
             observed_reference_skill_ids(&line, Some(&matcher), &reference_lookup),
+            BTreeSet::from(["skill_windows".to_owned()])
+        );
+
+        let nested_arguments = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": serde_json::json!({"path": session_path}).to_string()
+            }
+        })
+        .to_string();
+        assert_eq!(
+            observed_reference_skill_ids(&nested_arguments, Some(&matcher), &reference_lookup),
             BTreeSet::from(["skill_windows".to_owned()])
         );
     }

@@ -117,6 +117,35 @@ took 75.32 seconds now completes in under one second and enforces a five-second
 upper bound in the unoptimized test profile. These measurements describe the
 recorded reference run, not a universal machine-performance guarantee.
 
+## Agent session-evidence dogfood
+
+The 1.8 dogfood run reproduced a usage-evidence failure on the same reference
+home. Five of eight supported Agent session roots existed, but v1.7.1 reported
+zero complete denominators and observed use for only one Agent. Discovery found
+as many as 1,856 files in one root, while the scanner sorted only a traversal
+prefix and skipped a newest file when it exceeded the four-megabyte Agent
+budget. Claude Code consequently had a present session root but zero observed
+bytes.
+
+The scanner now discovers before selecting the newest bounded set, samples
+complete-line tails from large JSONL files and complete nested objects from
+large monolithic JSON tails, and spreads the byte budget across recent sessions.
+Representative nested Claude Code, Pi, Cursor, and Hermes tool-call fixtures
+bind Skill names or `SKILL.md` paths while tool declarations and Skill catalog
+text remain non-events. Complete JSON session dumps are parsed as one structured
+record when they fit the per-file budget.
+
+The repaired real Scan found the same 193 Skills and 689 placements with
+`files_changed=false`. It reported five roots present, five sampled, five
+limited, three missing, zero inaccessible, and zero complete denominators.
+Observed-use coverage increased from one Agent to two, and recent structured
+`Loaded` evidence increased from 8 to 61 observed events across 56 Evidence
+records, including 53 Cursor records. The result still emits no unsupported
+usage percentage: bounded samples support positive event counts, while absence
+remains unknown. Scan output reports discovered, observed, partially observed,
+skipped, and discovery-truncation facts per Agent; no raw conversation text is
+persisted.
+
 ## Release-candidate platform evidence
 
 The 2026-08-22 release gates use actual hosted operating systems and the packaged

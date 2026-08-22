@@ -257,11 +257,28 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(
         lines,
         "Observed-use Agents",
-        format!(
-            "{} · reliable {}/8",
-            text(value, "observed_use_agent_count"),
-            text(value, "coverage_reliable_agent_count")
-        ),
+        if let Some(coverage) = value.get("session_coverage") {
+            format!(
+                "{} · sampled {}/{} · complete {}/{} · limited {}/{} · missing {}/{} · inaccessible {}/{}",
+                text(value, "observed_use_agent_count"),
+                text(coverage, "sampled_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "complete_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "limited_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "missing_root_agents"),
+                text(coverage, "supported_agents"),
+                text(coverage, "inaccessible_agents"),
+                text(coverage, "supported_agents")
+            )
+        } else {
+            format!(
+                "{} · reliable {}/8",
+                text(value, "observed_use_agent_count"),
+                text(value, "coverage_reliable_agent_count")
+            )
+        },
     );
     lines.push(String::new());
     lines.push("  Top Findings".into());
@@ -1256,6 +1273,15 @@ mod tests {
             "default_exposure": 184,
             "observed_use_agent_count": 4,
             "coverage_reliable_agent_count": 3,
+            "session_coverage": {
+                "supported_agents": 8,
+                "roots_present_agents": 6,
+                "sampled_agents": 5,
+                "complete_agents": 3,
+                "limited_agents": 3,
+                "missing_root_agents": 2,
+                "inaccessible_agents": 0
+            },
             "findings": [
                 {"severity": "high", "category": "layout", "title": "Broken links"},
                 {"severity": "medium", "category": "overlap", "title": "Exact duplicates"},
@@ -1286,6 +1312,9 @@ mod tests {
                 assert!(output.contains(expected), "{expected} missing at {width}");
             }
             assert!(!output.contains("Coverage\n"));
+            assert!(output.contains(
+                "sampled 5/8 · complete 3/8 · limited 3/8 · missing 2/8 · inaccessible 0/8"
+            ));
         }
     }
 
