@@ -114,3 +114,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 14
+
+  wsl:
+    name: WSL as Linux
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out smoke test
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Download Linux release artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: skillroster-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Verify Linux artifact in Ubuntu WSL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $image = Join-Path $env:RUNNER_TEMP "ubuntu-24.04.4-wsl-amd64.wsl"
+          $install = Join-Path $env:RUNNER_TEMP "skillroster-wsl"
+          Invoke-WebRequest -Uri "https://releases.ubuntu.com/noble/ubuntu-24.04.4-wsl-amd64.wsl" -OutFile $image
+          $actual = (Get-FileHash -Algorithm SHA256 $image).Hash.ToLowerInvariant()
+          if ($actual -ne "9b2f7730dc68227dd04a9f3e5eab86ad85caf556b8606ad94f1f29ff5c4fd3f5") {
+            throw "Ubuntu WSL image checksum mismatch: $actual"
+          }
+          wsl --import SkillRosterAcceptance $install $image --version 1
+          if ($LASTEXITCODE -ne 0) { throw "WSL import failed with exit code $LASTEXITCODE" }
+          try {
+            $archive = (Resolve-Path "dist/skillroster-*-x86_64-unknown-linux-gnu.tar.gz").Path
+            $archiveWsl = (wsl -d SkillRosterAcceptance -- wslpath -a $archive).Trim()
+            $repoWsl = (wsl -d SkillRosterAcceptance -- wslpath -a $env:GITHUB_WORKSPACE).Trim()
+            $command = 'set -euo pipefail; mkdir -p /tmp/skillroster-release; tar -xzf "$1" -C /tmp/skillroster-release; binary="$(find /tmp/skillroster-release -type f -name skillroster -print -quit)"; chmod +x "$binary"; "$2/scripts/release/smoke.sh" "$binary"'
+            wsl -d SkillRosterAcceptance --user root -- bash -lc $command bash $archiveWsl $repoWsl
+            if ($LASTEXITCODE -ne 0) { throw "WSL governance smoke failed with exit code $LASTEXITCODE" }
+          }
+          finally {
+            wsl --unregister SkillRosterAcceptance
+          }
