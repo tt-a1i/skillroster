@@ -1103,6 +1103,13 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         let mut details = stored.details.clone();
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
+            object.entry("kind").or_insert_with(|| {
+                json!(crate::roster_recommendation::finding_kind(
+                    &stored.category,
+                    &stored.title
+                ))
+            });
+            object.insert("files_changed".into(), json!(false));
             let report = store
                 .get_report(&stored.report_id)?
                 .ok_or_else(|| anyhow!("Report {} does not exist", stored.report_id))?;
