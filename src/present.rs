@@ -496,9 +496,20 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         .and_then(Value::as_array)
         .or_else(|| value.get("placements").and_then(Value::as_array));
     if let Some(rows) = evidence_rows.filter(|rows| !rows.is_empty()) {
-        lines.push(String::new());
-        lines.push("  Evidence paths".into());
-        for row in rows.iter().take(10) {
+        let path_count = rows
+            .iter()
+            .filter(|row| row.get("path").and_then(Value::as_str).is_some())
+            .count();
+        let rows_with_paths = rows
+            .iter()
+            .filter(|row| row.get("path").and_then(Value::as_str).is_some())
+            .take(10)
+            .collect::<Vec<_>>();
+        if !rows_with_paths.is_empty() {
+            lines.push(String::new());
+            lines.push("  Evidence paths".into());
+        }
+        for row in rows_with_paths {
             let agent = row
                 .get("facts")
                 .and_then(|facts| facts.get("agent"))
@@ -512,8 +523,8 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
             );
             lines.push(format!("{prefix}{path}"));
         }
-        if rows.len() > 10 {
-            lines.push(format!("  + {} more on this page", rows.len() - 10));
+        if path_count > 10 {
+            lines.push(format!("  + {} more on this page", path_count - 10));
         }
     }
 
@@ -537,6 +548,55 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         lines.extend(summary(
             "Blocked · no automatic change is supported",
             "Confirm trusted source directories before rescanning",
+        ));
+    } else if value["resolution"]["decision"].as_str() == Some("choose_same_name_variant") {
+        lines.push(String::new());
+        lines.push("  Variants requiring a choice".into());
+        if let Some(variants) = value["resolution"]["variants"].as_array() {
+            for variant in variants.iter().take(5) {
+                let digest = variant["content_digests"]
+                    .as_array()
+                    .and_then(|digests| digests.first())
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let agents = variant["agents"]
+                    .as_array()
+                    .map(|agents| {
+                        agents
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|agents| !agents.is_empty())
+                    .unwrap_or_else(|| "source-only".into());
+                let label = format!("  {} · {agents}", take_width(digest, 12, false));
+                lines.push(middle_truncate(&label, width));
+                if let Some(path) = variant["paths"]
+                    .as_array()
+                    .and_then(|paths| paths.first())
+                    .and_then(Value::as_str)
+                {
+                    lines.push(format!(
+                        "    {}",
+                        middle_truncate(path, width.saturating_sub(4))
+                    ));
+                }
+                if let Some(additional) = variant["paths"]
+                    .as_array()
+                    .map(|paths| paths.len().saturating_sub(1))
+                    .filter(|count| *count > 0)
+                {
+                    lines.push(format!("    + {additional} additional placements"));
+                }
+            }
+        }
+        if value["resolution"]["variants_truncated"].as_bool() == Some(true) {
+            lines.push("  Additional variants require --full pagination".into());
+        }
+        lines.extend(summary(
+            "Blocked · choose one canonical variant first",
+            "Compare the reported paths before authoring a Plan",
         ));
     } else if value["planning"]["decision"].as_str() == Some("resolve_source_dependency") {
         lines.push(String::new());
@@ -1495,6 +1555,56 @@ mod tests {
             assert!(output.contains("Observed link targets"));
             assert!(output.contains("no automatic change is supported"));
             assert!(!output.contains("Independent Skills     none"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn finding_report_shows_same_name_variant_choice_without_empty_paths() {
+        let value = json!({
+            "id": "finding_00000000000000000000000000000000",
+            "title": "Same-name Skills have different content",
+            "summary": "humanizer-zh resolves to 2 distinct content digests.",
+            "severity": "medium",
+            "category": "layout",
+            "evidence_quality": "observed",
+            "impact": {"affected_skill_count": 2, "affected_placement_count": 5},
+            "detail": {"mode": "compact"},
+            "items": [{"path": null}, {"path": null}],
+            "resolution": {
+                "decision": "choose_same_name_variant",
+                "variants_truncated": false,
+                "variants": [
+                    {
+                        "content_digests": ["13ccd64485a12613e9e10c96b5289290"],
+                        "agents": ["claude-code", "codex", "pi"],
+                        "paths": ["/Users/example/.agents_skills/humanizer-zh/SKILL.md"]
+                    },
+                    {
+                        "content_digests": ["b3685e6c0ee6f527e9462db3d36b2a1b"],
+                        "agents": ["hermes"],
+                        "paths": ["/Users/example/.hermes/skills/humanizer-zh/SKILL.md"]
+                    }
+                ]
+            }
+        });
+        for width in [60, 80, 120] {
+            let output = render(
+                "report",
+                &value,
+                RenderOptions {
+                    width,
+                    styled: false,
+                },
+            );
+            assert!(output.contains("Variants requiring a choice"));
+            assert!(output.contains("13ccd64485a1"));
+            assert!(output.contains("hermes"));
+            assert!(output.contains("choose one canonical variant first"));
+            assert!(!output.contains("source       none"));
             assert!(
                 output.lines().all(|line| display_width(line) <= width),
                 "line exceeded {width} columns:\n{output}"

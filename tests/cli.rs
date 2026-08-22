@@ -111,6 +111,55 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
 }
 
 #[test]
+fn public_find_routes_natural_cjk_paraphrases_against_cjk_metadata() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    let humanizer = skill_root.join("humanizer-zh");
+    let unrelated = skill_root.join("generic-writer");
+    fs::create_dir_all(&humanizer).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    fs::write(
+        humanizer.join("SKILL.md"),
+        "---\nname: humanizer-zh\ndescription: 去除文本中的 AI 生成痕迹，让中文表达更自然、更像人类书写。\n---\n编辑中文并保留原意。\n",
+    )
+    .unwrap();
+    fs::write(
+        unrelated.join("SKILL.md"),
+        "---\nname: generic-writer\ndescription: Generic English writing helper\n---\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[&common[..], &["find", "把中文改自然一点", "--limit", "3"]].concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["task"], "把中文改自然一点");
+    assert_eq!(found["result"]["matches"][0]["name"], "humanizer-zh");
+    assert!(
+        found["result"]["matches"][0]["match_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason
+                .as_str()
+                .unwrap()
+                .starts_with("cjk_description_bigrams:"))
+    );
+    assert_find_paths_are_readable(&found);
+}
+
+#[test]
 fn public_find_expands_plural_candidates_and_bounds_incidental_single_token_matches() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -394,6 +443,88 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
         let output: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(output["error"]["code"], "invalid_cli_arguments");
     }
+}
+
+#[test]
+fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex = home.join(".codex/skills/shared-capability");
+    let claude = home.join(".claude/skills/shared-capability");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        codex.join("SKILL.md"),
+        "---\nname: shared-capability\ndescription: First implementation\n---\nalpha\n",
+    )
+    .unwrap();
+    fs::write(
+        claude.join("SKILL.md"),
+        "---\nname: shared-capability\ndescription: Second implementation\n---\nbeta\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["title"] == "Same-name Skills have different content"
+                && finding["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("shared-capability")
+        })
+        .unwrap();
+    assert_eq!(finding["affected_skill_count"], 2);
+    assert_eq!(finding["affected_placement_count"], 2);
+    let finding_id = finding["id"].as_str().unwrap();
+
+    let compact = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        compact["result"]["resolution"]["decision"],
+        "choose_same_name_variant"
+    );
+    assert_eq!(
+        compact["result"]["resolution"]["automatic_change_supported"],
+        false
+    );
+    let variants = compact["result"]["resolution"]["variants"]
+        .as_array()
+        .unwrap();
+    assert_eq!(variants.len(), 2);
+    for variant in variants {
+        assert!(variant["skill_id"].as_str().unwrap().starts_with("skill_"));
+        assert_eq!(variant["content_digests"].as_array().unwrap().len(), 1);
+        assert_eq!(variant["paths"].as_array().unwrap().len(), 1);
+        assert!(Path::new(variant["paths"][0].as_str().unwrap()).is_file());
+        assert_eq!(variant["agents"].as_array().unwrap().len(), 1);
+    }
+    assert!(
+        compact["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+
+    let full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    assert_eq!(full["result"]["placements"].as_array().unwrap().len(), 2);
 }
 
 #[test]
@@ -921,7 +1052,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.10"
+        "1.8.11"
     );
 
     let undone = json_output(&run(
@@ -1091,7 +1222,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.10");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.11");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],

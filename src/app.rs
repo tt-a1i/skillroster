@@ -1133,6 +1133,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
             {
                 object.insert("planning".into(), planning);
             }
+            add_same_name_resolution(object, &scan);
             let affected_skill_ids = object
                 .get("affected_skill_ids")
                 .and_then(Value::as_array)
@@ -1387,6 +1388,87 @@ fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
     );
 }
 
+fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &ScanResult) {
+    if object.get("title").and_then(Value::as_str)
+        != Some("Same-name Skills have different content")
+    {
+        return;
+    }
+    let mut affected_skill_ids = object
+        .get("affected_skill_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    affected_skill_ids.sort();
+    affected_skill_ids.dedup();
+    let variant_count = affected_skill_ids.len();
+    let variants = affected_skill_ids
+        .iter()
+        .take(10)
+        .filter_map(|skill_id| {
+            let skill = scan.skills.iter().find(|skill| skill.id == *skill_id)?;
+            let placements = scan
+                .placements
+                .iter()
+                .filter(|placement| placement.skill_id == *skill_id)
+                .collect::<Vec<_>>();
+            let content_digests = std::iter::once(skill.content_digest.clone())
+                .chain(
+                    placements
+                        .iter()
+                        .map(|placement| placement.content_digest.clone()),
+                )
+                .collect::<BTreeSet<_>>();
+            let paths = placements
+                .iter()
+                .map(|placement| placement.entrypoint.display().to_string())
+                .collect::<BTreeSet<_>>();
+            let path_count = paths.len();
+            let paths = paths.into_iter().take(10).collect::<Vec<_>>();
+            let paths_truncated = paths.len() < path_count;
+            let agents = placements
+                .iter()
+                .filter_map(|placement| placement.agent.map(AgentKind::id))
+                .collect::<BTreeSet<_>>();
+            let providers = placements
+                .iter()
+                .filter_map(|placement| placement.provider.clone())
+                .collect::<BTreeSet<_>>();
+            let roots = placements
+                .iter()
+                .map(|placement| placement.root.display().to_string())
+                .collect::<BTreeSet<_>>();
+            let governable = placements.iter().any(|placement| placement.governable);
+            Some(json!({
+                "skill_id": skill_id,
+                "content_digests": content_digests,
+                "paths": paths,
+                "path_count": path_count,
+                "paths_truncated": paths_truncated,
+                "agents": agents,
+                "providers": providers,
+                "roots": roots,
+                "source": skill.metadata.source.clone(),
+                "governable": governable
+            }))
+        })
+        .collect::<Vec<_>>();
+    object.insert(
+        "resolution".into(),
+        json!({
+            "decision": "choose_same_name_variant",
+            "automatic_change_supported": false,
+            "variant_count": variant_count,
+            "variants_truncated": variants.len() < variant_count,
+            "variants": variants,
+            "next_step": "compare_variant_content_and_choose_canonical"
+        }),
+    );
+}
+
 fn compact_finding_detail(mut details: Value) -> Value {
     let Some(object) = details.as_object_mut() else {
         return details;
@@ -1494,9 +1576,11 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
         } => {
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
+            let requires_variant_decision =
+                result["resolution"]["decision"].as_str() == Some("choose_same_name_variant");
             let planning_blocked = result["planning"]["supported"].as_bool() == Some(false);
             let mut actions = Vec::new();
-            if !requires_trust_decision && !planning_blocked {
+            if !requires_trust_decision && !requires_variant_decision && !planning_blocked {
                 actions.push(action(
                     "plan",
                     &["plan", "--stdin", "--json"],
@@ -2141,6 +2225,9 @@ fn find_command(
             routable_ids.remove(&skill_id);
         }
     }
+    if crate::query::contains_cjk(retrieval_query.text()) {
+        candidate_ids.extend(routable_ids.iter().cloned());
+    }
     candidate_ids.retain(|skill_id| routable_ids.contains(skill_id));
     let mut matches = crate::query::find_matching(
         &scan,
@@ -2199,7 +2286,7 @@ fn find_command(
             ));
         }
     }
-    let cjk_hint_required = retrieval_hints.is_empty() && contains_cjk(task);
+    let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
     if cjk_hint_required {
         warnings.push(
             "Find is lexical and the task contains CJK text; retry with one concise English capability paraphrase via --hint if relevant Skills use English metadata"
@@ -2235,15 +2322,6 @@ fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
-}
-
-fn contains_cjk(text: &str) -> bool {
-    text.chars().any(|character| {
-        matches!(
-            character as u32,
-            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0x20000..=0x2fa1f
-        )
-    })
 }
 
 fn current_roster_state(states: &[RosterState]) -> String {
@@ -4164,6 +4242,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.8.9",
         "1087110d8f8f9bb2c1839b1eda11b4417ca7b57af4449113a6fb5b1394e3309d",
+    ),
+    (
+        "1.8.10",
+        "dbc604dbfc45db5bf766609b28513eacb1ba87a96fc0cba7bb11337561bddd01",
     ),
 ];
 

@@ -280,9 +280,30 @@ evidence, Core/On-demand Roster governance, and approved Apply/Undo requests;
 shared installation and symlink synchronization still ranked
 `agent-skills-manager` first. The exact original `duplicate unused` query and
 each inventory, duplicate, usage-evidence, Roster, Plan, Apply, Receipt, and
-Undo branch passed independently. The maintained 84-task English/CJK routing set
+Undo branch passed independently. The maintained 86-task English/CJK routing set
 passed before governance, after Apply, and after Undo. Inspection and routing
 changed no real Agent files.
+
+The v1.8.11 CJK routing dogfood reused a fresh isolated Snapshot of the real
+home with the bundled Bootstrap as a trusted non-exposed source: 232 independent
+Skills and 744 placements. Before the change, a near-verbatim Chinese
+description routed to `humanizer-zh`, while the natural paraphrases
+`把中文改自然一点` and `编辑中文让它更像人写的` returned no matches. CJK-aware
+local scoring then ranked `humanizer-zh` first for both, exposed the contributing
+description/body bigrams, and kept the previously sampled real task routes in
+Top-3. A bounded Chinese stop-unit list removed generic `帮我` / `看看` noise;
+the maintained 86-task set passed before governance, after Apply, and after
+Undo. All real-home Find operations were read-only.
+
+The same run followed the `humanizer-zh` variant warning into its Layout
+Finding. Before the fix, full detail contained two Skill IDs and two digests but
+zero placements or readable paths, while still suggesting a generic Plan. The
+new immutable Report identified five real placements: one shared-content
+variant across Codex, Claude Code, Pi, and the shared source, plus one divergent
+Hermes variant. Compact and full detail kept each digest, Agent set, root, and
+path together, returned `choose_same_name_variant`, and offered no Plan before
+the canonical-content decision. Human output preserved the same facts at 60,
+80, and 120 columns without displaying null paths or changing Agent files.
 
 ## Evidence boundary
 

@@ -127,12 +127,21 @@ top-level `triggers` and the semicolon-separated string
 `metadata.skillroster-routing-triggers` as the same declared retrieval
 evidence. The latter must be explicitly quoted and remains valid under the
 Agent Skills metadata string-value contract; non-string and nested forms are
-ignored. Ranking
-normalizes conservative ASCII plurals, treats explicit use and do-not-use
-description clauses as positive and exclusion evidence, and removes the
+ignored. Ranking normalizes conservative ASCII plurals and segments contiguous
+Han text into overlapping two-character lexical units after removing a bounded
+set of common Chinese stop-units. A query containing Han text expands scoring
+only to the already-scanned, locally routable Skill set so natural CJK
+paraphrases can reach CJK metadata even when SQLite FTS has no whole-token
+candidate; Archived Skills remain excluded. Match reasons expose CJK
+description and full-text bigram counts. Ranking also treats explicit use and
+do-not-use description clauses as positive and exclusion evidence, and removes the
 low-confidence tail relative to the strongest result. Same-name Skill
 identities occupy one ranked capability result and are
 reported as explicit variants rather than silently treated as equivalent.
+The corresponding divergent-content Finding carries the affected placements
+and a bounded `choose_same_name_variant` resolution that keeps each digest,
+path, Agent, provider, root, and governability fact together. It offers no Plan
+until the caller has compared the variants and chosen canonical content.
 Variant details keep provider, governance, and path facts bound to one identity;
 the response preserves the total count and marks bounded detail truncation.
 Provider-managed results include their plugin identity and a non-governable

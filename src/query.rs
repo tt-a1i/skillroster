@@ -361,6 +361,16 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             .map(|skill| skill.content_digest.as_str())
             .collect::<BTreeSet<_>>();
         if skills.len() > 1 && digests.len() > 1 {
+            let affected_skill_ids = skills
+                .iter()
+                .map(|skill| skill.id.clone())
+                .collect::<Vec<_>>();
+            let affected_placement_ids = scan
+                .placements
+                .iter()
+                .filter(|placement| affected_skill_ids.contains(&placement.skill_id))
+                .map(|placement| placement.id.clone())
+                .collect::<Vec<_>>();
             push_finding(
                 findings,
                 FindingCategory::Layout,
@@ -370,8 +380,8 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                     "{name} resolves to {} distinct content digests.",
                     digests.len()
                 ),
-                skills.iter().map(|skill| skill.id.clone()).collect(),
-                Vec::new(),
+                affected_skill_ids,
+                affected_placement_ids,
                 skills
                     .iter()
                     .map(|skill| format!("digest:{}", skill.content_digest))
@@ -1251,20 +1261,31 @@ pub(crate) fn find_matching(
                 description_routing_sections(&description);
             let triggers = skill.metadata.triggers.join(" ").to_lowercase();
             let all_text = skill_search_text(skill).to_lowercase();
-            let name_overlap = query_tokens.intersection(&tokens(&name)).count();
-            let trigger_overlap = query_tokens.intersection(&tokens(&triggers)).count();
-            let description_overlap = query_tokens
-                .intersection(&tokens(&positive_description))
-                .count();
+            let name_tokens = tokens(&name);
+            let trigger_tokens = tokens(&triggers);
+            let description_tokens = tokens(&positive_description);
+            let excluded_description_tokens = tokens(&excluded_description);
+            let all_text_tokens = tokens(&all_text);
+            let name_overlap = query_tokens.intersection(&name_tokens).count();
+            let trigger_overlap = query_tokens.intersection(&trigger_tokens).count();
+            let description_overlap = query_tokens.intersection(&description_tokens).count();
             let excluded_description_overlap = query_tokens
-                .intersection(&tokens(&excluded_description))
+                .intersection(&excluded_description_tokens)
                 .count();
             let exclusion_penalty_tokens = if excluded_description_overlap >= 2 {
                 excluded_description_overlap
             } else {
                 0
             };
-            let overlap = query_tokens.intersection(&tokens(&all_text)).count();
+            let overlap = query_tokens.intersection(&all_text_tokens).count();
+            let cjk_description_overlap = query_tokens
+                .intersection(&description_tokens)
+                .filter(|token| contains_cjk(token))
+                .count();
+            let cjk_all_text_overlap = query_tokens
+                .intersection(&all_text_tokens)
+                .filter(|token| contains_cjk(token))
+                .count();
             let mut score = name_overlap as f64 * 24.0
                 + trigger_overlap as f64 * 18.0
                 + description_overlap as f64 * 12.0
@@ -1300,6 +1321,9 @@ pub(crate) fn find_matching(
             if description_overlap > 0 {
                 reasons.push(format!("description_tokens:{description_overlap}"));
             }
+            if cjk_description_overlap > 0 {
+                reasons.push(format!("cjk_description_bigrams:{cjk_description_overlap}"));
+            }
             if exclusion_penalty_tokens > 0 {
                 reasons.push(format!(
                     "excluded_description_tokens:{exclusion_penalty_tokens}"
@@ -1307,6 +1331,9 @@ pub(crate) fn find_matching(
             }
             if overlap > 0 {
                 reasons.push(format!("all_text_tokens:{overlap}"));
+            }
+            if cjk_all_text_overlap > 0 {
+                reasons.push(format!("cjk_all_text_bigrams:{cjk_all_text_overlap}"));
             }
             let observed_usage = scan.usage.iter().any(|usage| {
                 usage.skill_id == skill.id && usage.quality == EvidenceQuality::Observed
@@ -1464,12 +1491,55 @@ pub(crate) fn find_matching(
 }
 
 fn tokens(text: &str) -> BTreeSet<String> {
-    text.split(|character: char| !character.is_alphanumeric())
-        .map(str::trim)
-        .filter(|token| token.len() >= 2)
-        .map(normalize_token)
-        .filter(|token| !is_search_stopword(token))
-        .collect()
+    let mut output = BTreeSet::new();
+    let mut word = String::new();
+    let mut cjk_run = Vec::new();
+    for character in text.chars() {
+        if is_cjk(character) {
+            insert_word_token(&mut output, &mut word);
+            cjk_run.push(character);
+        } else if character.is_alphanumeric() {
+            insert_cjk_bigrams(&mut output, &mut cjk_run);
+            word.push(character);
+        } else {
+            insert_word_token(&mut output, &mut word);
+            insert_cjk_bigrams(&mut output, &mut cjk_run);
+        }
+    }
+    insert_word_token(&mut output, &mut word);
+    insert_cjk_bigrams(&mut output, &mut cjk_run);
+    output
+}
+
+fn insert_word_token(output: &mut BTreeSet<String>, word: &mut String) {
+    if word.chars().count() >= 2 {
+        let normalized = normalize_token(word.trim());
+        if !is_search_stopword(&normalized) {
+            output.insert(normalized);
+        }
+    }
+    word.clear();
+}
+
+fn insert_cjk_bigrams(output: &mut BTreeSet<String>, run: &mut Vec<char>) {
+    for pair in run.windows(2) {
+        let token = pair.iter().collect::<String>();
+        if !is_search_stopword(&token) {
+            output.insert(token);
+        }
+    }
+    run.clear();
+}
+
+pub(crate) fn contains_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x3400..=0x4dbf | 0x4e00..=0x9fff | 0x20000..=0x2fa1f
+    )
 }
 
 fn is_search_stopword(token: &str) -> bool {
@@ -1498,6 +1568,23 @@ fn is_search_stopword(token: &str) -> bool {
             | "use"
             | "using"
             | "with"
+            | "一个"
+            | "一份"
+            | "一下"
+            | "一点"
+            | "什么"
+            | "使用"
+            | "创建"
+            | "可以"
+            | "已经"
+            | "当前"
+            | "帮我"
+            | "怎么"
+            | "需要"
+            | "看看"
+            | "这个"
+            | "那个"
+            | "进行"
     )
 }
 
@@ -2099,6 +2186,17 @@ mod tests {
             ])
         );
         assert_eq!(candidate_search_text("publish blogs"), "publish blogs blog");
+    }
+
+    #[test]
+    fn token_matching_segments_cjk_runs_into_overlapping_bigrams() {
+        let segmented = tokens("把中文改自然一点 AI");
+
+        for expected in ["把中", "中文", "文改", "改自", "自然", "然一", "ai"] {
+            assert!(segmented.contains(expected), "missing token {expected:?}");
+        }
+        assert!(!segmented.contains("一点"));
+        assert!(!segmented.contains("把中文改自然一点"));
     }
 
     #[test]

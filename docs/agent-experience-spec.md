@@ -132,7 +132,8 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 - set `schema_version: 1` on every declarative Plan request;
 - never parse human terminal output or TUI frames;
 - preserve a non-English Find task verbatim and supply a positive English
-  target-surface, object, operation, and state paraphrase through `--hint`;
+  target-surface, object, operation, and state paraphrase through `--hint` when
+  relevant metadata may be English or the native-language result is uncertain;
 - treat `suggested_actions` as typed options, not authorization;
 - automatically prepare a read-only Plan when evidence is sufficient;
 - show the complete Plan impact before Apply;
@@ -149,7 +150,7 @@ Machine results should expose facts, not preformatted prose:
 - `primary_metrics` with value, unit, coverage, and comparison baseline;
 - Findings with stable ID, category, severity, Evidence quality, impact fields, and affected IDs;
 - a bounded `report --summary --json` first view with no more than three Findings, one primary Evidence reference per selected Finding, and complete `finding_rollups` grouped by category, severity, and title with deduplicated affected counts; a category/severity-filterable `report --findings --json` page for enumerating compact Finding summaries; and compact paged Evidence items from `report --finding ID --json`; exact complete records require `--full`, exact-duplicate detail exposes at most five ranked owned canonical candidates, and large-Roster detail exposes bounded per-Agent Core selection previews without requiring pagination;
-- Find results that keep the original task, expose Agent-authored retrieval hints, and collapse same-name identities into one explicitly variant capability result;
+- Find results that keep the original task, expose Agent-authored retrieval hints, and collapse same-name identities into one explicitly variant capability result; the linked divergent-content Finding groups readable paths, digests, Agents, providers, and governance facts by variant and requires a canonical-content choice before Plan;
 - bounded Plan `change_summary`, `operation_groups`, affected-scope counts and `impact` deltas for current and proposed state; `diff_summary` contains at most three semantic Roster, Library, and filesystem items, or bounded line details for a source update; the same persisted summary appears in initial JSON, full detail, and confirmation preview, while full operations are loaded only through `plan --show PLAN_ID` when needed;
 - affected Agents, Skills, placements, operation groups, exclusions, and deletion count;
 - risk, reversibility, drift, confirmation, and recovery state;
