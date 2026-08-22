@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use crate::change::{
     self, ChangeReceipt, Operation, OperationPolicy, PrepareContext, PreparedPlan,
 };
-use crate::cli::{Cli, Command, LifecycleCommand, ModifiedBootstrapChoice};
+use crate::cli::{
+    Cli, Command, LifecycleCommand, ModifiedBootstrapChoice, ReportCategory, ReportSeverity,
+};
 use crate::harness::{self, AgentKind};
 use crate::model::{
     AgentId, AgentRecord, ApiError, EvidenceId, EvidenceKind, EvidenceQuality, EvidenceRecord,
@@ -114,16 +116,27 @@ pub fn run(cli: Cli) -> Result<Output> {
             )
         }
         Some(Command::Report(args)) => {
-            let finding_id = args.finding.as_deref();
-            let result = report_command(
-                &store,
-                finding_id,
-                args.summary,
-                args.full,
-                usize::from(args.limit),
-                usize::try_from(args.offset)?,
-            )?;
-            let actions = report_actions(&result, finding_id, args.full, args.limit, args.offset);
+            let request = if let Some(id) = args.finding.as_deref() {
+                ReportRequest::Finding {
+                    id,
+                    full: args.full,
+                    limit: usize::from(args.limit),
+                    offset: usize::try_from(args.offset)?,
+                }
+            } else if args.summary {
+                ReportRequest::Summary
+            } else if args.findings {
+                ReportRequest::Findings {
+                    category: args.category,
+                    severity: args.severity,
+                    limit: usize::from(args.limit),
+                    offset: usize::try_from(args.offset)?,
+                }
+            } else {
+                ReportRequest::Exhaustive
+            };
+            let result = report_command(&store, request)?;
+            let actions = report_actions(&result, request);
             ("report", result, vec![], actions)
         }
         Some(Command::Find(args)) => (
@@ -1057,15 +1070,32 @@ fn compact_scan_warnings(warnings: Vec<String>) -> Vec<String> {
     remaining
 }
 
-fn report_command(
-    store: &StateStore,
-    finding: Option<&str>,
-    summary_only: bool,
-    full_detail: bool,
-    detail_limit: usize,
-    detail_offset: usize,
-) -> Result<Value> {
-    if let Some(id) = finding {
+#[derive(Clone, Copy)]
+enum ReportRequest<'a> {
+    Summary,
+    Findings {
+        category: Option<ReportCategory>,
+        severity: Option<ReportSeverity>,
+        limit: usize,
+        offset: usize,
+    },
+    Finding {
+        id: &'a str,
+        full: bool,
+        limit: usize,
+        offset: usize,
+    },
+    Exhaustive,
+}
+
+fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Value> {
+    if let ReportRequest::Finding {
+        id,
+        full,
+        limit,
+        offset,
+    } = request
+    {
         let id = FindingId::parse(id.to_string())?;
         let stored = store
             .get_finding(&id)?
@@ -1098,24 +1128,24 @@ fn report_command(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let end = detail_offset.saturating_add(detail_limit);
+            let end = offset.saturating_add(limit);
             let paged_skill_ids = affected_skill_ids
                 .iter()
-                .skip(detail_offset)
-                .take(detail_limit)
+                .skip(offset)
+                .take(limit)
                 .cloned()
                 .collect::<Vec<_>>();
             let paged_placement_ids = affected_placement_ids
                 .iter()
-                .skip(detail_offset)
-                .take(detail_limit)
+                .skip(offset)
+                .take(limit)
                 .cloned()
                 .collect::<Vec<_>>();
             let paged_evidence_ids = stored
                 .evidence_ids
                 .iter()
-                .skip(detail_offset)
-                .take(detail_limit)
+                .skip(offset)
+                .take(limit)
                 .cloned()
                 .collect::<Vec<_>>();
             let mut placements = scan
@@ -1165,8 +1195,8 @@ fn report_command(
             object.insert(
                 "page".into(),
                 json!({
-                    "offset": detail_offset,
-                    "limit": detail_limit,
+                    "offset": offset,
+                    "limit": limit,
                     "next_offset": next_offset,
                     "has_more": next_offset.is_some(),
                     "totals": {
@@ -1185,12 +1215,12 @@ fn report_command(
             object.insert(
                 "detail".into(),
                 json!({
-                    "mode": if full_detail { "full" } else { "compact" },
-                    "full_available": !full_detail
+                    "mode": if full { "full" } else { "compact" },
+                    "full_available": !full
                 }),
             );
         }
-        return Ok(if full_detail {
+        return Ok(if full {
             details
         } else {
             compact_finding_detail(details)
@@ -1199,11 +1229,7 @@ fn report_command(
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id {
-            return Ok(if summary_only {
-                compact_report(&existing.summary)
-            } else {
-                existing.summary
-            });
+            return Ok(select_report_view(&existing.summary, request));
         }
     }
     let report = crate::query::build_report(&scan);
@@ -1286,11 +1312,7 @@ fn report_command(
         },
         &findings,
     )?;
-    Ok(if summary_only {
-        compact_report(&value)
-    } else {
-        value
-    })
+    Ok(select_report_view(&value, request))
 }
 
 fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
@@ -1367,56 +1389,107 @@ fn compact_finding_detail(mut details: Value) -> Value {
     details
 }
 
-fn report_actions(
-    result: &Value,
-    finding_id: Option<&str>,
-    full_detail: bool,
-    limit: u16,
-    offset: u32,
-) -> Vec<SuggestedAction> {
-    let Some(finding_id) = finding_id else {
-        return vec![action(
-            "plan",
-            &["plan", "--stdin", "--json"],
-            false,
-            false,
-            "findings_available",
-        )];
-    };
-    let requires_trust_decision =
-        result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
-    let mut actions = Vec::new();
-    if !requires_trust_decision {
-        actions.push(action(
-            "plan",
-            &["plan", "--stdin", "--json"],
-            false,
-            false,
-            "finding_action_available",
-        ));
+fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAction> {
+    match request {
+        ReportRequest::Summary => {
+            let total = result["finding_count"].as_u64().unwrap_or_default();
+            let returned = result["findings"]
+                .as_array()
+                .map_or(0, |findings| findings.len() as u64);
+            if total <= returned {
+                return Vec::new();
+            }
+            vec![action(
+                "list_findings",
+                &[
+                    "report",
+                    "--findings",
+                    "--limit",
+                    "20",
+                    "--offset",
+                    "0",
+                    "--json",
+                ],
+                false,
+                false,
+                "more_findings_available",
+            )]
+        }
+        ReportRequest::Findings {
+            category,
+            severity,
+            limit,
+            ..
+        } => {
+            let Some(next_offset) = result["page"]["next_offset"].as_u64() else {
+                return Vec::new();
+            };
+            let mut argv = vec!["report".to_owned(), "--findings".to_owned()];
+            if let Some(category) = category {
+                argv.extend(["--category".to_owned(), category.id().to_owned()]);
+            }
+            if let Some(severity) = severity {
+                argv.extend(["--severity".to_owned(), severity.id().to_owned()]);
+            }
+            argv.extend([
+                "--limit".to_owned(),
+                limit.to_string(),
+                "--offset".to_owned(),
+                next_offset.to_string(),
+                "--json".to_owned(),
+            ]);
+            let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            vec![action(
+                "list_more_findings",
+                &argv,
+                false,
+                false,
+                "more_filtered_findings_available",
+            )]
+        }
+        ReportRequest::Finding {
+            id,
+            full,
+            limit,
+            offset,
+        } => {
+            let requires_trust_decision =
+                result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
+            let mut actions = Vec::new();
+            if !requires_trust_decision {
+                actions.push(action(
+                    "plan",
+                    &["plan", "--stdin", "--json"],
+                    false,
+                    false,
+                    "finding_action_available",
+                ));
+            }
+            if !full {
+                let limit = limit.to_string();
+                let offset = offset.to_string();
+                actions.push(action(
+                    "show_full_finding",
+                    &[
+                        "report",
+                        "--finding",
+                        id,
+                        "--full",
+                        "--limit",
+                        &limit,
+                        "--offset",
+                        &offset,
+                        "--json",
+                    ],
+                    false,
+                    false,
+                    "finding_full_detail_available",
+                ));
+            }
+            actions
+        }
+        ReportRequest::Exhaustive => Vec::new(),
     }
-    if !full_detail {
-        let limit = limit.to_string();
-        let offset = offset.to_string();
-        actions.push(action(
-            "show_full_finding",
-            &[
-                "report",
-                "--finding",
-                finding_id,
-                "--full",
-                "--limit",
-                &limit,
-                "--offset",
-                &offset,
-                "--json",
-            ],
-            false,
-            false,
-            "finding_full_detail_available",
-        ));
-    }
-    actions
 }
 
 fn finding_library_planning(
@@ -1495,26 +1568,101 @@ fn finding_library_planning(
     }))
 }
 
+fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
+    match request {
+        ReportRequest::Summary => compact_report(report),
+        ReportRequest::Findings {
+            category,
+            severity,
+            limit,
+            offset,
+        } => paged_finding_report(report, category, severity, limit, offset),
+        ReportRequest::Exhaustive | ReportRequest::Finding { .. } => report.clone(),
+    }
+}
+
+fn compact_finding_summary(finding: &Value) -> Value {
+    json!({
+        "id": finding["id"],
+        "category": finding["category"],
+        "severity": finding["severity"],
+        "title": finding["title"],
+        "summary": finding["summary"],
+        "evidence_quality": finding["evidence_quality"],
+        "primary_evidence_id": finding["evidence_ids"].as_array().and_then(|ids| ids.first()),
+        "affected_skill_count": finding["affected_skill_count"],
+        "affected_placement_count": finding["affected_placement_count"],
+        "impact": finding["impact"],
+        "coverage": finding["coverage"]
+    })
+}
+
+fn paged_finding_report(
+    report: &Value,
+    category: Option<ReportCategory>,
+    severity: Option<ReportSeverity>,
+    limit: usize,
+    offset: usize,
+) -> Value {
+    let findings = report["findings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let matching = findings
+        .iter()
+        .filter(|finding| {
+            category.is_none_or(|value| finding["category"].as_str() == Some(value.id()))
+                && severity.is_none_or(|value| finding["severity"].as_str() == Some(value.id()))
+        })
+        .collect::<Vec<_>>();
+    let total = matching.len();
+    let items = matching
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(compact_finding_summary)
+        .collect::<Vec<_>>();
+    let end = offset.saturating_add(items.len());
+    let next_offset = (end < total).then_some(end);
+    json!({
+        "view": "findings",
+        "report_id": report["report_id"],
+        "snapshot_id": report["snapshot_id"],
+        "skill_count": report["skill_count"],
+        "placement_count": report["placement_count"],
+        "default_exposure": report["default_exposure"],
+        "observed_use_agent_count": report["observed_use_agent_count"],
+        "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
+        "primary_metrics": report["primary_metrics"],
+        "finding_count": findings.len(),
+        "matched_finding_count": total,
+        "category_counts": report["category_counts"],
+        "filters": {
+            "category": category.map(ReportCategory::id),
+            "severity": severity.map(ReportSeverity::id)
+        },
+        "page": {
+            "offset": offset,
+            "limit": limit,
+            "returned": items.len(),
+            "total": total,
+            "next_offset": next_offset,
+            "has_more": next_offset.is_some()
+        },
+        "items": items,
+        "files_changed": false
+    })
+}
+
 fn compact_report(report: &Value) -> Value {
-    let findings = report["findings"].as_array().cloned().unwrap_or_default();
+    let findings = report["findings"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let compact_findings = findings
         .iter()
         .take(3)
-        .map(|finding| {
-            json!({
-                "id": finding["id"],
-                "category": finding["category"],
-                "severity": finding["severity"],
-                "title": finding["title"],
-                "summary": finding["summary"],
-                "evidence_quality": finding["evidence_quality"],
-                "primary_evidence_id": finding["evidence_ids"].as_array().and_then(|ids| ids.first()),
-                "affected_skill_count": finding["affected_skill_count"],
-                "affected_placement_count": finding["affected_placement_count"],
-                "impact": finding["impact"],
-                "coverage": finding["coverage"]
-            })
-        })
+        .map(compact_finding_summary)
         .collect::<Vec<_>>();
     json!({
         "report_id": report["report_id"],
@@ -3107,6 +3255,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.2.0",
         "a12e3bbf45e4a3d51b8075dd2b56a410f113fb27cd803676fb614bd88f278f9c",
     ),
+    (
+        "1.3.0",
+        "0fe2e7b8aed1f6db1c57a3d5b6efc247b795e1af01d5422b9168e707bc8c7b47",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4192,13 +4344,13 @@ mod recovery_tests {
             BootstrapContentStatus::Modified
         );
         let windows_legacy =
-            include_str!("../tests/fixtures/bootstrap-v1.2.0.md").replace('\n', "\r\n");
+            include_str!("../tests/fixtures/bootstrap-v1.3.0.md").replace('\n', "\r\n");
         assert_eq!(
             bootstrap_content_status(
                 &bootstrap_content_digest(windows_legacy.as_bytes()),
                 &current
             ),
-            BootstrapContentStatus::OfficialOutdated("1.2.0")
+            BootstrapContentStatus::OfficialOutdated("1.3.0")
         );
     }
 

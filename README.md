@@ -27,6 +27,8 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 skillroster scan --json
 skillroster --source-root /absolute/trusted/source scan --json
 skillroster report --summary --json
+skillroster report --findings --limit 20 --json
+skillroster report --findings --category usage --json
 skillroster report --finding <finding-id> --limit 20 --json
 skillroster report --finding <finding-id> --full --json
 skillroster find "database migration" --json
@@ -89,6 +91,11 @@ collections, placement records, and Evidence records stay behind explicit
 `report --finding ID --full --json`. Unsafe escaping links return a trust
 decision and observed targets instead of suggesting an automatic filesystem
 Plan.
+
+The three-Finding summary leads to `report --findings`, a compact paged list
+that can be filtered by category or severity. This gives Agents a bounded path
+to every Finding without loading the exhaustive report. Only a selected
+Finding leads to Evidence inspection or planning.
 
 ## Status
 
