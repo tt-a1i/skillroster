@@ -6,5 +6,6 @@ pub mod model;
 pub mod present;
 pub mod query;
 pub mod roster_plan;
+pub mod roster_recommendation;
 pub mod scan;
 pub mod sqlite;

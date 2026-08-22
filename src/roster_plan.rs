@@ -14,6 +14,94 @@ pub struct DerivedRosterPlan {
     pub impact: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct RosterChangeExclusion {
+    pub agent: String,
+    pub skill_id: String,
+    pub reason: &'static str,
+}
+
+pub struct SupportedRosterChanges {
+    pub changes: Vec<RosterChange>,
+    pub exclusions: Vec<RosterChangeExclusion>,
+}
+
+/// Keep a semantic bulk recommendation useful without weakening raw Plan safety.
+/// A demotion is excluded when no exact owned placement can remain or be migrated.
+pub fn exclude_unpreservable_demotions(
+    scan: &ScanResult,
+    changes: Vec<RosterChange>,
+) -> Result<SupportedRosterChanges> {
+    let mut by_skill = BTreeMap::<&str, Vec<&RosterChange>>::new();
+    for change in &changes {
+        agent(&change.agent)?;
+        by_skill.entry(&change.skill_id).or_default().push(change);
+    }
+    let mut excluded_pairs = BTreeSet::new();
+    let mut exclusions = Vec::new();
+    for (skill_id, requests) in by_skill {
+        let placements = scan
+            .placements
+            .iter()
+            .filter(|placement| placement.skill_id == skill_id)
+            .collect::<Vec<_>>();
+        let demoted_agents = requests
+            .iter()
+            .filter(|request| request.state != "core")
+            .map(|request| agent(&request.agent))
+            .collect::<Result<BTreeSet<_>>>()?;
+        if demoted_agents.is_empty() {
+            continue;
+        }
+        let removable = placements
+            .iter()
+            .copied()
+            .filter(|placement| {
+                placement
+                    .agent
+                    .is_some_and(|agent| demoted_agents.contains(&agent))
+            })
+            .collect::<Vec<_>>();
+        let exact_digest = scan
+            .skills
+            .iter()
+            .find(|skill| skill.id == skill_id)
+            .map(|skill| skill.content_digest.as_str())
+            .ok_or_else(|| anyhow!("Skill {skill_id} is not in the latest Snapshot"))?;
+        let retained_owned = placements
+            .iter()
+            .copied()
+            .filter(|placement| !removable.iter().any(|item| item.id == placement.id))
+            .any(|placement| is_real_exact(placement, exact_digest));
+        let migratable_owned = removable
+            .iter()
+            .copied()
+            .any(|placement| is_real_exact(placement, exact_digest));
+        if retained_owned || migratable_owned {
+            continue;
+        }
+        for request in requests
+            .into_iter()
+            .filter(|request| request.state != "core")
+        {
+            excluded_pairs.insert((request.agent.clone(), request.skill_id.clone()));
+            exclusions.push(RosterChangeExclusion {
+                agent: request.agent.clone(),
+                skill_id: request.skill_id.clone(),
+                reason: "no_owned_exact_content_to_preserve",
+            });
+        }
+    }
+    let changes = changes
+        .into_iter()
+        .filter(|change| !excluded_pairs.contains(&(change.agent.clone(), change.skill_id.clone())))
+        .collect();
+    Ok(SupportedRosterChanges {
+        changes,
+        exclusions,
+    })
+}
+
 pub fn derive(
     scan: &ScanResult,
     state_dir: &Path,
@@ -362,6 +450,43 @@ mod tests {
         assert_eq!(plan.impact["after_default_exposure"], 0);
         assert!(plan.impact["exposure_reduction_percent"].as_f64().unwrap() >= 50.0);
         assert_eq!(plan.implicit_library_changes.len(), 120);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn semantic_bulk_changes_exclude_an_unowned_escaping_link() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".codex/skills");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: external\n---\nfixture\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("external")).unwrap();
+        let snapshot = scan(&ScanOptions::for_home(&home)).unwrap();
+        let skill_id = snapshot.placements[0].skill_id.clone();
+
+        let supported = exclude_unpreservable_demotions(
+            &snapshot,
+            vec![RosterChange {
+                agent: "codex".into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(supported.changes.is_empty());
+        assert_eq!(supported.exclusions.len(), 1);
+        assert_eq!(supported.exclusions[0].skill_id, skill_id);
+        assert_eq!(
+            supported.exclusions[0].reason,
+            "no_owned_exact_content_to_preserve"
+        );
     }
 
     #[test]

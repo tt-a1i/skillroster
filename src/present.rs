@@ -1050,7 +1050,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "bootstrap_version": "1.4.0",
+                "bootstrap_version": "1.5.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -1072,7 +1072,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "bootstrap_version": "1.4.0",
+                "bootstrap_version": "1.5.0",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,

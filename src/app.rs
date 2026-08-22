@@ -1117,6 +1117,10 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 finding_library_planning(&stored, &report.scan_id, &latest_scan_id, &scan)
             {
                 object.insert("planning".into(), planning);
+            } else if let Some(planning) =
+                finding_roster_planning(store, &stored, &report.scan_id, &latest_scan_id, &scan)?
+            {
+                object.insert("planning".into(), planning);
             }
             let affected_skill_ids = object
                 .get("affected_skill_ids")
@@ -1566,6 +1570,133 @@ fn finding_library_planning(
             }]
         }
     }))
+}
+
+fn finding_roster_planning(
+    store: &StateStore,
+    finding: &FindingRecord,
+    scan_id: &ScanId,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<Option<Value>> {
+    if finding.category != FindingCategory::Exposure
+        || finding.title != "Large default Rosters need review"
+    {
+        return Ok(None);
+    }
+    if scan_id != latest_scan_id {
+        return Ok(Some(json!({
+            "supported": false,
+            "reason": "stale_finding",
+            "snapshot_id": scan_id,
+            "latest_snapshot_id": latest_scan_id
+        })));
+    }
+    let recommendation = match crate::roster_recommendation::recommend(
+        finding,
+        scan,
+        &declared_core_pairs(store, scan)?,
+        &crate::roster_recommendation::RecommendationRequest {
+            core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
+            protected_skill_ids: BTreeSet::new(),
+        },
+    ) {
+        Ok(recommendation) => recommendation,
+        Err(error) => {
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": "automatic_roster_selection_unavailable",
+                "detail": error.to_string(),
+                "snapshot_id": scan_id
+            })));
+        }
+    };
+    let supported =
+        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
+    let agents = recommendation
+        .agents
+        .iter()
+        .map(|agent| {
+            let unchanged_blocked_count = supported
+                .exclusions
+                .iter()
+                .filter(|exclusion| exclusion.agent == agent.agent.id())
+                .count();
+            let preview = agent
+                .core_selections
+                .iter()
+                .take(5)
+                .map(|selection| {
+                    json!({
+                        "skill_id": selection.skill_id,
+                        "name": selection.name,
+                        "reason": selection.reason
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "agent": agent.agent.id(),
+                "before_default_exposure": agent.before_default_exposure,
+                "unique_skill_count": agent.unique_skill_count,
+                "proposed_core_count": agent.core_count,
+                "proposed_on_demand_count": agent.on_demand_count.saturating_sub(unchanged_blocked_count),
+                "unchanged_blocked_count": unchanged_blocked_count,
+                "positive_signal_count": agent.positive_signal_count,
+                "fallback_core_count": agent.fallback_core_count,
+                "core_preview": preview,
+                "core_preview_truncated": agent.core_selections.len() > 5
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked_change_count = supported.exclusions.len();
+    let blocked_changes = supported
+        .exclusions
+        .iter()
+        .take(5)
+        .map(|exclusion| {
+            json!({
+                "agent": exclusion.agent,
+                "skill_id": exclusion.skill_id,
+                "reason": exclusion.reason,
+                "state": "unchanged"
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Some(json!({
+        "supported": true,
+        "decision": "right_size_default_rosters",
+        "snapshot_id": scan_id,
+        "request_field": "finding_roster_changes",
+        "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+        "allowed_core_budget": {
+            "minimum": 1,
+            "maximum": crate::roster_recommendation::MAX_CORE_BUDGET,
+            "unit": "skills_per_affected_agent"
+        },
+        "selection_policy": [
+            "protected_by_request",
+            "declared_core",
+            "skillroster_bootstrap",
+            "positive_usage_evidence",
+            "stable_fallback"
+        ],
+        "absence_of_usage_evidence": "not_negative_evidence",
+        "automatic_target_states": ["core", "on_demand"],
+        "explicit_only_or_archive_decision_implied": false,
+        "blocked_change_count": blocked_change_count,
+        "blocked_changes": blocked_changes,
+        "blocked_changes_truncated": blocked_change_count > 5,
+        "agent_count": agents.len(),
+        "agents": agents,
+        "plan_request_template": {
+            "schema_version": 1,
+            "finding_roster_changes": [{
+                "finding_id": finding.id,
+                "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "protected_skill_ids": []
+            }]
+        }
+    })))
 }
 
 fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
@@ -2028,17 +2159,33 @@ fn affected_summary(prepared: &PreparedPlan, scan: &ScanResult) -> Value {
                 .map(|change| change.skill_id.clone()),
         )
         .collect::<std::collections::BTreeSet<_>>();
-    let placements = prepared
-        .library_changes
+    let roster_pairs = prepared
+        .roster_changes
         .iter()
-        .flat_map(|change| change.placement_ids.iter().cloned())
-        .chain(
-            prepared
-                .source_updates
-                .iter()
-                .map(|change| change.placement_id.clone()),
-        )
-        .collect::<std::collections::BTreeSet<_>>();
+        .map(|change| (change.agent.as_str(), change.skill_id.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut placements = scan
+        .placements
+        .iter()
+        .filter(|placement| {
+            placement.agent.is_some_and(|agent| {
+                roster_pairs.contains(&(agent.id(), placement.skill_id.as_str()))
+            })
+        })
+        .map(|placement| placement.id.clone())
+        .collect::<BTreeSet<_>>();
+    placements.extend(
+        prepared
+            .library_changes
+            .iter()
+            .flat_map(|change| change.placement_ids.iter().cloned())
+            .chain(
+                prepared
+                    .source_updates
+                    .iter()
+                    .map(|change| change.placement_id.clone()),
+            ),
+    );
     for placement in &scan.placements {
         if placements.contains(&placement.id) {
             if let Some(agent) = placement.agent {
@@ -2129,6 +2276,20 @@ fn bounded_plan_impact(mut impact: Value) -> Value {
         );
         object.insert("exclusions_truncated".into(), json!(exclusions.len() > 5));
     }
+    if let Some(blocked) = object
+        .remove("blocked_preconditions")
+        .and_then(|value| value.as_array().cloned())
+    {
+        object.insert("blocked_precondition_count".into(), json!(blocked.len()));
+        object.insert(
+            "blocked_preconditions".into(),
+            json!(blocked.iter().take(5).collect::<Vec<_>>()),
+        );
+        object.insert(
+            "blocked_preconditions_truncated".into(),
+            json!(blocked.len() > 5),
+        );
+    }
     if let Some(roster) = object.get_mut("roster") {
         bound_transition(roster, "state");
     }
@@ -2194,9 +2355,142 @@ struct FindingLibraryChangeRequest {
     requested_state: RequestedGovernanceState,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FindingRosterChangeRequest {
+    finding_id: String,
+    core_budget: usize,
+    #[serde(default)]
+    protected_skill_ids: Vec<String>,
+}
+
 struct FindingPlanProvenance {
     report_id: ReportId,
     finding_ids: Vec<FindingId>,
+    roster_exclusions: Vec<Value>,
+}
+
+fn declared_core_pairs(
+    store: &StateStore,
+    scan: &ScanResult,
+) -> Result<BTreeSet<(AgentKind, String)>> {
+    let mut pairs = BTreeSet::new();
+    let unique = scan
+        .placements
+        .iter()
+        .filter_map(|placement| {
+            placement
+                .agent
+                .map(|agent| (agent, placement.skill_id.as_str()))
+        })
+        .collect::<BTreeSet<_>>();
+    for (agent, skill_id) in unique {
+        let Some(agent_id) = store.agent_id(&model_agent(agent))? else {
+            continue;
+        };
+        let skill_id = SkillId::parse(skill_id.to_owned())?;
+        if store
+            .roster_entry(&agent_id, &skill_id)?
+            .is_some_and(|entry| entry.state == RosterState::Core)
+        {
+            pairs.insert((agent, skill_id.as_str().to_owned()));
+        }
+    }
+    Ok(pairs)
+}
+
+fn expand_finding_roster_changes(
+    store: &StateStore,
+    mut input: Value,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<(Value, Option<FindingPlanProvenance>)> {
+    let object = input
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Plan input must be a JSON object"))?;
+    let raw = object
+        .remove("finding_roster_changes")
+        .unwrap_or_else(|| json!([]));
+    let requests: Vec<FindingRosterChangeRequest> = serde_json::from_value(raw)?;
+    if requests.is_empty() {
+        return Ok((input, None));
+    }
+    if requests.len() != 1 {
+        bail!("one finding_roster_changes request is allowed per Plan");
+    }
+    if [
+        "scan_id",
+        "evidence_ids",
+        "roster_changes",
+        "source_updates",
+        "library_changes",
+        "finding_library_changes",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+    {
+        bail!(
+            "finding_roster_changes cannot be mixed with CLI-derived IDs or other governance changes"
+        );
+    }
+    let request = requests.into_iter().next().expect("length checked");
+    let protected_skill_ids = request
+        .protected_skill_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if protected_skill_ids.len() != request.protected_skill_ids.len() {
+        bail!("finding_roster_changes contains duplicate protected Skill IDs");
+    }
+    let finding_id = FindingId::parse(request.finding_id)?;
+    let finding = store
+        .get_finding(&finding_id)?
+        .ok_or_else(|| anyhow!("Finding {finding_id} does not exist"))?;
+    let report = store
+        .get_report(&finding.report_id)?
+        .ok_or_else(|| anyhow!("Report {} does not exist", finding.report_id))?;
+    if report.scan_id != *latest_scan_id {
+        bail!("Finding {finding_id} does not belong to the latest Snapshot {latest_scan_id}");
+    }
+    let recommendation = crate::roster_recommendation::recommend(
+        &finding,
+        scan,
+        &declared_core_pairs(store, scan)?,
+        &crate::roster_recommendation::RecommendationRequest {
+            core_budget: request.core_budget,
+            protected_skill_ids,
+        },
+    )?;
+    let supported =
+        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
+    if supported.changes.is_empty() {
+        bail!("Finding {finding_id} has no safely governable Roster changes");
+    }
+    if finding.evidence_ids.is_empty() {
+        bail!("Finding {finding_id} has no Evidence");
+    }
+    input["scan_id"] = json!(latest_scan_id);
+    input["evidence_ids"] = json!(finding.evidence_ids);
+    input["roster_changes"] = serde_json::to_value(supported.changes)?;
+    Ok((
+        input,
+        Some(FindingPlanProvenance {
+            report_id: finding.report_id,
+            finding_ids: vec![finding_id],
+            roster_exclusions: supported
+                .exclusions
+                .into_iter()
+                .map(|exclusion| {
+                    json!({
+                        "agent": exclusion.agent,
+                        "skill_id": exclusion.skill_id,
+                        "reason": exclusion.reason,
+                        "state": "unchanged"
+                    })
+                })
+                .collect(),
+        }),
+    ))
 }
 
 fn exact_duplicate_finding_scope(
@@ -2288,6 +2582,7 @@ fn expand_finding_library_changes(
         "roster_changes",
         "source_updates",
         "library_changes",
+        "finding_roster_changes",
     ]
     .iter()
     .any(|key| object.contains_key(*key))
@@ -2344,6 +2639,7 @@ fn expand_finding_library_changes(
         Some(FindingPlanProvenance {
             report_id: report_id.expect("non-empty Finding requests have a Report"),
             finding_ids,
+            roster_exclusions: Vec::new(),
         }),
     ))
 }
@@ -2872,7 +3168,11 @@ fn prepare_plan(
     }
     let (scan_id, scan) = latest_scan(store)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
-        expand_finding_library_changes(store, input, &scan_id, &scan)?
+        let (input, roster_provenance) =
+            expand_finding_roster_changes(store, input, &scan_id, &scan)?;
+        let (input, library_provenance) =
+            expand_finding_library_changes(store, input, &scan_id, &scan)?;
+        (input, roster_provenance.or(library_provenance))
     } else {
         (input, None)
     };
@@ -2960,6 +3260,15 @@ fn prepare_plan(
     } else {
         json!(source_update_diffs)
     };
+    if let (Some(object), Some(provenance)) = (impact.as_object_mut(), finding_provenance.as_ref())
+    {
+        if !provenance.roster_exclusions.is_empty() {
+            object.insert(
+                "blocked_preconditions".into(),
+                json!(provenance.roster_exclusions),
+            );
+        }
+    }
     if let Some(object) = impact.as_object_mut() {
         object.insert(
             "roster".into(),
@@ -3258,6 +3567,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.3.0",
         "0fe2e7b8aed1f6db1c57a3d5b6efc247b795e1af01d5422b9168e707bc8c7b47",
+    ),
+    (
+        "1.4.0",
+        "2161ba4834fb350afee75fd6ab90ecff49741c971bb2d670b8d3c9f6588f9b70",
     ),
 ];
 
@@ -4344,13 +4657,13 @@ mod recovery_tests {
             BootstrapContentStatus::Modified
         );
         let windows_legacy =
-            include_str!("../tests/fixtures/bootstrap-v1.3.0.md").replace('\n', "\r\n");
+            include_str!("../tests/fixtures/bootstrap-v1.4.0.md").replace('\n', "\r\n");
         assert_eq!(
             bootstrap_content_status(
                 &bootstrap_content_digest(windows_legacy.as_bytes()),
                 &current
             ),
-            BootstrapContentStatus::OfficialOutdated("1.3.0")
+            BootstrapContentStatus::OfficialOutdated("1.4.0")
         );
     }
 

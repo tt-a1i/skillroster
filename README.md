@@ -85,6 +85,18 @@ For an exact-duplicate Finding, the Agent submits only the choices it owns:
 SkillRoster resolves the current Snapshot, Evidence, Skill, and complete
 placement set from that immutable Finding and rejects stale or mismatched input.
 
+For a large default-Roster Finding, the Agent chooses a Core budget instead of
+copying every Skill and placement into the request:
+
+```json
+{"schema_version":1,"finding_roster_changes":[{"finding_id":"finding_...","core_budget":50,"protected_skill_ids":[]}]}
+```
+
+The CLI preserves declared and protected Core Skills, ranks positive local
+usage evidence, and moves only the remainder to On-demand. Missing usage is not
+treated as evidence for archiving. A placement without exact owned canonical
+content stays unchanged and appears as a bounded blocked precondition.
+
 Finding drilldown is compact by default: each paged `item` carries one
 traceable Evidence ID, subject, path, and decision facts. Complete duplicate ID
 collections, placement records, and Evidence records stay behind explicit
