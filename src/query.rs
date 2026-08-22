@@ -6,6 +6,7 @@ use crate::scan::{
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -691,15 +692,23 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             if exact_placements.len() < 2 {
                 continue;
             }
+            let physical_sources = exact_placements
+                .iter()
+                .map(|placement| physical_source_identity(placement, &scan.placements))
+                .collect::<BTreeSet<_>>();
+            if physical_sources.len() < 2 {
+                continue;
+            }
             push_finding(
                 findings,
                 FindingCategory::Overlap,
                 Severity::Medium,
                 "Exact duplicate Skill placements",
                 format!(
-                    "{} has {} placements with the same normalized content digest.",
+                    "{} has {} placements across {} distinct physical sources with the same normalized content digest.",
                     skill.name,
-                    exact_placements.len()
+                    exact_placements.len(),
+                    physical_sources.len()
                 ),
                 vec![skill.id.clone()],
                 exact_placements
@@ -770,6 +779,41 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             ],
             EvidenceQuality::Inferred,
         );
+    }
+}
+
+fn physical_source_identity(
+    start: &crate::scan::SkillPlacement,
+    placements: &[crate::scan::SkillPlacement],
+) -> PathBuf {
+    let mut current = start;
+    let mut visited = BTreeSet::new();
+    loop {
+        if current.link_status != LinkStatus::Valid {
+            return current.directory.clone();
+        }
+        if !visited.insert(current.directory.clone()) {
+            return current.directory.clone();
+        }
+        let Some(target) = current.link_target.as_deref() else {
+            return current.directory.clone();
+        };
+        if let Some(next) = placements
+            .iter()
+            .find(|placement| placement.directory == target || placement.entrypoint == target)
+        {
+            current = next;
+            continue;
+        }
+        return skill_directory_for_link_target(target);
+    }
+}
+
+fn skill_directory_for_link_target(target: &Path) -> PathBuf {
+    if target.file_name().is_some_and(|name| name == "SKILL.md") {
+        target.parent().unwrap_or(target).to_path_buf()
+    } else {
+        target.to_path_buf()
     }
 }
 
@@ -1495,7 +1539,6 @@ mod tests {
     use super::*;
     use crate::scan::{ScanOptions, scan};
     use std::fs;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture() -> (PathBuf, ScanResult) {
@@ -1561,6 +1604,73 @@ mod tests {
                 && finding.evidence_quality == EvidenceQuality::Unknown
         }));
         assert!(!report.files_changed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_duplicate_ignores_one_physical_source_shared_by_valid_links() {
+        let (root, mut scan) = fixture();
+        let source = scan
+            .placements
+            .iter()
+            .find(|placement| placement.directory.ends_with("research-a"))
+            .unwrap()
+            .clone();
+        let mut direct_link = source.clone();
+        direct_link.id = "placement_direct_link".into();
+        direct_link.directory = root.join("linked-direct");
+        direct_link.entrypoint = direct_link.directory.join("SKILL.md");
+        direct_link.link_target = Some(source.directory.clone());
+        direct_link.link_status = LinkStatus::Valid;
+        let mut indirect_link = source.clone();
+        indirect_link.id = "placement_indirect_link".into();
+        indirect_link.directory = root.join("linked-indirect");
+        indirect_link.entrypoint = indirect_link.directory.join("SKILL.md");
+        indirect_link.link_target = Some(direct_link.directory.clone());
+        indirect_link.link_status = LinkStatus::Valid;
+        scan.placements
+            .retain(|placement| placement.skill_id != source.skill_id || placement.id == source.id);
+        scan.placements.push(direct_link);
+        scan.placements.push(indirect_link);
+
+        let report = build_report(&scan);
+
+        assert!(!report.findings.iter().any(|finding| {
+            finding.title == "Exact duplicate Skill placements"
+                && finding.affected_skill_ids.contains(&source.skill_id)
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_duplicate_keeps_multiple_physical_sources_with_shared_links() {
+        let (root, mut scan) = fixture();
+        let source = scan
+            .placements
+            .iter()
+            .find(|placement| placement.directory.ends_with("research-a"))
+            .unwrap()
+            .clone();
+        let mut shared_link = source.clone();
+        shared_link.id = "placement_shared_link".into();
+        shared_link.directory = root.join("linked-copy");
+        shared_link.entrypoint = shared_link.directory.join("SKILL.md");
+        shared_link.link_target = Some(source.directory.clone());
+        shared_link.link_status = LinkStatus::Valid;
+        scan.placements.push(shared_link);
+
+        let report = build_report(&scan);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| {
+                finding.title == "Exact duplicate Skill placements"
+                    && finding.affected_skill_ids.contains(&source.skill_id)
+            })
+            .unwrap();
+
+        assert_eq!(finding.affected_placement_ids.len(), 3);
+        assert!(finding.summary.contains("2 distinct physical sources"));
         fs::remove_dir_all(root).unwrap();
     }
 
