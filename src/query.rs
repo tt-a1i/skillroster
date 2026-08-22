@@ -786,6 +786,9 @@ fn physical_source_identity(
     start: &crate::scan::SkillPlacement,
     placements: &[crate::scan::SkillPlacement],
 ) -> PathBuf {
+    if start.physical_directory.is_some() {
+        return start.physical_directory_or_logical().to_path_buf();
+    }
     let mut current = start;
     let mut visited = BTreeSet::new();
     loop {
@@ -2276,6 +2279,7 @@ mod tests {
                     root: PathBuf::from(format!("/{}/skills", agent.id())),
                     directory: PathBuf::from(format!("/{}/skills/{index}", agent.id())),
                     entrypoint: PathBuf::from(format!("/{}/skills/{index}/SKILL.md", agent.id())),
+                    physical_directory: None,
                     content_digest: format!("digest_{index}"),
                     link_target: None,
                     link_status: crate::scan::LinkStatus::NotLink,
