@@ -518,21 +518,81 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
             } else {
                 lines.push(format!("     roster {roster} · source {source}"));
             }
-            if item
+            let has_variants = item
                 .get("variant_count")
                 .and_then(Value::as_u64)
-                .is_some_and(|count| count > 1)
-            {
+                .is_some_and(|count| count > 1);
+            let variant_details = item
+                .get("variants")
+                .and_then(Value::as_array)
+                .filter(|variants| !variants.is_empty());
+            if has_variants {
                 lines.push(format!(
                     "     variants {} · inspect layout Finding",
                     text(item, "variant_count")
                 ));
             }
             lines.push(format!("     reasons {reasons}"));
-            lines.push(format!(
-                "     {}",
-                middle_truncate(path, width.saturating_sub(5))
-            ));
+            if let Some(variants) = variant_details {
+                for variant in variants.iter().take(3) {
+                    let providers = variant
+                        .get("providers")
+                        .and_then(Value::as_array)
+                        .map(|providers| {
+                            providers
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|providers| !providers.is_empty());
+                    let label = if let Some(providers) = providers {
+                        let management = if variant
+                            .get("governable")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            "mixed"
+                        } else {
+                            "read-only"
+                        };
+                        format!("plugin {providers} · {management}")
+                    } else {
+                        let agents = variant
+                            .get("agents")
+                            .and_then(Value::as_array)
+                            .map(|agents| {
+                                agents
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .filter(|agents| !agents.is_empty())
+                            .unwrap_or_else(|| "source".into());
+                        format!("{agents} · roster {}", text(variant, "roster_state"))
+                    };
+                    let variant_path = variant
+                        .get("paths")
+                        .and_then(Value::as_array)
+                        .and_then(|paths| paths.first())
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    lines.push(format!(
+                        "       {}",
+                        middle_truncate(&label, width.saturating_sub(7))
+                    ));
+                    lines.push(format!(
+                        "       {}",
+                        middle_truncate(variant_path, width.saturating_sub(7))
+                    ));
+                }
+            } else {
+                lines.push(format!(
+                    "     {}",
+                    middle_truncate(path, width.saturating_sub(5))
+                ));
+            }
         }
         if items.is_empty() {
             lines.push("  No matching Skills found.".into());
@@ -1397,6 +1457,44 @@ mod tests {
         assert!(
             provider.contains("Codex plugin browser@openai-bundled · provider-managed · read-only")
         );
+
+        let variants = render(
+            "find",
+            &json!({"matches": [{
+                "name": "shared-browser",
+                "roster_state": "unassigned",
+                "source": null,
+                "variant_count": 2,
+                "match_reasons": ["name_tokens:1"],
+                "paths": ["/local/shared-browser/SKILL.md"],
+                "variants": [
+                    {
+                        "skill_id": "skill_local",
+                        "paths": ["/local/shared-browser/SKILL.md"],
+                        "agents": ["codex"],
+                        "roster_state": "core",
+                        "providers": [],
+                        "governable": true
+                    },
+                    {
+                        "skill_id": "skill_plugin",
+                        "paths": ["/plugins/browser/shared-browser/SKILL.md"],
+                        "agents": [],
+                        "roster_state": "unassigned",
+                        "providers": ["browser@openai-bundled"],
+                        "governable": false
+                    }
+                ]
+            }]}),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(variants.contains("codex · roster core"));
+        assert!(variants.contains("/local/shared-browser/SKILL.md"));
+        assert!(variants.contains("plugin browser@openai-bundled · read-only"));
+        assert!(variants.contains("/plugins/browser/shared-browser/SKILL.md"));
 
         let planned = render(
             "plan",

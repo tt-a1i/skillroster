@@ -291,7 +291,7 @@ fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<
     let mut sections = BTreeMap::<String, PluginConfigState>::new();
     let mut current_plugin = None::<String>;
     for line in config.lines() {
-        let line = line.trim();
+        let line = strip_toml_comment(line).trim();
         if line.starts_with('[') {
             current_plugin = parse_plugin_section(line);
             if let Some(plugin_id) = &current_plugin {
@@ -302,7 +302,7 @@ fn parse_enabled_codex_plugins(config: &str, warnings: &mut Vec<String>) -> Vec<
         let Some(plugin_id) = &current_plugin else {
             continue;
         };
-        let value = line.split('#').next().unwrap_or_default().trim();
+        let value = line;
         let enabled = value
             .split_once('=')
             .filter(|(key, _)| key.trim() == "enabled")
@@ -360,6 +360,25 @@ fn parse_plugin_section(line: &str) -> Option<String> {
     line.strip_prefix("[plugins.\"")
         .and_then(|value| value.strip_suffix("\"]"))
         .map(str::to_owned)
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '#' && !quoted {
+            return &line[..index];
+        }
+    }
+    line
 }
 
 fn safe_path_component(value: &str) -> bool {
@@ -1446,7 +1465,7 @@ mod tests {
         let mut warnings = Vec::new();
         let plugins = parse_enabled_codex_plugins(
             r#"
-[plugins."browser@openai-bundled"]
+[plugins."browser@openai-bundled"] # enabled browser provider
 enabled  =  true
 [plugins."disabled@openai-bundled"]
 enabled	=	false

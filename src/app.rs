@@ -1989,16 +1989,45 @@ fn find_command(
     let mut warnings = Vec::new();
     let mut rescan_required = false;
     for (index, found) in matches.iter_mut().enumerate() {
-        let skill_id = SkillId::parse(found.skill_id.clone())?;
-        found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-        let paths = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
-        found.paths = paths.paths;
-        if paths.drifted {
+        let mut drifted_variants = 0_usize;
+        if found.variants.is_empty() {
+            let skill_id = SkillId::parse(found.skill_id.clone())?;
+            found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
+            let current = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
+            found.paths = current.paths;
+            drifted_variants += usize::from(current.drifted);
+        } else {
+            for variant in &mut found.variants {
+                let skill_id = SkillId::parse(variant.skill_id.clone())?;
+                variant.roster_state =
+                    current_roster_state(&store.roster_states_for_skill(&skill_id)?);
+                let current = current_readable_skill_paths(&scan, state_dir, &variant.skill_id)?;
+                variant.paths = current.paths;
+                drifted_variants += usize::from(current.drifted);
+            }
+            if let Some(representative) = found
+                .variants
+                .iter()
+                .find(|variant| variant.skill_id == found.skill_id)
+            {
+                found.paths = representative.paths.clone();
+                found.roster_state = representative.roster_state.clone();
+            }
+        }
+        if drifted_variants > 0 {
             rescan_required = true;
-            warnings.push(format!(
-                "{} has no current path that matches the latest Snapshot identity and fingerprint; run skillroster scan",
-                found.name
-            ));
+            let variant_count = found.variants.len().max(1);
+            warnings.push(if drifted_variants == variant_count {
+                format!(
+                    "{} has no current path that matches the latest Snapshot identity and fingerprint; run skillroster scan",
+                    found.name
+                )
+            } else {
+                format!(
+                    "{} has {drifted_variants} same-name variant(s) with path drift; run skillroster scan",
+                    found.name
+                )
+            });
         }
         if index < 3 && found.variant_count > 1 {
             warnings.push(format!(
