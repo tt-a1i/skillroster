@@ -257,29 +257,47 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(
         lines,
         "Observed-use Agents",
-        if let Some(coverage) = value.get("session_coverage") {
+        text(value, "observed_use_agent_count"),
+    );
+    if let Some(coverage) = value.get("session_coverage") {
+        fact(
+            lines,
+            "Session sample",
             format!(
-                "{} · sampled {}/{} · complete {}/{} · limited {}/{} · missing {}/{} · inaccessible {}/{}",
-                text(value, "observed_use_agent_count"),
+                "sampled {}/{} · complete {}/{}",
                 text(coverage, "sampled_agents"),
                 text(coverage, "supported_agents"),
                 text(coverage, "complete_agents"),
-                text(coverage, "supported_agents"),
+                text(coverage, "supported_agents")
+            ),
+        );
+        fact(
+            lines,
+            "Coverage limits",
+            format!(
+                "limited {}/{} · missing {}/{}",
                 text(coverage, "limited_agents"),
                 text(coverage, "supported_agents"),
                 text(coverage, "missing_root_agents"),
-                text(coverage, "supported_agents"),
+                text(coverage, "supported_agents")
+            ),
+        );
+        fact(
+            lines,
+            "Inaccessible",
+            format!(
+                "{}/{}",
                 text(coverage, "inaccessible_agents"),
                 text(coverage, "supported_agents")
-            )
-        } else {
-            format!(
-                "{} · reliable {}/8",
-                text(value, "observed_use_agent_count"),
-                text(value, "coverage_reliable_agent_count")
-            )
-        },
-    );
+            ),
+        );
+    } else {
+        fact(
+            lines,
+            "Reliable coverage",
+            format!("{}/8", text(value, "coverage_reliable_agent_count")),
+        );
+    }
     lines.push(String::new());
     lines.push("  Top Findings".into());
     if let Some(findings) = value.get("findings").and_then(Value::as_array) {
@@ -293,6 +311,34 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
         if findings.is_empty() {
             lines.push("  none".into());
+        }
+    }
+    if let Some(rollups) = value.get("finding_rollups").and_then(Value::as_array)
+        && !rollups.is_empty()
+    {
+        const VISIBLE_ROLLUPS: usize = 5;
+        lines.push(String::new());
+        lines.push("  Finding groups".into());
+        for rollup in rollups.iter().take(VISIBLE_ROLLUPS) {
+            let prefix = format!(
+                "  {} × {} Skills · {} placements · ",
+                text(rollup, "finding_count"),
+                text(rollup, "affected_skill_count"),
+                text(rollup, "affected_placement_count")
+            );
+            lines.push(format!(
+                "{prefix}{}",
+                middle_truncate(
+                    &text(rollup, "title"),
+                    width.saturating_sub(display_width(&prefix))
+                )
+            ));
+        }
+        if rollups.len() > VISIBLE_ROLLUPS {
+            lines.push(format!(
+                "  … {} more groups in JSON",
+                rollups.len() - VISIBLE_ROLLUPS
+            ));
         }
     }
     if let Some(counts) = value.get("category_counts").and_then(Value::as_object) {
@@ -1051,8 +1097,11 @@ fn terminal_width() -> usize {
 }
 
 fn middle_truncate(value: &str, maximum: usize) -> String {
-    if display_width(value) <= maximum || maximum < 5 {
+    if display_width(value) <= maximum {
         return value.into();
+    }
+    if maximum < 5 {
+        return take_width(value, maximum, false);
     }
     let left_budget = (maximum - 1) / 2;
     let right_budget = maximum - left_budget - 1;
@@ -1271,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn report_preserves_four_metrics_top_three_and_category_totals_at_reference_widths() {
+    fn report_preserves_metrics_top_three_rollups_and_totals_at_reference_widths() {
         let value = json!({
             "skill_count": 137,
             "placement_count": 212,
@@ -1293,6 +1342,20 @@ mod tests {
                 {"severity": "low", "category": "lifecycle", "title": "Unknown source"},
                 {"severity": "info", "category": "usage", "title": "Coverage"}
             ],
+            "finding_rollups": [
+                {
+                    "title": "Exact duplicate Skill placements",
+                    "finding_count": 110,
+                    "affected_skill_count": 110,
+                    "affected_placement_count": 561
+                },
+                {
+                    "title": "Semantic overlap candidate",
+                    "finding_count": 25,
+                    "affected_skill_count": 50,
+                    "affected_placement_count": 0
+                }
+            ],
             "category_counts": {"layout": 1, "overlap": 1, "lifecycle": 1, "usage": 1}
         });
         for width in [60, 80, 120] {
@@ -1312,14 +1375,23 @@ mod tests {
                 "Broken links",
                 "Exact duplicates",
                 "Unknown source",
+                "Finding groups",
+                "110 ×",
+                "110 Skills",
+                "561 placements",
                 "Category totals",
             ] {
                 assert!(output.contains(expected), "{expected} missing at {width}");
             }
             assert!(!output.contains("Coverage\n"));
-            assert!(output.contains(
-                "sampled 5/8 · complete 3/8 · limited 3/8 · missing 2/8 · inaccessible 0/8"
-            ));
+            assert!(output.contains("sampled 5/8 · complete 3/8"));
+            assert!(output.contains("limited 3/8 · missing 2/8"));
+            assert!(output.contains("Inaccessible"));
+            assert!(output.contains("0/8"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
         }
     }
 

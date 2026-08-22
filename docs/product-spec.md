@@ -172,7 +172,7 @@ The bootstrap Skill instructs an Agent to prepare a complete read-only Plan when
 
 1. a one-sentence diagnosis;
 2. independent Skill count, placement count, default exposure, and observed-use count;
-3. the three most important Findings, then the remaining Findings grouped by category;
+3. the three most important Findings plus compact rollups that state the complete scale of every Finding group without loading the exhaustive report;
 4. prioritized recommendations with expected measurable impact;
 5. uncertainties, evidence quality, and safety risks;
 6. one primary next action and whether confirmation is required.

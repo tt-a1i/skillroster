@@ -8,7 +8,7 @@ description: >
   distributing, synchronizing, or repairing shared Skill directories and
   symlinks.
 metadata:
-  bootstrap-version: "1.8.8"
+  bootstrap-version: "1.8.9"
   skillroster-routing-triggers: "scan analyze duplicate unused local Agent Skills; inventory installed Agent Skills; analyze duplicate Agent Skills; evaluate possible unused local Agent Skills from usage evidence; govern a Skill Roster; prepare a Skill governance Plan; apply approved Skill Plan; create Skill Receipt; undo Skill organization"
 ---
 
@@ -18,7 +18,7 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 
 ## Inspect and propose
 
-1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis.
+1. Run `skillroster scan --json`, then `skillroster report --summary --json`. Use the compact result for the first user-facing diagnosis. Read `finding_rollups` to state the complete scale of each Finding group without loading the exhaustive report; use the three selected `findings` only for the highest-priority decisions.
 2. Distinguish observed, inferred, and unknown usage. Read `session_coverage` before presenting usage: `sampled_agents` have bounded local evidence, `complete_agents` alone support a complete observable-session denominator, `missing_root_agents` have no discovered session directory, and `inaccessible_agents` have a configured directory that could not be read. Limited samples may support observed event counts and stages, never a usage percentage or an “unused” claim. When the three-item summary is insufficient, use `report --findings --limit 20 --json`; narrow it with one `--category` or `--severity` from the summary totals, and follow `page.next_offset` only while that category still affects the decision. This paged list is the enumeration path; keep the exhaustive report out of the Agent context.
 3. Use stable Finding and Evidence IDs for follow-up questions. The summary and paged list expose one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Its compact `items` combine the Evidence ID, subject, path, quality, and decision facts without repeating complete internal collections. Use `--full` only when an exact complete ID or record is needed. Exact-duplicate and large-Roster details include bounded `planning` choices independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
 4. Make semantic governance choices in the conversation, then submit them to `skillroster plan --stdin --json`. For exact duplicates or a large default Roster, send `schema_version` plus the corresponding Finding request below; SkillRoster derives the current Snapshot, Evidence, Skills, placements, and complete changes. Other request families include the latest `scan_id` and relevant `evidence_ids`.

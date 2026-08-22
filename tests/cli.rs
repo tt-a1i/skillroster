@@ -275,6 +275,15 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
         &[&common[..], &["report", "--summary"]].concat(),
         None,
     ));
+    let duplicate_rollup = summary["result"]["finding_rollups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rollup| rollup["title"] == "Exact duplicate Skill placements")
+        .unwrap();
+    assert_eq!(duplicate_rollup["finding_count"], 30);
+    assert_eq!(duplicate_rollup["affected_skill_count"], 30);
+    assert_eq!(duplicate_rollup["affected_placement_count"], 60);
     assert_eq!(summary["suggested_actions"][0]["action"], "list_findings");
     assert_eq!(
         summary["suggested_actions"][0]["argv"],
@@ -313,6 +322,10 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
     assert_eq!(first["result"]["matched_finding_count"], 30);
     assert_eq!(first["result"]["page"]["returned"], 10);
     assert_eq!(first["result"]["page"]["next_offset"], 10);
+    assert_eq!(
+        first["result"]["finding_rollups"],
+        summary["result"]["finding_rollups"]
+    );
     assert_eq!(first["result"]["items"].as_array().unwrap().len(), 10);
     assert!(
         first["result"]["items"]
@@ -908,7 +921,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.8"
+        "1.8.9"
     );
 
     let undone = json_output(&run(
@@ -1078,7 +1091,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.8");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.9");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -3475,8 +3488,6 @@ fn report_distinguishes_inaccessible_and_missing_session_roots() {
     let human = run(&[&common[..], &["report", "--summary"]].concat(), None);
     assert!(human.status.success());
     let stdout = String::from_utf8_lossy(&human.stdout);
-    assert!(
-        stdout.contains("missing 7/8 · inaccessible 1/8"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("limited 0/8 · missing 7/8"), "{stdout}");
+    assert!(stdout.contains("Inaccessible           1/8"), "{stdout}");
 }
