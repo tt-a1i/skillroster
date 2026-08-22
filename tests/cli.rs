@@ -990,6 +990,73 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let shared = home.join(".agents_skills");
+    let opencode = home.join(".config/opencode/skills");
+    let hermes = home.join(".hermes/skills");
+    for root in [&shared, &opencode, &hermes] {
+        fs::create_dir_all(root).unwrap();
+    }
+    for (parent, link) in [
+        (home.join(".codex"), home.join(".codex/skills")),
+        (home.join(".claude"), home.join(".claude/skills")),
+        (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+    ] {
+        fs::create_dir_all(parent).unwrap();
+        symlink(&shared, link).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_eq!(
+        setup["result"]["detected_agents"].as_array().unwrap().len(),
+        5
+    );
+    assert_eq!(setup["result"]["targets"].as_array().unwrap().len(), 5);
+    assert_eq!(setup["result"]["missing_count"], 5);
+    assert_eq!(setup["result"]["physical_target_count"], 3);
+    assert_eq!(setup["result"]["operation_count"], 6);
+
+    let plan_id = setup["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    let operations = detail["result"]["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), 6);
+    let unique_targets = operations
+        .iter()
+        .map(|operation| operation["target"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique_targets.len(), 6);
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    for root in [&shared, &opencode, &hermes] {
+        assert!(root.join("skillroster/SKILL.md").is_file());
+    }
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    for root in [&shared, &opencode, &hermes] {
+        assert!(!root.join("skillroster").exists());
+    }
+}
+
 #[test]
 fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     let temp = TempDir::new().unwrap();

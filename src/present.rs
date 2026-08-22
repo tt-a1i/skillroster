@@ -840,6 +840,11 @@ fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Detected Agents",
         array_len(value, "detected_agents"),
     );
+    fact(
+        lines,
+        "Physical targets",
+        text(value, "physical_target_count"),
+    );
     fact(lines, "Current", text(value, "current_count"));
     fact(lines, "Missing", text(value, "missing_count"));
     fact(lines, "Official outdated", text(value, "outdated_count"));
