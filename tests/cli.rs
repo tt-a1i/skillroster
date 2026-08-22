@@ -368,11 +368,11 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         Some(&plan_input),
     ));
     assert_eq!(plan["result"]["files_changed"], false);
-    assert_eq!(plan["result"]["evidence_ids"][0], evidence_id);
+    assert_eq!(plan["result"]["evidence"]["ids"][0], evidence_id);
     assert_eq!(plan["result"]["change_summary"]["roster_change_count"], 1);
     assert_eq!(
-        plan["result"]["impact"]["roster"]["after"][0]["state"],
-        "on_demand"
+        plan["result"]["impact"]["roster"]["after_state_counts"]["on_demand"],
+        1
     );
     let plan_id = plan["result"]["plan_id"].as_str().unwrap();
 
@@ -935,11 +935,11 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     ));
     assert_eq!(plan["result"]["risk"], "source_update");
     assert_eq!(
-        plan["result"]["diff_summary"][0]["choice_reason"],
+        plan["result"]["diff_summary"]["items"][0]["choice_reason"],
         "first_observed_baseline_untrusted"
     );
     assert_eq!(
-        plan["result"]["diff_summary"][0]["choice"],
+        plan["result"]["diff_summary"]["items"][0]["choice"],
         "adopt_upstream"
     );
     let applied = json_output(&run(
@@ -998,7 +998,7 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         Some(&trusted_request.to_string()),
     ));
     assert_eq!(
-        trusted_plan["result"]["diff_summary"][0]["choice_reason"],
+        trusted_plan["result"]["diff_summary"]["items"][0]["choice_reason"],
         "trusted_baseline_clean"
     );
     let undone = json_output(&run(&[&common[..], &["undo", receipt]].concat(), None));
@@ -1391,6 +1391,11 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
         fs::create_dir_all(directory).unwrap();
         fs::write(directory.join("SKILL.md"), content).unwrap();
     }
+    for index in 0..48 {
+        let directory = home.join(format!(".codex/skills/shared-copy-{index:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
     let common = [
         "--home",
         home.to_str().unwrap(),
@@ -1420,8 +1425,8 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
     assert_eq!(planning["snapshot_id"], report["result"]["snapshot_id"]);
     assert_eq!(planning["request_field"], "finding_library_changes");
     let candidates = planning["canonical_candidates"].as_array().unwrap();
-    assert_eq!(planning["canonical_candidate_count"], 3);
-    assert_eq!(planning["canonical_candidates_truncated"], false);
+    assert_eq!(planning["canonical_candidate_count"], 51);
+    assert_eq!(planning["canonical_candidates_truncated"], true);
     assert_eq!(
         candidates[0]["path"],
         source_skill.join("SKILL.md").to_str().unwrap()
@@ -1437,26 +1442,54 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
             "requested_state": "managed"
         }]
     });
-    let plan = json_output(&run(
+    let plan_output = run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
-    ));
+    );
+    assert!(
+        plan_output.stdout.len() < 8_000,
+        "summary response was {} bytes",
+        plan_output.stdout.len()
+    );
+    let plan = json_output(&plan_output);
     assert_eq!(plan["result"]["risk"], "library_governance");
-    assert_eq!(plan["result"]["finding_ids"], json!([finding_id]));
+    assert_eq!(plan["result"]["findings"]["ids"], json!([finding_id]));
+    assert_eq!(plan["result"]["detail_level"], "summary");
+    assert!(plan["result"].get("operations").is_none());
+    assert!(plan["result"].get("library_changes").is_none());
+    assert_eq!(plan["result"]["change_summary"]["operation_count"], 101);
+    assert_eq!(plan["result"]["affected"]["placement_count"], 51);
+    assert_eq!(plan["result"]["affected"]["agent_count"], 2);
     assert_eq!(
-        plan["result"]["library_changes"][0]["placement_ids"]
+        plan["result"]["affected"]["agents"],
+        json!(["claude-code", "codex"])
+    );
+    assert_eq!(plan["result"]["evidence"]["count"], 1);
+    assert_eq!(plan["result"]["files_changed"], false);
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    assert_eq!(
+        plan["result"]["detail"]["command"],
+        json!(["plan", "--show", plan_id, "--json"])
+    );
+    let full_output = run(&[&common[..], &["plan", "--show", plan_id]].concat(), None);
+    assert!(full_output.stdout.len() > plan_output.stdout.len());
+    let full = json_output(&full_output);
+    assert_eq!(full["result"]["detail_level"], "full");
+    assert_eq!(full["result"]["operations"].as_array().unwrap().len(), 101);
+    assert_eq!(
+        full["result"]["library_changes"][0]["placement_ids"]
             .as_array()
             .unwrap()
             .len(),
-        3
+        51
     );
-    assert_eq!(plan["result"]["evidence_ids"].as_array().unwrap().len(), 1);
-    assert_eq!(plan["result"]["files_changed"], false);
+    assert_eq!(full["result"]["finding_ids"], json!([finding_id]));
+    assert_eq!(full["result"]["files_changed"], false);
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     let stored_report_id: String = database
         .query_row(
             "SELECT report_id FROM plans WHERE id = ?1",
-            [plan["result"]["plan_id"].as_str().unwrap()],
+            [plan_id],
             |row| row.get(0),
         )
         .unwrap();
@@ -1607,10 +1640,28 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
         "evidence_ids": [evidence_id],
         "roster_changes": roster_changes
     });
-    let plan = json_output(&run(
+    let plan_output = run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&proposal.to_string()),
-    ));
+    );
+    assert!(
+        plan_output.stdout.len() < 12_000,
+        "large Roster summary was {} bytes",
+        plan_output.stdout.len()
+    );
+    let plan = json_output(&plan_output);
+    assert_eq!(plan["result"]["detail_level"], "summary");
+    assert!(plan["result"].get("operations").is_none());
+    assert!(plan["result"].get("roster_changes").is_none());
+    assert_eq!(plan["result"]["affected"]["skill_count"], 101);
+    assert!(
+        plan["result"]["affected"]["skill_ids"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 10
+    );
+    assert_eq!(plan["result"]["affected"]["skill_ids_truncated"], true);
     assert_eq!(plan["result"]["impact"]["before_default_exposure"], 101);
     assert!(
         plan["result"]["impact"]["after_default_exposure"]

@@ -13,7 +13,7 @@ Use the local `skillroster` binary as the deterministic source of facts. Invoke 
 2. Distinguish observed, inferred, and unknown usage. Missing evidence does not mean unused.
 3. Use stable Finding and Evidence IDs for follow-up questions. The summary exposes one `primary_evidence_id`; use `report --finding ID --limit 20 --json` when paths or Evidence affect the decision. Exact-duplicate detail includes a bounded `planning.canonical_candidates` list independently of pagination. Continue with `--offset NEXT_OFFSET --limit 20` only when another decision still needs more evidence, and keep the same Snapshot rather than silently rescanning.
 4. Make semantic governance choices in the conversation, then submit declarative target states to `skillroster plan --stdin --json`. For an exact-duplicate Finding, send `schema_version` plus `finding_library_changes`; SkillRoster derives the current Snapshot, Evidence, Skill, and complete placement set. For other request families, include the latest `scan_id` and relevant `evidence_ids`.
-5. Present the validated Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `impact` before/after facts, affected Agents, uncertainty, canonical deletion count, reversibility, and Plan ID. The source-oriented `diff_summary` may be empty for ordinary Roster or Library Plans; do not treat that as a missing Plan delta.
+5. Present the validated summary Plan in one viewport: diagnosis, four core metrics, three main Findings, `change_summary`, `operation_groups`, bounded `affected` facts, `impact` before/after facts, uncertainty, canonical deletion count, reversibility, and Plan ID. The full immutable representation stays in local state; use `skillroster plan --show PLAN_ID --json` only when an exact operation, path, or complete ID list is needed to answer the user. Do not load it by default.
 
 Use only these Plan request families:
 
@@ -37,6 +37,8 @@ temporary source-root arguments. Keep unconfirmed targets unread.
 ## Apply or undo
 
 Show the complete immutable Plan before requesting one explicit confirmation. After the user confirms, run `skillroster apply PLAN_ID --json`; do not substitute direct filesystem commands or bypass drift checks. Report verification, changed-path count, Receipt ID, and canonical deletion count.
+
+“Complete” means the summary accounts for every affected Agent, Skill, placement, operation group, exclusion, risk, and before/after delta by count; it does not require copying every internal operation into the conversation. If the user asks for an exact path or operation, load the stored detail with `plan --show` before confirmation.
 
 For Undo, first explain the bounded Receipt impact and obtain one explicit confirmation, then run `skillroster undo RECEIPT_ID --json`.
 

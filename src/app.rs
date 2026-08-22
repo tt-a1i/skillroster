@@ -142,21 +142,33 @@ pub fn run(cli: Cli) -> Result<Output> {
             vec![],
             vec![],
         ),
-        Some(Command::Plan(_)) => {
-            let result = plan_command(&store, &state_dir)?;
+        Some(Command::Plan(args)) => {
+            let showing_detail = args.show.is_some();
+            let result = match args.show.as_deref() {
+                Some(id) => plan_detail_command(&store, id)?,
+                None => plan_command(&store, &state_dir)?,
+            };
             let id = result["plan_id"].as_str().unwrap_or_default().to_string();
-            (
-                "plan",
-                result,
-                vec![],
-                vec![action(
+            let mut actions = Vec::new();
+            if !showing_detail {
+                actions.push(action(
+                    "show_plan_detail",
+                    &["plan", "--show", &id, "--json"],
+                    false,
+                    false,
+                    "plan_detail_available",
+                ));
+            }
+            if result["state"].as_str() == Some("ready") {
+                actions.push(action(
                     "apply",
                     &["apply", &id, "--json"],
                     true,
                     true,
                     "plan_ready",
-                )],
-            )
+                ));
+            }
+            ("plan", result, vec![], actions)
         }
         Some(Command::Apply(args)) => {
             if !cli.json {
@@ -436,22 +448,7 @@ fn human_plan_preview(store: &StateStore, id: &str) -> Result<String> {
         .get_plan(&id)?
         .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
     let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
-    let raw = &record.input["raw"];
-    let risk = if raw["source_updates"]
-        .as_array()
-        .is_some_and(|v| !v.is_empty())
-    {
-        "source_update"
-    } else if raw["library_changes"]
-        .as_array()
-        .is_some_and(|v| !v.is_empty())
-    {
-        "library_governance"
-    } else if prepared.operations.is_empty() {
-        "roster_change"
-    } else {
-        "filesystem_change"
-    };
+    let risk = plan_risk(&record.input["raw"], &prepared);
     Ok(crate::present::human(
         "plan",
         &json!({
@@ -1625,6 +1622,207 @@ fn plan_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
     )
 }
 
+fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
+    let id = PlanId::parse(id.to_owned())?;
+    let record = store
+        .get_plan(&id)?
+        .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
+    let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
+    Ok(json!({
+        "detail_level": "full",
+        "plan_id": prepared.id,
+        "snapshot_id": prepared.scan_id,
+        "report_id": record.report_id,
+        "digest": prepared.digest,
+        "state": record.status,
+        "operations": prepared.operations,
+        "roster_changes": prepared.roster_changes,
+        "evidence_ids": prepared.evidence_ids,
+        "finding_ids": record
+            .input
+            .get("finding_ids")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+        "source_updates": prepared.source_updates,
+        "library_changes": prepared.library_changes,
+        "roster_before": record.input["roster_before"].clone(),
+        "library_before": record.input["library_before"].clone(),
+        "risk": plan_risk(&record.input["raw"], &prepared),
+        "reversible": true,
+        "canonical_deletion_count": 0,
+        "confirmation_required": true,
+        "files_changed": false
+    }))
+}
+
+fn plan_risk(raw: &Value, prepared: &PreparedPlan) -> &'static str {
+    if raw["source_updates"]
+        .as_array()
+        .is_some_and(|values| !values.is_empty())
+    {
+        "source_update"
+    } else if raw["library_changes"]
+        .as_array()
+        .is_some_and(|values| !values.is_empty())
+    {
+        "library_governance"
+    } else if prepared.operations.is_empty() {
+        "roster_change"
+    } else {
+        "filesystem_change"
+    }
+}
+
+fn operation_groups(operations: &[Operation]) -> Value {
+    let mut groups = std::collections::BTreeMap::<&str, usize>::new();
+    for operation in operations {
+        let kind = match operation {
+            Operation::CreateDirectory { .. } => "create_directory",
+            Operation::CreateSymlink { .. } => "create_symlink",
+            Operation::WriteFile { .. } => "write_file",
+            Operation::ReplaceFile { .. } => "replace_file",
+            Operation::RemoveSymlink { .. } => "remove_symlink",
+            Operation::Copy { .. } => "copy",
+            Operation::MoveRecoverable { .. } => "move_recoverable",
+        };
+        *groups.entry(kind).or_default() += 1;
+    }
+    json!(groups)
+}
+
+fn affected_summary(prepared: &PreparedPlan, scan: &ScanResult) -> Value {
+    let mut agents = prepared
+        .roster_changes
+        .iter()
+        .map(|change| change.agent.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let skills = prepared
+        .roster_changes
+        .iter()
+        .map(|change| change.skill_id.clone())
+        .chain(
+            prepared
+                .library_changes
+                .iter()
+                .map(|change| change.skill_id.clone()),
+        )
+        .chain(
+            prepared
+                .source_updates
+                .iter()
+                .map(|change| change.skill_id.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    let placements = prepared
+        .library_changes
+        .iter()
+        .flat_map(|change| change.placement_ids.iter().cloned())
+        .chain(
+            prepared
+                .source_updates
+                .iter()
+                .map(|change| change.placement_id.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>();
+    for placement in &scan.placements {
+        if placements.contains(&placement.id) {
+            if let Some(agent) = placement.agent {
+                agents.insert(agent.id().to_owned());
+            }
+        }
+    }
+    let skill_count = skills.len();
+    let skill_ids = skills.iter().take(10).cloned().collect::<Vec<_>>();
+    json!({
+        "agent_count": agents.len(),
+        "agents": agents,
+        "skill_count": skill_count,
+        "skill_ids": skill_ids,
+        "skill_ids_truncated": skill_count > 10,
+        "placement_count": placements.len()
+    })
+}
+
+fn bounded_ids(ids: Vec<String>) -> Value {
+    json!({
+        "count": ids.len(),
+        "ids": ids.iter().take(10).collect::<Vec<_>>(),
+        "ids_truncated": ids.len() > 10
+    })
+}
+
+fn state_counts(values: &[Value], key: &str) -> Value {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for value in values {
+        let state = value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("unassigned");
+        *counts.entry(state.to_owned()).or_default() += 1;
+    }
+    json!(counts)
+}
+
+fn bound_transition(value: &mut Value, after_state_key: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let before = object
+        .remove("before")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let after = object
+        .remove("after")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    object.insert("change_count".into(), json!(after.len()));
+    object.insert("before_state_counts".into(), state_counts(&before, "state"));
+    object.insert(
+        "after_state_counts".into(),
+        state_counts(&after, after_state_key),
+    );
+}
+
+fn bounded_plan_impact(mut impact: Value) -> Value {
+    let Some(object) = impact.as_object_mut() else {
+        let items = impact.as_array().cloned().unwrap_or_default();
+        return json!({
+            "item_count": items.len(),
+            "items": items.iter().take(10).collect::<Vec<_>>(),
+            "items_truncated": items.len() > 10
+        });
+    };
+    for (ids_key, count_key) in [
+        ("affected_skill_ids", "affected_skill_count"),
+        ("affected_placement_ids", "affected_placement_count"),
+    ] {
+        if let Some(ids) = object
+            .remove(ids_key)
+            .and_then(|value| value.as_array().cloned())
+        {
+            object.insert(count_key.into(), json!(ids.len()));
+        }
+    }
+    if let Some(exclusions) = object
+        .remove("exclusions")
+        .and_then(|value| value.as_array().cloned())
+    {
+        object.insert("exclusion_count".into(), json!(exclusions.len()));
+        object.insert(
+            "exclusions".into(),
+            json!(exclusions.iter().take(5).collect::<Vec<_>>()),
+        );
+        object.insert("exclusions_truncated".into(), json!(exclusions.len() > 5));
+    }
+    if let Some(roster) = object.get_mut("roster") {
+        bound_transition(roster, "state");
+    }
+    if let Some(library) = object.get_mut("library") {
+        bound_transition(library, "requested_state");
+    }
+    impact
+}
+
 #[derive(Clone, Copy)]
 enum PlanOrigin {
     Agent,
@@ -2464,43 +2662,72 @@ fn prepare_plan(
         );
         object.insert("operation_count".into(), json!(prepared.operations.len()));
     }
+    let finding_ids = finding_provenance
+        .as_ref()
+        .map(|provenance| provenance.finding_ids.clone())
+        .unwrap_or_default();
+    let report_id = finding_provenance
+        .as_ref()
+        .map(|provenance| provenance.report_id.clone());
+    let risk = match effective_origin {
+        PlanOrigin::Agent => "roster_change",
+        PlanOrigin::RosterGovernance => "roster_change",
+        PlanOrigin::BootstrapSetup => "filesystem_change",
+        PlanOrigin::SourceUpdate => "source_update",
+        PlanOrigin::LibraryGovernance => "library_governance",
+    };
+    let operations_by_kind = operation_groups(&prepared.operations);
+    let affected = affected_summary(&prepared, &scan);
+    let impact = bounded_plan_impact(impact);
+    let diff_items = if matches!(effective_origin, PlanOrigin::SourceUpdate) {
+        source_update_diffs.iter().take(10).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     store.save_plan(&plan_record(
         &prepared,
         input,
         roster_before.clone(),
         library_before.clone(),
-        finding_provenance
-            .as_ref()
-            .map(|provenance| provenance.report_id.clone()),
+        report_id,
+        finding_ids.clone(),
     )?)?;
     Ok(json!({
+        "detail_level": "summary",
         "plan_id": prepared.id,
         "snapshot_id": prepared.scan_id,
         "digest": prepared.digest,
         "state": "ready",
-        "operations": prepared.operations,
-        "roster_changes": prepared.roster_changes,
-        "evidence_ids": prepared.evidence_ids,
-        "finding_ids": finding_provenance
-            .as_ref()
-            .map(|provenance| provenance.finding_ids.clone())
-            .unwrap_or_default(),
-        "source_updates": prepared.source_updates,
-        "library_changes": prepared.library_changes,
+        "evidence": bounded_ids(prepared.evidence_ids.clone()),
+        "findings": bounded_ids(
+            finding_ids.iter().map(ToString::to_string).collect::<Vec<_>>()
+        ),
         "change_summary": change_summary,
-        "diff_summary": if matches!(effective_origin, PlanOrigin::SourceUpdate) {
-            json!(source_update_diffs)
-        } else {
-            json!([])
+        "operation_groups": operations_by_kind,
+        "affected": affected,
+        "diff_summary": {
+            "item_count": if matches!(effective_origin, PlanOrigin::SourceUpdate) {
+                source_update_diffs.len()
+            } else {
+                0
+            },
+            "items": diff_items,
+            "items_truncated": matches!(effective_origin, PlanOrigin::SourceUpdate)
+                && source_update_diffs.len() > 10
         },
         "impact": impact,
-        "risk": match effective_origin {
-            PlanOrigin::Agent => "roster_change",
-            PlanOrigin::RosterGovernance => "roster_change",
-            PlanOrigin::BootstrapSetup => "filesystem_change",
-            PlanOrigin::SourceUpdate => "source_update",
-            PlanOrigin::LibraryGovernance => "library_governance",
+        "detail": {
+            "available": true,
+            "command": ["plan", "--show", prepared.id, "--json"],
+            "contains": [
+                "operations",
+                "roster_changes",
+                "source_updates",
+                "library_changes",
+                "before_state"
+            ]
         },
+        "risk": risk,
         "reversible": true,
         "canonical_deletion_count": 0,
         "confirmation_required": true,
@@ -2736,7 +2963,9 @@ fn setup_command(store: &StateStore, home: &Path, state_dir: &Path) -> Result<Va
         json!({"schema_version": 1, "scan_id": snapshot.id, "operations": operations}),
         PlanOrigin::BootstrapSetup,
     )?;
-    let operation_count = plan["operations"].as_array().map_or(0, Vec::len);
+    let operation_count = plan["change_summary"]["operation_count"]
+        .as_u64()
+        .unwrap_or_default();
     Ok(json!({
         "detected_agents": detected,
         "plan_id": plan["plan_id"],
@@ -3317,6 +3546,7 @@ fn plan_record(
     roster_before: Vec<Value>,
     library_before: Vec<Value>,
     report_id: Option<ReportId>,
+    finding_ids: Vec<FindingId>,
 ) -> Result<PlanRecord> {
     let operations = prepared
         .operations
@@ -3362,6 +3592,7 @@ fn plan_record(
         input: json!({
             "raw": raw,
             "prepared": prepared,
+            "finding_ids": finding_ids,
             "roster_before": roster_before,
             "library_before": library_before
         }),

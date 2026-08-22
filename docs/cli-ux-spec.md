@@ -113,7 +113,7 @@ Empty results are calm, successful output. Find never implies activation.
 
 ### `plan`
 
-Show before/after Roster counts, affected Agents and Skills, operation categories, risk, reversibility, exclusions, and blocked preconditions. A ready Plan ends with its immutable ID and digest; it performs no mutation.
+Show before/after Roster counts, affected Agents and Skills, operation categories, risk, reversibility, exclusions, and blocked preconditions. A ready Plan ends with its immutable ID and digest; it performs no mutation. Agent JSON defaults to the bounded summary even when the stored Plan contains hundreds of operations. `plan --show PLAN_ID --json` explicitly returns the complete stored operations, changes, and before-state collections for audits or exact-path questions.
 
 ### `apply` and `undo`
 
