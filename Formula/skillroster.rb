@@ -3,7 +3,7 @@ class Skillroster < Formula
   homepage "https://github.com/tt-a1i/skillroster"
   url "https://github.com/tt-a1i/skillroster.git",
       revision: "49608057bf43d08bc34e98e2bdef2470a327f705"
-  version "1.8.1"
+  version "1.8.2"
 
   depends_on "rust" => :build
 
@@ -12,7 +12,7 @@ class Skillroster < Formula
   end
 
   test do
-    assert_match "skillroster 1.8.1", shell_output("#{bin}/skillroster --version")
+    assert_match "skillroster 1.8.2", shell_output("#{bin}/skillroster --version")
     assert_match "One library. The right roster for every agent.", shell_output("#{bin}/skillroster --help")
   end
 end
