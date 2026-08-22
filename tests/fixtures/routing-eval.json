@@ -82,5 +82,7 @@
   {"task":"应用已经批准的 Skill 计划","hints":["apply approved Skill Plan"],"skill":"skillroster","rank_first":true},
   {"task":"为这次 Skill 变更创建回执","hints":["create Skill Receipt"],"skill":"skillroster","rank_first":true},
   {"task":"撤销上次 Skill 整理","hints":["undo Skill organization"],"skill":"skillroster","rank_first":true},
-  {"task":"统一管理各个 Agent 安装的 Skill","hints":["manage Skills across coding Agents with shared library symlinks"],"skill":"agent-skills-manager","rank_first":true,"max_matches":3}
+  {"task":"统一管理各个 Agent 安装的 Skill","hints":["manage Skills across coding Agents with shared library symlinks"],"skill":"agent-skills-manager","rank_first":true,"max_matches":3},
+  {"task":"把中文改自然一点","skill":"humanizer-zh","rank_first":true,"max_matches":3},
+  {"task":"编辑中文让它更像人写的","skill":"humanizer-zh","rank_first":true,"max_matches":3}
 ]
