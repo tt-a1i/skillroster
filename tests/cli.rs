@@ -828,7 +828,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.5.0"
+        "1.5.1"
     );
 
     let undone = json_output(&run(
@@ -845,59 +845,63 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
 
 #[test]
 fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
-    let temp = TempDir::new().unwrap();
-    let home = temp.path().join("home");
-    let state = temp.path().join("state");
-    let root = home.join(".codex/skills");
-    let ordinary = root.join("ordinary");
-    let bootstrap = root.join("skillroster/SKILL.md");
-    fs::create_dir_all(&ordinary).unwrap();
-    fs::write(
-        ordinary.join("SKILL.md"),
-        "---\nname: ordinary\ndescription: fixture\n---\n",
-    )
-    .unwrap();
-    fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
-    let legacy = include_str!("fixtures/bootstrap-v1.4.0.md");
-    fs::write(&bootstrap, legacy).unwrap();
-    let common = [
-        "--home",
-        home.to_str().unwrap(),
-        "--state-dir",
-        state.to_str().unwrap(),
-        "--json",
-    ];
-    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    for (legacy_version, legacy) in [
+        ("1.4.0", include_str!("fixtures/bootstrap-v1.4.0.md")),
+        ("1.5.0", include_str!("fixtures/bootstrap-v1.5.0.md")),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let root = home.join(".codex/skills");
+        let ordinary = root.join("ordinary");
+        let bootstrap = root.join("skillroster/SKILL.md");
+        fs::create_dir_all(&ordinary).unwrap();
+        fs::write(
+            ordinary.join("SKILL.md"),
+            "---\nname: ordinary\ndescription: fixture\n---\n",
+        )
+        .unwrap();
+        fs::create_dir_all(bootstrap.parent().unwrap()).unwrap();
+        fs::write(&bootstrap, legacy).unwrap();
+        let common = [
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+        ];
+        json_output(&run(&[&common[..], &["scan"]].concat(), None));
 
-    let upgrade = json_output(&run(&[&common[..], &["setup"]].concat(), None));
-    assert_eq!(upgrade["result"]["state"], "preview_ready");
-    assert_eq!(upgrade["result"]["outdated_count"], 1);
-    assert_eq!(upgrade["result"]["modified_count"], 0);
-    assert_eq!(upgrade["result"]["replace_count"], 1);
-    assert_eq!(
-        upgrade["result"]["targets"][0]["status"],
-        "official_outdated"
-    );
-    assert_eq!(
-        upgrade["result"]["targets"][0]["installed_version"],
-        "1.4.0"
-    );
-    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+        let upgrade = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+        assert_eq!(upgrade["result"]["state"], "preview_ready");
+        assert_eq!(upgrade["result"]["outdated_count"], 1);
+        assert_eq!(upgrade["result"]["modified_count"], 0);
+        assert_eq!(upgrade["result"]["replace_count"], 1);
+        assert_eq!(
+            upgrade["result"]["targets"][0]["status"],
+            "official_outdated"
+        );
+        assert_eq!(
+            upgrade["result"]["targets"][0]["installed_version"],
+            legacy_version
+        );
+        assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
 
-    let plan_id = upgrade["result"]["plan_id"].as_str().unwrap();
-    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
-    assert_eq!(applied["result"]["verification"], "passed");
-    assert_eq!(
-        fs::read_to_string(&bootstrap).unwrap(),
-        include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
-    );
-    let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
-    assert_eq!(current["result"]["state"], "up_to_date");
+        let plan_id = upgrade["result"]["plan_id"].as_str().unwrap();
+        let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+        assert_eq!(applied["result"]["verification"], "passed");
+        assert_eq!(
+            fs::read_to_string(&bootstrap).unwrap(),
+            include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
+        );
+        let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+        assert_eq!(current["result"]["state"], "up_to_date");
 
-    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
-    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
-    assert_eq!(undone["result"]["verification"], "passed");
-    assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+        let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+        let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+        assert_eq!(undone["result"]["verification"], "passed");
+        assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+    }
 }
 
 #[test]
@@ -918,7 +922,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.5.0");
+    assert_eq!(output["result"]["bootstrap_version"], "1.5.1");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],

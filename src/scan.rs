@@ -1,5 +1,5 @@
 use crate::harness::{AgentKind, SessionSignal, classify_session_record, known_agent_roots};
-use aho_corasick::AhoCorasickBuilder;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -760,11 +760,23 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
         first_seen_unix: None,
         last_seen_unix: None,
     };
-    let skill_lookup: Vec<(String, String)> = result
-        .skills
+    let mut skill_ids_by_name = BTreeMap::<String, BTreeSet<String>>::new();
+    for skill in &result.skills {
+        skill_ids_by_name
+            .entry(skill.name.to_ascii_lowercase())
+            .or_default()
+            .insert(skill.id.clone());
+    }
+    let skill_lookup = skill_ids_by_name
         .iter()
-        .map(|skill| (skill.id.clone(), skill.name.to_lowercase()))
-        .collect();
+        .filter(|(_, ids)| ids.len() == 1)
+        .map(|(name, ids)| {
+            (
+                ids.iter().next().expect("length checked").clone(),
+                name.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     let patterns = skill_lookup
         .iter()
         .map(|(_, name)| name.as_str())
@@ -772,6 +784,38 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     let matcher = AhoCorasickBuilder::new()
         .ascii_case_insensitive(true)
         .build(&patterns)
+        .ok();
+    let mut skill_ids_by_reference = BTreeMap::<String, BTreeSet<String>>::new();
+    for placement in &result.placements {
+        let mut entrypoints = vec![placement.entrypoint.clone()];
+        if let Some(target) = &placement.link_target {
+            entrypoints.push(target.join("SKILL.md"));
+        }
+        if placement.link_status != LinkStatus::EscapesRoot {
+            if let Ok(resolved) = fs::canonicalize(&placement.entrypoint) {
+                entrypoints.push(resolved);
+            }
+        }
+        for entrypoint in entrypoints {
+            skill_ids_by_reference
+                .entry(normalize_reference_text(&entrypoint.to_string_lossy()))
+                .or_default()
+                .insert(placement.skill_id.clone());
+        }
+    }
+    let reference_lookup = skill_ids_by_reference
+        .into_iter()
+        .filter_map(|(reference, ids)| {
+            (ids.len() == 1).then(|| (ids.into_iter().next().expect("length checked"), reference))
+        })
+        .collect::<Vec<_>>();
+    let reference_patterns = reference_lookup
+        .iter()
+        .map(|(_, reference)| reference.as_str())
+        .collect::<Vec<_>>();
+    let reference_matcher = AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(&reference_patterns)
         .ok();
     let mut events = BTreeMap::<(String, UsageStage, String), UsageEvidence>::new();
     let mut bytes_observed = 0_u64;
@@ -857,10 +901,43 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 }
                 lines_observed += 1;
                 let lower = line.to_lowercase();
+                if let Some((stage, quality)) = classify_usage_line(agent, &line) {
+                    let mut observed_skill_ids = observed_reference_skill_ids(
+                        &line,
+                        reference_matcher.as_ref(),
+                        &reference_lookup,
+                    );
+                    for reference in explicit_skill_field_values(&line) {
+                        if result.skills.iter().any(|skill| skill.id == reference) {
+                            observed_skill_ids.insert(reference.clone());
+                        }
+                        if let Some(ids) = skill_ids_by_name.get(&reference.to_ascii_lowercase()) {
+                            if ids.len() == 1 {
+                                observed_skill_ids.extend(ids.iter().cloned());
+                            }
+                        }
+                    }
+                    for skill_id in observed_skill_ids {
+                        let key = (skill_id.clone(), stage, source_path_digest.clone());
+                        let event = events.entry(key).or_insert_with(|| UsageEvidence {
+                            agent,
+                            skill_id,
+                            stage,
+                            quality,
+                            event_count: 0,
+                            first_seen_unix: timestamp,
+                            last_seen_unix: timestamp,
+                            source_path_digest: source_path_digest.clone(),
+                        });
+                        event.event_count += 1;
+                    }
+                    continue;
+                }
                 let Some(matcher) = &matcher else { continue };
                 for matched in matcher.find_iter(&lower) {
                     let (skill_id, _) = &skill_lookup[matched.pattern().as_usize()];
-                    let (stage, quality) = classify_usage_line(agent, &line);
+                    let stage = UsageStage::Exposed;
+                    let quality = EvidenceQuality::Inferred;
                     let key = (skill_id.clone(), stage, source_path_digest.clone());
                     let event = events.entry(key).or_insert_with(|| UsageEvidence {
                         agent,
@@ -918,14 +995,89 @@ fn collect_session_files(
     Ok(false)
 }
 
-fn classify_usage_line(agent: AgentKind, line: &str) -> (UsageStage, EvidenceQuality) {
+fn classify_usage_line(agent: AgentKind, line: &str) -> Option<(UsageStage, EvidenceQuality)> {
     match classify_session_record(agent, line) {
-        Some(SessionSignal::Outcome) => (UsageStage::Outcome, EvidenceQuality::Observed),
-        Some(SessionSignal::Applied) => (UsageStage::Applied, EvidenceQuality::Observed),
-        Some(SessionSignal::Loaded) => (UsageStage::Loaded, EvidenceQuality::Observed),
-        Some(SessionSignal::Matched) => (UsageStage::Matched, EvidenceQuality::Observed),
-        None => (UsageStage::Exposed, EvidenceQuality::Inferred),
+        Some(SessionSignal::Outcome) => Some((UsageStage::Outcome, EvidenceQuality::Observed)),
+        Some(SessionSignal::Applied) => Some((UsageStage::Applied, EvidenceQuality::Observed)),
+        Some(SessionSignal::Loaded) => Some((UsageStage::Loaded, EvidenceQuality::Observed)),
+        Some(SessionSignal::Matched) => Some((UsageStage::Matched, EvidenceQuality::Observed)),
+        None => None,
     }
+}
+
+fn observed_reference_skill_ids(
+    line: &str,
+    matcher: Option<&AhoCorasick>,
+    reference_lookup: &[(String, String)],
+) -> BTreeSet<String> {
+    let Some(matcher) = matcher else {
+        return BTreeSet::new();
+    };
+    let decoded = decoded_record_text(line).unwrap_or_else(|| line.to_owned());
+    let searchable = normalize_reference_text(&decoded);
+    matcher
+        .find_iter(&searchable)
+        .map(|matched| reference_lookup[matched.pattern().as_usize()].0.clone())
+        .collect()
+}
+
+fn normalize_reference_text(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn decoded_record_text(line: &str) -> Option<String> {
+    fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) => output.push(value.clone()),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_strings(value, output);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect_strings(value, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let value = serde_json::from_str(line).ok()?;
+    let mut strings = Vec::new();
+    collect_strings(&value, &mut strings);
+    Some(strings.join("\n"))
+}
+
+fn explicit_skill_field_values(line: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let payload = object.get("payload").and_then(serde_json::Value::as_object);
+    [
+        "skill_id",
+        "skill_name",
+        "selected_skill",
+        "matched_skill",
+        "loaded_skill",
+        "applied_skill",
+        "invoked_skill",
+        "outcome_skill",
+    ]
+    .into_iter()
+    .flat_map(|field| {
+        [
+            object.get(field),
+            payload.and_then(|payload| payload.get(field)),
+        ]
+    })
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::to_owned)
+    .collect()
 }
 
 fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Option<u64>) {
@@ -1023,7 +1175,13 @@ pub fn placements_by_skill(scan: &ScanResult) -> BTreeMap<&str, Vec<&SkillPlacem
 }
 
 pub fn agents_with_usage(scan: &ScanResult) -> BTreeSet<AgentKind> {
-    scan.usage.iter().map(|usage| usage.agent).collect()
+    scan.usage
+        .iter()
+        .filter(|usage| {
+            usage.stage > UsageStage::Exposed && usage.quality == EvidenceQuality::Observed
+        })
+        .map(|usage| usage.agent)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1169,6 +1327,214 @@ mod tests {
         assert_eq!(discovered, AgentKind::ALL.into_iter().collect());
         assert_eq!(result.skills.len(), 8);
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn codex_nested_records_produce_matched_and_loaded_usage() {
+        let home = temp_directory("codex-nested-usage");
+        let skill = home.join(".codex/skills/research-directory");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: primary-research\ndescription: Primary-source research\n---\n",
+        )
+        .unwrap();
+        let entrypoint = skill.join("SKILL.md");
+        let generic = home.join(".codex/skills/plan");
+        fs::create_dir_all(&generic).unwrap();
+        fs::write(
+            generic.join("SKILL.md"),
+            "---\nname: plan\ndescription: Planning workflow\n---\n",
+        )
+        .unwrap();
+        let records = [
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "base_instructions": "primary-research is available in the local Skill catalog"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": format!(
+                            "Plan this with [$primary-research]({})",
+                            entrypoint.display()
+                        )
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": format!(
+                        "await tools.exec_command({{cmd: \"sed -n '1,80p' {}\"}})",
+                        entrypoint.display()
+                    )
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(sessions.join("session.jsonl"), records).unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let skill_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "primary-research")
+            .unwrap()
+            .id;
+        let generic_skill_id = &result
+            .skills
+            .iter()
+            .find(|skill| skill.name == "plan")
+            .unwrap()
+            .id;
+        let stages = result
+            .usage
+            .iter()
+            .filter(|usage| usage.skill_id == *skill_id && usage.agent == AgentKind::Codex)
+            .map(|usage| (usage.stage, usage.quality))
+            .collect::<Vec<_>>();
+
+        assert!(stages.contains(&(UsageStage::Exposed, EvidenceQuality::Inferred)));
+        assert!(
+            stages.contains(&(UsageStage::Matched, EvidenceQuality::Observed)),
+            "entrypoint={} placements={:?} usage={:?}",
+            entrypoint.display(),
+            result.placements,
+            result.usage
+        );
+        assert!(
+            stages.contains(&(UsageStage::Loaded, EvidenceQuality::Observed)),
+            "entrypoint={} placements={:?} usage={:?}",
+            entrypoint.display(),
+            result.placements,
+            result.usage
+        );
+        assert!(
+            result
+                .usage
+                .iter()
+                .filter(|usage| usage.skill_id == *generic_skill_id)
+                .all(|usage| usage.stage == UsageStage::Exposed)
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn json_escaped_windows_reference_binds_observed_usage() {
+        let windows_path = r"C:\Users\tester\.codex\skills\research\SKILL.md";
+        let session_path = r"C:\Users\tester\.codex/skills/research\SKILL.md";
+        let reference_lookup = vec![(
+            "skill_windows".to_owned(),
+            normalize_reference_text(windows_path),
+        )];
+        let matcher = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(
+                reference_lookup
+                    .iter()
+                    .map(|(_, reference)| reference.as_str()),
+            )
+            .unwrap();
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": format!(
+                    "await tools.exec_command({{cmd: \"rg -n name {}\"}})",
+                    session_path
+                )
+            }
+        })
+        .to_string();
+
+        assert!(line.contains(r"C:\\Users\\tester"));
+        assert_eq!(
+            classify_usage_line(AgentKind::Codex, &line),
+            Some((UsageStage::Loaded, EvidenceQuality::Observed))
+        );
+        assert_eq!(
+            observed_reference_skill_ids(&line, Some(&matcher), &reference_lookup),
+            BTreeSet::from(["skill_windows".to_owned()])
+        );
+    }
+
+    #[test]
+    fn ambiguous_skill_name_does_not_receive_observed_usage() {
+        let home = temp_directory("ambiguous-usage-name");
+        for (directory, body) in [("one", "first"), ("two", "second")] {
+            let skill = home.join(".codex/skills").join(directory);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: research\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            "{\"type\":\"match_skill\",\"matched_skill\":\"research\"}\n",
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+
+        assert_eq!(result.skills.len(), 2);
+        assert!(
+            result
+                .usage
+                .iter()
+                .all(|usage| usage.stage == UsageStage::Exposed)
+        );
+        assert!(agents_with_usage(&result).is_empty());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn exposed_inference_is_not_counted_as_observed_agent_usage() {
+        let mut result = ScanResult::default();
+        result.usage.push(UsageEvidence {
+            agent: AgentKind::Codex,
+            skill_id: "skill_fixture".into(),
+            stage: UsageStage::Exposed,
+            quality: EvidenceQuality::Inferred,
+            event_count: 1,
+            first_seen_unix: None,
+            last_seen_unix: None,
+            source_path_digest: "sha256:fixture".into(),
+        });
+        assert!(agents_with_usage(&result).is_empty());
+
+        result.usage.push(UsageEvidence {
+            agent: AgentKind::Codex,
+            skill_id: "skill_fixture".into(),
+            stage: UsageStage::Matched,
+            quality: EvidenceQuality::Observed,
+            event_count: 1,
+            first_seen_unix: None,
+            last_seen_unix: None,
+            source_path_digest: "sha256:fixture".into(),
+        });
+        assert_eq!(
+            agents_with_usage(&result),
+            BTreeSet::from([AgentKind::Codex])
+        );
     }
 
     #[cfg(unix)]
