@@ -1791,10 +1791,10 @@ fn reject_unresolved_recovery_except(state_dir: &Path, except: &str) -> Result<(
     Ok(())
 }
 
-struct WriteLock(File);
+pub(crate) struct WriteLock(File);
 
 impl WriteLock {
-    fn acquire(state_dir: &Path) -> Result<Self> {
+    pub(crate) fn acquire(state_dir: &Path) -> Result<Self> {
         let path = state_dir.join("write.lock");
         let file = OpenOptions::new()
             .read(true)

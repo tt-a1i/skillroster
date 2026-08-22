@@ -1,7 +1,10 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
+use fs2::FileExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -255,6 +258,35 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(purged["result"]["plans_or_receipts_changed"], false);
     assert_eq!(purged["result"]["agent_files_changed"], false);
 
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state.join("write.lock"))
+        .unwrap();
+    write_lock.try_lock_exclusive().unwrap();
+    let locked_purge = run(
+        &[&common[..], &["lifecycle", "purge", "--raw-days", "180"]].concat(),
+        None,
+    );
+    assert!(!locked_purge.status.success());
+    let locked_purge: Value = serde_json::from_slice(&locked_purge.stdout).unwrap();
+    assert_eq!(locked_purge["error"]["code"], "write_locked");
+    let locked_delete = run(
+        &[
+            &common[..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!locked_delete.status.success());
+    let locked_delete: Value = serde_json::from_slice(&locked_delete.stdout).unwrap();
+    assert_eq!(locked_delete["error"]["code"], "write_locked");
+    FileExt::unlock(&write_lock).unwrap();
+    drop(write_lock);
+
     let undone = json_output(&run(&[&common[..], &["undo", receipt]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
     let original_status: String = database
@@ -303,8 +335,16 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         None,
     ));
     assert_eq!(history["result"]["plans_or_receipts_changed"], true);
+    assert_eq!(history["result"]["files_changed"], true);
     assert_eq!(history["result"]["agent_files_changed"], false);
     assert_eq!(history["result"]["library_files_changed"], false);
+    assert!(
+        history["result"]["plan_receipt_result"]["recovery_directories"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "purging Receipt history must also remove its recovery content"
+    );
     for table in ["plans", "plan_operations", "receipts", "receipt_operations"] {
         let count: i64 = database
             .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -798,7 +838,8 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         forged_error["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("immutable source baseline")
+            .contains("immutable source baseline"),
+        "unexpected forged-baseline rejection: {forged_error}"
     );
 
     let mut stale_evidence_request = modified_request.clone();
@@ -1063,12 +1104,14 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         "unassigned"
     );
     assert_find_paths_are_readable(&hosted_find);
+    let expected_library_entry = fs::canonicalize(library_skill.join("SKILL.md")).unwrap();
     assert!(
         hosted_find["result"]["matches"][0]["paths"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|path| path == library_skill.join("SKILL.md").to_str().unwrap())
+            .any(|path| fs::canonicalize(path.as_str().unwrap())
+                .is_ok_and(|actual| actual == expected_library_entry))
     );
     json_output(&run(
         &[
@@ -1205,7 +1248,9 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|path| path.as_str().unwrap().contains("/library/"))
+            .all(|path| Path::new(path.as_str().unwrap())
+                .components()
+                .any(|component| component.as_os_str() == "library"))
     );
     let undone = json_output(&run(
         &[

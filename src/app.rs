@@ -278,6 +278,9 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, b
     if error.downcast_ref::<crate::model::InvalidId>().is_some() {
         return ("invalid_id", false);
     }
+    if let Some(change) = error.downcast_ref::<crate::change::ChangeError>() {
+        return (change.code, change.retryable);
+    }
     if let Some(storage) = error.downcast_ref::<crate::sqlite::StorageError>() {
         return match storage {
             crate::sqlite::StorageError::Sql(rusqlite::Error::SqliteFailure(code, _))
@@ -612,25 +615,41 @@ fn lifecycle_purge_command(
     raw_days: Option<u16>,
     plans_receipts: bool,
 ) -> Result<Value> {
+    let _write_lock = change::WriteLock::acquire(state_dir)?;
     let (cutoff, usage_result) = if let Some(raw_days) = raw_days {
         let cutoff = Utc::now().timestamp() - i64::from(raw_days) * 24 * 60 * 60;
         (Some(cutoff), Some(store.purge_usage_before(cutoff)?))
     } else {
         (None, None)
     };
-    let plan_receipt_result = if plans_receipts {
+    let usage_changed = usage_result.as_ref().is_some_and(|result| {
+        result.aggregated_raw_usage_rows > 0
+            || result.deleted_raw_usage_rows > 0
+            || result.deleted_evidence_rows > 0
+            || result.deleted_payload_usage_summaries > 0
+    });
+    let (plan_receipt_result, plans_or_receipts_changed) = if plans_receipts {
         if recovery_text(store, state_dir)? == "required" {
             bail!("recovery is required before Plans and Receipts can be purged");
         }
         let removed_journals = remove_receipt_journals(state_dir)?;
         let result = store.purge_plans_and_receipts()?;
-        Some(json!({
-            "plans": result.plans,
-            "receipts": result.receipts,
-            "receipt_journals": removed_journals,
-        }))
+        let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
+        let changed = result.plans > 0
+            || result.receipts > 0
+            || removed_journals > 0
+            || removed_recovery_directories > 0;
+        (
+            Some(json!({
+                "plans": result.plans,
+                "receipts": result.receipts,
+                "receipt_journals": removed_journals,
+                "recovery_directories": removed_recovery_directories,
+            })),
+            changed,
+        )
     } else {
-        None
+        (None, false)
     };
     Ok(json!({
         "operation": "purge",
@@ -639,14 +658,17 @@ fn lifecycle_purge_command(
         "usage_result": usage_result,
         "plan_receipt_result": plan_receipt_result,
         "monthly_aggregates_retained": raw_days.is_some(),
-        "plans_or_receipts_changed": plans_receipts,
+        "plans_or_receipts_changed": plans_or_receipts_changed,
         "agent_files_changed": false,
         "library_files_changed": false,
-        "files_changed": false,
+        "files_changed": usage_changed || plans_or_receipts_changed,
     }))
 }
 
 fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Value> {
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    let _write_lock = change::WriteLock::acquire(state_dir)?;
     let existed = database_path.exists();
     let journals = change::journals(state_dir)?;
     if existed {
@@ -659,6 +681,7 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
         bail!("recovery is required before the local state database can be deleted");
     }
     let removed_journals = remove_receipt_journals(state_dir)?;
+    let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
     let mut removed_database_files = Vec::new();
     for path in [
         database_path.to_path_buf(),
@@ -673,13 +696,16 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
             }
         }
     }
-    let files_changed = !removed_database_files.is_empty() || removed_journals > 0;
+    let files_changed = !removed_database_files.is_empty()
+        || removed_journals > 0
+        || removed_recovery_directories > 0;
     Ok(json!({
         "operation": "delete_local_state",
         "database_path": database_path,
         "database_existed": existed,
         "removed_database_files": removed_database_files,
         "removed_receipt_journals": removed_journals,
+        "removed_recovery_directories": removed_recovery_directories,
         "rebuild_command": "skillroster scan --json",
         "agent_files_changed": false,
         "library_files_changed": false,
@@ -712,6 +738,43 @@ fn remove_receipt_journals(state_dir: &Path) -> Result<u64> {
             );
         }
         std::fs::remove_file(&path)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn remove_recovery_artifacts(state_dir: &Path) -> Result<u64> {
+    let directory = state_dir.join("recovery");
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", directory.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing to delete invalid recovery directory: {}",
+            directory.display()
+        );
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if ReceiptId::parse(name).is_err() {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "refusing to delete invalid Receipt recovery path: {}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(&path)
+            .with_context(|| format!("cannot delete {}", path.display()))?;
         removed += 1;
     }
     Ok(removed)

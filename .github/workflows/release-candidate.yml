@@ -90,6 +90,13 @@ jobs:
           & "target/$env:TARGET/release/skillroster.exe" --version
           & "target/$env:TARGET/release/skillroster.exe" --help | Out-Null
 
+      - name: Exercise release governance loop
+        shell: pwsh
+        run: |
+          $binary = "target/$env:TARGET/release/skillroster"
+          if ($IsWindows) { $binary = "$binary.exe" }
+          scripts/release/smoke.ps1 -Binary $binary
+
       - name: Package Unix artifact
         if: matrix.package == 'unix'
         shell: bash

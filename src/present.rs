@@ -424,10 +424,21 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
     fact(lines, "Changed paths", text(value, "changed_path_count"));
     fact(lines, "Verification", text(value, "verification"));
     fact(lines, "Undo available", text(value, "undo_available"));
-    lines.extend(summary(
-        "Changed · bounded by the Receipt",
-        "Use the Receipt ID to inspect or undo",
-    ));
+    if value
+        .get("files_changed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        lines.extend(summary(
+            "Changed · bounded by the Receipt",
+            "Use the Receipt ID to inspect or undo",
+        ));
+    } else {
+        lines.extend(summary(
+            "Verified · no files changed",
+            "The Receipt records this no-change decision",
+        ));
+    }
 }
 
 fn setup(value: &Value, lines: &mut Vec<String>) {
@@ -465,10 +476,30 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
                 "Monthly aggregates",
                 text(value, "monthly_aggregates_retained"),
             );
-            lines.extend(summary(
-                "Changed · controlled SQLite history only",
-                "Plans, Receipts, and Agent files were preserved",
-            ));
+            let files_changed = value
+                .get("files_changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let plan_history_changed = value
+                .get("plans_or_receipts_changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if plan_history_changed {
+                lines.extend(summary(
+                    "Changed · Plans and Receipts removed from local state",
+                    "Agent and Library files were preserved",
+                ));
+            } else if files_changed {
+                lines.extend(summary(
+                    "Changed · raw usage condensed in local state",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
+                ));
+            } else {
+                lines.extend(summary(
+                    "No stored history matched · no files changed",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
+                ));
+            }
         }
         "recovery_inspect" => {
             fact(lines, "Recovery", text(value, "recovery_state"));
@@ -666,6 +697,48 @@ mod tests {
         assert!(output.contains("Cancelled · no files changed"));
         assert!(output.contains("Verification           not run"));
         assert!(!output.contains("bounded by the Receipt"));
+    }
+
+    #[test]
+    fn verified_no_change_mutation_does_not_claim_a_file_change() {
+        let output = render(
+            "apply",
+            &json!({
+                "plan_id": "plan_1",
+                "receipt_id": "receipt_1",
+                "changed_path_count": 0,
+                "verification": "passed",
+                "undo_available": false,
+                "files_changed": false
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(output.contains("Verified · no files changed"));
+        assert!(!output.contains("Changed · bounded"));
+    }
+
+    #[test]
+    fn destructive_history_purge_names_what_was_removed() {
+        let output = render(
+            "lifecycle",
+            &json!({
+                "operation": "purge",
+                "raw_usage_days": null,
+                "monthly_aggregates_retained": false,
+                "plans_or_receipts_changed": true,
+                "files_changed": true
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(output.contains("Plans and Receipts removed"));
+        assert!(output.contains("Agent and Library files were preserved"));
+        assert!(!output.contains("Plans, Receipts, Agent files"));
     }
 
     #[test]
