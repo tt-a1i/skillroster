@@ -29,6 +29,7 @@ skillroster --source-root /absolute/trusted/source scan --json
 skillroster report --summary --json
 skillroster report --finding <finding-id> --limit 20 --json
 skillroster find "database migration" --json
+skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
 skillroster plan --stdin --json
 skillroster apply <plan-id> --json
 skillroster undo <receipt-id> --json

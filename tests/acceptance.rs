@@ -17,6 +17,8 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 struct RouteCase {
     task: String,
     skill: String,
+    #[serde(default)]
+    hints: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,7 +115,12 @@ fn evaluate_capabilities(home: &Path, state: &Path, routes: &[RouteCase]) -> (us
     let mut routed = 0;
     let mut succeeded = 0;
     for case in routes {
-        let found = cli_json(home, state, &["find", &case.task, "--limit", "3"], None);
+        let mut arguments = vec!["find", case.task.as_str()];
+        for hint in &case.hints {
+            arguments.extend(["--hint", hint.as_str()]);
+        }
+        arguments.extend(["--limit", "3"]);
+        let found = cli_json(home, state, &arguments, None);
         let Some(matched) = found["result"]["matches"]
             .as_array()
             .unwrap()

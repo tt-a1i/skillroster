@@ -45,6 +45,6 @@ Use `skillroster status --json` for pending Plans, the last Receipt, retention, 
 
 ## Find an on-demand Skill
 
-Run `skillroster find "TASK" --json`. Explain the top matches and evidence, then read the selected `SKILL.md` directly from its returned path. If the lexical matches are clearly about another domain, retry once with concrete tool or operation terms already implied by the task (for example, `MySQL DDL` for a database migration); do not present an irrelevant top result as confidence. Finding a Skill does not activate or install it.
+Run `skillroster find "TASK" --json`, keeping the user's task verbatim. For a non-English or mixed-language task, include one concise English capability paraphrase through `--hint "TEXT"` on the first call; use tool and operation terms implied by the task, not a guessed Skill name. Retry once with a refined hint only when the result is empty or clearly about another domain. Explain the top matches and evidence. A `variant_count` above one is unresolved same-name content ambiguity: show the warning and inspect the corresponding layout Finding before choosing content. Otherwise read the selected `SKILL.md` directly from its returned path. Finding a Skill does not activate or install it.
 
 Never parse styled terminal output, invent a health score, infer token savings, or claim files changed without a successful Receipt.

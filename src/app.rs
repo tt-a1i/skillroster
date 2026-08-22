@@ -132,7 +132,13 @@ pub fn run(cli: Cli) -> Result<Output> {
         ),
         Some(Command::Find(args)) => (
             "find",
-            find_command(&store, &state_dir, &args.task, usize::from(args.limit))?,
+            find_command(
+                &store,
+                &state_dir,
+                &args.task,
+                &args.hints,
+                usize::from(args.limit),
+            )?,
             vec![],
             vec![],
         ),
@@ -1332,10 +1338,22 @@ fn finding_coverage(finding: &crate::query::Finding, scan: &ScanResult) -> Value
     })
 }
 
-fn find_command(store: &StateStore, state_dir: &Path, task: &str, limit: usize) -> Result<Value> {
+fn find_command(
+    store: &StateStore,
+    state_dir: &Path,
+    task: &str,
+    hints: &[String],
+    limit: usize,
+) -> Result<Value> {
     let (scan_id, scan) = latest_scan(store)?;
+    let retrieval_hints = normalize_retrieval_hints(hints);
+    let retrieval_query = std::iter::once(task.trim())
+        .chain(retrieval_hints.iter().map(String::as_str))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut candidate_ids = store
-        .search_skill_ids(task, scan.skills.len())?
+        .search_skill_ids(&retrieval_query, scan.skills.len())?
         .into_iter()
         .map(|id| id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1346,10 +1364,11 @@ fn find_command(store: &StateStore, state_dir: &Path, task: &str, limit: usize) 
             candidate_ids.remove(&skill_id);
         }
     }
-    let mut matches = crate::query::find_matching(&scan, task, limit, Some(&candidate_ids));
+    let mut matches =
+        crate::query::find_matching(&scan, &retrieval_query, limit, Some(&candidate_ids));
     let mut warnings = Vec::new();
     let mut rescan_required = false;
-    for found in &mut matches {
+    for (index, found) in matches.iter_mut().enumerate() {
         let skill_id = SkillId::parse(found.skill_id.clone())?;
         found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
         let paths = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
@@ -1361,17 +1380,57 @@ fn find_command(store: &StateStore, state_dir: &Path, task: &str, limit: usize) 
                 found.name
             ));
         }
+        if index < 3 && found.variant_count > 1 {
+            warnings.push(format!(
+                "{} represents {} same-name Skill variants; inspect the layout Finding before choosing content",
+                found.name, found.variant_count
+            ));
+        }
+    }
+    if retrieval_hints.is_empty() && contains_cjk(task) {
+        warnings.push(
+            "Find is lexical and the task contains CJK text; retry with one concise English capability paraphrase via --hint if relevant Skills use English metadata"
+                .into(),
+        );
+    }
+    if matches.is_empty() {
+        warnings.push(
+            "No lexical Skill match was found; retry once with concrete capability, tool, or operation terms via --hint"
+                .into(),
+        );
     }
     warnings.sort();
     warnings.dedup();
     Ok(json!({
         "snapshot_id": scan_id,
         "task": task,
+        "retrieval_hints": retrieval_hints,
         "matches": matches,
         "rescan_required": rescan_required,
         "warnings": warnings,
         "files_changed": false
     }))
+}
+
+fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {
+    let mut normalized = hints
+        .iter()
+        .map(|hint| hint.trim())
+        .filter(|hint| !hint.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|character| {
+        matches!(
+            character as u32,
+            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0x20000..=0x2fa1f
+        )
+    })
 }
 
 fn current_roster_state(states: &[RosterState]) -> String {

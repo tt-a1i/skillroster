@@ -307,6 +307,16 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                 .unwrap_or_else(|| "not provided".into());
             lines.push(format!("  {}. {}", index + 1, text(item, "name")));
             lines.push(format!("     roster {roster} · source {source}"));
+            if item
+                .get("variant_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 1)
+            {
+                lines.push(format!(
+                    "     variants {} · inspect layout Finding",
+                    text(item, "variant_count")
+                ));
+            }
             lines.push(format!("     reasons {reasons}"));
             lines.push(format!(
                 "     {}",
@@ -315,6 +325,15 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
         if items.is_empty() {
             lines.push("  No matching Skills found.".into());
+        }
+    }
+    if let Some(warnings) = value.get("warnings").and_then(Value::as_array)
+        && !warnings.is_empty()
+    {
+        lines.push(String::new());
+        lines.push("  Retrieval notes".into());
+        for warning in warnings.iter().filter_map(Value::as_str).take(3) {
+            lines.push(format!("  - {warning}"));
         }
     }
     lines.extend(summary(
@@ -857,16 +876,19 @@ mod tests {
                 "name": "research",
                 "roster_state": "core",
                 "source": "github:owner/repo",
+                "variant_count": 2,
                 "match_reasons": ["declared_trigger", "token_overlap:2"],
                 "paths": ["/skills/research/SKILL.md"]
-            }]}),
+            }], "warnings": ["research has two content variants"]}),
             RenderOptions {
                 width: 80,
                 styled: false,
             },
         );
         assert!(found.contains("roster core · source github:owner/repo"));
+        assert!(found.contains("variants 2 · inspect layout Finding"));
         assert!(found.contains("declared_trigger"));
+        assert!(found.contains("Retrieval notes"));
 
         let planned = render(
             "plan",

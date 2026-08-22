@@ -14,7 +14,7 @@ The suite proves:
 
 - all eight direct adapters discover their independent filesystem fixture;
 - each adapter conservatively normalizes Exposed, Matched, Loaded, Applied, and Outcome evidence, while prose-only mentions create no observed stage;
-- the maintained 40-task routing set reaches at least 95% Top-3 recall;
+- the maintained 47-task routing set, including Agent-hinted Chinese tasks, reaches at least 95% Top-3 recall;
 - a public `plan`/`apply` moves non-Core Skills to On-demand, `find` still returns readable paths, and Receipt-bounded `undo` restores the original Agent tree;
 - small (5 Skills), large (120 Skills), and cross-Agent (12 Skills) duplicate scenarios preserve counts, traceable Finding evidence, and the four report metrics;
 - plain 60-, 80-, and 120-column reports retain their core fields, no-change statement, and no ANSI bytes.
@@ -26,7 +26,7 @@ Top-3 routing and task success are separate checks:
 
 The governed run uses the public `scan`, `report`, `plan`, `apply`, `find`, and `undo` commands. It marks seven of ten Skills On-demand, then repeats both checks against paths returned after the real Apply. This validates deterministic fixture capability, not whether an external model completed a natural-language task.
 
-Current local result (2026-08-22): **40/40 Top-3 hits before governance and 40/40 after governance**. Re-run the test above for release evidence; this recorded result is not a substitute for CI.
+Current local result (2026-08-22): **47/47 Top-3 hits before governance and 47/47 after governance**. Re-run the test above for release evidence; this recorded result is not a substitute for CI.
 
 ## Executed three-arm value comparison
 

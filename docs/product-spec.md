@@ -100,7 +100,7 @@ The first complete command surface is:
 ```bash
 skillroster scan [--json]
 skillroster report [--finding <id>] [--json]
-skillroster find <task> [--json]
+skillroster find <task> [--hint <text>]... [--json]
 skillroster plan --stdin [--json]
 skillroster apply <plan-id> [--json]
 skillroster undo <receipt-id> [--json]
@@ -109,6 +109,12 @@ skillroster setup [--json]
 ```
 
 `setup` detects supported Agents and returns a preview for installing the single bootstrap Skill. In JSON mode it never prompts or mutates; the installation is represented by a Plan and completed through the normal Apply path.
+
+`find` preserves the user's original task and accepts repeatable Agent-authored
+retrieval hints. Hints let the semantic caller supply a cross-language or
+capability paraphrase while the CLI remains a deterministic local lexical
+index. Same-name Skill identities occupy one ranked capability result and are
+reported as explicit variants rather than silently treated as equivalent.
 
 All JSON responses use a versioned envelope:
 

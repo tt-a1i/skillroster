@@ -72,6 +72,10 @@ pub struct FindMatch {
     pub source: Option<String>,
     pub match_reasons: Vec<String>,
     pub evidence_quality: EvidenceQuality,
+    /// Same declared name with distinct Skill identities is one ambiguous capability result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variant_skill_ids: Vec<String>,
+    pub variant_count: usize,
 }
 
 pub fn build_report(scan: &ScanResult) -> Report {
@@ -1028,6 +1032,17 @@ pub(crate) fn find_matching(
     }
     let query_tokens = tokens(&query);
     let placement_groups = placements_by_skill(scan);
+    let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
+    for skill in &scan.skills {
+        variants_by_name
+            .entry(skill.name.trim().to_lowercase())
+            .or_default()
+            .push(skill.id.clone());
+    }
+    for variants in variants_by_name.values_mut() {
+        variants.sort();
+        variants.dedup();
+    }
     let mut matches = scan
         .skills
         .iter()
@@ -1088,6 +1103,14 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
+            let mut variant_skill_ids = variants_by_name
+                .get(&name.trim().to_lowercase())
+                .cloned()
+                .unwrap_or_else(|| vec![skill.id.clone()]);
+            let variant_count = variant_skill_ids.len();
+            if variant_count == 1 {
+                variant_skill_ids.clear();
+            }
             let placements = placement_groups
                 .get(skill.id.as_str())
                 .cloned()
@@ -1120,6 +1143,8 @@ pub(crate) fn find_matching(
                 } else {
                     EvidenceQuality::Inferred
                 },
+                variant_skill_ids,
+                variant_count,
             })
         })
         .collect::<Vec<_>>();
@@ -1131,11 +1156,33 @@ pub(crate) fn find_matching(
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.skill_id.cmp(&right.skill_id))
     });
-    matches.truncate(limit);
-    for (index, matched) in matches.iter_mut().enumerate() {
+    let mut capability_indexes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut capabilities: Vec<FindMatch> = Vec::new();
+    for matched in matches {
+        let capability = matched.name.trim().to_lowercase();
+        if let Some(index) = capability_indexes.get(&capability).copied() {
+            let existing = &mut capabilities[index];
+            existing.variant_skill_ids.push(matched.skill_id);
+            existing.variant_skill_ids.sort();
+            existing.variant_skill_ids.dedup();
+            existing.variant_count = existing.variant_skill_ids.len();
+            continue;
+        }
+        capability_indexes.insert(capability, capabilities.len());
+        capabilities.push(matched);
+    }
+    for matched in &mut capabilities {
+        if matched.variant_count > 1 {
+            matched
+                .match_reasons
+                .push(format!("name_variants:{}", matched.variant_count));
+        }
+    }
+    capabilities.truncate(limit);
+    for (index, matched) in capabilities.iter_mut().enumerate() {
         matched.rank = index + 1;
     }
-    matches
+    capabilities
 }
 
 fn tokens(text: &str) -> BTreeSet<String> {
@@ -1425,6 +1472,62 @@ mod tests {
     }
 
     #[test]
+    fn find_returns_one_ranked_capability_for_same_name_variants() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-routing-variants-{nonce}"));
+        for (directory, description, body) in [
+            (
+                "essay-a",
+                "Write a technical essay",
+                "Draft technical essays with diagrams.",
+            ),
+            (
+                "essay-b",
+                "Manage financial spreadsheets",
+                "Build deterministic workbook formulas.",
+            ),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(
+                path.join("SKILL.md"),
+                format!("---\nname: tech-essay-writer\ndescription: {description}\n---\n{body}"),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: crate::harness::AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        let matches = find(&scan, "diagrams", 10);
+
+        assert_eq!(
+            matches
+                .iter()
+                .filter(|matched| matched.name == "tech-essay-writer")
+                .count(),
+            1
+        );
+        let matched = matches
+            .iter()
+            .find(|matched| matched.name == "tech-essay-writer")
+            .unwrap();
+        assert_eq!(matched.variant_count, 2);
+        assert_eq!(matched.variant_skill_ids.len(), 2);
+        assert!(matched.match_reasons.contains(&"name_variants:2".into()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn report_first_view_prioritizes_systemic_and_category_diverse_findings() {
         fn finding(
             category: FindingCategory,
@@ -1540,6 +1643,8 @@ mod tests {
         struct Case {
             task: String,
             skill: String,
+            #[serde(default)]
+            hints: Vec<String>,
         }
 
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/routing-skills");
@@ -1557,7 +1662,11 @@ mod tests {
         let hits = cases
             .iter()
             .filter(|case| {
-                find(&scan, &case.task, 3)
+                let retrieval_query = std::iter::once(case.task.as_str())
+                    .chain(case.hints.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                find(&scan, &retrieval_query, 3)
                     .iter()
                     .any(|item| item.name == case.skill)
             })
