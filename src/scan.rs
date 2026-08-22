@@ -1,5 +1,5 @@
 use crate::harness::{AgentKind, SessionSignal, classify_session_record, known_agent_roots};
-use aho_corasick::AhoCorasickBuilder;
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -902,13 +902,11 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 lines_observed += 1;
                 let lower = line.to_lowercase();
                 if let Some((stage, quality)) = classify_usage_line(agent, &line) {
-                    let mut observed_skill_ids = BTreeSet::new();
-                    if let Some(reference_matcher) = &reference_matcher {
-                        for matched in reference_matcher.find_iter(&lower) {
-                            observed_skill_ids
-                                .insert(reference_lookup[matched.pattern().as_usize()].0.clone());
-                        }
-                    }
+                    let mut observed_skill_ids = observed_reference_skill_ids(
+                        &line,
+                        reference_matcher.as_ref(),
+                        &reference_lookup,
+                    );
                     for reference in explicit_skill_field_values(&line) {
                         if result.skills.iter().any(|skill| skill.id == reference) {
                             observed_skill_ids.insert(reference.clone());
@@ -1005,6 +1003,47 @@ fn classify_usage_line(agent: AgentKind, line: &str) -> Option<(UsageStage, Evid
         Some(SessionSignal::Matched) => Some((UsageStage::Matched, EvidenceQuality::Observed)),
         None => None,
     }
+}
+
+fn observed_reference_skill_ids(
+    line: &str,
+    matcher: Option<&AhoCorasick>,
+    reference_lookup: &[(String, String)],
+) -> BTreeSet<String> {
+    let Some(matcher) = matcher else {
+        return BTreeSet::new();
+    };
+    let searchable = decoded_record_text(line)
+        .unwrap_or_else(|| line.to_owned())
+        .to_ascii_lowercase();
+    matcher
+        .find_iter(&searchable)
+        .map(|matched| reference_lookup[matched.pattern().as_usize()].0.clone())
+        .collect()
+}
+
+fn decoded_record_text(line: &str) -> Option<String> {
+    fn collect_strings(value: &serde_json::Value, output: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(value) => output.push(value.clone()),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_strings(value, output);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values() {
+                    collect_strings(value, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let value = serde_json::from_str(line).ok()?;
+    let mut strings = Vec::new();
+    collect_strings(&value, &mut strings);
+    Some(strings.join("\n"))
 }
 
 fn explicit_skill_field_values(line: &str) -> Vec<String> {
@@ -1377,6 +1416,45 @@ mod tests {
                 .all(|usage| usage.stage == UsageStage::Exposed)
         );
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn json_escaped_windows_reference_binds_observed_usage() {
+        let windows_path = r"C:\Users\tester\.codex\skills\research\SKILL.md";
+        let reference_lookup = vec![(
+            "skill_windows".to_owned(),
+            windows_path.to_ascii_lowercase(),
+        )];
+        let matcher = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(true)
+            .build(
+                reference_lookup
+                    .iter()
+                    .map(|(_, reference)| reference.as_str()),
+            )
+            .unwrap();
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": format!(
+                    "await tools.exec_command({{cmd: \"rg -n name {}\"}})",
+                    windows_path
+                )
+            }
+        })
+        .to_string();
+
+        assert!(line.contains(r"C:\\Users\\tester"));
+        assert_eq!(
+            classify_usage_line(AgentKind::Codex, &line),
+            Some((UsageStage::Loaded, EvidenceQuality::Observed))
+        );
+        assert_eq!(
+            observed_reference_skill_ids(&line, Some(&matcher), &reference_lookup),
+            BTreeSet::from(["skill_windows".to_owned()])
+        );
     }
 
     #[test]
