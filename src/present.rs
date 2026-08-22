@@ -344,25 +344,39 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
 
 fn plan(value: &Value, lines: &mut Vec<String>) {
     fact(lines, "Plan", text(value, "plan_id"));
-    fact(lines, "Operations", array_len(value, "operations"));
+    let operation_count = value
+        .pointer("/change_summary/operation_count")
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or_else(|| array_len(value, "operations"));
+    fact(lines, "Operations", operation_count);
     let operation_categories = value
-        .get("operations")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("kind").and_then(Value::as_str))
-        .fold(
-            std::collections::BTreeMap::<&str, usize>::new(),
-            |mut counts, kind| {
-                *counts.entry(kind).or_default() += 1;
-                counts
-            },
-        );
-    fact(
-        lines,
-        "Operation categories",
-        map_counts(&operation_categories),
-    );
+        .get("operation_groups")
+        .and_then(Value::as_object)
+        .map(|groups| {
+            groups
+                .iter()
+                .map(|(kind, count)| format!("{kind} {}", count.as_u64().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_else(|| {
+            let counts = value
+                .get("operations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|item| item.get("kind").and_then(Value::as_str))
+                .fold(
+                    std::collections::BTreeMap::<&str, usize>::new(),
+                    |mut counts, kind| {
+                        *counts.entry(kind).or_default() += 1;
+                        counts
+                    },
+                );
+            map_counts(&counts)
+        });
+    fact(lines, "Operation categories", operation_categories);
     let roster_changes = value
         .get("roster_changes")
         .and_then(Value::as_array)
@@ -386,26 +400,89 @@ fn plan(value: &Value, lines: &mut Vec<String>) {
                 counts
             },
         );
-    let roster_transition = match (
-        value
-            .pointer("/impact/before_default_exposure")
-            .and_then(Value::as_u64),
-        value
-            .pointer("/impact/after_default_exposure")
-            .and_then(Value::as_u64),
-    ) {
-        (Some(before), Some(after)) => {
-            format!("default exposure {before} → {after}")
-        }
-        _ => format!("current stored states → {}", map_counts(&after)),
+    let risk = text(value, "risk");
+    let (transition_label, transition) = if risk == "library_governance" {
+        let items = value
+            .pointer("/impact/items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let relinked = items
+            .iter()
+            .filter_map(|item| item.pointer("/after/relinked_placement_count"))
+            .filter_map(Value::as_u64)
+            .sum::<u64>();
+        let before = items
+            .first()
+            .and_then(|item| item.pointer("/before/governance_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("current");
+        let after = items
+            .first()
+            .and_then(|item| item.pointer("/after/governance_state"))
+            .and_then(Value::as_str)
+            .unwrap_or("planned");
+        (
+            "Library before → after",
+            format!("{before} → {after} · {relinked} placements relinked"),
+        )
+    } else if risk == "source_update" {
+        (
+            "Source updates",
+            format!(
+                "{} reviewed changes",
+                value
+                    .pointer("/diff_summary/item_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+            ),
+        )
+    } else if risk == "filesystem_change" {
+        ("Filesystem change", format!("{operation_count} operations"))
+    } else {
+        let transition = match (
+            value
+                .pointer("/impact/before_default_exposure")
+                .and_then(Value::as_u64),
+            value
+                .pointer("/impact/after_default_exposure")
+                .and_then(Value::as_u64),
+        ) {
+            (Some(before), Some(after)) => format!("default exposure {before} → {after}"),
+            _ => value
+                .pointer("/impact/roster/after_state_counts")
+                .and_then(Value::as_object)
+                .map(|counts| {
+                    counts
+                        .iter()
+                        .map(|(state, count)| {
+                            format!("{state} {}", count.as_u64().unwrap_or_default())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                })
+                .map(|after| format!("current stored states → {after}"))
+                .unwrap_or_else(|| format!("current stored states → {}", map_counts(&after))),
+        };
+        ("Roster before → after", transition)
     };
-    fact(lines, "Roster before → after", roster_transition);
+    fact(lines, transition_label, transition);
     fact(
         lines,
         "Affected",
-        format!("{} Agents · {} Skills", agents.len(), skills.len()),
+        format!(
+            "{} Agents · {} Skills",
+            value
+                .pointer("/affected/agent_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(agents.len() as u64),
+            value
+                .pointer("/affected/skill_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(skills.len() as u64)
+        ),
     );
-    fact(lines, "Risk", text(value, "risk"));
+    fact(lines, "Risk", risk);
     fact(lines, "Reversible", text(value, "reversible"));
     fact(
         lines,
@@ -912,6 +989,38 @@ mod tests {
         assert!(planned.contains("current stored states → core 1 · on_demand 1"));
         assert!(planned.contains("2 Agents · 1 Skills"));
         assert!(planned.contains("Reversible"));
+
+        let library = render(
+            "plan",
+            &json!({
+                "plan_id": "plan_2",
+                "change_summary": {"operation_count": 101},
+                "operation_groups": {
+                    "create_directory": 1,
+                    "create_symlink": 50,
+                    "move_recoverable": 50
+                },
+                "affected": {"agent_count": 1, "skill_count": 1},
+                "impact": {"items": [{
+                    "before": {"governance_state": "observed"},
+                    "after": {
+                        "governance_state": "managed",
+                        "relinked_placement_count": 50
+                    }
+                }]},
+                "risk": "library_governance",
+                "reversible": true,
+                "canonical_deletion_count": 0,
+                "state": "ready"
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(library.contains("Library before → after"));
+        assert!(library.contains("observed → managed · 50 placements relinked"));
+        assert!(!library.contains("no Roster changes"));
     }
 
     fn strip_ansi(value: &str) -> String {

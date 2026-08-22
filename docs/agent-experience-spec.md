@@ -146,7 +146,7 @@ Machine results should expose facts, not preformatted prose:
 - Findings with stable ID, category, severity, Evidence quality, impact fields, and affected IDs;
 - a bounded `report --summary --json` first view with no more than three Findings and one primary Evidence reference, plus paged placement paths and Evidence facts from `report --finding ID --json`; exact-duplicate detail also exposes at most five ranked, owned canonical candidates without requiring pagination;
 - Find results that keep the original task, expose Agent-authored retrieval hints, and collapse same-name identities into one explicitly variant capability result;
-- Plan `change_summary` counts and `impact` deltas for current and proposed state; source-update line details remain in `diff_summary`;
+- bounded Plan `change_summary`, `operation_groups`, affected-scope counts and `impact` deltas for current and proposed state; source-update line details remain in the bounded `diff_summary`, while full operations are loaded only through `plan --show PLAN_ID` when needed;
 - affected Agents, Skills, placements, operation groups, exclusions, and deletion count;
 - risk, reversibility, drift, confirmation, and recovery state;
 - typed `suggested_actions` containing argv, mutation status, confirmation requirement, and reason code.

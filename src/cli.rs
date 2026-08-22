@@ -107,6 +107,10 @@ pub struct FindArgs {
 pub struct PlanArgs {
     #[arg(long, default_value_t = true)]
     pub stdin: bool,
+
+    /// Show the complete stored representation of an immutable Plan.
+    #[arg(long, value_name = "PLAN_ID")]
+    pub show: Option<String>,
 }
 
 #[derive(Debug, Args)]
