@@ -54,6 +54,10 @@ _Avoid_: Imported Skill, owned Skill
 A traceable fact supporting a Finding, such as a path, source declaration, symlink target, exposure record, or local usage event.
 _Avoid_: Proof, confidence
 
+**Fingerprint Completeness**:
+The typed coverage of a Skill package digest: Complete, Bounded, Unreadable, or Unknown. Only Complete may authorize an exact-content governance decision; the other states remain inventory facts.
+_Avoid_: Best-effort exact hash
+
 **Usage Observation**:
 A privacy-preserving bounded observation for one Skill, Agent, usage stage,
 quality, and session-source path. Unchanged observations deduplicate across

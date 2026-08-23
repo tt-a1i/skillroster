@@ -11,7 +11,9 @@ const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
 use crate::model::RosterState;
-use crate::scan::{LinkStatus, RootKind, RootStatus, ScanResult, SkillPlacement};
+use crate::scan::{
+    FingerprintCompleteness, LinkStatus, RootKind, RootStatus, ScanResult, SkillPlacement,
+};
 
 #[derive(Debug)]
 pub struct DerivedRosterPlan {
@@ -25,6 +27,25 @@ pub struct RosterPhysicalConflict {
     pub skill_id: String,
     pub agents: Vec<String>,
 }
+
+#[derive(Debug)]
+pub struct RosterDiscoveryIncomplete {
+    pub agent: String,
+    pub path: PathBuf,
+    pub detail: Option<String>,
+}
+
+impl std::fmt::Display for RosterDiscoveryIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Agent {} Skill root discovery is incomplete; run a new Scan before planning Roster changes",
+            self.agent
+        )
+    }
+}
+
+impl std::error::Error for RosterDiscoveryIncomplete {}
 
 impl std::fmt::Display for RosterPhysicalConflict {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -496,6 +517,7 @@ pub fn derive(
     let mut pairs = HashSet::new();
     for change in changes {
         let agent = agent(&change.agent)?;
+        agent_root(scan, agent)?;
         if !pairs.insert((change.skill_id.as_str(), agent)) {
             bail!(
                 "duplicate Roster request for Agent {} and Skill {}",
@@ -1033,6 +1055,7 @@ fn verified_real_source(
 
 fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
     placement.governable
+        && placement.fingerprint_completeness == FingerprintCompleteness::Complete
         && placement.content_digest == digest
         && placement.link_target.is_none()
         && std::fs::symlink_metadata(&placement.directory)
@@ -1040,15 +1063,24 @@ fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
 }
 
 fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
-    scan.roots
+    let root = scan
+        .roots
         .iter()
         .find(|root| {
             root.agent == Some(agent)
                 && root.kind == RootKind::Skills
                 && root.status == RootStatus::Included
         })
-        .map(|root| root.path.clone())
-        .ok_or_else(|| anyhow!("Agent {} has no included Skill root", agent.id()))
+        .ok_or_else(|| anyhow!("Agent {} has no included Skill root", agent.id()))?;
+    if !root.discovery_complete {
+        return Err(RosterDiscoveryIncomplete {
+            agent: agent.id().into(),
+            path: root.path.clone(),
+            detail: root.detail.clone(),
+        }
+        .into());
+    }
+    Ok(root.path.clone())
 }
 
 fn agent(value: &str) -> Result<AgentKind> {
@@ -1093,6 +1125,28 @@ mod tests {
 
     use super::*;
     use crate::scan::{ScanOptions, scan};
+
+    #[test]
+    fn roster_planning_types_bounded_root_discovery() {
+        let scan = ScanResult {
+            roots: vec![crate::scan::RootObservation {
+                agent: Some(AgentKind::Codex),
+                kind: RootKind::Skills,
+                path: PathBuf::from("/fixture/codex"),
+                status: RootStatus::Included,
+                explicit: false,
+                detail: Some("Skill discovery was bounded at depth 5".into()),
+                discovery_complete: false,
+            }],
+            ..ScanResult::default()
+        };
+
+        let error = agent_root(&scan, AgentKind::Codex).unwrap_err();
+
+        let blocker = error.downcast_ref::<RosterDiscoveryIncomplete>().unwrap();
+        assert_eq!(blocker.agent, "codex");
+        assert_eq!(blocker.path, PathBuf::from("/fixture/codex"));
+    }
 
     #[cfg(unix)]
     fn shared_agent_root_fixture() -> (TempDir, ScanResult, PathBuf) {

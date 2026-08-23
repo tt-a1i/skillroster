@@ -480,6 +480,75 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             EvidenceQuality::Observed,
         );
     }
+
+    let bounded = scan
+        .roots
+        .iter()
+        .filter(|root| root.kind == crate::scan::RootKind::Skills)
+        .filter(|root| root.status == crate::scan::RootStatus::Included && !root.discovery_complete)
+        .collect::<Vec<_>>();
+    if !bounded.is_empty() {
+        push_finding(
+            findings,
+            FindingCategory::Inventory,
+            Severity::Medium,
+            "Some configured roots had bounded discovery",
+            format!(
+                "{} known or explicit roots were included but not inspected to their full depth; inventory is partial.",
+                bounded.len()
+            ),
+            Vec::new(),
+            Vec::new(),
+            bounded
+                .iter()
+                .map(|root| {
+                    format!(
+                        "path:{}:{}",
+                        root.agent.map(AgentKind::id).unwrap_or("shared"),
+                        root.path.display()
+                    )
+                })
+                .collect(),
+            EvidenceQuality::Observed,
+        );
+    }
+
+    let incomplete_fingerprints = scan
+        .placements
+        .iter()
+        .filter(|placement| {
+            matches!(
+                placement.link_status,
+                LinkStatus::NotLink | LinkStatus::Valid
+            ) && placement.fingerprint_completeness
+                != crate::scan::FingerprintCompleteness::Complete
+        })
+        .collect::<Vec<_>>();
+    if !incomplete_fingerprints.is_empty() {
+        push_finding(
+            findings,
+            FindingCategory::Inventory,
+            Severity::Medium,
+            "Some Skill package fingerprints are incomplete",
+            format!(
+                "{} readable placements have bounded, unreadable, or legacy-unknown package fingerprints and cannot support exact-content governance.",
+                incomplete_fingerprints.len()
+            ),
+            incomplete_fingerprints
+                .iter()
+                .map(|placement| placement.skill_id.clone())
+                .collect(),
+            incomplete_fingerprints
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            incomplete_fingerprints
+                .iter()
+                .map(|placement| format!("path:{}", placement.entrypoint.display()))
+                .collect(),
+            EvidenceQuality::Observed,
+        );
+    }
 }
 
 fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
@@ -1017,6 +1086,11 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         let Some(skill) = scan.skills.iter().find(|skill| skill.id == skill_id) else {
             continue;
         };
+        if placements.iter().any(|placement| {
+            placement.fingerprint_completeness != crate::scan::FingerprintCompleteness::Complete
+        }) {
+            continue;
+        }
         let mut by_digest = BTreeMap::<&str, Vec<&crate::scan::SkillPlacement>>::new();
         for placement in placements {
             by_digest
@@ -2220,6 +2294,7 @@ mod tests {
             status: crate::scan::RootStatus::Inaccessible,
             explicit: false,
             detail: None,
+            discovery_complete: true,
         };
         let mut scan = ScanResult {
             roots: vec![root(crate::scan::RootKind::Sessions)],
@@ -2244,6 +2319,32 @@ mod tests {
             inventory.coverage_basis,
             FindingCoverageBasis::SkillRootScan
         );
+    }
+
+    #[test]
+    fn inventory_reports_included_roots_with_bounded_discovery() {
+        let scan = ScanResult {
+            roots: vec![crate::scan::RootObservation {
+                agent: Some(AgentKind::Codex),
+                kind: crate::scan::RootKind::Skills,
+                path: PathBuf::from("/fixture/bounded"),
+                status: crate::scan::RootStatus::Included,
+                explicit: false,
+                detail: Some("Skill discovery was bounded at depth 5".into()),
+                discovery_complete: false,
+            }],
+            ..ScanResult::default()
+        };
+
+        let report = build_report(&scan);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.title == "Some configured roots had bounded discovery")
+            .unwrap();
+
+        assert_eq!(finding.coverage_basis, FindingCoverageBasis::SkillRootScan);
+        assert_eq!(finding.evidence_quality, EvidenceQuality::Observed);
     }
     use crate::scan::{ScanOptions, scan};
     use std::fs;
@@ -2454,6 +2555,59 @@ mod tests {
 
         assert_eq!(finding.affected_placement_ids.len(), 3);
         assert!(finding.summary.contains("2 distinct physical sources"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_package_fingerprints_never_become_exact_duplicates() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-bounded-duplicate-{nonce}"));
+        for (name, bytes) in [
+            ("copy-a", 16 * 1024 * 1024 + 1),
+            ("copy-b", 16 * 1024 * 1024 + 2),
+        ] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                "---\nname: bounded-copy\n---\nSame entrypoint.",
+            )
+            .unwrap();
+            fs::File::create(directory.join("asset.bin"))
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        assert_eq!(scan.placements.len(), 2);
+        assert!(scan.placements.iter().all(|placement| {
+            placement.fingerprint_completeness == crate::scan::FingerprintCompleteness::Bounded
+        }));
+        let report = build_report(&scan);
+        let incomplete = report
+            .findings
+            .iter()
+            .find(|finding| finding.title == "Some Skill package fingerprints are incomplete")
+            .unwrap();
+        assert_eq!(incomplete.affected_placement_ids.len(), 2);
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| { finding.title == "Exact duplicate Skill placements" })
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3272,6 +3426,8 @@ mod tests {
                     entrypoint: PathBuf::from(format!("/{}/skills/{index}/SKILL.md", agent.id())),
                     physical_directory: None,
                     content_digest: format!("digest_{index}"),
+                    fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
+                    fingerprint_detail: None,
                     link_target: None,
                     link_status: crate::scan::LinkStatus::NotLink,
                     default_exposed: true,

@@ -56,6 +56,8 @@ Use this placement test for every capability: local truth, stable identity, repr
 
 A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently.
 
+Skill-root discovery and package fingerprints carry explicit completeness facts. A configured root whose depth limit was reached remains Included but is marked discovery-incomplete, making structural coverage unreliable. Each placement fingerprint is `complete`, `bounded`, `unreadable`, or `unknown`; payloads created before this contract default to `unknown`. Only a complete package fingerprint may support an exact-duplicate Finding or any Library/Roster Plan that relies on exact content. Bounded or unreadable packages remain inventory facts and require a new complete Scan before governance. Apply repeats this check so a Ready Plan created by an older binary cannot bypass the boundary.
+
 Skill identity uses this precedence:
 
 1. declared source plus version or revision;
