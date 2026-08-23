@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2702,6 +2702,7 @@ fn paged_finding_report(
                 && severity.is_none_or(|value| finding["severity"].as_str() == Some(value.id()))
         })
         .collect::<Vec<_>>();
+    let matching = interleave_finding_families(matching);
     let total = matching.len();
     let items = matching
         .into_iter()
@@ -2746,6 +2747,40 @@ fn paged_finding_report(
         "items": items,
         "files_changed": false
     })
+}
+
+fn interleave_finding_families(findings: Vec<&Value>) -> Vec<&Value> {
+    let mut families = Vec::<((&str, &str, &str), Vec<&Value>)>::new();
+    let mut family_indices = BTreeMap::<(&str, &str, &str), usize>::new();
+    for finding in findings {
+        let key = (
+            finding["category"].as_str().unwrap_or("unknown"),
+            finding["severity"].as_str().unwrap_or("unknown"),
+            finding["title"].as_str().unwrap_or("Unknown Finding"),
+        );
+        if let Some(index) = family_indices.get(&key).copied() {
+            families[index].1.push(finding);
+        } else {
+            family_indices.insert(key, families.len());
+            families.push((key, vec![finding]));
+        }
+    }
+
+    let mut interleaved = Vec::new();
+    let mut member_index = 0;
+    loop {
+        let before = interleaved.len();
+        for (_, members) in &families {
+            if let Some(finding) = members.get(member_index) {
+                interleaved.push(*finding);
+            }
+        }
+        if interleaved.len() == before {
+            break;
+        }
+        member_index += 1;
+    }
+    interleaved
 }
 
 fn compact_report(report: &Value) -> Value {
@@ -6536,6 +6571,58 @@ mod recovery_tests {
         assert_eq!(rollups[0]["finding_count"], 2);
         assert_eq!(rollups[0]["affected_skill_count"], 2);
         assert_eq!(rollups[0]["affected_placement_count"], 3);
+    }
+
+    #[test]
+    fn finding_pages_interleave_families_without_losing_instances() {
+        let finding = |id: &str, category: &str, title: &str| {
+            json!({
+                "id": id,
+                "category": category,
+                "severity": "medium",
+                "title": title,
+                "affected_skill_ids": [],
+                "affected_placement_ids": []
+            })
+        };
+        let report = json!({
+            "findings": [
+                finding("a1", "overlap", "family-a"),
+                finding("a2", "overlap", "family-a"),
+                finding("a3", "overlap", "family-a"),
+                finding("b1", "overlap", "family-b"),
+                finding("b2", "overlap", "family-b"),
+                finding("c1", "usage", "family-c")
+            ]
+        });
+
+        let first = paged_finding_report(&report, None, None, 4, 0);
+        let second = paged_finding_report(&report, None, None, 4, 4);
+        let ids = |page: &Value| {
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(&first), ["a1", "b1", "c1", "a2"]);
+        assert_eq!(ids(&second), ["b2", "a3"]);
+        assert_eq!(first["page"]["total"], 6);
+        assert_eq!(first["page"]["next_offset"], 4);
+        assert_eq!(second["page"]["has_more"], false);
+        assert_eq!(first, paged_finding_report(&report, None, None, 4, 0));
+
+        let filtered = paged_finding_report(
+            &report,
+            Some(ReportCategory::Overlap),
+            Some(ReportSeverity::Medium),
+            10,
+            0,
+        );
+        assert_eq!(ids(&filtered), ["a1", "b1", "a2", "b2", "a3"]);
+        assert_eq!(filtered["page"]["total"], 5);
     }
 
     #[test]
