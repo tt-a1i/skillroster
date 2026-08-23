@@ -151,6 +151,39 @@ pub struct FindMatch {
     pub variants: Vec<FindVariant>,
     pub variant_count: usize,
     pub variants_truncated: bool,
+    /// Same-Snapshot analysis needed to resolve same-name content ambiguity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_finding: Option<VariantFindingReference>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VariantFindingReference {
+    pub state: VariantFindingState,
+    pub reason_code: VariantFindingReason,
+    pub snapshot_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    pub argv: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantFindingState {
+    Available,
+    ReportRequired,
+    FindingUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VariantFindingReason {
+    SameSnapshotVariantSetMatched,
+    CurrentSnapshotReportMissing,
+    MatchingDivergentContentFindingMissing,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1645,6 +1678,7 @@ pub(crate) fn find_matching(
                 variants,
                 variant_count,
                 variants_truncated,
+                variant_finding: None,
             })
         })
         .collect::<Vec<_>>();
@@ -2664,6 +2698,7 @@ mod tests {
                 variants: Vec::new(),
                 variant_count: 1,
                 variants_truncated: false,
+                variant_finding: None,
             }
         }
 

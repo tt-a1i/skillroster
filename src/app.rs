@@ -143,18 +143,16 @@ pub fn run(cli: Cli) -> Result<Output> {
             let actions = report_actions(&result, request);
             ("report", result, vec![], actions)
         }
-        Some(Command::Find(args)) => (
-            "find",
-            find_command(
+        Some(Command::Find(args)) => {
+            let (result, actions) = find_command(
                 &store,
                 &state_dir,
                 &args.task,
                 &args.hints,
                 usize::from(args.limit),
-            )?,
-            vec![],
-            vec![],
-        ),
+            )?;
+            ("find", result, vec![], actions)
+        }
         Some(Command::Plan(args)) => {
             let showing_detail = args.show.is_some();
             let result = match args.show.as_deref() {
@@ -2587,7 +2585,7 @@ fn find_command(
     task: &str,
     hints: &[String],
     limit: usize,
-) -> Result<Value> {
+) -> Result<(Value, Vec<SuggestedAction>)> {
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
@@ -2647,7 +2645,7 @@ fn find_command(
     };
     let mut warnings = Vec::new();
     let mut rescan_required = false;
-    for (index, found) in matches.iter_mut().enumerate() {
+    for found in &mut matches {
         let mut drifted_variants = 0_usize;
         if found.variants.is_empty() {
             let skill_id = SkillId::parse(found.skill_id.clone())?;
@@ -2688,12 +2686,31 @@ fn find_command(
                 )
             });
         }
-        if index < 3 && found.variant_count > 1 {
-            warnings.push(format!(
-                "{} represents {} same-name Skill variants; inspect the layout Finding before choosing content",
+    }
+    let actions = bind_variant_findings(store, &scan_id, &scan, &routable_ids, &mut matches)?;
+    for found in matches
+        .iter()
+        .take(3)
+        .filter(|found| found.variant_count > 1)
+    {
+        let next = found.variant_finding.as_ref();
+        warnings.push(match next.and_then(|reference| reference.finding_id.as_deref()) {
+            Some(finding_id) => format!(
+                "{} represents {} same-name Skill variants; inspect Finding {finding_id} before choosing content",
                 found.name, found.variant_count
-            ));
-        }
+            ),
+            None if matches!(
+                next.map(|reference| reference.state),
+                Some(crate::query::VariantFindingState::ReportRequired)
+            ) => format!(
+                "{} represents {} same-name Skill variants; materialize the current Report before choosing content",
+                found.name, found.variant_count
+            ),
+            _ => format!(
+                "{} represents {} same-name Skill variants, but no matching current divergent-content Finding is available",
+                found.name, found.variant_count
+            ),
+        });
     }
     let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
     if cjk_hint_required {
@@ -2710,16 +2727,163 @@ fn find_command(
     }
     warnings.sort();
     warnings.dedup();
-    Ok(json!({
-        "snapshot_id": scan_id,
-        "task": task,
-        "retrieval_hints": retrieval_hints,
-        "ranking_strategy": ranking_strategy,
-        "matches": matches,
-        "rescan_required": rescan_required,
-        "warnings": warnings,
-        "files_changed": false
-    }))
+    Ok((
+        json!({
+            "snapshot_id": scan_id,
+            "task": task,
+            "retrieval_hints": retrieval_hints,
+            "ranking_strategy": ranking_strategy,
+            "matches": matches,
+            "rescan_required": rescan_required,
+            "warnings": warnings,
+            "files_changed": false
+        }),
+        actions,
+    ))
+}
+
+fn bind_variant_findings(
+    store: &StateStore,
+    scan_id: &ScanId,
+    scan: &ScanResult,
+    routable_ids: &BTreeSet<String>,
+    matches: &mut [crate::query::FindMatch],
+) -> Result<Vec<SuggestedAction>> {
+    let report = store
+        .latest_report()?
+        .filter(|report| report.scan_id == *scan_id);
+    let mut actions = Vec::new();
+    let mut action_argvs = BTreeSet::new();
+
+    for (index, found) in matches
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, found)| found.variant_count > 1)
+    {
+        let capability_name = found.name.trim().to_lowercase();
+        let variant_ids = scan
+            .skills
+            .iter()
+            .filter(|skill| skill.name.trim().to_lowercase() == capability_name)
+            .filter(|skill| routable_ids.contains(&skill.id))
+            .map(|skill| skill.id.clone())
+            .collect::<BTreeSet<_>>();
+        let (reference, suggested) = if let Some(report) = report.as_ref() {
+            if let Some(finding_id) = matching_variant_finding_id(store, report, &variant_ids)? {
+                let suggested = action(
+                    "inspect_variant_finding",
+                    &["report", "--finding", &finding_id, "--json"],
+                    false,
+                    false,
+                    "same_snapshot_variant_finding_available",
+                );
+                (
+                    crate::query::VariantFindingReference {
+                        state: crate::query::VariantFindingState::Available,
+                        reason_code:
+                            crate::query::VariantFindingReason::SameSnapshotVariantSetMatched,
+                        snapshot_id: scan_id.to_string(),
+                        report_id: Some(report.id.to_string()),
+                        finding_id: Some(finding_id),
+                        resolution: Some("choose_same_name_variant".into()),
+                        argv: suggested.argv.clone(),
+                    },
+                    suggested,
+                )
+            } else {
+                let suggested = action(
+                    "inspect_layout_findings",
+                    &["report", "--findings", "--category", "layout", "--json"],
+                    false,
+                    false,
+                    "matching_divergent_content_finding_missing",
+                );
+                (
+                    crate::query::VariantFindingReference {
+                        state: crate::query::VariantFindingState::FindingUnavailable,
+                        reason_code: crate::query::VariantFindingReason::MatchingDivergentContentFindingMissing,
+                        snapshot_id: scan_id.to_string(),
+                        report_id: Some(report.id.to_string()),
+                        finding_id: None,
+                        resolution: None,
+                        argv: suggested.argv.clone(),
+                    },
+                    suggested,
+                )
+            }
+        } else {
+            let suggested = action(
+                "materialize_report",
+                &["report", "--summary", "--json"],
+                false,
+                false,
+                "current_snapshot_report_missing",
+            );
+            (
+                crate::query::VariantFindingReference {
+                    state: crate::query::VariantFindingState::ReportRequired,
+                    reason_code: crate::query::VariantFindingReason::CurrentSnapshotReportMissing,
+                    snapshot_id: scan_id.to_string(),
+                    report_id: None,
+                    finding_id: None,
+                    resolution: None,
+                    argv: suggested.argv.clone(),
+                },
+                suggested,
+            )
+        };
+        found.variant_finding = Some(reference);
+        if index < 3 && action_argvs.insert(suggested.argv.clone()) {
+            actions.push(suggested);
+        }
+    }
+    Ok(actions)
+}
+
+fn matching_variant_finding_id(
+    store: &StateStore,
+    report: &ReportRecord,
+    variant_ids: &BTreeSet<String>,
+) -> Result<Option<String>> {
+    let Some(candidate) = report.summary["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|finding| {
+            if finding["category"] != "layout"
+                || finding["title"] != "Same-name Skills have different content"
+            {
+                return None;
+            }
+            let affected = finding["affected_skill_ids"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            (affected == *variant_ids)
+                .then(|| finding["id"].as_str())
+                .flatten()
+        })
+    else {
+        return Ok(None);
+    };
+    let id = FindingId::parse(candidate.to_owned())?;
+    let Some(stored) = store.get_finding(&id)? else {
+        return Ok(None);
+    };
+    let stored_variant_ids = stored.details["affected_skill_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    Ok((stored.report_id == report.id
+        && stored.category == FindingCategory::Layout
+        && stored.title == "Same-name Skills have different content"
+        && stored_variant_ids == *variant_ids)
+        .then(|| id.to_string()))
 }
 
 fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {

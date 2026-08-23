@@ -110,6 +110,7 @@ fn public_cli_exits_quietly_when_the_output_consumer_closes() {
         "--json",
     ];
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
     let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
     let finding_id = report["result"]["findings"][0]["id"].as_str().unwrap();
 
@@ -772,6 +773,30 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         "--json",
     ];
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let before_report = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        before_report["result"]["matches"][0]["variant_finding"]["state"],
+        "report_required"
+    );
+    assert_eq!(
+        before_report["result"]["matches"][0]["variant_finding"]["reason_code"],
+        "current_snapshot_report_missing"
+    );
+    assert!(before_report["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert_eq!(
+        before_report["suggested_actions"][0]["argv"],
+        json!(["skillroster", "report", "--summary", "--json"])
+    );
+    assert_eq!(before_report["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        before_report["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
     let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
     let finding = report["result"]["findings"]
         .as_array()
@@ -788,6 +813,44 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert_eq!(finding["affected_skill_count"], 2);
     assert_eq!(finding["affected_placement_count"], 2);
     let finding_id = finding["id"].as_str().unwrap();
+
+    let linked_find = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    let variant_finding = &linked_find["result"]["matches"][0]["variant_finding"];
+    assert_eq!(variant_finding["state"], "available");
+    assert_eq!(variant_finding["finding_id"], finding_id);
+    assert_eq!(variant_finding["report_id"], report["result"]["report_id"]);
+    assert_eq!(
+        variant_finding["snapshot_id"],
+        report["result"]["snapshot_id"]
+    );
+    assert_eq!(variant_finding["resolution"], "choose_same_name_variant");
+    assert_eq!(
+        variant_finding["argv"],
+        json!(["skillroster", "report", "--finding", finding_id, "--json"])
+    );
+    assert_eq!(
+        linked_find["suggested_actions"][0]["argv"],
+        variant_finding["argv"]
+    );
+    assert_eq!(linked_find["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        linked_find["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let after_rescan = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        after_rescan["result"]["matches"][0]["variant_finding"]["state"],
+        "report_required"
+    );
+    assert!(after_rescan["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
 
     let compact = json_output(&run(
         &[&common[..], &["report", "--finding", finding_id]].concat(),
@@ -4715,6 +4778,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     ));
     assert_eq!(after["result"]["matches"][0]["variant_count"], 1);
     assert!(after["result"]["matches"][0]["variants"].is_null());
+    assert!(after["result"]["matches"][0]["variant_finding"].is_null());
 
     json_output(&run(
         &[
