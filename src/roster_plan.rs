@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
+const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 1;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
@@ -125,6 +127,7 @@ pub fn source_confirmation_block(
             "path": write_source_confirmation_detail(
                 state_dir,
                 json!({
+                    "schema_version": SOURCE_CONFIRMATION_SCHEMA_VERSION,
                     "reason": "trusted_canonical_sources_required",
                     "decision": "confirm_trusted_source_roots",
                     "requested_core_budget": core_budget,
@@ -179,11 +182,38 @@ fn scan_with_source_roots_argv(source_roots: &[String]) -> Vec<String> {
 
 fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result<PathBuf> {
     let directory = state_dir.join("source-confirmation");
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("cannot create {}", directory.display()))?;
+    match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "refusing invalid source-confirmation directory: {}",
+                directory.display()
+            );
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&directory)
+                .with_context(|| format!("cannot create {}", directory.display()))?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", directory.display()));
+        }
+    }
     let path = directory.join(format!("{}.json", ulid::Ulid::new()));
-    std::fs::write(&path, serde_json::to_vec(&complete)?)
+    let bytes = serde_json::to_vec(&complete)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("cannot create {}", path.display()))?;
+    file.write_all(&bytes)
         .with_context(|| format!("cannot write {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("cannot sync {}", path.display()))?;
     Ok(path)
 }
 
@@ -1109,6 +1139,7 @@ mod tests {
         );
         let detail_path = blocked.details["detail"]["path"].as_str().unwrap();
         let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["schema_version"], 1);
         assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
         assert_eq!(complete["source_roots"], json!(expected_roots));
         assert_eq!(
@@ -1143,6 +1174,31 @@ mod tests {
             );
         }
         assert!(!changes.iter().any(|item| item["name"] == "skill-10"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_confirmation_block_refuses_a_symlinked_detail_directory() {
+        let state = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), state.path().join("source-confirmation"))
+            .unwrap();
+        let exclusions = (0..11)
+            .map(|index| RosterChangeExclusion {
+                agent: "codex".into(),
+                skill_id: format!("skill_{index:032}"),
+                name: format!("skill-{index:02}"),
+                reason: "no_owned_exact_content_to_preserve",
+                observed_source_target: Some(test_absolute_path(&format!(
+                    "opt/root-{index:02}/pkg"
+                ))),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).is_err()
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

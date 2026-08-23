@@ -225,8 +225,9 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 - Derived event summaries are retained for 180 days by default.
 - Older usage is reduced to monthly aggregates.
 - Plans and Receipts remain until explicitly purged.
-- `status` exposes storage location and retention state.
-- Users can inspect, export, purge, or delete the database and rebuild it by scanning again.
+- Overflow source-confirmation details are versioned local artifacts retained until explicitly purged or local state is deleted.
+- `status` exposes storage location, retention state, and retained source-confirmation artifact counts and bytes.
+- Users can inspect, export, purge, or delete retained local state and rebuild inventory by scanning again.
 
 Reports may identify structural and provenance risks—unknown source, changed content, executable scripts, declaration mismatch, and escaping links—but must not claim malware detection or runtime safety.
 

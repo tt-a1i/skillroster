@@ -1467,16 +1467,25 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
             ));
         }
         "purge" => {
-            fact(
-                lines,
-                "Raw retention",
-                format!("{} days", text(value, "raw_usage_days")),
-            );
-            fact(
-                lines,
-                "Monthly aggregates",
-                text(value, "monthly_aggregates_retained"),
-            );
+            if value.get("raw_usage_days").is_some_and(Value::is_number) {
+                fact(
+                    lines,
+                    "Raw retention",
+                    format!("{} days", text(value, "raw_usage_days")),
+                );
+                fact(
+                    lines,
+                    "Monthly aggregates",
+                    text(value, "monthly_aggregates_retained"),
+                );
+            }
+            let removed_source_details = value
+                .get("removed_source_confirmation_details")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if removed_source_details > 0 {
+                fact(lines, "Source details removed", removed_source_details);
+            }
             let files_changed = value
                 .get("files_changed")
                 .and_then(Value::as_bool)
@@ -1489,6 +1498,18 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
                 lines.extend(summary(
                     "Changed · Plans and Receipts removed from local state",
                     "Agent and Library files were preserved",
+                ));
+            } else if removed_source_details > 0
+                && value.get("raw_usage_days").is_some_and(Value::is_number)
+            {
+                lines.extend(summary(
+                    "Changed · selected local lifecycle state removed",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
+                ));
+            } else if removed_source_details > 0 {
+                lines.extend(summary(
+                    "Changed · source-confirmation details removed",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
                 ));
             } else if files_changed {
                 lines.extend(summary(

@@ -1079,6 +1079,97 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
 }
 
 #[test]
+fn source_confirmation_details_follow_public_lifecycle() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let details = state.join("source-confirmation");
+    fs::create_dir(&details).unwrap();
+    let artifact = details.join("fixture.json");
+    fs::write(
+        &artifact,
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "reason": "trusted_canonical_sources_required",
+            "source_roots": [temp.path().join("reviewed")]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(
+        status["result"]["retention"]["source_confirmation_details"]["count"],
+        1
+    );
+    let inspect = json_output(&run(
+        &[&common[..], &["lifecycle", "inspect"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        inspect["result"]["counts"]["source_confirmation_details"],
+        1
+    );
+    assert_eq!(
+        inspect["result"]["source_confirmation_details"]["retention"],
+        "until_explicit_purge_or_delete"
+    );
+
+    let export_path = temp.path().join("lifecycle-details.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                export_path.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let exported: Value = serde_json::from_slice(&fs::read(export_path).unwrap()).unwrap();
+    assert_eq!(
+        exported["source_confirmation_details"][0]["schema_version"],
+        1
+    );
+
+    let purged = json_output(&run(
+        &[
+            &common[..],
+            &["lifecycle", "purge", "--source-confirmation"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(purged["result"]["removed_source_confirmation_details"], 1);
+    assert!(!details.exists());
+
+    fs::create_dir(&details).unwrap();
+    fs::write(&artifact, b"{\"schema_version\":1}").unwrap();
+    let deleted = json_output(&run(
+        &[
+            &common[..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(deleted["result"]["removed_source_confirmation_details"], 1);
+    assert!(!details.exists());
+}
+
+#[test]
 fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
