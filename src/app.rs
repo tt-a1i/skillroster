@@ -672,7 +672,7 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
 fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path) -> Result<Value> {
     let source_confirmation_details = read_source_confirmation_details(state_dir)?;
     let export = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": Utc::now().timestamp(),
         "retention": {
             "raw_usage_days": 180,

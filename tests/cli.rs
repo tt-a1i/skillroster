@@ -2224,6 +2224,7 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
         None,
     ));
     let retained: Value = serde_json::from_slice(&fs::read(&retained_export).unwrap()).unwrap();
+    assert_eq!(retained["schema_version"], 2);
     assert_eq!(
         retained["usage_history"]["raw_value_field"],
         "observed_event_count"
