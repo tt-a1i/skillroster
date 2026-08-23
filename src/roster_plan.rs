@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
+
+const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
@@ -49,7 +51,8 @@ pub fn source_confirmation_block(
     finding_id: &str,
     core_budget: usize,
     exclusions: &[RosterChangeExclusion],
-) -> RosterPlanBlocked {
+    state_dir: &Path,
+) -> Result<RosterPlanBlocked> {
     let mut exclusions = exclusions.to_vec();
     exclusions.sort_by(|left, right| {
         (&left.agent, &left.name, &left.skill_id).cmp(&(&right.agent, &right.name, &right.skill_id))
@@ -65,63 +68,134 @@ pub fn source_confirmation_block(
         .collect::<Vec<_>>();
     let blocked_changes = exclusions
         .iter()
-        .map(|exclusion| {
-            let mut item = json!({
-                "agent": exclusion.agent,
-                "skill_id": exclusion.skill_id,
-                "name": exclusion.name,
-                "reason": exclusion.reason,
-                "state": "unchanged"
-            });
-            if let Some(target) = &exclusion.observed_source_target {
-                item["observed_source_target"] = json!(target);
-            }
-            item
-        })
+        .map(blocked_change_json)
+        .collect::<Vec<_>>();
+    let skill_ids = exclusions
+        .iter()
+        .map(|exclusion| exclusion.skill_id.clone())
+        .collect::<Vec<_>>();
+    let blocked_change_count = exclusions.len();
+    let source_root_count = source_root_paths.len();
+    let changes_truncated = blocked_change_count > SOURCE_CONFIRMATION_JSON_LIMIT;
+    let roots_truncated = source_root_count > SOURCE_CONFIRMATION_JSON_LIMIT;
+    let bounded_changes = blocked_changes
+        .iter()
+        .take(SOURCE_CONFIRMATION_JSON_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let bounded_roots = source_root_paths
+        .iter()
+        .take(SOURCE_CONFIRMATION_JSON_LIMIT)
+        .cloned()
         .collect::<Vec<_>>();
     let mut relevant_ids = vec![finding_id.to_string()];
     relevant_ids.extend(
-        exclusions
+        skill_ids
             .iter()
-            .map(|exclusion| exclusion.skill_id.clone()),
+            .take(SOURCE_CONFIRMATION_JSON_LIMIT)
+            .cloned(),
     );
-    let blocked_change_count = exclusions.len();
-    RosterPlanBlocked {
+    let mut details = json!({
+        "reason": "trusted_canonical_sources_required",
+        "decision": "confirm_trusted_source_roots",
+        "automatic_change_supported": false,
+        "requested_core_budget": core_budget,
+        "blocked_change_count": blocked_change_count,
+        "blocked_changes": bounded_changes,
+        "blocked_changes_truncated": changes_truncated,
+        "source_root_count": source_root_count,
+        "source_roots": bounded_roots.clone(),
+        "source_roots_truncated": roots_truncated,
+        "after_confirmation": {
+            "repeatable_option": "--source-root",
+            "source_roots": bounded_roots.clone(),
+            "argv_template": [
+                "skillroster",
+                "--source-root",
+                "<confirmed-canonical-source-directory>",
+                "scan",
+                "--json"
+            ],
+            "next": "rescan with only the reported reviewed source roots and retry the same Plan request"
+        },
+        "files_changed": false
+    });
+    if changes_truncated || roots_truncated {
+        details["detail"] = json!({
+            "path": write_source_confirmation_detail(
+                state_dir,
+                json!({
+                    "reason": "trusted_canonical_sources_required",
+                    "decision": "confirm_trusted_source_roots",
+                    "requested_core_budget": core_budget,
+                    "blocked_change_count": blocked_change_count,
+                    "blocked_changes": blocked_changes,
+                    "skill_ids": skill_ids,
+                    "source_root_count": source_root_count,
+                    "source_roots": source_root_paths,
+                    "after_confirmation": {
+                        "repeatable_option": "--source-root",
+                        "source_roots": source_root_paths,
+                        "argv": scan_with_source_roots_argv(&source_root_paths)
+                    }
+                }),
+            )?
+        });
+    }
+    Ok(RosterPlanBlocked {
         message: format!(
             "Finding {finding_id} is blocked by {blocked_change_count} Roster changes without owned exact content at core_budget {core_budget}; confirm the reported source roots, rescan, and use the new Finding"
         ),
         relevant_ids,
-        paths: source_root_paths.clone(),
-        details: json!({
-            "reason": "trusted_canonical_sources_required",
-            "decision": "confirm_trusted_source_roots",
-            "automatic_change_supported": false,
-            "requested_core_budget": core_budget,
-            "blocked_change_count": blocked_change_count,
-            "blocked_changes": blocked_changes,
-            "blocked_changes_truncated": false,
-            "source_root_count": source_root_paths.len(),
-            "source_roots": source_root_paths,
-            "source_roots_truncated": false,
-            "after_confirmation": {
-                "repeatable_option": "--source-root",
-                "source_roots": source_root_paths,
-                "argv_template": [
-                    "skillroster",
-                    "--source-root",
-                    "<confirmed-canonical-source-directory>",
-                    "scan",
-                    "--json"
-                ],
-                "next": "rescan with only the reported reviewed source roots and retry the same Plan request"
-            },
-            "files_changed": false,
-            "detail": {
-                "mode": "complete",
-                "contains": ["blocked_changes", "source_roots"]
-            }
-        }),
+        paths: bounded_roots,
+        details,
+    })
+}
+
+fn blocked_change_json(exclusion: &RosterChangeExclusion) -> Value {
+    let mut item = json!({
+        "agent": exclusion.agent,
+        "skill_id": exclusion.skill_id,
+        "name": exclusion.name,
+        "reason": exclusion.reason,
+        "state": "unchanged"
+    });
+    if let Some(target) = &exclusion.observed_source_target {
+        item["observed_source_target"] = json!(target);
     }
+    item
+}
+
+fn scan_with_source_roots_argv(source_roots: &[String]) -> Vec<String> {
+    let mut argv = vec!["skillroster".into()];
+    for root in source_roots {
+        argv.push("--source-root".into());
+        argv.push(root.clone());
+    }
+    argv.push("scan".into());
+    argv.push("--json".into());
+    argv
+}
+
+fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result<PathBuf> {
+    let directory = state_dir.join("source-confirmation");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("cannot create {}", directory.display()))?;
+    let path = directory.join(format!("{}.json", ulid::Ulid::new()));
+    std::fs::write(&path, serde_json::to_vec(&complete)?)
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+#[cfg(test)]
+pub fn test_absolute_path(relative: &str) -> PathBuf {
+    let mut path = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
+    path.extend(
+        relative
+            .split('/')
+            .filter(|component| !component.is_empty()),
+    );
+    path
 }
 
 /// Collapse observed escaping-link targets to the fewest `--source-root` directories.
@@ -948,86 +1022,127 @@ mod tests {
 
     #[test]
     fn reviewed_source_roots_collapse_sibling_packages_and_keep_singletons() {
-        let shared = PathBuf::from("/opt/reviewed/alpha");
-        let sibling = PathBuf::from("/opt/reviewed/beta");
-        let unique = PathBuf::from("/elsewhere/one-off");
+        let shared = test_absolute_path("opt/reviewed/alpha");
+        let sibling = test_absolute_path("opt/reviewed/beta");
+        let unique = test_absolute_path("elsewhere/one-off");
         let roots = minimum_reviewed_source_roots([shared, sibling, unique.clone()]);
-        assert_eq!(roots, vec![unique, PathBuf::from("/opt/reviewed")]);
+        assert_eq!(roots, vec![unique, test_absolute_path("opt/reviewed")]);
     }
 
     #[test]
     fn source_confirmation_block_is_typed_bounded_and_actionable() {
+        let state = TempDir::new().unwrap();
         let exclusions = vec![
             RosterChangeExclusion {
                 agent: "codex".into(),
                 skill_id: "skill_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                 name: "alpha".into(),
                 reason: "no_owned_exact_content_to_preserve",
-                observed_source_target: Some(PathBuf::from("/opt/reviewed/alpha")),
+                observed_source_target: Some(test_absolute_path("opt/reviewed/alpha")),
             },
             RosterChangeExclusion {
                 agent: "codex".into(),
                 skill_id: "skill_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                 name: "beta".into(),
                 reason: "no_owned_exact_content_to_preserve",
-                observed_source_target: Some(PathBuf::from("/opt/reviewed/beta")),
+                observed_source_target: Some(test_absolute_path("opt/reviewed/beta")),
             },
         ];
-        let blocked = source_confirmation_block("finding_fixture", 10, &exclusions);
-        assert_eq!(blocked.paths, vec!["/opt/reviewed"]);
+        let blocked =
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
+        let reviewed = test_absolute_path("opt/reviewed");
+        assert_eq!(blocked.paths, vec![reviewed.display().to_string()]);
         assert!(blocked.relevant_ids.contains(&"finding_fixture".into()));
         assert_eq!(blocked.details["decision"], "confirm_trusted_source_roots");
         assert_eq!(blocked.details["requested_core_budget"], 10);
         assert_eq!(blocked.details["blocked_change_count"], 2);
         assert_eq!(blocked.details["blocked_changes_truncated"], false);
-        assert_eq!(blocked.details["source_roots"], json!(["/opt/reviewed"]));
+        assert_eq!(blocked.details["source_roots"], json!([reviewed]));
         assert_eq!(blocked.details["blocked_changes"][0]["name"], "alpha");
         assert_eq!(
             blocked.details["blocked_changes"][0]["observed_source_target"],
-            "/opt/reviewed/alpha"
+            json!(test_absolute_path("opt/reviewed/alpha"))
         );
         assert_eq!(blocked.details["files_changed"], false);
-        assert_eq!(blocked.details["detail"]["mode"], "complete");
+        assert!(blocked.details.get("detail").is_none());
+        assert!(!state.path().join("source-confirmation").exists());
         assert!(!blocked.message.contains("session"));
     }
 
     #[test]
-    fn source_confirmation_block_keeps_every_blocker_and_root_in_json() {
+    fn source_confirmation_block_writes_omitted_identities_to_a_detail_file() {
+        let state = TempDir::new().unwrap();
         let exclusions = (0..11)
             .map(|index| RosterChangeExclusion {
                 agent: "codex".into(),
                 skill_id: format!("skill_{index:032}"),
                 name: format!("skill-{index:02}"),
                 reason: "no_owned_exact_content_to_preserve",
-                observed_source_target: Some(PathBuf::from(format!("/opt/root-{index:02}/pkg"))),
+                observed_source_target: Some(test_absolute_path(&format!(
+                    "opt/root-{index:02}/pkg"
+                ))),
             })
             .collect::<Vec<_>>();
-        let blocked = source_confirmation_block("finding_fixture", 10, &exclusions);
+        let blocked =
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
         let changes = blocked.details["blocked_changes"].as_array().unwrap();
-        assert_eq!(changes.len(), 11);
+        assert_eq!(changes.len(), 10);
         assert_eq!(blocked.details["blocked_change_count"], 11);
-        assert_eq!(blocked.details["blocked_changes_truncated"], false);
-        assert_eq!(blocked.details["source_roots_truncated"], false);
-        assert_eq!(blocked.details["detail"]["mode"], "complete");
+        assert_eq!(blocked.details["blocked_changes_truncated"], true);
+        assert_eq!(blocked.details["source_roots_truncated"], true);
+        assert_eq!(blocked.relevant_ids.len(), 11);
+        let expected_roots = (0..11)
+            .map(|index| test_absolute_path(&format!("opt/root-{index:02}/pkg")))
+            .collect::<Vec<_>>();
+        let bounded_roots = expected_roots.iter().take(10).cloned().collect::<Vec<_>>();
+        assert_eq!(
+            blocked.paths,
+            bounded_roots
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(blocked.details["source_roots"], json!(bounded_roots));
+        assert_eq!(
+            blocked.details["after_confirmation"]["source_roots"],
+            json!(bounded_roots)
+        );
+        let detail_path = blocked.details["detail"]["path"].as_str().unwrap();
+        let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
+        assert_eq!(complete["source_roots"], json!(expected_roots));
+        assert_eq!(
+            complete["after_confirmation"]["source_roots"],
+            json!(expected_roots)
+        );
+        let argv = complete["after_confirmation"]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        for root in &expected_roots {
+            let root = root.display().to_string();
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--source-root" && pair[1] == root),
+                "missing --source-root {root} in {argv:?}"
+            );
+        }
         for exclusion in &exclusions {
             assert!(
-                changes.iter().any(|item| {
-                    item["skill_id"] == exclusion.skill_id && item["name"] == exclusion.name
-                }),
+                complete["blocked_changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| {
+                        item["skill_id"] == exclusion.skill_id && item["name"] == exclusion.name
+                    }),
                 "missing {}",
                 exclusion.skill_id
             );
-            assert!(blocked.relevant_ids.contains(&exclusion.skill_id));
         }
-        let expected_roots = (0..11)
-            .map(|index| format!("/opt/root-{index:02}/pkg"))
-            .collect::<Vec<_>>();
-        assert_eq!(blocked.paths, expected_roots);
-        assert_eq!(blocked.details["source_roots"], json!(expected_roots));
-        assert_eq!(
-            blocked.details["after_confirmation"]["source_roots"],
-            json!(expected_roots)
-        );
+        assert!(!changes.iter().any(|item| item["name"] == "skill-10"));
     }
 
     #[cfg(unix)]
@@ -1063,7 +1178,9 @@ mod tests {
             reason: "no_owned_exact_content_to_preserve",
             observed_source_target: Some(PathBuf::from("/")),
         }];
-        let blocked = source_confirmation_block("finding_fixture", 10, &exclusions);
+        let state = TempDir::new().unwrap();
+        let blocked =
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
         assert!(blocked.paths.is_empty());
         assert_eq!(blocked.details["source_roots"], json!([]));
         assert_eq!(blocked.details["blocked_changes"][0]["name"], "rootish");

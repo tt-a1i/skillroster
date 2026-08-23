@@ -3105,6 +3105,7 @@ fn expand_finding_roster_changes(
     mut input: Value,
     latest_scan_id: &ScanId,
     scan: &ScanResult,
+    state_dir: &Path,
 ) -> Result<(Value, Option<FindingPlanProvenance>)> {
     let object = input
         .as_object_mut()
@@ -3179,7 +3180,8 @@ fn expand_finding_roster_changes(
             finding_id.as_str(),
             request.core_budget,
             &supported.exclusions,
-        )
+            state_dir,
+        )?
         .into());
     }
     if finding.evidence_ids.is_empty() {
@@ -3944,7 +3946,7 @@ fn prepare_plan(
     let (scan_id, scan) = latest_scan(store)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
         let (input, roster_provenance) =
-            expand_finding_roster_changes(store, input, &scan_id, &scan)?;
+            expand_finding_roster_changes(store, input, &scan_id, &scan, state_dir)?;
         let (input, library_provenance) =
             expand_finding_library_changes(store, input, &scan_id, &scan)?;
         (input, roster_provenance.or(library_provenance))
@@ -6206,52 +6208,85 @@ mod recovery_tests {
     }
 
     #[test]
-    fn source_block_json_keeps_every_suggested_source_root() {
+    fn source_block_json_keeps_complete_roots_in_the_detail_file() {
+        let state = TempDir::new().unwrap();
         let exclusions = (0..11)
             .map(|index| crate::roster_plan::RosterChangeExclusion {
                 agent: "codex".into(),
                 skill_id: format!("skill_{index:032}"),
                 name: format!("skill-{index:02}"),
                 reason: "no_owned_exact_content_to_preserve",
-                observed_source_target: Some(std::path::PathBuf::from(format!(
-                    "/opt/root-{index:02}/pkg"
+                observed_source_target: Some(crate::roster_plan::test_absolute_path(&format!(
+                    "opt/root-{index:02}/pkg"
                 ))),
             })
             .collect::<Vec<_>>();
-        let blocked =
-            crate::roster_plan::source_confirmation_block("finding_fixture", 10, &exclusions);
+        let blocked = crate::roster_plan::source_confirmation_block(
+            "finding_fixture",
+            10,
+            &exclusions,
+            state.path(),
+        )
+        .unwrap();
         let envelope: Value = serde_json::from_str(&error_json("plan", &blocked)).unwrap();
         assert_eq!(
             envelope["error"]["details"]["blocked_changes"]
                 .as_array()
                 .unwrap()
                 .len(),
-            11
+            10
         );
         assert_eq!(
             envelope["error"]["details"]["source_roots"]
                 .as_array()
                 .unwrap()
                 .len(),
-            11
+            10
         );
         assert_eq!(
             envelope["error"]["details"]["blocked_changes_truncated"],
-            false
+            true
         );
-        assert_eq!(envelope["error"]["details"]["detail"]["mode"], "complete");
+        assert_eq!(envelope["error"]["details"]["source_roots_truncated"], true);
+        assert_eq!(envelope["error"]["paths"].as_array().unwrap().len(), 10);
         let argv = envelope["suggested_actions"][0]["argv"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        for index in 0..11 {
-            let root = format!("/opt/root-{index:02}/pkg");
+        let expected_roots = (0..11)
+            .map(|index| {
+                crate::roster_plan::test_absolute_path(&format!("opt/root-{index:02}/pkg"))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for root in expected_roots.iter().take(10) {
             assert!(
                 argv.windows(2)
                     .any(|pair| pair[0] == "--source-root" && pair[1] == root),
-                "missing --source-root {root} in {argv:?}"
+                "missing bounded --source-root {root} in {argv:?}"
+            );
+        }
+        assert!(!argv.iter().any(|value| value == &expected_roots[10]));
+        let detail_path = envelope["error"]["details"]["detail"]["path"]
+            .as_str()
+            .unwrap();
+        let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["source_roots"], json!(expected_roots));
+        let complete_argv = complete["after_confirmation"]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        for root in &expected_roots {
+            assert!(
+                complete_argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--source-root" && pair[1] == root),
+                "missing complete --source-root {root} in {complete_argv:?}"
             );
         }
     }

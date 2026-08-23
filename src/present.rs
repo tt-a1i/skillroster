@@ -237,12 +237,13 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
             ));
         }
     }
-    if details["blocked_changes_truncated"].as_bool() == Some(true)
+    let more_blockers = details["blocked_changes_truncated"].as_bool() == Some(true)
         || details
             .get("blocked_changes")
             .and_then(Value::as_array)
-            .is_some_and(|items| items.len() > 5)
-    {
+            .is_some_and(|items| items.len() > 5);
+    let detail_path = details.pointer("/detail/path").and_then(Value::as_str);
+    if more_blockers && detail_path.is_none() {
         lines.push("  Inspect JSON error.details for remaining blockers".into());
     }
     lines.push(String::new());
@@ -265,12 +266,17 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
     if shown == 0 {
         lines.push("  none disclosed".into());
     }
-    if details["source_roots_truncated"].as_bool() == Some(true)
+    let more_roots = details["source_roots_truncated"].as_bool() == Some(true)
         || details
             .get("source_roots")
             .and_then(Value::as_array)
-            .is_some_and(|items| items.len() > 5)
-    {
+            .is_some_and(|items| items.len() > 5);
+    if let Some(path) = detail_path.filter(|_| more_blockers || more_roots) {
+        lines.push(format!(
+            "  Read {}",
+            middle_truncate(path, width.saturating_sub(8))
+        ));
+    } else if more_roots {
         lines.push("  Inspect JSON error.details for remaining source roots".into());
     }
     lines.extend(summary(
@@ -1848,8 +1854,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_budget_overflow_points_at_complete_json_details() {
-        let blocked_changes = (0..11)
+    fn custom_budget_overflow_points_at_the_detail_file() {
+        let blocked_changes = (0..10)
             .map(|index| {
                 json!({
                     "agent": "codex",
@@ -1858,7 +1864,7 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let source_roots = (0..11)
+        let source_roots = (0..10)
             .map(|index| json!(format!("/opt/root-{index:02}/pkg")))
             .collect::<Vec<_>>();
         let details = json!({
@@ -1866,9 +1872,12 @@ mod tests {
             "requested_core_budget": 10,
             "blocked_change_count": 11,
             "blocked_changes": blocked_changes,
-            "blocked_changes_truncated": false,
+            "blocked_changes_truncated": true,
             "source_roots": source_roots,
-            "source_roots_truncated": false
+            "source_roots_truncated": true,
+            "detail": {
+                "path": "/tmp/skillroster/source-confirmation/overflow.json"
+            }
         });
         let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
         blocked_roster_plan_lines(&details, &mut lines, 80);
@@ -1879,13 +1888,10 @@ mod tests {
         assert!(output.contains("/opt/root-00/pkg"), "{output}");
         assert!(!output.contains("/opt/root-05/pkg"), "{output}");
         assert!(
-            output.contains("Inspect JSON error.details for remaining blockers"),
+            output.contains("Read /tmp/skillroster/source-confirmation/overflow.json"),
             "{output}"
         );
-        assert!(
-            output.contains("Inspect JSON error.details for remaining source roots"),
-            "{output}"
-        );
+        assert!(!output.contains("Inspect JSON error.details"), "{output}");
         assert!(!output.to_lowercase().contains("truncated"), "{output}");
         assert!(
             output.lines().all(|line| display_width(line) <= 80),
