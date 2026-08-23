@@ -55,7 +55,7 @@ impl Cli {
 pub enum Command {
     /// Discover Skills and persist an immutable Snapshot.
     Scan,
-    /// Analyze the latest Snapshot or drill into one Finding.
+    /// Analyze the latest Snapshot or drill into one Finding. Defaults to the bounded Summary view.
     Report(ReportArgs),
     /// Rank locally known Skills for a task without activating them.
     Find(FindArgs),
@@ -82,8 +82,8 @@ pub struct ReportArgs {
     #[arg(long, conflicts_with_all = ["finding", "summary", "full"])]
     pub findings: bool,
 
-    /// Show complete IDs, placement records, and Evidence records for one Finding.
-    #[arg(long, requires = "finding")]
+    /// Return the exhaustive report, or complete records for one Finding.
+    #[arg(long, conflicts_with_all = ["findings", "summary"])]
     pub full: bool,
 
     /// Return core metrics and the three highest-priority Findings.

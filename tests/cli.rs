@@ -42,6 +42,19 @@ fn json_output(output: &std::process::Output) -> Value {
 }
 
 #[test]
+fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
+    let output = run(&["report", "--help"], None);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        help.contains("Defaults to the bounded Summary view"),
+        "{help}"
+    );
+    assert!(help.contains("--full"), "{help}");
+    assert!(help.contains("exhaustive report"), "{help}");
+}
+
+#[test]
 fn public_cli_exits_quietly_when_the_output_consumer_closes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -360,7 +373,10 @@ fn finding_drilldown_is_bounded_and_pageable() {
         state.to_str().unwrap(),
         "--json",
     ];
-    let invalid_full = run(&[&common[..], &["report", "--full"]].concat(), None);
+    let invalid_full = run(
+        &[&common[..], &["report", "--full", "--summary"]].concat(),
+        None,
+    );
     assert!(!invalid_full.status.success());
     let invalid_full: Value = serde_json::from_slice(&invalid_full.stdout).unwrap();
     assert_eq!(invalid_full["error"]["code"], "invalid_cli_arguments");
@@ -455,6 +471,32 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
         &[&common[..], &["report", "--summary"]].concat(),
         None,
     ));
+    let default_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(
+        default_report["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        default_report["result"]["finding_count"],
+        summary["result"]["finding_count"]
+    );
+    assert_eq!(
+        default_report["result"]["finding_rollups"],
+        summary["result"]["finding_rollups"]
+    );
+    assert_eq!(default_report["result"]["files_changed"], false);
+    let exhaustive_report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    assert_eq!(
+        exhaustive_report["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        60
+    );
+    assert_eq!(exhaustive_report["result"]["files_changed"], false);
     let duplicate_rollup = summary["result"]["finding_rollups"]
         .as_array()
         .unwrap()
@@ -697,6 +739,10 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(scan["ok"], true);
     assert_eq!(scan["result"]["skill_count"], 1);
     assert_eq!(scan["result"]["files_changed"], false);
+    assert_eq!(
+        scan["suggested_actions"][0]["argv"],
+        serde_json::json!(["skillroster", "report", "--json"])
+    );
     let codex_coverage = scan["result"]["coverage"]
         .as_array()
         .unwrap()
@@ -758,11 +804,10 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
         report["result"]["report_id"]
     );
     let summary_report_output = run(&[&common[..], &["report", "--summary"]].concat(), None);
-    let summary_report_output_len = summary_report_output.stdout.len();
     let summary_report = json_output(&summary_report_output);
     assert_eq!(
         summary_report["result"]["finding_count"],
-        report["result"]["findings"].as_array().unwrap().len()
+        report["result"]["finding_count"]
     );
     assert!(
         summary_report["result"]["findings"]
@@ -771,7 +816,17 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
             .len()
             <= 3
     );
-    assert!(summary_report_output_len < report_output_len);
+    assert_eq!(
+        summary_report["result"]["findings"],
+        report["result"]["findings"]
+    );
+    let full_report_output = run(&[&common[..], &["report", "--full"]].concat(), None);
+    let full_report = json_output(&full_report_output);
+    assert_eq!(
+        full_report["result"]["findings"].as_array().unwrap().len(),
+        report["result"]["finding_count"].as_u64().unwrap() as usize
+    );
+    assert!(full_report_output.stdout.len() > report_output_len);
     assert_eq!(
         summary_report["result"]["session_coverage"],
         report["result"]["session_coverage"]
@@ -4201,7 +4256,7 @@ fn public_report_covers_issue_nine_finding_families_without_runtime_claims() {
         "--json",
     ];
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
-    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
     let findings = report["result"]["findings"].as_array().unwrap();
     for title in [
         "Declared identity has divergent local content",

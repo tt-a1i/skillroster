@@ -105,7 +105,7 @@ The first complete command surface is:
 
 ```bash
 skillroster scan [--json]
-skillroster report [--summary | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
+skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find <task> [--hint <text>]... [--json]
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
@@ -178,6 +178,10 @@ All JSON responses use a versioned envelope:
 ```
 
 IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
+
+Selector-free `report --json` returns the bounded three-Finding Summary view;
+`--summary` is an explicit alias. The exhaustive diagnostic report requires
+top-level `report --full --json`.
 
 `report --finding ID --json` returns compact paged Evidence items by default.
 Each item contains the Evidence ID, subject, path, quality, and decision facts;

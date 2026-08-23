@@ -108,7 +108,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 warnings,
                 vec![action(
                     "report",
-                    &["report", "--summary", "--json"],
+                    &["report", "--json"],
                     false,
                     false,
                     "scan_complete",
@@ -123,6 +123,8 @@ pub fn run(cli: Cli) -> Result<Output> {
                     limit: usize::from(args.limit),
                     offset: usize::try_from(args.offset)?,
                 }
+            } else if args.full {
+                ReportRequest::Exhaustive
             } else if args.summary {
                 ReportRequest::Summary
             } else if args.findings {
@@ -133,7 +135,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                     offset: usize::try_from(args.offset)?,
                 }
             } else {
-                ReportRequest::Exhaustive
+                ReportRequest::Summary
             };
             let result = report_command(&store, request)?;
             let actions = report_actions(&result, request);

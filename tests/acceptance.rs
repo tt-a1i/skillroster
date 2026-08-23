@@ -330,8 +330,13 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
     copy_tree(&Path::new(FIXTURES).join("agents/home"), &home);
 
     cli_json(&home, &state, &["scan"], None);
-    let report = cli_json(&home, &state, &["report"], None);
-    let finding_id = report["result"]["findings"]
+    let report = cli_json(
+        &home,
+        &state,
+        &["report", "--findings", "--category", "usage"],
+        None,
+    );
+    let finding_id = report["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
