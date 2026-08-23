@@ -49,15 +49,25 @@ Keep Roster, source, and Library changes in separate Plans. A stale Snapshot,
 Evidence ID, fingerprint, incomplete scope, or revision requires rescan or user
 input, never weaker validation.
 
-If planning reports `trusted_canonical_sources_required`, use only the typed
-blocked Skills and observed `--source-root` suggestions. A truncated result
+If planning reports `trusted_canonical_sources_required`, treat that stable ID
+only as a request for an exact local read permission, never as a claim that the
+directory or its content is trustworthy. Use only the typed blocked Skills and
+observed source targets. A truncated result
 points to a SkillRoster-owned JSON detail file; validate its schema before
 using the complete identities and argv. Do not inspect or trust targets
 independently, synthesize broader parents, or submit a partial Plan.
 
 For an escaping Skill link, show the observed target and obtain confirmation
-before rescanning with one explicit source root per trusted canonical source.
-Then prefer a reviewed Managed or Hosted Library Plan.
+before running
+`skillroster source-root confirm --finding FINDING_ID --path ABSOLUTE_PATH --json`.
+This records factual read access for that exact canonical directory and stable
+filesystem identity only. It does not endorse content, raise Evidence quality,
+or authorize Plan/Apply. Then rescan. Use `source-root inspect --json` to audit
+active, revoked, or drifted permissions and `source-root revoke ID --json` to
+revoke one. The temporary repeatable `--source-root` option remains a one-scan
+alternative. Treat its drift facts as bounded accidental/persistent-drift
+evidence, not proof against a malicious same-user ABA race. Never infer a
+parent, sibling, descendant, alias, or wildcard.
 
 ## Present
 

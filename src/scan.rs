@@ -25,11 +25,22 @@ pub struct ScanOptions {
     pub home: PathBuf,
     pub explicit_skill_roots: Vec<ExplicitSkillRoot>,
     pub explicit_source_roots: Vec<PathBuf>,
+    /// Durable permissions restore factual reads only. Unlike temporary
+    /// `explicit_source_roots`, they never make a placement governable.
+    #[serde(default)]
+    pub durable_read_roots: Vec<DurableReadRoot>,
     #[serde(default)]
     pub managed_source_roots: Vec<PathBuf>,
     pub excluded_session_agents: BTreeSet<AgentKind>,
     pub include_session_evidence: bool,
     pub max_depth: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableReadRoot {
+    pub permission_id: String,
+    pub path: PathBuf,
+    pub identity: crate::source_policy::RootIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,6 +55,7 @@ impl ScanOptions {
             home: home.into(),
             explicit_skill_roots: Vec::new(),
             explicit_source_roots: Vec::new(),
+            durable_read_roots: Vec::new(),
             managed_source_roots: Vec::new(),
             excluded_session_agents: BTreeSet::new(),
             include_session_evidence: true,
@@ -304,6 +316,14 @@ pub struct ScanResult {
     pub usage: Vec<UsageEvidence>,
     pub coverage: Vec<SessionCoverage>,
     pub warnings: Vec<String>,
+    /// Durable source-root read permissions frozen before this Scan. Drifted
+    /// permissions remain typed facts but are excluded from approved roots.
+    #[serde(default)]
+    pub source_root_policy: Vec<crate::source_policy::SourceRootPolicyFact>,
+    /// Permission IDs whose bounded discovery or consumption checks observed
+    /// drift, even if a later path check appears active again.
+    #[serde(default)]
+    pub durable_read_drifted_permission_ids: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +333,9 @@ struct EntryCandidate {
     governable: bool,
     provider: Option<String>,
     entrypoint: PathBuf,
+    /// Canonical physical Skill directory resolved during discovery. Durable
+    /// reads must remain bound to this exact directory at consumption time.
+    expected_physical_directory: Option<PathBuf>,
     link_target: Option<PathBuf>,
     link_status: LinkStatus,
 }
@@ -716,6 +739,19 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         .chain(options.explicit_source_roots.iter().cloned())
         .chain(confirmed_source_roots.iter().cloned())
         .collect::<Vec<_>>();
+    let approved_roots = normalized_confirmed_source_roots(&approved_roots);
+    // Durable paths were already canonicalized and identity-frozen by the
+    // caller. Never canonicalize them again here: a post-freeze retarget must
+    // not become an approved root.
+    let mut approved_roots = approved_roots;
+    approved_roots.extend(
+        options
+            .durable_read_roots
+            .iter()
+            .map(|root| root.path.clone()),
+    );
+    approved_roots.sort();
+    approved_roots.dedup();
     let mut candidates = Vec::new();
 
     for roots in &known {
@@ -768,6 +804,22 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
             &mut candidates,
         );
     }
+    for root in &options.durable_read_roots {
+        observe_durable_skill_root(
+            root,
+            SkillRootPolicy {
+                agent: None,
+                explicit: true,
+                governable: false,
+                detail: Some("durable exact local read permission; not governable".into()),
+                provider: None,
+            },
+            &approved_roots,
+            options.max_depth,
+            &mut result,
+            &mut candidates,
+        );
+    }
     for root in &options.explicit_skill_roots {
         observe_skill_root(
             &root.path,
@@ -801,7 +853,12 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         );
     }
 
-    materialize_candidates(candidates, &mut result);
+    materialize_candidates(
+        candidates,
+        &options.durable_read_roots,
+        &confirmed_source_roots,
+        &mut result,
+    );
 
     if options.include_session_evidence {
         for roots in &known {
@@ -925,6 +982,89 @@ fn observe_skill_root(
     }
 }
 
+fn observe_durable_skill_root(
+    root: &DurableReadRoot,
+    policy: SkillRootPolicy,
+    approved_roots: &[PathBuf],
+    max_depth: usize,
+    result: &mut ScanResult,
+    candidates: &mut Vec<EntryCandidate>,
+) {
+    observe_durable_skill_root_with_hook(
+        root,
+        policy,
+        approved_roots,
+        max_depth,
+        result,
+        candidates,
+        |_| {},
+    );
+}
+
+fn observe_durable_skill_root_with_hook(
+    root: &DurableReadRoot,
+    policy: SkillRootPolicy,
+    approved_roots: &[PathBuf],
+    max_depth: usize,
+    result: &mut ScanResult,
+    candidates: &mut Vec<EntryCandidate>,
+    mut before_enumerate: impl FnMut(&Path),
+) {
+    let reject = |detail: &str, result: &mut ScanResult| {
+        result
+            .durable_read_drifted_permission_ids
+            .insert(root.permission_id.clone());
+        result.roots.push(RootObservation {
+            agent: policy.agent,
+            kind: RootKind::Skills,
+            path: root.path.clone(),
+            status: RootStatus::Inaccessible,
+            explicit: policy.explicit,
+            detail: Some(detail.into()),
+            discovery_complete: false,
+        });
+        result.warnings.push(format!(
+            "excluded durable source root {}: {detail}",
+            root.path.display()
+        ));
+    };
+    if !crate::source_policy::identity_matches_exact(&root.path, &root.identity) {
+        reject("identity drift before enumeration", result);
+        return;
+    }
+    before_enumerate(&root.path);
+    if !crate::source_policy::identity_matches_exact(&root.path, &root.identity) {
+        reject("identity drift immediately before enumeration", result);
+        return;
+    }
+    let root_index = result.roots.len();
+    let candidate_start = candidates.len();
+    observe_skill_root(
+        &root.path,
+        policy,
+        approved_roots,
+        max_depth,
+        result,
+        candidates,
+    );
+    if !crate::source_policy::identity_matches_exact(&root.path, &root.identity) {
+        result
+            .durable_read_drifted_permission_ids
+            .insert(root.permission_id.clone());
+        candidates.truncate(candidate_start);
+        if let Some(observation) = result.roots.get_mut(root_index) {
+            observation.status = RootStatus::Inaccessible;
+            observation.discovery_complete = false;
+            observation.detail =
+                Some("identity drift during enumeration; candidates discarded".into());
+        }
+        result.warnings.push(format!(
+            "discarded durable source-root candidates after identity drift: {}",
+            root.path.display()
+        ));
+    }
+}
+
 fn discover_entrypoints(
     policy: &SkillRootPolicy,
     placement_root: &Path,
@@ -951,6 +1091,7 @@ fn discover_entrypoints(
                 root: placement_root.to_path_buf(),
                 governable: policy.governable,
                 provider: policy.provider.clone(),
+                expected_physical_directory: canonical_entrypoint_directory(&path),
                 entrypoint: path,
                 link_target: target,
                 link_status,
@@ -976,6 +1117,7 @@ fn discover_entrypoints(
                     root: placement_root.to_path_buf(),
                     governable: policy.governable,
                     provider: policy.provider.clone(),
+                    expected_physical_directory: canonical_entrypoint_directory(&linked_entrypoint),
                     entrypoint: linked_entrypoint,
                     link_target: target,
                     link_status: status,
@@ -1033,11 +1175,7 @@ fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
 }
 
 fn is_within_resolved_root(path: &Path, approved_roots: &[PathBuf]) -> bool {
-    approved_roots.iter().any(|root| {
-        fs::canonicalize(root)
-            .map(|root| path.starts_with(root))
-            .unwrap_or(false)
-    })
+    approved_roots.iter().any(|root| path.starts_with(root))
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -1054,7 +1192,46 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResult) {
+fn canonical_entrypoint_directory(entrypoint: &Path) -> Option<PathBuf> {
+    fs::canonicalize(entrypoint)
+        .ok()
+        .and_then(|entrypoint| entrypoint.parent().map(Path::to_path_buf))
+}
+
+fn durable_candidate_binding_is_current(
+    candidate: &EntryCandidate,
+    anchor: &DurableReadRoot,
+) -> bool {
+    let Some(expected) = candidate.expected_physical_directory.as_ref() else {
+        return false;
+    };
+    expected.starts_with(&anchor.path)
+        && crate::source_policy::identity_matches_exact(&anchor.path, &anchor.identity)
+        && canonical_entrypoint_directory(&candidate.entrypoint).as_ref() == Some(expected)
+}
+
+fn materialize_candidates(
+    candidates: Vec<EntryCandidate>,
+    durable_read_roots: &[DurableReadRoot],
+    temporary_source_roots: &[PathBuf],
+    result: &mut ScanResult,
+) {
+    materialize_candidates_with_hook(
+        candidates,
+        durable_read_roots,
+        temporary_source_roots,
+        result,
+        |_| {},
+    );
+}
+
+fn materialize_candidates_with_hook(
+    candidates: Vec<EntryCandidate>,
+    durable_read_roots: &[DurableReadRoot],
+    temporary_source_roots: &[PathBuf],
+    result: &mut ScanResult,
+    mut before_read: impl FnMut(&Path),
+) {
     let mut skills = BTreeMap::<String, ScannedSkill>::new();
     for candidate in candidates {
         let directory = candidate
@@ -1062,11 +1239,29 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             .parent()
             .unwrap_or(&candidate.root)
             .to_path_buf();
-        let safe_to_read = !matches!(
+        let expected_directory = candidate.expected_physical_directory.as_ref();
+        let temporary_override = expected_directory.is_some_and(|resolved| {
+            temporary_source_roots
+                .iter()
+                .any(|root| resolved.starts_with(root))
+        });
+        let durable_anchor = (!temporary_override)
+            .then(|| {
+                durable_read_roots.iter().find(|root| {
+                    candidate.entrypoint.starts_with(&root.path)
+                        || expected_directory
+                            .is_some_and(|resolved| resolved.starts_with(&root.path))
+                })
+            })
+            .flatten();
+        before_read(&candidate.entrypoint);
+        let binding_valid_before_read = durable_anchor
+            .is_none_or(|root| durable_candidate_binding_is_current(&candidate, root));
+        let initially_safe = !matches!(
             candidate.link_status,
             LinkStatus::Broken | LinkStatus::EscapesRoot
-        );
-        let (content, modified_at) = if safe_to_read {
+        ) && binding_valid_before_read;
+        let (mut content, mut modified_at) = if initially_safe {
             match read_bounded(&candidate.entrypoint, MAX_SKILL_FILE_BYTES) {
                 Ok(value) => value,
                 Err(error) => {
@@ -1084,8 +1279,8 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             ));
             (String::new(), None)
         };
-        let metadata = parse_skill_markdown(&content);
-        let (digest, fingerprint_completeness, fingerprint_detail) = if safe_to_read {
+        let mut metadata = parse_skill_markdown(&content);
+        let (mut digest, mut fingerprint_completeness, mut fingerprint_detail) = if initially_safe {
             match digest_skill_directory(&directory) {
                 Ok(fingerprint) => (
                     fingerprint.digest,
@@ -1116,6 +1311,38 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
                 Some("Skill package was not read because its link is unsafe".into()),
             )
         };
+        let mut executable_files = if initially_safe {
+            executable_files(&directory).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let binding_valid_after = durable_anchor
+            .is_none_or(|root| durable_candidate_binding_is_current(&candidate, root));
+        let safe_to_read = initially_safe && binding_valid_after;
+        if durable_anchor.is_some() && (!binding_valid_before_read || !binding_valid_after) {
+            if let Some(root) = durable_anchor {
+                result
+                    .durable_read_drifted_permission_ids
+                    .insert(root.permission_id.clone());
+            }
+            // The root or candidate binding changed at a bounded pre/post
+            // checkpoint. Discard every byte and derived fact; replacement
+            // content must not enter identity, search, Evidence, or governance.
+            result.warnings.push(format!(
+                "discarded Skill data after durable source-root binding drift: {}",
+                candidate.entrypoint.display()
+            ));
+            content.clear();
+            modified_at = None;
+            metadata = SkillMetadata::default();
+            digest = stable_digest(candidate.entrypoint.to_string_lossy().as_bytes());
+            fingerprint_completeness = FingerprintCompleteness::Unreadable;
+            fingerprint_detail = Some(
+                "Skill package data was discarded because its durable read permission drifted"
+                    .into(),
+            );
+            executable_files.clear();
+        }
         let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
             (Some(source), Some(version), _) => format!("source:{source}@{version}"),
             (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
@@ -1133,11 +1360,6 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             })
             .unwrap_or_else(|| "unnamed".into());
         let normalized_text = normalize_search_text(&content);
-        let executable_files = if safe_to_read {
-            executable_files(&directory).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         let physical_directory = safe_to_read.then(|| {
             fs::canonicalize(&candidate.entrypoint)
                 .ok()
@@ -1182,7 +1404,7 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             link_target: candidate.link_target,
             link_status: candidate.link_status,
             default_exposed: candidate.agent.is_some(),
-            governable: candidate.governable,
+            governable: candidate.governable && durable_anchor.is_none(),
             provider: candidate.provider,
             executable_files,
             declared_name_matches_directory,
@@ -2791,6 +3013,184 @@ enabled = true
             fs::canonicalize(source_root).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_read_discards_content_replaced_after_the_pre_read_identity_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_input = temp.path().join("source");
+        fs::create_dir(&source_input).unwrap();
+        fs::write(
+            source_input.join("SKILL.md"),
+            "---\nname: before\n---\noriginal body\n",
+        )
+        .unwrap();
+        let source = fs::canonicalize(&source_input).unwrap();
+        let agent_root = temp.path().join("agent");
+        fs::create_dir(&agent_root).unwrap();
+        let linked = agent_root.join("external");
+        std::os::unix::fs::symlink(&source, &linked).unwrap();
+        let anchor = DurableReadRoot {
+            permission_id: "sroot_replaced_during_read".into(),
+            path: source.clone(),
+            identity: crate::source_policy::capture_identity(&source).unwrap(),
+        };
+        let candidate = EntryCandidate {
+            agent: Some(AgentKind::Codex),
+            root: agent_root,
+            governable: true,
+            provider: None,
+            expected_physical_directory: Some(source.clone()),
+            entrypoint: linked.join("SKILL.md"),
+            link_target: Some(source.clone()),
+            link_status: LinkStatus::Valid,
+        };
+        let mut result = ScanResult::default();
+        let mut replaced = false;
+        materialize_candidates_with_hook(vec![candidate], &[anchor], &[], &mut result, |_| {
+            if replaced {
+                return;
+            }
+            fs::remove_dir_all(&source).unwrap();
+            fs::create_dir(&source).unwrap();
+            fs::write(
+                source.join("SKILL.md"),
+                "---\nname: replacement-secret\n---\nDO-NOT-ADOPT-SECRET\n",
+            )
+            .unwrap();
+            replaced = true;
+        });
+
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert!(!result.placements[0].governable);
+        assert!(result.placements[0].physical_directory.is_none());
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("replacement-secret"));
+        assert!(!encoded.contains("DO-NOT-ADOPT-SECRET"));
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("binding drift"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_read_rejects_an_agent_symlink_retargeted_before_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_input = temp.path().join("source");
+        fs::create_dir(&source_input).unwrap();
+        fs::write(
+            source_input.join("SKILL.md"),
+            "---\nname: permitted\n---\npermitted body\n",
+        )
+        .unwrap();
+        let source = fs::canonicalize(&source_input).unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(
+            external.join("SKILL.md"),
+            "---\nname: external-marker\n---\nEXTERNAL-SECRET-MARKER\n",
+        )
+        .unwrap();
+        let agent_root = temp.path().join("agent");
+        fs::create_dir(&agent_root).unwrap();
+        let linked = agent_root.join("external");
+        std::os::unix::fs::symlink(&source, &linked).unwrap();
+        let anchor = DurableReadRoot {
+            permission_id: "sroot_retargeted_entrypoint".into(),
+            path: source.clone(),
+            identity: crate::source_policy::capture_identity(&source).unwrap(),
+        };
+        let candidate = EntryCandidate {
+            agent: Some(AgentKind::Codex),
+            root: agent_root,
+            governable: true,
+            provider: None,
+            entrypoint: linked.join("SKILL.md"),
+            expected_physical_directory: Some(source.clone()),
+            link_target: Some(source),
+            link_status: LinkStatus::Valid,
+        };
+        let mut result = ScanResult::default();
+        materialize_candidates_with_hook(vec![candidate], &[anchor], &[], &mut result, |_| {
+            fs::remove_file(&linked).unwrap();
+            std::os::unix::fs::symlink(&external, &linked).unwrap();
+        });
+
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert!(!result.placements[0].governable);
+        assert!(result.placements[0].physical_directory.is_none());
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("external-marker"));
+        assert!(!encoded.contains("EXTERNAL-SECRET-MARKER"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_root_replacement_before_enumeration_discards_all_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_input = temp.path().join("source");
+        fs::create_dir_all(source_input.join("permitted-name")).unwrap();
+        fs::write(
+            source_input.join("permitted-name/SKILL.md"),
+            "---\nname: permitted-name\n---\n",
+        )
+        .unwrap();
+        let source = fs::canonicalize(&source_input).unwrap();
+        let anchor = DurableReadRoot {
+            permission_id: "sroot_replaced_before_enumeration".into(),
+            path: source.clone(),
+            identity: crate::source_policy::capture_identity(&source).unwrap(),
+        };
+        let mut result = ScanResult::default();
+        let mut candidates = Vec::new();
+        observe_durable_skill_root_with_hook(
+            &anchor,
+            SkillRootPolicy {
+                agent: None,
+                explicit: true,
+                governable: false,
+                detail: Some("durable read-only fixture".into()),
+                provider: None,
+            },
+            std::slice::from_ref(&source),
+            5,
+            &mut result,
+            &mut candidates,
+            |_| {
+                fs::remove_dir_all(&source).unwrap();
+                fs::create_dir_all(source.join("substitute-secret-name")).unwrap();
+                fs::write(
+                    source.join("substitute-secret-name/SKILL.md"),
+                    "---\nname: SUBSTITUTE-SECRET-NAME\n---\n",
+                )
+                .unwrap();
+            },
+        );
+
+        assert!(candidates.is_empty());
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].status, RootStatus::Inaccessible);
+        assert!(!result.roots[0].discovery_complete);
+        assert!(
+            result
+                .durable_read_drifted_permission_ids
+                .contains("sroot_replaced_before_enumeration")
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("substitute-secret-name"));
+        assert!(!encoded.contains("SUBSTITUTE-SECRET-NAME"));
     }
 
     #[test]

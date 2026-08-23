@@ -1701,7 +1701,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     let plan_input = json!({
         "schema_version": 1,
         "scan_id": snapshot,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": [evidence_id.clone()],
         "roster_changes": [{
             "agent": "codex",
             "skill_id": skill_id,
@@ -3343,7 +3343,7 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     let request = json!({
         "schema_version": 1,
         "scan_id": snapshot,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": [evidence_id.clone()],
         "source_updates": [{
             "skill_id": skill_id,
             "placement_id": placement_id,
@@ -6743,17 +6743,312 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
         detail["result"]["resolution"]["automatic_change_supported"],
         false
     );
-    assert_eq!(detail["suggested_actions"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        detail["suggested_actions"][0]["action"],
-        "show_full_finding"
+    let actions = detail["suggested_actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 2);
+    assert!(
+        actions
+            .iter()
+            .any(|action| action["action"] == "show_full_finding")
     );
+    let confirm = actions
+        .iter()
+        .find(|action| action["action"] == "confirm_source_root_read_permission")
+        .unwrap();
+    assert_eq!(confirm["requires_confirmation"], true);
+    assert_eq!(confirm["mutates"], true);
     assert!(
         detail["result"]["items"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["facts"]["link_target"] == json!(source))
+    );
+
+    let sibling = temp.path().join("unobserved-sibling");
+    fs::create_dir(&sibling).unwrap();
+    let unobserved = run(
+        &[
+            &common[..],
+            &[
+                "source-root",
+                "confirm",
+                "--finding",
+                finding_id,
+                "--path",
+                sibling.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!unobserved.status.success());
+    let unobserved: Value = serde_json::from_slice(&unobserved.stdout).unwrap();
+    assert_eq!(unobserved["error"]["code"], "source_root_path_not_observed");
+    assert_eq!(unobserved["error"]["details"]["path"], json!(sibling));
+
+    let unobserved_alias = temp.path().join("unobserved-alias");
+    std::os::unix::fs::symlink(&source, &unobserved_alias).unwrap();
+    let alias = run(
+        &[
+            &common[..],
+            &[
+                "source-root",
+                "confirm",
+                "--finding",
+                finding_id,
+                "--path",
+                unobserved_alias.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!alias.status.success());
+    let alias: Value = serde_json::from_slice(&alias.stdout).unwrap();
+    assert_eq!(alias["error"]["code"], "source_root_path_not_observed");
+    assert_eq!(alias["error"]["details"]["path"], json!(unobserved_alias));
+
+    let confirmed = json_output(&run_suggested_action(confirm));
+    assert_eq!(
+        confirmed["result"]["permission_scope"],
+        "exact_local_read_only"
+    );
+    assert_eq!(confirmed["result"]["content_endorsed"], false);
+    assert_eq!(confirmed["result"]["evidence_quality_changed"], false);
+    assert_eq!(confirmed["result"]["plan_apply_authorized"], false);
+    assert_eq!(confirmed["result"]["files_changed"], false);
+    assert_eq!(confirmed["result"]["state_files_changed"], true);
+    let mut permission_id = confirmed["result"]["permission"]["permission_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let rescanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(
+        rescanned["result"]["source_root_policy"]["permissions"][0]["state"],
+        "active"
+    );
+    let found = json_output(&run(&[&common[..], &["find", "fixture"]].concat(), None));
+    assert_eq!(found["result"]["matches"][0]["name"], "external");
+
+    let snapshot = rescanned["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let external_skill = payload["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|skill| skill["name"] == "external")
+        .unwrap();
+    let skill_id = external_skill["id"].as_str().unwrap();
+    let placements = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|placement| placement["skill_id"] == skill_id)
+        .collect::<Vec<_>>();
+    assert!(!placements.is_empty());
+    assert!(
+        placements
+            .iter()
+            .all(|placement| placement["governable"] == false)
+    );
+    assert!(
+        placements
+            .iter()
+            .all(|placement| { placement["fingerprint_completeness"] == "complete" })
+    );
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let placement_ids = placements
+        .iter()
+        .map(|placement| placement["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let current_fingerprint = placements[0]["content_digest"].as_str().unwrap();
+    let upstream = "---\nname: external\nsource: fixture\nversion: v2\n---\nchanged\n";
+    let upstream_digest = format!("{:x}", Sha256::digest(upstream.as_bytes()));
+    let source_update = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id.clone()],
+        "source_updates": [{
+            "skill_id": skill_id,
+            "placement_id": placement_ids[0],
+            "source": "fixture",
+            "current_revision": "v1",
+            "current_fingerprint": current_fingerprint,
+            "base_digest": null,
+            "upstream_revision": "v2",
+            "upstream_content": upstream,
+            "upstream_digest": upstream_digest
+        }]
+    });
+    let source_update = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&source_update.to_string()),
+    );
+    assert!(!source_update.status.success());
+    assert!(
+        String::from_utf8_lossy(&source_update.stdout).contains("read-only"),
+        "{}",
+        String::from_utf8_lossy(&source_update.stdout)
+    );
+    let library_change = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id.clone()],
+        "library_changes": [{
+            "skill_id": skill_id,
+            "canonical_placement_id": placement_ids[0],
+            "placement_ids": placement_ids,
+            "requested_state": "managed"
+        }]
+    });
+    let library_change = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&library_change.to_string()),
+    );
+    assert!(!library_change.status.success());
+    assert!(String::from_utf8_lossy(&library_change.stdout).contains("read-only"));
+    let roster_change = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "roster_changes": [{
+            "agent": "codex",
+            "skill_id": skill_id,
+            "state": "core"
+        }]
+    });
+    let roster_change = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&roster_change.to_string()),
+    );
+    assert!(!roster_change.status.success());
+    assert!(String::from_utf8_lossy(&roster_change.stdout).contains("read-only"));
+    let plan_count: i64 = database
+        .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(plan_count, 0);
+
+    let stale = run_suggested_action(confirm);
+    assert!(!stale.status.success());
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(stale["error"]["code"], "source_root_finding_stale");
+
+    fs::remove_dir_all(&source).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: external\ndescription: replacement fixture\n---\n",
+    )
+    .unwrap();
+    let drifted = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(
+        drifted["result"]["source_root_policy"]["permissions"][0]["state"],
+        "replaced"
+    );
+    let persisted_payload: String = database
+        .query_row(
+            "SELECT p.payload_json FROM scan_payloads p JOIN scans s ON s.id = p.scan_id WHERE s.status = 'completed' ORDER BY s.completed_at DESC, s.started_at DESC, s.rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let persisted_payload: Value = serde_json::from_str(&persisted_payload).unwrap();
+    assert_ne!(
+        persisted_payload["source_root_policy"][0]["state"],
+        "active"
+    );
+    let drift_report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let drift_finding_id = drift_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let drift_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", drift_finding_id]].concat(),
+        None,
+    ));
+    let drift_confirm = drift_detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "confirm_source_root_read_permission")
+        .unwrap();
+    let identity_conflict = run_suggested_action(drift_confirm);
+    assert!(!identity_conflict.status.success());
+    let identity_conflict: Value = serde_json::from_slice(&identity_conflict.stdout).unwrap();
+    assert_eq!(
+        identity_conflict["error"]["code"],
+        "source_root_permission_identity_drift"
+    );
+    assert_eq!(
+        identity_conflict["error"]["details"]["permission_id"],
+        permission_id
+    );
+
+    json_output(&run(
+        &[
+            &common[..],
+            &["source-root", "revoke", permission_id.as_str()],
+        ]
+        .concat(),
+        None,
+    ));
+    let reconfirmed = json_output(&run_suggested_action(drift_confirm));
+    assert_eq!(reconfirmed["result"]["already_permitted"], false);
+    permission_id = reconfirmed["result"]["permission"]["permission_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let inspect = json_output(&run(
+        &[&common[..], &["source-root", "inspect"]].concat(),
+        None,
+    ));
+    assert_eq!(inspect["result"]["permission_count"], 2);
+    assert_eq!(inspect["result"]["active_count"], 1);
+    assert_eq!(inspect["result"]["revoked_count"], 1);
+
+    let revoked = json_output(&run(
+        &[
+            &common[..],
+            &["source-root", "revoke", permission_id.as_str()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(revoked["result"]["permission"]["state"], "revoked");
+    assert_eq!(revoked["result"]["files_changed"], false);
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let blocked_again = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert!(
+        blocked_again["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| finding["title"] == "Skill links escape an approved root")
     );
 }
 

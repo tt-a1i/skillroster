@@ -46,6 +46,7 @@ impl Cli {
             Some(Command::Status) => "status",
             Some(Command::Lifecycle(_)) => "lifecycle",
             Some(Command::Setup(_)) => "setup",
+            Some(Command::SourceRoot(_)) => "source-root",
             None => "home",
         }
     }
@@ -71,6 +72,46 @@ pub enum Command {
     Lifecycle(LifecycleArgs),
     /// Preview bootstrap Skill installation or upgrade for detected Agents.
     Setup(SetupArgs),
+    /// Confirm, inspect, or revoke exact local source-root read permissions.
+    SourceRoot(SourceRootArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SourceRootArgs {
+    #[command(subcommand)]
+    pub command: SourceRootCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SourceRootCommand {
+    /// Permit factual reads of one exact target observed by an escaping-link Finding.
+    Confirm(SourceRootConfirmArgs),
+    /// Inspect active, revoked, and drifted local read permissions.
+    Inspect(SourceRootInspectArgs),
+    /// Revoke one exact local read permission by opaque ID.
+    Revoke(IdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SourceRootInspectArgs {
+    /// Maximum permission records returned in this page.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=100))]
+    pub limit: u16,
+
+    /// Zero-based permission-record offset.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct SourceRootConfirmArgs {
+    /// Current escaping-link Finding that observed the exact target.
+    #[arg(long)]
+    pub finding: String,
+
+    /// Exact absolute observed canonical directory.
+    #[arg(long)]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Args)]

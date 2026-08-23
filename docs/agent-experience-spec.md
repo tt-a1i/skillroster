@@ -209,8 +209,9 @@ Summary order and bind each stable Finding ID without implying Plan or Apply.
 
 Suggested action argv retains any effective `--state-dir`, `--home`, `--root`,
 and `--source-root` overrides so an Agent can execute the transition against
-the same local Snapshot and discovery trust boundary. It never broadens source
-trust or treats a suggested mutation as authorization.
+the same local Snapshot and explicit read boundary. It never broadens read
+permission, endorses source content, or treats a suggested mutation as
+authorization.
 
 Suggested actions must represent a required or evidence-backed transition.
 Healthy `status` output with a completed Snapshot does not prescribe another
@@ -253,9 +254,14 @@ The Agent distinguishes “not observed” from “unused,” names missing cove
 ### External canonical source
 
 The Agent leaves an escaping link unread, shows its target, and asks whether
-the source is intentional. A confirmed source is rescanned through
-`--source-root` without increasing any Agent's default exposure; unconfirmed
-sources remain excluded.
+the source is intentional. After confirmation it records an exact local read
+permission with `source-root confirm`, then rescans without increasing any
+Agent's default exposure. The decision does not endorse content or authorize a
+Plan; unconfirmed, revoked, or identity-drifted sources remain excluded. The
+temporary `--source-root` flag remains available for one Scan. Drift detection
+uses bounded identity and entrypoint-binding checks around discovery and
+content consumption; it detects accidental or persistent changes, not a
+malicious same-user ABA race completed entirely between checkpoints.
 
 ### One-confirmation Apply
 

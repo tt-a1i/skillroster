@@ -4,6 +4,16 @@ SkillRoster keeps governance state in `~/.skillroster/skillroster.db`. It reads
 supported Agent sessions in place and stores only derived evidence summaries;
 exports do not contain raw prompts or responses.
 
+Exact source-root read permissions are also local SQLite policy. Each record
+keeps the confirmed canonical directory, bound Finding/Snapshot, approval and
+optional revocation time, and stable filesystem identity. Use
+`skillroster source-root inspect --json` to see active, revoked, missing,
+replaced, or retargeted permissions. A permission survives ordinary evidence
+and Plan/Receipt purges; revoke it explicitly with
+`skillroster source-root revoke ID --json`, or remove it with the complete local
+state. These records authorize factual reads only and never endorse content or
+authorize governance.
+
 When a bounded planning error omits source-confirmation blockers, SkillRoster
 writes one versioned JSON detail artifact under
 `~/.skillroster/source-confirmation/`. These derived artifacts contain Skill
@@ -25,7 +35,8 @@ and a source-path digest; it does not store the sampled conversation text.
 
 Use `skillroster lifecycle inspect --json` to see row counts, retained
 source-confirmation detail counts, evidence-source exclusions, and recovery
-state. Export derived evidence and retained source-confirmation details to a
+state. It also reports source-root permission counts and drift state. Export
+derived evidence, the complete permission audit, and retained source-confirmation details to a
 new local file:
 
 ```sh

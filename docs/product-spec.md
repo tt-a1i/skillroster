@@ -144,8 +144,28 @@ skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
 skillroster undo <receipt-id> [--json]
 skillroster status [--json]
+skillroster source-root confirm --finding <finding-id> --path <absolute-path> [--json]
+skillroster source-root inspect [--json]
+skillroster source-root revoke <permission-id> [--json]
 skillroster setup [--modified-choice retain-local|adopt-current] [--json]
 ```
+
+`source-root confirm` persists one exact local read permission bound to a
+current completed escaping-link Finding, its observed canonical directory, and
+the directory's stable filesystem identity. Scan freezes active permissions
+before discovery; missing, inaccessible, replaced, or retargeted roots fail
+closed independently and remain typed audit facts. Confirming read access does
+not endorse content, raise Evidence quality, authorize governance or Plan/Apply,
+or change Agent/Skill files. `inspect` includes active, revoked, and drifted
+records; `revoke` retains the approval and revocation times. No parent, sibling,
+descendant, alias, wildcard, or Agent-specific permission is inferred.
+Discovery and content consumption recheck the frozen directory identity and
+exact entrypoint binding at bounded pre/post checkpoints, discard derived facts
+when they observe drift, and preserve the drift in the Snapshot. This protects
+against accidental or persistent local replacement and retargeting. It is not
+an adversarial sandbox against a same-user process completing an ABA swap
+entirely between checkpoints; descriptor/handle-bound traversal is tracked as
+separate security hardening.
 
 `setup` detects supported Agents and returns a preview for installing or
 upgrading the single bootstrap Skill. Exact official older copies are eligible

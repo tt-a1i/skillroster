@@ -9,8 +9,9 @@ use crate::model::{
     PlanStatus, ReceiptId, ReceiptRecord, ReceiptStatus, ReportId, ReportRecord, RootRecord,
     RosterEntry, ScanId, ScanRun, SkillId, SkillRecord, UsageEvent,
 };
+use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermission};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LifecycleCounts {
@@ -21,6 +22,7 @@ pub struct LifecycleCounts {
     pub plans: u64,
     pub receipts: u64,
     pub evidence_exclusions: u64,
+    pub source_root_permissions: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -217,6 +219,13 @@ impl StateStore {
         if current == 8 {
             let transaction = self.connection.transaction()?;
             migration_v9(&transaction)?;
+            transaction.pragma_update(None, "user_version", 9_i64)?;
+            transaction.commit()?;
+            current = 9;
+        }
+        if current == 9 {
+            let transaction = self.connection.transaction()?;
+            migration_v10(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -227,6 +236,125 @@ impl StateStore {
         Ok(self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?)
+    }
+
+    /// Stores one exact local source-root read permission. Immutable approval
+    /// facts cannot be replaced; the only allowed update is setting revoked_at.
+    pub fn save_source_root_permission(
+        &self,
+        permission: &SourceRootPermission,
+    ) -> StorageResult<()> {
+        let path = permission.path.to_str().ok_or_else(|| {
+            StorageError::InvalidData("source-root permission path must be valid Unicode".into())
+        })?;
+        let identity = json(&permission.identity)?;
+        if let Some(existing) = self.get_source_root_permission(&permission.id)? {
+            if existing.path != permission.path
+                || existing.finding_id != permission.finding_id
+                || existing.snapshot_id != permission.snapshot_id
+                || existing.identity != permission.identity
+                || existing.granted_at != permission.granted_at
+                || existing.revoked_at.is_some()
+                || permission.revoked_at.is_none()
+            {
+                return Err(StorageError::InvalidData(format!(
+                    "source-root permission {} immutable approval facts changed",
+                    permission.id
+                )));
+            }
+            self.connection.execute(
+                "UPDATE source_root_permissions SET revoked_at = ?1
+                 WHERE id = ?2 AND revoked_at IS NULL",
+                params![permission.revoked_at, permission.id.as_str()],
+            )?;
+            return Ok(());
+        }
+        self.connection.execute(
+            "INSERT INTO source_root_permissions
+                (id, canonical_path, finding_id, snapshot_id, identity_json, granted_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                permission.id.as_str(),
+                path,
+                permission.finding_id,
+                permission.snapshot_id,
+                identity,
+                permission.granted_at,
+                permission.revoked_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_source_root_permission(
+        &self,
+        id: &SourcePermissionId,
+    ) -> StorageResult<Option<SourceRootPermission>> {
+        self.connection
+            .query_row(
+                "SELECT canonical_path, finding_id, snapshot_id, identity_json,
+                        granted_at, revoked_at
+                 FROM source_root_permissions WHERE id = ?1",
+                [id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(path, finding_id, snapshot_id, identity, granted_at, revoked_at)| {
+                    Ok(SourceRootPermission {
+                        id: id.clone(),
+                        path: path.into(),
+                        finding_id,
+                        snapshot_id,
+                        identity: from_json::<RootIdentity>(&identity)?,
+                        granted_at,
+                        revoked_at,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn list_source_root_permissions(&self) -> StorageResult<Vec<SourceRootPermission>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, canonical_path, finding_id, snapshot_id, identity_json,
+                    granted_at, revoked_at
+             FROM source_root_permissions ORDER BY granted_at DESC, id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, path, finding_id, snapshot_id, identity, granted_at, revoked_at) = row?;
+                Ok(SourceRootPermission {
+                    id: SourcePermissionId::parse(id).map_err(invalid_id)?,
+                    path: path.into(),
+                    finding_id,
+                    snapshot_id,
+                    identity: from_json::<RootIdentity>(&identity)?,
+                    granted_at,
+                    revoked_at,
+                })
+            })
+            .collect()
     }
 
     pub fn save_scan(&self, scan: &ScanRun) -> StorageResult<()> {
@@ -1449,6 +1577,7 @@ impl StateStore {
             plans: table_count(&self.connection, "plans")?,
             receipts: table_count(&self.connection, "receipts")?,
             evidence_exclusions: table_count(&self.connection, "evidence_exclusions")?,
+            source_root_permissions: table_count(&self.connection, "source_root_permissions")?,
         })
     }
 
@@ -1975,6 +2104,23 @@ fn migration_v9(transaction: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn migration_v10(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE source_root_permissions (
+            id TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            snapshot_id TEXT NOT NULL,
+            identity_json TEXT NOT NULL,
+            granted_at INTEGER NOT NULL,
+            revoked_at INTEGER
+         );
+         CREATE UNIQUE INDEX one_active_source_root_permission
+            ON source_root_permissions(canonical_path) WHERE revoked_at IS NULL;",
+    )?;
+    Ok(())
+}
+
 fn table_count(connection: &Connection, table: &str) -> StorageResult<u64> {
     let query = format!("SELECT COUNT(*) FROM {table}");
     Ok(connection.query_row(&query, [], |row| row.get(0))?)
@@ -2199,7 +2345,7 @@ mod tests {
 
     #[test]
     fn migration_upgrades_prior_states_sequentially() {
-        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8] {
+        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9] {
             let mut connection = Connection::open_in_memory().unwrap();
             let transaction = connection.transaction().unwrap();
             migration_v1(&transaction).unwrap();
@@ -2223,6 +2369,9 @@ mod tests {
             }
             if starting_version >= 8 {
                 migration_v8(&transaction).unwrap();
+            }
+            if starting_version >= 9 {
+                migration_v9(&transaction).unwrap();
             }
             transaction
                 .pragma_update(None, "user_version", starting_version)
