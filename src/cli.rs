@@ -205,11 +205,11 @@ pub enum LifecycleCommand {
     Export(LifecycleExportArgs),
     /// Exclude one Agent's session evidence from future Scans.
     Exclude(LifecycleExcludeArgs),
-    /// Aggregate and remove raw usage/evidence older than the retention window.
+    /// Purge explicitly selected retained local state.
     Purge(LifecyclePurgeArgs),
     /// Inspect Receipts that require manual recovery.
     Recovery,
-    /// Delete only SkillRoster's SQLite state; Agent and Library files remain.
+    /// Delete SkillRoster's rebuildable local state; Agent and Library files remain.
     Delete(LifecycleDeleteArgs),
 }
 
@@ -239,6 +239,10 @@ pub struct LifecyclePurgeArgs {
     /// Explicitly purge all Plans and Receipts, including their Undo history.
     #[arg(long)]
     pub plans_receipts: bool,
+
+    /// Purge retained source-confirmation detail artifacts.
+    #[arg(long)]
+    pub source_confirmation: bool,
 
     /// Required exact token when --plans-receipts is selected.
     #[arg(long)]

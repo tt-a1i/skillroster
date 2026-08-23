@@ -186,6 +186,105 @@ pub fn error_human(error: &dyn Display) -> String {
     format!("SkillRoster · Error\n\nERR  {error}\n\nNo files changed.")
 }
 
+pub fn blocked_roster_plan(details: &Value) -> String {
+    let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+    blocked_roster_plan_lines(details, &mut lines, terminal_width());
+    lines.join("\n")
+}
+
+fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: usize) {
+    fact(lines, "Status", "blocked");
+    fact(
+        lines,
+        "Decision",
+        text(details, "decision").replace('_', " "),
+    );
+    fact(lines, "Core budget", text(details, "requested_core_budget"));
+    fact(
+        lines,
+        "Blocked changes",
+        details
+            .get("blocked_change_count")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "none".into()),
+    );
+    lines.push(String::new());
+    lines.push("  Skills needing a source decision".into());
+    let blockers = details
+        .get("blocked_changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(5);
+    for blocker in blockers {
+        let agent = blocker
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("agent");
+        let name = blocker
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let label = format!("  {agent:<12} {name}");
+        lines.push(middle_truncate(&label, width));
+        if let Some(target) = blocker
+            .get("observed_source_target")
+            .and_then(Value::as_str)
+        {
+            lines.push(format!(
+                "    {}",
+                middle_truncate(target, width.saturating_sub(4))
+            ));
+        }
+    }
+    let more_blockers = details["blocked_changes_truncated"].as_bool() == Some(true)
+        || details
+            .get("blocked_changes")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() > 5);
+    let detail_path = details.pointer("/detail/path").and_then(Value::as_str);
+    if more_blockers && detail_path.is_none() {
+        lines.push("  Inspect JSON error.details for remaining blockers".into());
+    }
+    lines.push(String::new());
+    lines.push("  Reviewed source directories".into());
+    let roots = details
+        .get("source_roots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(5);
+    let mut shown = 0;
+    for root in roots {
+        shown += 1;
+        lines.push(format!(
+            "  --source-root {}",
+            middle_truncate(root, width.saturating_sub(18))
+        ));
+    }
+    if shown == 0 {
+        lines.push("  none disclosed".into());
+    }
+    let more_roots = details["source_roots_truncated"].as_bool() == Some(true)
+        || details
+            .get("source_roots")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() > 5);
+    if let Some(path) = detail_path.filter(|_| more_blockers || more_roots) {
+        lines.push(format!(
+            "  Read {}",
+            middle_truncate(path, width.saturating_sub(8))
+        ));
+    } else if more_roots {
+        lines.push("  Inspect JSON error.details for remaining source roots".into());
+    }
+    lines.extend(summary(
+        "Blocked · no automatic change is supported",
+        "Confirm the reported source directories before rescanning",
+    ));
+}
+
 fn title(value: &str) -> String {
     let mut chars = value.chars();
     chars
@@ -1368,16 +1467,25 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
             ));
         }
         "purge" => {
-            fact(
-                lines,
-                "Raw retention",
-                format!("{} days", text(value, "raw_usage_days")),
-            );
-            fact(
-                lines,
-                "Monthly aggregates",
-                text(value, "monthly_aggregates_retained"),
-            );
+            if value.get("raw_usage_days").is_some_and(Value::is_number) {
+                fact(
+                    lines,
+                    "Raw retention",
+                    format!("{} days", text(value, "raw_usage_days")),
+                );
+                fact(
+                    lines,
+                    "Monthly aggregates",
+                    text(value, "monthly_aggregates_retained"),
+                );
+            }
+            let removed_source_details = value
+                .get("removed_source_confirmation_details")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if removed_source_details > 0 {
+                fact(lines, "Source details removed", removed_source_details);
+            }
             let files_changed = value
                 .get("files_changed")
                 .and_then(Value::as_bool)
@@ -1390,6 +1498,18 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
                 lines.extend(summary(
                     "Changed · Plans and Receipts removed from local state",
                     "Agent and Library files were preserved",
+                ));
+            } else if removed_source_details > 0
+                && value.get("raw_usage_days").is_some_and(Value::is_number)
+            {
+                lines.extend(summary(
+                    "Changed · selected local lifecycle state removed",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
+                ));
+            } else if removed_source_details > 0 {
+                lines.extend(summary(
+                    "Changed · source-confirmation details removed",
+                    "Plans, Receipts, Agent files, and Library files were preserved",
                 ));
             } else if files_changed {
                 lines.extend(summary(
@@ -1715,6 +1835,89 @@ mod tests {
         let rendered = error_human(&"drifted plan");
         assert!(rendered.contains("drifted plan"));
         assert!(rendered.ends_with("No files changed."));
+    }
+
+    #[test]
+    fn custom_budget_source_blockers_stay_bounded_at_reference_widths() {
+        let details = json!({
+            "decision": "confirm_trusted_source_roots",
+            "requested_core_budget": 10,
+            "blocked_change_count": 2,
+            "blocked_changes": [
+                {
+                    "agent": "codex",
+                    "name": "alpha",
+                    "observed_source_target": "/Users/example/reviewed/alpha"
+                },
+                {
+                    "agent": "codex",
+                    "name": "beta",
+                    "observed_source_target": "/Users/example/reviewed/beta"
+                }
+            ],
+            "blocked_changes_truncated": false,
+            "source_roots": ["/Users/example/reviewed"],
+            "source_roots_truncated": false
+        });
+        for width in [60, 80, 120] {
+            let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+            blocked_roster_plan_lines(&details, &mut lines, width);
+            let output = lines.join("\n");
+            assert!(output.contains("blocked"));
+            assert!(output.contains("alpha"));
+            assert!(output.contains("--source-root"));
+            assert!(output.contains("no automatic change is supported"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_budget_overflow_points_at_the_detail_file() {
+        let blocked_changes = (0..10)
+            .map(|index| {
+                json!({
+                    "agent": "codex",
+                    "name": format!("skill-{index:02}"),
+                    "observed_source_target": format!("/opt/root-{index:02}/pkg")
+                })
+            })
+            .collect::<Vec<_>>();
+        let source_roots = (0..10)
+            .map(|index| json!(format!("/opt/root-{index:02}/pkg")))
+            .collect::<Vec<_>>();
+        let details = json!({
+            "decision": "confirm_trusted_source_roots",
+            "requested_core_budget": 10,
+            "blocked_change_count": 11,
+            "blocked_changes": blocked_changes,
+            "blocked_changes_truncated": true,
+            "source_roots": source_roots,
+            "source_roots_truncated": true,
+            "detail": {
+                "path": "/tmp/skillroster/source-confirmation/overflow.json"
+            }
+        });
+        let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+        blocked_roster_plan_lines(&details, &mut lines, 80);
+        let output = lines.join("\n");
+        assert!(output.contains("skill-00"), "{output}");
+        assert!(output.contains("skill-04"), "{output}");
+        assert!(!output.contains("skill-05"), "{output}");
+        assert!(output.contains("/opt/root-00/pkg"), "{output}");
+        assert!(!output.contains("/opt/root-05/pkg"), "{output}");
+        assert!(
+            output.contains("Read /tmp/skillroster/source-confirmation/overflow.json"),
+            "{output}"
+        );
+        assert!(!output.contains("Inspect JSON error.details"), "{output}");
+        assert!(!output.to_lowercase().contains("truncated"), "{output}");
+        assert!(
+            output.lines().all(|line| display_width(line) <= 80),
+            "line exceeded 80 columns:\n{output}"
+        );
     }
 
     #[test]

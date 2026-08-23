@@ -274,6 +274,8 @@ pub struct ApiError {
     pub relevant_ids: Vec<String>,
     #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

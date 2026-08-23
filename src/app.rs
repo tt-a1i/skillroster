@@ -47,7 +47,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                         "Delete SkillRoster local state at {}?",
                         database_path.display()
                     ),
-                    "The SQLite database and Receipt journals will be deleted. Agent and Library files are preserved. A new Scan rebuilds inventory state.",
+                    "The SQLite database, Receipt journals, and source-confirmation details will be deleted. Agent and Library files are preserved. A new Scan rebuilds inventory state.",
                 )?
             {
                 return cancelled_output("lifecycle");
@@ -233,7 +233,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             ),
             LifecycleCommand::Export(args) => (
                 "lifecycle",
-                lifecycle_export_command(&store, &args.output)?,
+                lifecycle_export_command(&store, &state_dir, &args.output)?,
                 vec![],
                 vec![],
             ),
@@ -244,8 +244,10 @@ pub fn run(cli: Cli) -> Result<Output> {
                 vec![],
             ),
             LifecycleCommand::Purge(args) => {
-                if args.raw_days.is_none() && !args.plans_receipts {
-                    bail!("purge requires --raw-days DAYS and/or --plans-receipts");
+                if args.raw_days.is_none() && !args.plans_receipts && !args.source_confirmation {
+                    bail!(
+                        "purge requires --raw-days DAYS, --plans-receipts, and/or --source-confirmation"
+                    );
                 }
                 if args.plans_receipts && args.confirm.as_deref() != Some("PURGE-PLANS-RECEIPTS") {
                     bail!("Plans and Receipts purge requires --confirm PURGE-PLANS-RECEIPTS");
@@ -255,6 +257,8 @@ pub fn run(cli: Cli) -> Result<Output> {
                         "Purge the explicitly selected local lifecycle state?",
                         if args.plans_receipts {
                             "Selected Plans, Receipts, and their Undo history will be deleted. Agent and Library files are preserved."
+                        } else if args.source_confirmation {
+                            "Selected source-confirmation details will be deleted. Agent and Library files are preserved."
                         } else {
                             "Only selected SQLite usage/evidence rows are affected; Plans, Receipts, Agent files, and Library files are preserved."
                         },
@@ -269,6 +273,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                         &state_dir,
                         args.raw_days,
                         args.plans_receipts,
+                        args.source_confirmation,
                     )?,
                     vec![],
                     vec![],
@@ -342,6 +347,36 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "trusted_canonical_sources_required".into(),
+                message: blocked.message.clone(),
+                retryable: false,
+                relevant_ids: blocked.relevant_ids.clone(),
+                paths: blocked.paths.clone(),
+                details: Some(blocked.details.clone()),
+            },
+        );
+        if !blocked.paths.is_empty() {
+            let mut argv = Vec::new();
+            for path in &blocked.paths {
+                argv.push("--source-root");
+                argv.push(path.as_str());
+            }
+            argv.extend(["scan", "--json"]);
+            envelope.suggested_actions = vec![action(
+                "scan_with_confirmed_source_roots",
+                &argv,
+                false,
+                true,
+                "trusted_canonical_sources_required",
+            )];
+        }
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     let classified = classify_error(error);
     serde_json::to_string(&JsonEnvelope::<Value>::failure(
         command,
@@ -351,6 +386,7 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
             retryable: classified.1,
             relevant_ids: extract_relevant_ids(&error.to_string()),
             paths: extract_paths(&error.to_string()),
+            details: None,
         },
     ))
     .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
@@ -358,6 +394,12 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, bool) {
     let message = error.to_string().to_lowercase();
+    if error
+        .downcast_ref::<crate::roster_plan::RosterPlanBlocked>()
+        .is_some()
+    {
+        return ("trusted_canonical_sources_required", false);
+    }
     if error.downcast_ref::<clap::Error>().is_some() {
         return ("invalid_cli_arguments", false);
     }
@@ -616,13 +658,15 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
             "raw_usage_days": 180,
             "older_usage": "monthly_aggregates_retained",
             "automatic_purge": false,
+            "source_confirmation_details": source_confirmation_detail_summary(state_dir)?,
             "current": lifecycle,
         },
         "files_changed": false
     }))
 }
 
-fn lifecycle_export_command(store: &StateStore, output: &Path) -> Result<Value> {
+fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path) -> Result<Value> {
+    let source_confirmation_details = read_source_confirmation_details(state_dir)?;
     let export = json!({
         "schema_version": 1,
         "generated_at": Utc::now().timestamp(),
@@ -632,6 +676,7 @@ fn lifecycle_export_command(store: &StateStore, output: &Path) -> Result<Value> 
         },
         "data": store.export_lifecycle()?,
         "evidence_exclusions": store.evidence_exclusions()?,
+        "source_confirmation_details": source_confirmation_details,
         "privacy": "derived summaries only; no raw conversation text",
     });
     let parent = output
@@ -661,6 +706,7 @@ fn lifecycle_export_command(store: &StateStore, output: &Path) -> Result<Value> 
         "operation": "export",
         "output_path": output,
         "counts": store.lifecycle_counts()?,
+        "source_confirmation_detail_count": source_confirmation_details.len(),
         "files_changed": true,
     }))
 }
@@ -670,10 +716,14 @@ fn lifecycle_inspect_command(
     database_path: &Path,
     state_dir: &Path,
 ) -> Result<Value> {
+    let mut counts = serde_json::to_value(store.lifecycle_counts()?)?;
+    let source_confirmation_details = source_confirmation_detail_summary(state_dir)?;
+    counts["source_confirmation_details"] = source_confirmation_details["count"].clone();
     Ok(json!({
         "operation": "inspect",
         "database_path": database_path,
-        "counts": store.lifecycle_counts()?,
+        "counts": counts,
+        "source_confirmation_details": source_confirmation_details,
         "evidence_exclusions": store.evidence_exclusions()?,
         "recovery_state": recovery_text(store, state_dir)?,
         "privacy": "derived summaries only; no raw conversation text",
@@ -701,9 +751,13 @@ fn lifecycle_purge_command(
     state_dir: &Path,
     raw_days: Option<u16>,
     plans_receipts: bool,
+    source_confirmation: bool,
 ) -> Result<Value> {
     if plans_receipts && recovery_text(store, state_dir)? == "required" {
         bail!("recovery is required before Plans and Receipts can be purged");
+    }
+    if source_confirmation {
+        source_confirmation_detail_paths(state_dir)?;
     }
     let (cutoff, usage_result) = if let Some(raw_days) = raw_days {
         let cutoff = Utc::now().timestamp() - i64::from(raw_days) * 24 * 60 * 60;
@@ -737,6 +791,11 @@ fn lifecycle_purge_command(
     } else {
         (None, false)
     };
+    let removed_source_confirmation_details = if source_confirmation {
+        remove_source_confirmation_details(state_dir)?
+    } else {
+        0
+    };
     Ok(json!({
         "operation": "purge",
         "raw_usage_days": raw_days,
@@ -745,9 +804,10 @@ fn lifecycle_purge_command(
         "plan_receipt_result": plan_receipt_result,
         "monthly_aggregates_retained": raw_days.is_some(),
         "plans_or_receipts_changed": plans_or_receipts_changed,
+        "removed_source_confirmation_details": removed_source_confirmation_details,
         "agent_files_changed": false,
         "library_files_changed": false,
-        "files_changed": usage_changed || plans_or_receipts_changed,
+        "files_changed": usage_changed || plans_or_receipts_changed || removed_source_confirmation_details > 0,
     }))
 }
 
@@ -757,6 +817,7 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
     let _write_lock = change::WriteLock::acquire(state_dir)?;
     let existed = database_path.exists();
     let journals = change::journals(state_dir)?;
+    source_confirmation_detail_paths(state_dir)?;
     if existed {
         let store = StateStore::open(database_path)?;
         if recovery_text(&store, state_dir)? == "required" {
@@ -785,9 +846,11 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
     // the only recovery material before a database deletion error.
     let removed_journals = remove_receipt_journals(state_dir)?;
     let removed_recovery_directories = remove_recovery_artifacts(state_dir)?;
+    let removed_source_confirmation_details = remove_source_confirmation_details(state_dir)?;
     let files_changed = !removed_database_files.is_empty()
         || removed_journals > 0
-        || removed_recovery_directories > 0;
+        || removed_recovery_directories > 0
+        || removed_source_confirmation_details > 0;
     Ok(json!({
         "operation": "delete_local_state",
         "database_path": database_path,
@@ -795,11 +858,190 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
         "removed_database_files": removed_database_files,
         "removed_receipt_journals": removed_journals,
         "removed_recovery_directories": removed_recovery_directories,
+        "removed_source_confirmation_details": removed_source_confirmation_details,
         "rebuild_command": "skillroster scan --json",
         "agent_files_changed": false,
         "library_files_changed": false,
         "files_changed": files_changed,
     }))
+}
+
+fn source_confirmation_detail_paths(state_dir: &Path) -> Result<Vec<PathBuf>> {
+    let directory = state_dir.join("source-confirmation");
+    let metadata = match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", directory.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing invalid source-confirmation directory: {}",
+            directory.display()
+        );
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            bail!(
+                "refusing invalid source-confirmation detail: {}",
+                path.display()
+            );
+        }
+        validate_source_confirmation_detail(&path)?;
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn validate_source_confirmation_detail(path: &Path) -> Result<()> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid source-confirmation detail name: {}",
+                path.display()
+            )
+        })?;
+    ulid::Ulid::from_string(stem).map_err(|_| {
+        anyhow!(
+            "invalid source-confirmation detail name: {}",
+            path.display()
+        )
+    })?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let detail: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    if !recognized_source_confirmation_detail(&detail) {
+        bail!(
+            "refusing unrecognized source-confirmation detail: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn recognized_source_confirmation_detail(detail: &Value) -> bool {
+    (|| -> Option<bool> {
+        let core_budget = detail["requested_core_budget"].as_u64()?;
+        let blocked_changes = detail["blocked_changes"].as_array()?;
+        let blocked_change_count = detail["blocked_change_count"].as_u64()?;
+        let skill_ids = detail["skill_ids"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        let blocker_facts = blocked_changes
+            .iter()
+            .map(|blocker| {
+                let agent = blocker["agent"].as_str()?;
+                parse_agent_kind(agent).ok()?;
+                let skill_id = blocker["skill_id"].as_str()?;
+                SkillId::parse(skill_id.to_owned()).ok()?;
+                (!blocker["name"].as_str()?.trim().is_empty()).then_some(())?;
+                (blocker["reason"] == "no_owned_exact_content_to_preserve").then_some(())?;
+                (blocker["state"] == "unchanged").then_some(())?;
+                let observed_source_target =
+                    if let Some(target) = blocker.get("observed_source_target") {
+                        let target = Path::new(target.as_str()?);
+                        (target.is_absolute() && target.parent().is_some()).then_some(())?;
+                        Some(target.to_path_buf())
+                    } else {
+                        None
+                    };
+                Some((skill_id, observed_source_target))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let blocker_skill_ids = blocker_facts
+            .iter()
+            .map(|(skill_id, _)| *skill_id)
+            .collect::<Vec<_>>();
+        let source_roots = detail["source_roots"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        let source_root_count = detail["source_root_count"].as_u64()?;
+        let expected_source_roots = crate::roster_plan::minimum_reviewed_source_roots(
+            blocker_facts
+                .iter()
+                .filter_map(|(_, target)| target.clone()),
+        )
+        .into_iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>();
+        let mut expected_argv = vec!["skillroster"];
+        for root in &source_roots {
+            expected_argv.extend(["--source-root", *root]);
+        }
+        expected_argv.extend(["scan", "--json"]);
+        let argv = detail["after_confirmation"]["argv"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        Some(
+            detail["schema_version"] == 1
+                && detail["reason"] == "trusted_canonical_sources_required"
+                && detail["decision"] == "confirm_trusted_source_roots"
+                && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
+                    .contains(&core_budget)
+                && blocked_change_count == blocked_changes.len() as u64
+                && blocker_skill_ids == skill_ids
+                && source_root_count == source_roots.len() as u64
+                && source_roots == expected_source_roots
+                && detail["after_confirmation"]["repeatable_option"] == "--source-root"
+                && detail["after_confirmation"]["source_roots"] == detail["source_roots"]
+                && argv == expected_argv,
+        )
+    })()
+    .unwrap_or(false)
+}
+
+fn source_confirmation_detail_summary(state_dir: &Path) -> Result<Value> {
+    let paths = source_confirmation_detail_paths(state_dir)?;
+    let bytes = paths.iter().try_fold(0_u64, |total, path| {
+        Ok::<_, anyhow::Error>(total + std::fs::symlink_metadata(path)?.len())
+    })?;
+    Ok(json!({
+        "count": paths.len(),
+        "bytes": bytes,
+        "retention": "until_explicit_purge_or_delete",
+    }))
+}
+
+fn read_source_confirmation_details(state_dir: &Path) -> Result<Vec<Value>> {
+    source_confirmation_detail_paths(state_dir)?
+        .into_iter()
+        .map(|path| {
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("cannot parse {}", path.display()))
+        })
+        .collect()
+}
+
+fn remove_source_confirmation_details(state_dir: &Path) -> Result<u64> {
+    let directory = state_dir.join("source-confirmation");
+    let paths = source_confirmation_detail_paths(state_dir)?;
+    for path in &paths {
+        std::fs::remove_file(path).with_context(|| format!("cannot delete {}", path.display()))?;
+    }
+    if std::fs::symlink_metadata(&directory).is_ok() {
+        std::fs::remove_dir(&directory)
+            .with_context(|| format!("cannot delete {}", directory.display()))?;
+    }
+    Ok(paths.len() as u64)
 }
 
 fn remove_receipt_journals(state_dir: &Path) -> Result<u64> {
@@ -3068,6 +3310,7 @@ fn expand_finding_roster_changes(
     mut input: Value,
     latest_scan_id: &ScanId,
     scan: &ScanResult,
+    state_dir: &Path,
 ) -> Result<(Value, Option<FindingPlanProvenance>)> {
     let object = input
         .as_object_mut()
@@ -3138,10 +3381,13 @@ fn expand_finding_roster_changes(
                 "Finding {finding_id} is blocked because a non-Agent source link depends on a placement scheduled for removal; resolve the reported source dependency, rescan, and use the new Finding"
             );
         }
-        bail!(
-            "Finding {finding_id} is blocked by {} Roster changes without owned exact content; confirm the reported source roots, rescan, and use the new Finding",
-            supported.exclusions.len()
-        );
+        return Err(crate::roster_plan::source_confirmation_block(
+            finding_id.as_str(),
+            request.core_budget,
+            &supported.exclusions,
+            state_dir,
+        )?
+        .into());
     }
     if finding.evidence_ids.is_empty() {
         bail!("Finding {finding_id} has no Evidence");
@@ -3905,7 +4151,7 @@ fn prepare_plan(
     let (scan_id, scan) = latest_scan(store)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
         let (input, roster_provenance) =
-            expand_finding_roster_changes(store, input, &scan_id, &scan)?;
+            expand_finding_roster_changes(store, input, &scan_id, &scan, state_dir)?;
         let (input, library_provenance) =
             expand_finding_library_changes(store, input, &scan_id, &scan)?;
         (input, roster_provenance.or(library_provenance))
@@ -6132,9 +6378,52 @@ mod recovery_tests {
         )
         .unwrap();
 
-        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true).is_err());
+        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true, false).is_err());
         let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_confirmation_purge_validates_paths_before_mutating_usage() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&outside, state_dir.join("source-confirmation")).unwrap();
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = ScanRun {
+            id: ScanId::new(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        store.save_scan(&scan).unwrap();
+        store
+            .save_scan_payload(
+                &scan.id,
+                &json!({
+                    "usage": [{
+                        "agent": "codex",
+                        "skill_id": "skill_fixture",
+                        "stage": "loaded",
+                        "quality": "observed",
+                        "event_count": 1,
+                        "first_seen_unix": 1,
+                        "last_seen_unix": 1
+                    }]
+                }),
+            )
+            .unwrap();
+
+        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), false, true).is_err());
+
+        let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
+        assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
+        assert!(outside.join("keep.json").is_file());
     }
 
     #[test]
@@ -6164,6 +6453,90 @@ mod recovery_tests {
 
         assert_eq!(impact, stored);
         assert_eq!(impact["exposure_reduction_percent"], 55.84);
+    }
+
+    #[test]
+    fn source_block_json_keeps_complete_roots_in_the_detail_file() {
+        let state = TempDir::new().unwrap();
+        let exclusions = (0..11)
+            .map(|index| crate::roster_plan::RosterChangeExclusion {
+                agent: "codex".into(),
+                skill_id: format!("skill_{index:032}"),
+                name: format!("skill-{index:02}"),
+                reason: "no_owned_exact_content_to_preserve",
+                observed_source_target: Some(crate::roster_plan::test_absolute_path(&format!(
+                    "opt/root-{index:02}/pkg"
+                ))),
+            })
+            .collect::<Vec<_>>();
+        let blocked = crate::roster_plan::source_confirmation_block(
+            "finding_fixture",
+            10,
+            &exclusions,
+            state.path(),
+        )
+        .unwrap();
+        let envelope: Value = serde_json::from_str(&error_json("plan", &blocked)).unwrap();
+        assert_eq!(
+            envelope["error"]["details"]["blocked_changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            envelope["error"]["details"]["source_roots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(
+            envelope["error"]["details"]["blocked_changes_truncated"],
+            true
+        );
+        assert_eq!(envelope["error"]["details"]["source_roots_truncated"], true);
+        assert_eq!(envelope["error"]["paths"].as_array().unwrap().len(), 10);
+        let argv = envelope["suggested_actions"][0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let expected_roots = (0..11)
+            .map(|index| {
+                crate::roster_plan::test_absolute_path(&format!("opt/root-{index:02}/pkg"))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        for root in expected_roots.iter().take(10) {
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--source-root" && pair[1] == root),
+                "missing bounded --source-root {root} in {argv:?}"
+            );
+        }
+        assert!(!argv.iter().any(|value| value == &expected_roots[10]));
+        let detail_path = envelope["error"]["details"]["detail"]["path"]
+            .as_str()
+            .unwrap();
+        let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["source_roots"], json!(expected_roots));
+        let complete_argv = complete["after_confirmation"]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        for root in &expected_roots {
+            assert!(
+                complete_argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--source-root" && pair[1] == root),
+                "missing complete --source-root {root} in {complete_argv:?}"
+            );
+        }
     }
 }
 

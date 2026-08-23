@@ -52,6 +52,13 @@ fn main() {
             }
             if json {
                 write_stdout_or_exit(&app::error_json(command, error.as_ref()));
+            } else if let Some(blocked) =
+                error.downcast_ref::<skillroster::roster_plan::RosterPlanBlocked>()
+            {
+                eprintln!(
+                    "{}",
+                    skillroster::present::blocked_roster_plan(&blocked.details)
+                );
             } else {
                 eprintln!("{}", skillroster::present::error_human(&error));
             }
