@@ -1308,13 +1308,32 @@ impl StateStore {
         Ok(count != 0)
     }
 
-    pub fn pending_plans(&self) -> StorageResult<Vec<PlanRecord>> {
+    pub fn pending_plans(
+        &self,
+        latest_scan_id: Option<&ScanId>,
+        limit: usize,
+    ) -> StorageResult<(usize, Vec<PlanRecord>)> {
+        let latest_scan_id = latest_scan_id.map(ScanId::as_str);
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM plans
+             WHERE status IN ('applying', 'recovery_required')
+                OR (status = 'ready' AND scan_id = ?1)",
+            params![latest_scan_id],
+            |row| row.get(0),
+        )?;
         let mut statement = self.connection.prepare(
             "SELECT immutable_json, status FROM plans
-             WHERE status IN ('ready', 'applying', 'recovery_required')
-             ORDER BY created_at ASC, id ASC",
+             WHERE status IN ('applying', 'recovery_required')
+                OR (status = 'ready' AND scan_id = ?1)
+             ORDER BY CASE status
+                 WHEN 'recovery_required' THEN 0
+                 WHEN 'applying' THEN 1
+                 ELSE 2
+             END,
+             created_at DESC, id DESC
+             LIMIT ?2",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![latest_scan_id, limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         let mut plans = Vec::new();
@@ -1324,7 +1343,9 @@ impl StateStore {
             plan.status = enum_from_text(&status)?;
             plans.push(plan);
         }
-        Ok(plans)
+        let count = usize::try_from(count)
+            .map_err(|_| StorageError::InvalidData("pending Plan count is invalid".into()))?;
+        Ok((count, plans))
     }
 
     pub fn latest_receipt(&self) -> StorageResult<Option<ReceiptRecord>> {
@@ -2375,6 +2396,47 @@ mod tests {
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::Ready
         );
+    }
+
+    #[test]
+    fn pending_plans_are_current_bounded_and_lifecycle_prioritized() {
+        let store = StateStore::open_in_memory().unwrap();
+        let old_scan = scan();
+        let mut current_scan = scan();
+        current_scan.started_at = 30;
+        current_scan.completed_at = Some(40);
+        store.save_scan(&old_scan).unwrap();
+        store.save_scan(&current_scan).unwrap();
+        let save_plan = |scan_id: ScanId, status: PlanStatus, created_at: i64| {
+            let plan = PlanRecord {
+                id: PlanId::new(),
+                scan_id,
+                report_id: None,
+                created_at,
+                status,
+                input: serde_json::json!({}),
+                fingerprint: format!("plan-{created_at}"),
+                operations: Vec::new(),
+            };
+            store.save_plan(&plan).unwrap();
+            plan.id
+        };
+        let stale_ready = save_plan(old_scan.id.clone(), PlanStatus::Ready, 1);
+        let applying = save_plan(old_scan.id.clone(), PlanStatus::Applying, 2);
+        let recovery = save_plan(old_scan.id, PlanStatus::RecoveryRequired, 3);
+        for created_at in 10..35 {
+            save_plan(current_scan.id.clone(), PlanStatus::Ready, created_at);
+        }
+
+        let (count, plans) = store.pending_plans(Some(&current_scan.id), 20).unwrap();
+
+        assert_eq!(count, 27);
+        assert_eq!(plans.len(), 20);
+        assert_eq!(plans[0].id, recovery);
+        assert_eq!(plans[0].status, PlanStatus::RecoveryRequired);
+        assert_eq!(plans[1].id, applying);
+        assert_eq!(plans[1].status, PlanStatus::Applying);
+        assert!(plans.iter().all(|plan| plan.id != stale_ready));
     }
 
     #[test]
