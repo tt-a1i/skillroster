@@ -596,8 +596,8 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     let known = known_agent_roots(&options.home);
     let plugin_roots = codex_plugin_skill_roots(&options.home, &mut result.warnings);
     // These paths are already an explicit trust decision from the caller.
-    // Preserve the supplied aliases for link-containment checks, while
-    // inventorying each resolved physical source only once.
+    // Inventory and link-containment decisions use the resolved physical
+    // sources so an alias and its canonical path have identical semantics.
     let confirmed_source_roots = normalized_confirmed_source_roots(&options.explicit_source_roots);
     let shared_roots = [
         options.home.join(".agents_skills"),
@@ -884,34 +884,40 @@ fn inspect_link(
         path.parent().unwrap_or(Path::new(".")).join(raw_target)
     };
     let normalized_target = lexical_normalize(&target);
-    if !approved_roots
-        .iter()
-        .map(|root| lexical_normalize(root))
-        .any(|root| normalized_target.starts_with(root))
-    {
-        return (Some(normalized_target), LinkStatus::EscapesRoot);
-    }
-
-    // Lexical containment is only an early rejection. An in-root target can
-    // still escape through a symlink in one of its parent components, so the
-    // final resolved path must be contained by a resolved approved root too.
-    // A target that cannot be fully resolved is never safe to read.
+    // Trust the resolved destination, not the spelling of the path used to
+    // reach it. A confirmed canonical source and a symlink alias to that
+    // source must therefore have identical semantics. If the target is
+    // broken, resolve its nearest existing ancestor so an in-root missing
+    // target remains Broken while an indirect escape remains fail-closed.
     let resolved_target = match fs::canonicalize(path) {
         Ok(target) => target,
-        Err(_) => return (Some(normalized_target), LinkStatus::Broken),
+        Err(_) => {
+            let status = canonical_existing_ancestor(&normalized_target)
+                .filter(|ancestor| is_within_resolved_root(ancestor, approved_roots))
+                .map_or(LinkStatus::EscapesRoot, |_| LinkStatus::Broken);
+            return (Some(normalized_target), status);
+        }
     };
-    let within_resolved_root = approved_roots.iter().any(|root| {
-        fs::canonicalize(root)
-            .map(|root| resolved_target.starts_with(root))
-            .unwrap_or(false)
-    });
-    if !within_resolved_root {
+    if !is_within_resolved_root(&resolved_target, approved_roots) {
         return (Some(normalized_target), LinkStatus::EscapesRoot);
     }
     if fs::metadata(path).is_err() {
         return (Some(normalized_target), LinkStatus::Broken);
     }
     (Some(normalized_target), LinkStatus::Valid)
+}
+
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find_map(|ancestor| fs::canonicalize(ancestor).ok())
+}
+
+fn is_within_resolved_root(path: &Path, approved_roots: &[PathBuf]) -> bool {
+    approved_roots.iter().any(|root| {
+        fs::canonicalize(root)
+            .map(|root| path.starts_with(root))
+            .unwrap_or(false)
+    })
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
@@ -2323,7 +2329,7 @@ enabled = true
 
     #[cfg(unix)]
     #[test]
-    fn explicit_source_roots_deduplicate_physical_sources_and_preserve_confirmed_aliases() {
+    fn explicit_source_root_alias_and_canonical_path_have_identical_semantics() {
         let root = temp_directory("source-root");
         let home = root.join("home");
         let source_root = root.join("sources");
@@ -2344,10 +2350,29 @@ enabled = true
             .unwrap();
         std::os::unix::fs::symlink(&source_skill, claude_root.join("external")).unwrap();
 
-        let mut options = ScanOptions::for_home(&home);
-        options.explicit_source_roots = vec![source_alias, source_root.clone()];
-        options.include_session_evidence = false;
-        let result = scan(&options).unwrap();
+        let scan_with = |source: PathBuf| {
+            let mut options = ScanOptions::for_home(&home);
+            options.explicit_source_roots = vec![source];
+            options.include_session_evidence = false;
+            scan(&options).unwrap()
+        };
+        let canonical_result = scan_with(source_root.clone());
+        let alias_result = scan_with(source_alias.clone());
+
+        let mut deduplicated_options = ScanOptions::for_home(&home);
+        deduplicated_options.explicit_source_roots = vec![source_alias, source_root.clone()];
+        deduplicated_options.include_session_evidence = false;
+        let deduplicated_result = scan(&deduplicated_options).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&canonical_result).unwrap(),
+            serde_json::to_value(&alias_result).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&canonical_result).unwrap(),
+            serde_json::to_value(&deduplicated_result).unwrap()
+        );
+        let result = canonical_result;
 
         assert!(result.warnings.is_empty());
         assert_eq!(result.skills.len(), 1);
