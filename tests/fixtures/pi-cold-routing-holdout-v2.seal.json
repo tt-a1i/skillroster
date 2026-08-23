@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "suite_id": "cold-routing-holdout-v2",
+  "seal_state": "frozen_before_first_run",
+  "source_revision": "5aef302731b2d0a53df915ba386addf1a65ca3c8",
+  "facts": {
+    "suite_id": "cold-routing-holdout-v2",
+    "manifest_sha256": "c75b5a2824fa8b1a66c93b62c37f550562c7f42875dbfdfc26a71609e93bb5f9",
+    "bootstrap_package_sha256": "e4b7f1bd1996a468e3e2d13e0dc60c6539a6c0687302fc9594b985c074e759a3",
+    "cli_binary_sha256": "c75caf280dc7d10044d24bed41a900649192b41106a3fb43029e1db5474fb91e",
+    "cli_source_tree_sha256": "14795878a46010cb7963f6371e9f487458e10d74032a5b9509e95af0e4751998",
+    "harness_tree_sha256": "8a1d8ff8cdfd2721aa94d38c704b7dc3e4cf5bc79a880b4474a85539fc4479be",
+    "target_packages_sha256": {
+      "holdout-relay-topology-002": "276126e9a710c54c09f2ae5b4ee5683d93e54770c00c440633608f88d4d863ff",
+      "holdout-humanize-device-002": "8c4d15f60d1debb58e88a2a83a56fdf06b9a20a8c6eec78dfe6137a40948cc2d",
+      "holdout-domain-rights-002": "08ead948f2594799b04efdead25a4f1f59030a1d60e8830696e1289f5deca581",
+      "holdout-session-watcher-002": "31ed563e5ea24b0a68f9982fdac975d10e1f95299091f65d2db55de47522ca40"
+    },
+    "materialized_workspaces_sha256": {
+      "holdout-relay-topology-002": "4b359afac31b10d1121d933ff86d0f8ad74051bf6c096ab08ec6fdd2bdf2398d",
+      "holdout-humanize-device-002": "de8292e11e86841456f97a332e6bf987fd3d2a71d1709cadbf6f47f55c3b44b9",
+      "holdout-domain-rights-002": "c5d64402bacb2bba1d7af7fab8497232701d46b9849a04fb20475c23e547838c",
+      "holdout-session-watcher-002": "c892feb2a93ccd6649dc733dc84151e4bbfc53e5b4b61cc47be703ae3d630bc3"
+    },
+    "oracle_contract_sha256": "78959789c3ff11a781f9cd0c91a8d8517ba26e728d0ee6e82bc0fe5336e01aae",
+    "evaluation_contract_sha256": "0352efe7e7620bb1989f6266725c4d57b6ede80c50cd356185d4e42bb822e706",
+    "public_model_profile_sha256": "43066ec052af14340694555fbf42e5e912ab8eb7c47cfdfba3be89e6b917ef38",
+    "arm_schedule_seed": "4d9f318a6c72e501b8d4430faec96725",
+    "arm_schedule_sha256": "67eda7d2aebbb652c7e871dd1ef99cdec1b2ea3e08237ec1025af26d58b798cf",
+    "git_bound_tree_sha256": "49e532fb5e10b5e7b079dce0a655bb56758fdb98d02cb5aaf2bd5b4ee4aa858e"
+  },
+  "seal_sha256": "d1a9441e18df7f6860463f178d1fb203d99fc3794f5eedd95f529a0266bc1e5d"
+}
