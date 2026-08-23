@@ -2505,7 +2505,7 @@ fn find_command(
     let pool_limit = if retrieval_hints.is_empty() {
         limit
     } else {
-        limit.saturating_mul(4).clamp(20, 100)
+        usize::from(crate::cli::MAX_FIND_RESULTS)
     };
     let augmented_matches = crate::query::find_matching(
         &scan,
