@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-24",
+  "scope": "diagnostic_canary",
+  "issues": [129, 130],
+  "harness": {
+    "name": "pi",
+    "version": "0.84.2",
+    "model": "seal/deepseek-v4-flash-0731-baidu",
+    "offline_startup": true,
+    "tools": ["read", "bash"],
+    "filesystem_write_policy": "deny writes beneath /Users/tushaokun"
+  },
+  "inputs": {
+    "cli_commit": "e16d563",
+    "cli_path": "/Users/tushaokun/code/skillroster/target/debug/skillroster",
+    "cli_sha256_at_run": "0baa23cd2f099b9b4a94c84fd59f3df8dd446dc47ccc320a578bfcd88f6da539",
+    "snapshot_id": "scan_000000000001166718ce7ac23556d9d0",
+    "user_message_sha256": "70eb69bba67a41e1f549318b1c76578e3ba0bff79dbfa4b3555ffbaf4ddb4846",
+    "target_skill_sha256": "9b83a71b5934c8fc744bf0f6b3ea35702b15b0cb36e643b4532e08922477fe65"
+  },
+  "baseline": {
+    "bootstrap_sha256": "11c9074ec790c4ce7820aa9bb8fe112b2fba607f847c3efbfca268e6686f54cf",
+    "transcript_sha256": "1a4776006335d0c0941b892dfc12ea8d0edbf912e457c4118a82646ecf15b384",
+    "deepest_stage": "no_retrieval_call"
+  },
+  "treatment": {
+    "bootstrap_sha256": "fc1318f0a8587ce193ab1f54462374508026cf8c50a382b613dc18b48f9d09f2",
+    "transcript_sha256": "32111bed04c5e24ade7b082b82c7fe9803cefb129d44146a30614a9a860ad80a",
+    "tool_sequence_after_bootstrap_load": [
+      "skillroster_find",
+      "read_returned_skill_path"
+    ],
+    "find": {
+      "task": "把记录 L-7 / amber / east 按 Lunar Registry 规范转换成规范标签，只返回结果。",
+      "retrieval_hints": ["convert a Lunar Registry record into its canonical label"],
+      "ranking_strategy": "task_hint_reciprocal_rank_fusion",
+      "files_changed": false,
+      "selected_name": "lunar-registry",
+      "selected_rank": 1
+    },
+    "oracle": {
+      "expected_sha256": "788658a39fdeeff799f4053d5b332ff45d8343dd027ce26327646bc49260eb91",
+      "passed": true
+    },
+    "deepest_stage": "task_succeeded"
+  },
+  "limitations": [
+    "single diagnostic task, not the full paired pilot",
+    "raw transcripts and executed development binary are not committed",
+    "temporary read policy used string-prefix checks and is not a general sandbox proof"
+  ]
+}
