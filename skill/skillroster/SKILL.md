@@ -1,8 +1,12 @@
 ---
 name: skillroster
 description: >
-  Inspect and govern locally installed Agent Skills with the SkillRoster CLI.
-  Use for inventory and usage evidence, duplicate or broken-link analysis,
+  Route tasks to specialized local Core and On-demand Skills, then inspect and
+  govern those Skills with the SkillRoster CLI. Use whenever a task may need
+  instructions that are not among the currently visible Skills: begin with
+  `skillroster find`, then read the returned SKILL.md before exploring the
+  workspace or doing the task.
+  Also use for inventory and usage evidence, duplicate or broken-link analysis,
   smaller Core and On-demand Rosters, capability search, approved Plans,
   Receipts, Apply, or Undo. Not for installing Skills or migrating,
   distributing, synchronizing, or repairing shared Skill directories and
@@ -15,6 +19,22 @@ metadata:
 # SkillRoster
 
 Use the local `skillroster` binary as the deterministic source of facts. Invoke every command with explicit `--json`; validate `schema_version` and `ok` before reading `result`. Treat typed `suggested_actions` as options, never authorization.
+
+## Route a task first
+
+When a task may require specialized instructions that are not already visible,
+the first task action after loading this Bootstrap must route it through
+SkillRoster:
+
+1. Run `skillroster find "TASK" --json`. `TASK` is the complete user message;
+   copy it verbatim without summarizing or dropping output constraints.
+2. For non-English or mixed-language input, add one faithful English capability
+   paraphrase with `--hint`; do not replace `TASK` or guess a Skill name.
+3. Read the selected result's exact `SKILL.md` path, then follow that Skill.
+
+Routing is complete only after the returned Skill path has been read. Find is
+read-only; it does not activate, install, or authorize a Skill. Do not inspect
+the workspace before this route is complete.
 
 ## Inspect and propose
 

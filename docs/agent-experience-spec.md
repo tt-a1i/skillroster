@@ -157,6 +157,9 @@ The Agent uses stable IDs internally and displays them where they help follow-up
 
 The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 
+- route a task through `skillroster find` before acting when its required
+  specialized instructions are not already visible, then read the selected
+  result's exact `SKILL.md` path;
 - invoke commands with explicit `--json`;
 - validate `schema_version` and `ok` before reading `result`;
 - set `schema_version: 1` on every declarative Plan request;
@@ -176,6 +179,15 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 - preserve the same report/Snapshot across follow-up questions;
 - state whether files changed in every final response;
 - stop when drift, ambiguity, unsupported scope, or recovery-required state appears.
+
+The model-visible description and the minimal `find` then read route must
+precede governance instructions. Once the Bootstrap is invoked for such a
+task, Find is its first task action after loading the Bootstrap and before
+further workspace exploration. Retrieval remains read-only: it neither
+activates nor authorizes a Skill. Detailed ranking interpretation may remain in
+the later Find reference section, but the initial route cannot depend on the
+Agent discovering that section after it has already classified the task as
+unrelated.
 
 ## 9. CLI data needed by the Agent
 

@@ -452,6 +452,27 @@ read-only `plan --show` action instead of suggesting a Scan that would stale
 those Plans. The 40-column terminal view wrapped the opaque Plan ID and avoided
 printing a context-free command. No Plan was applied and no Agent file changed.
 
+## Real-Agent cold-routing canary
+
+The v1.8.20 pre-release cold-routing canary held the Pi harness, model
+(`seal/deepseek-v4-flash-0731-baidu`), natural Chinese task, isolated Library,
+CLI Snapshot, permissions, and oracle constant. The target Skill had no default
+Agent exposure and deterministic CLI preflight ranked it first. With the
+governance-first Bootstrap, the Agent classified the task as unrelated and
+never called Find. After only the general route trigger and minimal
+`find -> read returned SKILL.md` steps were moved to the front, a fresh session
+called Find, read the exact returned cold path, and produced the oracle result.
+
+The harness allowed only SkillRoster Find plus reads of the isolated fixture and
+the repository Bootstrap. The observed transcript stayed within those paths,
+and the filesystem sandbox denied writes under the real home. This is one
+canary, not the paired multi-task success claim tracked by Issue #129. It
+identifies the Bootstrap entry contract as the first defect and does not justify
+a new semantic engine or a routing-recall claim.
+
+The frozen inputs, hashes, event chain, and safety limitation are recorded in
+[the Pi cold-routing canary ledger](acceptance/cold-routing-canary-v1.8.20.md).
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
