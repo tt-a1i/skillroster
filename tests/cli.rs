@@ -4122,6 +4122,11 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
         planning["resolution_choices"][0]["plan_request_template_available"],
         false
     );
+    assert_eq!(planning["resolution_choices"][0]["available"], false);
+    assert_eq!(
+        planning["resolution_choices"][0]["unavailable_reason"],
+        "blocked_skill_set_incomplete"
+    );
     assert!(
         planning["resolution_choices"][0]
             .get("plan_request_template")
@@ -4156,6 +4161,10 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     );
     assert_eq!(
         full["result"]["planning"]["resolution_choices"][0]["plan_request_template_available"],
+        true
+    );
+    assert_eq!(
+        full["result"]["planning"]["resolution_choices"][0]["available"],
         true
     );
     assert_eq!(

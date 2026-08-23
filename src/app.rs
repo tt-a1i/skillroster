@@ -2587,19 +2587,31 @@ fn finding_roster_planning(
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         if source_dependency {
+            let protection_available = !blocked_skills.truncated
+                && blocked_skills.count <= crate::roster_recommendation::MAX_CORE_BUDGET;
             let mut protect_choice = json!({
                 "choice": "protect_blocked_skills_as_core",
                 "requires_confirmation": true,
+                "available": protection_available,
+                "unavailable_reason": if blocked_skills.truncated {
+                    Some("blocked_skill_set_incomplete")
+                } else if blocked_skills.count > crate::roster_recommendation::MAX_CORE_BUDGET {
+                    Some("blocked_skill_count_exceeds_max_core_budget")
+                } else {
+                    None
+                },
                 "protected_skill_ids": blocked_skills.displayed_skill_ids,
                 "protected_skill_ids_complete": !blocked_skills.truncated,
-                "plan_request_template_available": !blocked_skills.truncated,
+                "plan_request_template_available": protection_available,
                 "next": if blocked_skills.truncated {
                     "open the full Finding before constructing a complete protected-Skill Plan request"
+                } else if !protection_available {
+                    "Core protection cannot contain every blocked Skill within the maximum budget; use the source-link preservation choice"
                 } else {
                     "after user confirmation, retry Plan with these protected Skill identities; another independent blocker may still fail closed"
                 }
             });
-            if !blocked_skills.truncated {
+            if protection_available {
                 protect_choice["plan_request_template"] = json!({
                     "schema_version": 1,
                     "finding_roster_changes": [{
