@@ -238,7 +238,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             } else {
                 ReportRequest::Summary
             };
-            let result = report_command(&store, request)?;
+            let result = report_command(&store, &state_dir, request)?;
             let actions = report_actions(&result, request);
             ("report", result, vec![], actions)
         }
@@ -1669,7 +1669,11 @@ enum ReportRequest<'a> {
     Exhaustive,
 }
 
-fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Value> {
+fn report_command(
+    store: &StateStore,
+    state_dir: &Path,
+    request: ReportRequest<'_>,
+) -> Result<Value> {
     if let ReportRequest::Finding {
         id,
         full,
@@ -1715,6 +1719,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
             )? {
                 object.insert("planning".into(), planning);
             }
+            add_semantic_overlap_comparison(object, &scan, state_dir)?;
             add_same_name_resolution(object, &scan);
             let affected_skill_ids = object
                 .get("affected_skill_ids")
@@ -2091,6 +2096,219 @@ fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &
             "next_step": "compare_variant_content_and_choose_canonical"
         }),
     );
+}
+
+const SEMANTIC_COMPARISON_NAME_LIMIT: usize = 160;
+const SEMANTIC_COMPARISON_DESCRIPTION_LIMIT: usize = 512;
+const SEMANTIC_COMPARISON_METADATA_LIMIT: usize = 256;
+const SEMANTIC_COMPARISON_LIST_LIMIT: usize = 10;
+const SEMANTIC_COMPARISON_LIST_ITEM_LIMIT: usize = 160;
+
+fn bounded_semantic_text(value: &str, limit: usize) -> (String, bool) {
+    let bounded = value.chars().take(limit).collect::<String>();
+    let truncated = value.chars().count() > limit;
+    (bounded, truncated)
+}
+
+fn bounded_semantic_optional_text(value: Option<&str>, limit: usize) -> (Option<String>, bool) {
+    value
+        .map(|value| {
+            let (bounded, truncated) = bounded_semantic_text(value, limit);
+            (Some(bounded), truncated)
+        })
+        .unwrap_or((None, false))
+}
+
+fn bounded_semantic_list<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    item_limit: usize,
+    character_limit: usize,
+) -> (Vec<String>, usize, bool) {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let count = values.len();
+    let mut truncated = count > item_limit;
+    let bounded = values
+        .into_iter()
+        .take(item_limit)
+        .map(|value| {
+            let (bounded, value_truncated) = bounded_semantic_text(value, character_limit);
+            truncated |= value_truncated;
+            bounded
+        })
+        .collect::<Vec<_>>();
+    (bounded, count, truncated)
+}
+
+fn add_semantic_overlap_comparison(
+    object: &mut serde_json::Map<String, Value>,
+    scan: &ScanResult,
+    state_dir: &Path,
+) -> Result<()> {
+    if object.get("title").and_then(Value::as_str)
+        != Some(crate::query::SEMANTIC_OVERLAP_FINDING_TITLE)
+    {
+        return Ok(());
+    }
+    let affected_skill_ids = object
+        .get("affected_skill_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if affected_skill_ids.len() != 2 {
+        return Ok(());
+    }
+    let Some(left) = scan
+        .skills
+        .iter()
+        .find(|skill| skill.id == affected_skill_ids[0])
+    else {
+        return Ok(());
+    };
+    let Some(right) = scan
+        .skills
+        .iter()
+        .find(|skill| skill.id == affected_skill_ids[1])
+    else {
+        return Ok(());
+    };
+    let Some(basis) = crate::query::semantic_overlap_basis(left, right) else {
+        return Ok(());
+    };
+    let skills = [left, right]
+        .into_iter()
+        .map(|skill| -> Result<Value> {
+            let placements = scan
+                .placements
+                .iter()
+                .filter(|placement| placement.skill_id == skill.id)
+                .collect::<Vec<_>>();
+            let agents = placements
+                .iter()
+                .filter_map(|placement| placement.agent.map(AgentKind::id))
+                .collect::<BTreeSet<_>>();
+            let providers = placements
+                .iter()
+                .filter_map(|placement| placement.provider.clone())
+                .collect::<BTreeSet<_>>();
+            let governable = placements.iter().any(|placement| placement.governable);
+            let (name, name_truncated) =
+                bounded_semantic_text(&skill.name, SEMANTIC_COMPARISON_NAME_LIMIT);
+            let (description, description_truncated) = bounded_semantic_optional_text(
+                skill.metadata.description.as_deref(),
+                SEMANTIC_COMPARISON_DESCRIPTION_LIMIT,
+            );
+            let (triggers, trigger_count, triggers_truncated) = bounded_semantic_list(
+                skill.metadata.triggers.iter().map(String::as_str),
+                SEMANTIC_COMPARISON_LIST_LIMIT,
+                SEMANTIC_COMPARISON_LIST_ITEM_LIMIT,
+            );
+            let (source, source_truncated) = bounded_semantic_optional_text(
+                skill.metadata.source.as_deref(),
+                SEMANTIC_COMPARISON_METADATA_LIMIT,
+            );
+            let (version, version_truncated) = bounded_semantic_optional_text(
+                skill.metadata.version.as_deref(),
+                SEMANTIC_COMPARISON_METADATA_LIMIT,
+            );
+            let (revision, revision_truncated) = bounded_semantic_optional_text(
+                skill.metadata.revision.as_deref(),
+                SEMANTIC_COMPARISON_METADATA_LIMIT,
+            );
+            let (agents, agent_count, agents_truncated) = bounded_semantic_list(
+                agents.iter().copied(),
+                SEMANTIC_COMPARISON_LIST_LIMIT,
+                SEMANTIC_COMPARISON_LIST_ITEM_LIMIT,
+            );
+            let (providers, provider_count, providers_truncated) = bounded_semantic_list(
+                providers.iter().map(String::as_str),
+                SEMANTIC_COMPARISON_LIST_LIMIT,
+                SEMANTIC_COMPARISON_LIST_ITEM_LIMIT,
+            );
+            let mut current_paths = current_readable_skill_paths(scan, state_dir, &skill.id)?;
+            let readable_path_count = current_paths.paths.len();
+            let visible_paths = current_paths
+                .paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            current_paths.paths.truncate(5);
+            let mut readable_placements = placements
+                .iter()
+                .filter(|placement| {
+                    let path = placement.entrypoint.display().to_string();
+                    visible_paths.contains(&path)
+                })
+                .map(|placement| {
+                    let (provider, provider_truncated) = bounded_semantic_optional_text(
+                        placement.provider.as_deref(),
+                        SEMANTIC_COMPARISON_LIST_ITEM_LIMIT,
+                    );
+                    json!({
+                        "placement_id": placement.id,
+                        "path": placement.entrypoint,
+                        "agent": placement.agent.map(AgentKind::id),
+                        "provider": provider,
+                        "provider_truncated": provider_truncated,
+                        "governable": placement.governable,
+                        "default_exposed": placement.default_exposed,
+                        "link_status": placement.link_status
+                    })
+                })
+                .collect::<Vec<_>>();
+            readable_placements
+                .sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
+            let readable_placement_count = readable_placements.len();
+            readable_placements.truncate(SEMANTIC_COMPARISON_LIST_LIMIT);
+            Ok(json!({
+                "skill_id": skill.id,
+                "name": name,
+                "name_truncated": name_truncated,
+                "description": description,
+                "description_truncated": description_truncated,
+                "triggers": triggers,
+                "trigger_count": trigger_count,
+                "triggers_truncated": triggers_truncated,
+                "summary": skill.summary,
+                "source": source,
+                "source_truncated": source_truncated,
+                "version": version,
+                "version_truncated": version_truncated,
+                "revision": revision,
+                "revision_truncated": revision_truncated,
+                "content_digest": skill.content_digest,
+                "digest_algorithm": skill.digest_algorithm,
+                "agents": agents,
+                "agent_count": agent_count,
+                "agents_truncated": agents_truncated,
+                "providers": providers,
+                "provider_count": provider_count,
+                "providers_truncated": providers_truncated,
+                "governable": governable,
+                "placement_count": placements.len(),
+                "readable_path_count": readable_path_count,
+                "readable_paths_truncated": readable_path_count > current_paths.paths.len(),
+                "current_content_available": !current_paths.drifted,
+                "readable_paths": current_paths.paths,
+                "readable_placement_count": readable_placement_count,
+                "readable_placements_truncated": readable_placement_count > readable_placements.len(),
+                "readable_placements": readable_placements
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    object.insert(
+        "comparison".into(),
+        json!({
+            "decision": "compare_skill_meaning",
+            "automatic_change_supported": false,
+            "semantic_conclusion_owner": "agent_or_user",
+            "basis": basis,
+            "skill_count": skills.len(),
+            "skills": skills
+        }),
+    );
+    Ok(())
 }
 
 fn compact_finding_detail(mut details: Value) -> Value {
@@ -3437,27 +3655,33 @@ fn current_readable_skill_paths(
         .iter()
         .find(|skill| skill.id == skill_id)
         .ok_or_else(|| anyhow!("Skill {skill_id} is not in the latest Snapshot"))?;
-    let directory_name = safe_skill_directory_name(&skill.name)?;
-    let mut candidates = vec![
-        state_dir
-            .join("library")
-            .join(&directory_name)
-            .join("SKILL.md"),
-    ];
+    let directory_name = safe_skill_directory_name(&skill.name).ok();
+    let mut candidates = directory_name
+        .as_ref()
+        .map(|directory_name| {
+            state_dir
+                .join("library")
+                .join(directory_name)
+                .join("SKILL.md")
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
     candidates.extend(
         scan.placements
             .iter()
             .filter(|placement| placement.skill_id == skill_id)
             .map(|placement| placement.entrypoint.clone()),
     );
-    candidates.extend(
-        scan.roots
-            .iter()
-            .filter(|root| {
-                root.kind == RootKind::Skills && root.status == scan::RootStatus::Included
-            })
-            .map(|root| root.path.join(&directory_name).join("SKILL.md")),
-    );
+    if let Some(directory_name) = directory_name {
+        candidates.extend(
+            scan.roots
+                .iter()
+                .filter(|root| {
+                    root.kind == RootKind::Skills && root.status == scan::RootStatus::Included
+                })
+                .map(|root| root.path.join(&directory_name).join("SKILL.md")),
+        );
+    }
     let mut approved_roots = scan
         .roots
         .iter()

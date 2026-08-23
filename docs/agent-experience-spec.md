@@ -80,6 +80,11 @@ follow the typed decision or open full detail. A paged Finding action preserves
 the same compact/full mode and advances `page.next_offset`. Findings lists
 interleave category/severity/title families before repeating instances so the
 first page represents the available problem types without hiding any Finding.
+For a Semantic overlap candidate, use its bounded `comparison` bundle to bind
+the two Skill IDs to names, descriptions, triggers, summaries, readable paths,
+and the structured routing-vocabulary Jaccard basis. The Agent owns the
+semantic conclusion and may read a returned `SKILL.md` path when those facts
+are insufficient; candidate evidence never authorizes a Plan.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
 Never execute a confirmation-gated Core-protection template or source-link

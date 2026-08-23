@@ -10,9 +10,67 @@ use std::path::{Path, PathBuf};
 
 pub const SAME_NAME_DIVERGENT_FINDING_KIND: &str = "same_name_divergent_content";
 pub const SAME_NAME_DIVERGENT_FINDING_TITLE: &str = "Same-name Skills have different content";
+pub const SEMANTIC_OVERLAP_FINDING_TITLE: &str = "Semantic overlap candidate";
+
+const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
+const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
 
 fn normalize_skill_name(name: &str) -> String {
     name.trim().to_lowercase()
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct SemanticOverlapBasis {
+    pub metric: &'static str,
+    pub score: f64,
+    pub intersection_count: usize,
+    pub union_count: usize,
+    pub shared_terms: Vec<String>,
+    pub shared_terms_truncated: bool,
+}
+
+fn semantic_overlap_basis_from_tokens(
+    left: &BTreeSet<String>,
+    right: &BTreeSet<String>,
+) -> Option<SemanticOverlapBasis> {
+    let shared = left.intersection(right).collect::<Vec<_>>();
+    let intersection_count = shared.len();
+    let union_count = left.union(right).count();
+    if intersection_count < 3 || union_count == 0 {
+        return None;
+    }
+    let shared_terms = shared
+        .iter()
+        .take(SEMANTIC_SHARED_TERM_PREVIEW_LIMIT)
+        .map(|term| {
+            term.chars()
+                .take(SEMANTIC_SHARED_TERM_CHARACTER_LIMIT)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let shared_terms_truncated = shared.len() > shared_terms.len()
+        || shared
+            .iter()
+            .take(shared_terms.len())
+            .any(|term| term.chars().count() > SEMANTIC_SHARED_TERM_CHARACTER_LIMIT);
+    Some(SemanticOverlapBasis {
+        metric: "routing_vocabulary_jaccard",
+        score: intersection_count as f64 / union_count as f64,
+        intersection_count,
+        union_count,
+        shared_terms,
+        shared_terms_truncated,
+    })
+}
+
+pub(crate) fn semantic_overlap_basis(
+    left: &ScannedSkill,
+    right: &ScannedSkill,
+) -> Option<SemanticOverlapBasis> {
+    semantic_overlap_basis_from_tokens(
+        &tokens(&skill_search_text(left)),
+        &tokens(&skill_search_text(right)),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1016,12 +1074,10 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 continue;
             }
             let right_tokens = &vocabularies[right_index];
-            let intersection = left_tokens.intersection(right_tokens).count();
-            let union = left_tokens.union(right_tokens).count();
-            if intersection < 3 || union == 0 {
+            let Some(basis) = semantic_overlap_basis_from_tokens(left_tokens, right_tokens) else {
                 continue;
-            }
-            let similarity = intersection as f64 / union as f64;
+            };
+            let similarity = basis.score;
             if similarity >= 0.45 {
                 candidates.push((similarity, left, right));
             }
@@ -1040,7 +1096,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             findings,
             FindingCategory::Overlap,
             Severity::Low,
-            "Semantic overlap candidate",
+            SEMANTIC_OVERLAP_FINDING_TITLE,
             format!(
                 "{} and {} share routing vocabulary (Jaccard {:.2}); this is review-only candidate evidence, not a confirmed duplicate.",
                 left.name, right.name, similarity
@@ -2310,6 +2366,12 @@ mod tests {
         let candidate_id = candidate.id.clone();
         candidate.name = "source-check".into();
         candidate.content_digest = "different_digest".into();
+        let basis = semantic_overlap_basis(&original, &candidate).unwrap();
+        assert_eq!(basis.metric, "routing_vocabulary_jaccard");
+        assert!(basis.score >= 0.45);
+        assert!(basis.intersection_count >= 3);
+        assert!(basis.union_count >= basis.intersection_count);
+        assert!(!basis.shared_terms.is_empty());
         scan.skills = vec![original, candidate];
         scan.placements.clear();
         scan.usage.clear();
