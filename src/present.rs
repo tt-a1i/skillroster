@@ -951,11 +951,14 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                     .and_then(Value::as_str)
                     .map(|finding_id| format!("Finding {finding_id}"))
                     .or_else(|| {
-                        (next
+                        match next
                             .and_then(|value| value.get("state"))
                             .and_then(Value::as_str)
-                            == Some("report_required"))
-                        .then(|| "current Report required".into())
+                        {
+                            Some("rescan_required") => Some("refresh Snapshot first".into()),
+                            Some("report_required") => Some("current Report required".into()),
+                            _ => None,
+                        }
                     })
                     .unwrap_or_else(|| "inspect layout Finding".into());
                 lines.push(format!(

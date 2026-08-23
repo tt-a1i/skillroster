@@ -841,6 +841,30 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         false
     );
 
+    fs::write(
+        codex.join("SKILL.md"),
+        "---\nname: shared-capability\ndescription: First implementation\n---\nchanged after report\n",
+    )
+    .unwrap();
+    let drifted_find = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted_find["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted_find["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    assert_eq!(
+        drifted_find["result"]["matches"][0]["variant_finding"]["reason_code"],
+        "routable_variant_drift_detected"
+    );
+    assert!(drifted_find["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert_eq!(
+        drifted_find["suggested_actions"][0]["argv"],
+        json!(["skillroster", "scan", "--json"])
+    );
+
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let after_rescan = json_output(&run(
         &[&common[..], &["find", "first implementation"]].concat(),

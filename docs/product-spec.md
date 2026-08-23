@@ -178,7 +178,8 @@ reported as explicit variants rather than silently treated as equivalent.
 For an ambiguous result, `variant_finding` binds the complete routable identity
 set to a same-Snapshot divergent-content Finding and provides its read-only
 drilldown. Without a compatible current Report it returns a typed reason and
-the minimum read-only analysis action; stale Finding IDs are never returned.
+the minimum read-only analysis action. A drifted routable variant requires a
+new Scan before any Finding can be linked; stale Finding IDs are never returned.
 The corresponding divergent-content Finding carries the affected placements
 and a bounded `choose_same_name_variant` resolution that keeps each digest,
 path, Agent, provider, root, and governability fact together. It offers no Plan

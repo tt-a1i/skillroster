@@ -2645,6 +2645,7 @@ fn find_command(
     };
     let mut warnings = Vec::new();
     let mut rescan_required = false;
+    let mut drifted_variant_skill_ids = BTreeSet::new();
     for found in &mut matches {
         let mut drifted_variants = 0_usize;
         if found.variants.is_empty() {
@@ -2652,6 +2653,9 @@ fn find_command(
             found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
             let current = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
             found.paths = current.paths;
+            if current.drifted {
+                drifted_variant_skill_ids.insert(found.skill_id.clone());
+            }
             drifted_variants += usize::from(current.drifted);
         } else {
             for variant in &mut found.variants {
@@ -2660,6 +2664,9 @@ fn find_command(
                     current_roster_state(&store.roster_states_for_skill(&skill_id)?);
                 let current = current_readable_skill_paths(&scan, state_dir, &variant.skill_id)?;
                 variant.paths = current.paths;
+                if current.drifted {
+                    drifted_variant_skill_ids.insert(variant.skill_id.clone());
+                }
                 drifted_variants += usize::from(current.drifted);
             }
             if let Some(representative) = found
@@ -2687,7 +2694,14 @@ fn find_command(
             });
         }
     }
-    let actions = bind_variant_findings(store, &scan_id, &scan, &routable_ids, &mut matches)?;
+    let actions = bind_variant_findings(
+        store,
+        &scan_id,
+        &scan,
+        &routable_ids,
+        &drifted_variant_skill_ids,
+        &mut matches,
+    )?;
     for found in matches
         .iter()
         .take(3)
@@ -2704,6 +2718,13 @@ fn find_command(
                 Some(crate::query::VariantFindingState::ReportRequired)
             ) => format!(
                 "{} represents {} same-name Skill variants; materialize the current Report before choosing content",
+                found.name, found.variant_count
+            ),
+            None if matches!(
+                next.map(|reference| reference.state),
+                Some(crate::query::VariantFindingState::RescanRequired)
+            ) => format!(
+                "{} represents {} same-name Skill variants; refresh the drifted Snapshot before choosing content",
                 found.name, found.variant_count
             ),
             _ => format!(
@@ -2747,6 +2768,7 @@ fn bind_variant_findings(
     scan_id: &ScanId,
     scan: &ScanResult,
     routable_ids: &BTreeSet<String>,
+    drifted_variant_skill_ids: &BTreeSet<String>,
     matches: &mut [crate::query::FindMatch],
 ) -> Result<Vec<SuggestedAction>> {
     let report = store
@@ -2768,7 +2790,27 @@ fn bind_variant_findings(
             .filter(|skill| routable_ids.contains(&skill.id))
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
-        let (reference, suggested) = if let Some(report) = report.as_ref() {
+        let (reference, suggested) = if !variant_ids.is_disjoint(drifted_variant_skill_ids) {
+            let suggested = action(
+                "refresh_drifted_snapshot",
+                &["scan", "--json"],
+                false,
+                false,
+                "routable_variant_drift_detected",
+            );
+            (
+                crate::query::VariantFindingReference {
+                    state: crate::query::VariantFindingState::RescanRequired,
+                    reason_code: crate::query::VariantFindingReason::RoutableVariantDriftDetected,
+                    snapshot_id: scan_id.to_string(),
+                    report_id: None,
+                    finding_id: None,
+                    resolution: None,
+                    argv: suggested.argv.clone(),
+                },
+                suggested,
+            )
+        } else if let Some(report) = report.as_ref() {
             if let Some(finding_id) = matching_variant_finding_id(store, report, &variant_ids)? {
                 let suggested = action(
                     "inspect_variant_finding",

@@ -174,6 +174,7 @@ pub struct VariantFindingReference {
 #[serde(rename_all = "snake_case")]
 pub enum VariantFindingState {
     Available,
+    RescanRequired,
     ReportRequired,
     FindingUnavailable,
 }
@@ -182,6 +183,7 @@ pub enum VariantFindingState {
 #[serde(rename_all = "snake_case")]
 pub enum VariantFindingReason {
     SameSnapshotVariantSetMatched,
+    RoutableVariantDriftDetected,
     CurrentSnapshotReportMissing,
     MatchingDivergentContentFindingMissing,
 }
