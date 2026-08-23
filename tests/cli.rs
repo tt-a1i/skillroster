@@ -2768,6 +2768,249 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
 
 #[test]
 #[cfg(unix)]
+fn custom_budget_plan_reports_actionable_source_blockers() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let reviewed = temp.path().join("reviewed");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&reviewed).unwrap();
+    for index in 0..10 {
+        let directory = root.join(format!("aaa-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: aaa-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    for name in ["mid-a", "mid-b"] {
+        let canonical = reviewed.join(name);
+        fs::create_dir(&canonical).unwrap();
+        fs::write(
+            canonical.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&canonical, root.join(name)).unwrap();
+    }
+    for index in 0..49 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", &finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["planning"]["supported"], true);
+
+    let default_request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let default_plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&default_request.to_string()),
+    ));
+    assert_eq!(default_plan["ok"], true);
+    assert_eq!(default_plan["result"]["files_changed"], false);
+
+    let custom_request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 10,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&custom_request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["ok"], false);
+    assert_eq!(
+        blocked["error"]["code"],
+        "trusted_canonical_sources_required"
+    );
+    assert_eq!(blocked["error"]["details"]["requested_core_budget"], 10);
+    assert_eq!(blocked["error"]["details"]["blocked_change_count"], 2);
+    assert_eq!(
+        blocked["error"]["details"]["blocked_changes_truncated"],
+        false
+    );
+    assert_eq!(
+        blocked["error"]["details"]["source_roots"],
+        json!([reviewed])
+    );
+    assert_eq!(blocked["error"]["paths"], json!([reviewed]));
+    let names = blocked["error"]["details"]["blocked_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["mid-a", "mid-b"]);
+    assert!(
+        blocked["error"]["details"]["blocked_changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| {
+                item["agent"] == "codex"
+                    && item["reason"] == "no_owned_exact_content_to_preserve"
+                    && item["observed_source_target"]
+                        .as_str()
+                        .is_some_and(|path| path.starts_with(reviewed.to_str().unwrap()))
+            })
+    );
+    assert_eq!(
+        blocked["error"]["details"]["after_confirmation"]["repeatable_option"],
+        "--source-root"
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert_eq!(
+        blocked["suggested_actions"][0]["action"],
+        "scan_with_confirmed_source_roots"
+    );
+    assert_eq!(
+        blocked["suggested_actions"][0]["requires_confirmation"],
+        true
+    );
+    assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
+    assert!(
+        blocked["suggested_actions"][0]["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair[0] == "--source-root" && pair[1] == reviewed.to_str().unwrap())
+    );
+    assert!(root.join("mid-a").exists());
+    assert!(root.join("aaa-000").exists());
+
+    for width in ["60", "80", "120"] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_skillroster"));
+        command
+            .args([
+                "--home",
+                home.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "plan",
+                "--stdin",
+            ])
+            .env("COLUMNS", width)
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(custom_request.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        let human = String::from_utf8(output.stderr).unwrap();
+        assert!(human.contains("mid-a"), "{human}");
+        assert!(human.contains("--source-root"), "{human}");
+        assert!(
+            human.contains("no automatic change is supported"),
+            "{human}"
+        );
+        let max_width: usize = width.parse().unwrap();
+        assert!(
+            human.lines().all(|line| line.chars().count() <= max_width),
+            "line exceeded {width} columns:\n{human}"
+        );
+    }
+
+    json_output(&run(
+        &[
+            &common[..],
+            &["--source-root", reviewed.to_str().unwrap(), "scan"],
+        ]
+        .concat(),
+        None,
+    ));
+    let report = json_output(&run(
+        &[
+            &common[..],
+            &["--source-root", reviewed.to_str().unwrap(), "report"],
+        ]
+        .concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let retry = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 10,
+            "protected_skill_ids": []
+        }]
+    });
+    let plan = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                reviewed.to_str().unwrap(),
+                "plan",
+                "--stdin",
+            ],
+        ]
+        .concat(),
+        Some(&retry.to_string()),
+    ));
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["result"]["files_changed"], false);
+    assert!(plan["result"]["plan_id"].as_str().is_some());
+    assert_eq!(plan["result"]["impact"]["after_default_exposure"], 10);
+    assert!(root.join("mid-a").exists());
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
+}
+
+#[test]
+#[cfg(unix)]
 fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

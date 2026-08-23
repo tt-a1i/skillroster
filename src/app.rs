@@ -342,6 +342,36 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "trusted_canonical_sources_required".into(),
+                message: blocked.message.clone(),
+                retryable: false,
+                relevant_ids: blocked.relevant_ids.clone(),
+                paths: blocked.paths.clone(),
+                details: Some(blocked.details.clone()),
+            },
+        );
+        if !blocked.paths.is_empty() {
+            let mut argv = Vec::new();
+            for path in &blocked.paths {
+                argv.push("--source-root");
+                argv.push(path.as_str());
+            }
+            argv.extend(["scan", "--json"]);
+            envelope.suggested_actions = vec![action(
+                "scan_with_confirmed_source_roots",
+                &argv,
+                false,
+                true,
+                "trusted_canonical_sources_required",
+            )];
+        }
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     let classified = classify_error(error);
     serde_json::to_string(&JsonEnvelope::<Value>::failure(
         command,
@@ -351,6 +381,7 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
             retryable: classified.1,
             relevant_ids: extract_relevant_ids(&error.to_string()),
             paths: extract_paths(&error.to_string()),
+            details: None,
         },
     ))
     .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
@@ -358,6 +389,12 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, bool) {
     let message = error.to_string().to_lowercase();
+    if error
+        .downcast_ref::<crate::roster_plan::RosterPlanBlocked>()
+        .is_some()
+    {
+        return ("trusted_canonical_sources_required", false);
+    }
     if error.downcast_ref::<clap::Error>().is_some() {
         return ("invalid_cli_arguments", false);
     }
@@ -3138,10 +3175,12 @@ fn expand_finding_roster_changes(
                 "Finding {finding_id} is blocked because a non-Agent source link depends on a placement scheduled for removal; resolve the reported source dependency, rescan, and use the new Finding"
             );
         }
-        bail!(
-            "Finding {finding_id} is blocked by {} Roster changes without owned exact content; confirm the reported source roots, rescan, and use the new Finding",
-            supported.exclusions.len()
-        );
+        return Err(crate::roster_plan::source_confirmation_block(
+            finding_id.as_str(),
+            request.core_budget,
+            &supported.exclusions,
+        )
+        .into());
     }
     if finding.evidence_ids.is_empty() {
         bail!("Finding {finding_id} has no Evidence");

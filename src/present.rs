@@ -186,6 +186,94 @@ pub fn error_human(error: &dyn Display) -> String {
     format!("SkillRoster · Error\n\nERR  {error}\n\nNo files changed.")
 }
 
+pub fn blocked_roster_plan(details: &Value) -> String {
+    let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+    blocked_roster_plan_lines(details, &mut lines, terminal_width());
+    lines.join("\n")
+}
+
+fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: usize) {
+    fact(lines, "Status", "blocked");
+    fact(
+        lines,
+        "Decision",
+        text(details, "decision").replace('_', " "),
+    );
+    fact(lines, "Core budget", text(details, "requested_core_budget"));
+    fact(
+        lines,
+        "Blocked changes",
+        details
+            .get("blocked_change_count")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "none".into()),
+    );
+    lines.push(String::new());
+    lines.push("  Skills needing a source decision".into());
+    let blockers = details
+        .get("blocked_changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(5);
+    for blocker in blockers {
+        let agent = blocker
+            .get("agent")
+            .and_then(Value::as_str)
+            .unwrap_or("agent");
+        let name = blocker
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let label = format!("  {agent:<12} {name}");
+        lines.push(middle_truncate(&label, width));
+        if let Some(target) = blocker
+            .get("observed_source_target")
+            .and_then(Value::as_str)
+        {
+            lines.push(format!(
+                "    {}",
+                middle_truncate(target, width.saturating_sub(4))
+            ));
+        }
+    }
+    if details["blocked_changes_truncated"].as_bool() == Some(true)
+        || details
+            .get("blocked_changes")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() > 5)
+    {
+        lines.push("  Inspect JSON for remaining blockers".into());
+    }
+    lines.push(String::new());
+    lines.push("  Reviewed source directories".into());
+    let roots = details
+        .get("source_roots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(5);
+    let mut shown = 0;
+    for root in roots {
+        shown += 1;
+        lines.push(format!(
+            "  --source-root {}",
+            middle_truncate(root, width.saturating_sub(18))
+        ));
+    }
+    if shown == 0 {
+        lines.push("  none disclosed".into());
+    }
+    if details["source_roots_truncated"].as_bool() == Some(true) {
+        lines.push("  Inspect JSON for remaining source roots".into());
+    }
+    lines.extend(summary(
+        "Blocked · no automatic change is supported",
+        "Confirm the reported source directories before rescanning",
+    ));
+}
+
 fn title(value: &str) -> String {
     let mut chars = value.chars();
     chars
@@ -1715,6 +1803,43 @@ mod tests {
         let rendered = error_human(&"drifted plan");
         assert!(rendered.contains("drifted plan"));
         assert!(rendered.ends_with("No files changed."));
+    }
+
+    #[test]
+    fn custom_budget_source_blockers_stay_bounded_at_reference_widths() {
+        let details = json!({
+            "decision": "confirm_trusted_source_roots",
+            "requested_core_budget": 10,
+            "blocked_change_count": 2,
+            "blocked_changes": [
+                {
+                    "agent": "codex",
+                    "name": "alpha",
+                    "observed_source_target": "/Users/example/reviewed/alpha"
+                },
+                {
+                    "agent": "codex",
+                    "name": "beta",
+                    "observed_source_target": "/Users/example/reviewed/beta"
+                }
+            ],
+            "blocked_changes_truncated": false,
+            "source_roots": ["/Users/example/reviewed"],
+            "source_roots_truncated": false
+        });
+        for width in [60, 80, 120] {
+            let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+            blocked_roster_plan_lines(&details, &mut lines, width);
+            let output = lines.join("\n");
+            assert!(output.contains("blocked"));
+            assert!(output.contains("alpha"));
+            assert!(output.contains("--source-root"));
+            assert!(output.contains("no automatic change is supported"));
+            assert!(
+                output.lines().all(|line| display_width(line) <= width),
+                "line exceeded {width} columns:\n{output}"
+            );
+        }
     }
 
     #[test]
