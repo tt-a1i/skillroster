@@ -223,7 +223,8 @@ test("sealed holdout manifest validates, stays domain-distinct, and freezes stri
   const holdout = validateManifest(JSON.parse(readFileSync("tests/fixtures/pi-cold-routing-holdout.json", "utf8")));
   assert.equal(holdout.suite_id, "cold-routing-holdout-v2"); assert.equal(holdout.model, "seal/gpt-5.6-sol"); assert.equal(holdout.tasks.length, 4);
   const seal = JSON.parse(readFileSync(join("tests/fixtures", holdout.seal_contract), "utf8"));
-  assert.equal(seal.seal_state, "pending_first_git_blob"); assert.equal(seal.facts, undefined);
+  assert.equal(seal.seal_state, "frozen_before_first_run"); assert.equal(seal.facts.suite_id, holdout.suite_id);
+  assert.match(seal.source_revision, /^[a-f0-9]{40}$/u); assert.match(seal.seal_sha256, /^[a-f0-9]{64}$/u);
   assert.deepEqual(holdout.aggregate_gate, { core_task_success_minimum: 4, on_demand_task_success_minimum: 4, on_demand_load_success_minimum: 3 });
   assert.deepEqual(training.aggregate_gate, trainingGate);
   assert.deepEqual(new Set(holdout.tasks.map((task) => task.family)), new Set(training.tasks.map((task) => task.family)));
