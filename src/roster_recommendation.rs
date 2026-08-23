@@ -38,6 +38,8 @@ pub struct CoreSelection {
     pub skill_id: String,
     pub name: String,
     pub reason: &'static str,
+    pub evidence_scope: &'static str,
+    pub evidence_agents: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +50,8 @@ pub struct AgentRecommendation {
     pub core_count: usize,
     pub on_demand_count: usize,
     pub positive_signal_count: usize,
+    pub direct_signal_count: usize,
+    pub cross_agent_signal_count: usize,
     pub fallback_core_count: usize,
     pub core_selections: Vec<CoreSelection>,
 }
@@ -66,19 +70,44 @@ struct Candidate {
     protected: bool,
     declared_core: bool,
     bootstrap: bool,
+    direct_signal: UsageSignal,
+    cross_agent_signal: UsageSignal,
+    cross_agent_sources: BTreeSet<AgentKind>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UsageSignal {
     quality_rank: u8,
     stage_rank: u8,
     event_count: u64,
     last_seen: u64,
 }
 
+impl UsageSignal {
+    fn observe(
+        &mut self,
+        quality: EvidenceQuality,
+        stage: UsageStage,
+        event_count: u64,
+        last_seen: u64,
+    ) {
+        let signal = (quality_rank(quality), stage_rank(stage));
+        if signal > (self.quality_rank, self.stage_rank) {
+            self.quality_rank = signal.0;
+            self.stage_rank = signal.1;
+        }
+        self.event_count = self.event_count.saturating_add(event_count);
+        self.last_seen = self.last_seen.max(last_seen);
+    }
+
+    const fn is_present(self) -> bool {
+        self.stage_rank > 0
+    }
+}
+
 impl Candidate {
     fn is_forced_core(&self) -> bool {
         self.protected || self.declared_core || self.bootstrap
-    }
-
-    fn has_positive_signal(&self) -> bool {
-        self.stage_rank > 0
     }
 
     fn reason(&self) -> &'static str {
@@ -88,23 +117,67 @@ impl Candidate {
             "declared_core"
         } else if self.bootstrap {
             "skillroster_bootstrap"
+        } else if self.direct_signal.is_present() {
+            signal_reason(self.direct_signal, false)
+        } else if self.cross_agent_signal.is_present() {
+            signal_reason(self.cross_agent_signal, true)
         } else {
-            match (self.quality_rank, self.stage_rank) {
-                (2, 4) => "observed_outcome",
-                (2, 3) => "observed_applied",
-                (2, 2) => "observed_loaded",
-                (2, 1) => "observed_matched",
-                (1, 4) => "inferred_outcome",
-                (1, 3) => "inferred_applied",
-                (1, 2) => "inferred_loaded",
-                (1, 1) => "inferred_matched",
-                (_, 4) => "unknown_quality_outcome",
-                (_, 3) => "unknown_quality_applied",
-                (_, 2) => "unknown_quality_loaded",
-                (_, 1) => "unknown_quality_matched",
-                _ => "stable_fallback",
-            }
+            "stable_fallback"
         }
+    }
+
+    fn evidence_scope(&self) -> &'static str {
+        if self.is_forced_core() {
+            "forced"
+        } else if self.direct_signal.is_present() {
+            "target_agent"
+        } else if self.cross_agent_signal.is_present() {
+            "cross_agent"
+        } else {
+            "fallback"
+        }
+    }
+
+    fn evidence_agents(&self) -> Vec<String> {
+        match self.evidence_scope() {
+            "target_agent" => vec![self.agent.id().to_owned()],
+            "cross_agent" => self
+                .cross_agent_sources
+                .iter()
+                .map(|agent| agent.id().to_owned())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn signal_reason(signal: UsageSignal, cross_agent: bool) -> &'static str {
+    match (cross_agent, signal.quality_rank, signal.stage_rank) {
+        (false, 2, 4) => "observed_outcome",
+        (false, 2, 3) => "observed_applied",
+        (false, 2, 2) => "observed_loaded",
+        (false, 2, 1) => "observed_matched",
+        (false, 1, 4) => "inferred_outcome",
+        (false, 1, 3) => "inferred_applied",
+        (false, 1, 2) => "inferred_loaded",
+        (false, 1, 1) => "inferred_matched",
+        (false, _, 4) => "unknown_quality_outcome",
+        (false, _, 3) => "unknown_quality_applied",
+        (false, _, 2) => "unknown_quality_loaded",
+        (false, _, 1) => "unknown_quality_matched",
+        (true, 2, 4) => "cross_agent_observed_outcome",
+        (true, 2, 3) => "cross_agent_observed_applied",
+        (true, 2, 2) => "cross_agent_observed_loaded",
+        (true, 2, 1) => "cross_agent_observed_matched",
+        (true, 1, 4) => "cross_agent_inferred_outcome",
+        (true, 1, 3) => "cross_agent_inferred_applied",
+        (true, 1, 2) => "cross_agent_inferred_loaded",
+        (true, 1, 1) => "cross_agent_inferred_matched",
+        (true, _, 4) => "cross_agent_unknown_quality_outcome",
+        (true, _, 3) => "cross_agent_unknown_quality_applied",
+        (true, _, 2) => "cross_agent_unknown_quality_loaded",
+        (true, _, 1) => "cross_agent_unknown_quality_matched",
+        (_, _, _) => "stable_fallback",
     }
 }
 
@@ -154,10 +227,9 @@ pub fn recommend(
                     protected: request.protected_skill_ids.contains(&placement.skill_id),
                     declared_core: declared_core.contains(&(agent, placement.skill_id.clone())),
                     bootstrap: name.eq_ignore_ascii_case("skillroster"),
-                    quality_rank: 0,
-                    stage_rank: 0,
-                    event_count: 0,
-                    last_seen: 0,
+                    direct_signal: UsageSignal::default(),
+                    cross_agent_signal: UsageSignal::default(),
+                    cross_agent_sources: BTreeSet::new(),
                 });
         }
     }
@@ -165,21 +237,23 @@ pub fn recommend(
         if usage.stage == UsageStage::Exposed {
             continue;
         }
-        let Some(candidate) = by_agent
-            .get_mut(&usage.agent)
-            .and_then(|skills| skills.get_mut(&usage.skill_id))
-        else {
-            continue;
-        };
-        let signal = (quality_rank(usage.quality), stage_rank(usage.stage));
-        if signal > (candidate.quality_rank, candidate.stage_rank) {
-            candidate.quality_rank = signal.0;
-            candidate.stage_rank = signal.1;
+        for (target_agent, skills) in &mut by_agent {
+            let Some(candidate) = skills.get_mut(&usage.skill_id) else {
+                continue;
+            };
+            let signal = if *target_agent == usage.agent {
+                &mut candidate.direct_signal
+            } else {
+                candidate.cross_agent_sources.insert(usage.agent);
+                &mut candidate.cross_agent_signal
+            };
+            signal.observe(
+                usage.quality,
+                usage.stage,
+                usage.event_count,
+                usage.last_seen_unix.unwrap_or_default(),
+            );
         }
-        candidate.event_count = candidate.event_count.saturating_add(usage.event_count);
-        candidate.last_seen = candidate
-            .last_seen
-            .max(usage.last_seen_unix.unwrap_or_default());
     }
 
     let mut changes = Vec::new();
@@ -215,11 +289,21 @@ pub fn recommend(
                 skill_id: candidate.skill_id.clone(),
                 name: candidate.name.clone(),
                 reason: candidate.reason(),
+                evidence_scope: candidate.evidence_scope(),
+                evidence_agents: candidate.evidence_agents(),
             })
             .collect::<Vec<_>>();
-        let positive_signal_count = candidates
+        let positive_signal_count = core_selections
             .iter()
-            .filter(|candidate| candidate.has_positive_signal())
+            .filter(|selection| matches!(selection.evidence_scope, "target_agent" | "cross_agent"))
+            .count();
+        let direct_signal_count = core_selections
+            .iter()
+            .filter(|selection| selection.evidence_scope == "target_agent")
+            .count();
+        let cross_agent_signal_count = core_selections
+            .iter()
+            .filter(|selection| selection.evidence_scope == "cross_agent")
             .count();
         let fallback_core_count = core_selections
             .iter()
@@ -244,6 +328,8 @@ pub fn recommend(
             core_count: core_ids.len(),
             on_demand_count: candidates.len().saturating_sub(core_ids.len()),
             positive_signal_count,
+            direct_signal_count,
+            cross_agent_signal_count,
             fallback_core_count,
             core_selections,
         });
@@ -306,10 +392,66 @@ fn candidate_order(left: &Candidate, right: &Candidate) -> Ordering {
         .then_with(|| right.protected.cmp(&left.protected))
         .then_with(|| right.declared_core.cmp(&left.declared_core))
         .then_with(|| right.bootstrap.cmp(&left.bootstrap))
-        .then_with(|| right.quality_rank.cmp(&left.quality_rank))
-        .then_with(|| right.stage_rank.cmp(&left.stage_rank))
-        .then_with(|| right.event_count.cmp(&left.event_count))
-        .then_with(|| right.last_seen.cmp(&left.last_seen))
+        .then_with(|| {
+            right
+                .direct_signal
+                .is_present()
+                .cmp(&left.direct_signal.is_present())
+        })
+        .then_with(|| {
+            right
+                .direct_signal
+                .quality_rank
+                .cmp(&left.direct_signal.quality_rank)
+        })
+        .then_with(|| {
+            right
+                .direct_signal
+                .stage_rank
+                .cmp(&left.direct_signal.stage_rank)
+        })
+        .then_with(|| {
+            right
+                .direct_signal
+                .event_count
+                .cmp(&left.direct_signal.event_count)
+        })
+        .then_with(|| {
+            right
+                .direct_signal
+                .last_seen
+                .cmp(&left.direct_signal.last_seen)
+        })
+        .then_with(|| {
+            right
+                .cross_agent_signal
+                .is_present()
+                .cmp(&left.cross_agent_signal.is_present())
+        })
+        .then_with(|| {
+            right
+                .cross_agent_signal
+                .quality_rank
+                .cmp(&left.cross_agent_signal.quality_rank)
+        })
+        .then_with(|| {
+            right
+                .cross_agent_signal
+                .stage_rank
+                .cmp(&left.cross_agent_signal.stage_rank)
+        })
+        .then_with(|| {
+            right
+                .cross_agent_signal
+                .event_count
+                .cmp(&left.cross_agent_signal.event_count)
+        })
+        .then_with(|| {
+            right
+                .cross_agent_signal
+                .last_seen
+                .cmp(&left.cross_agent_signal.last_seen)
+        })
         .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         .then_with(|| left.skill_id.cmp(&right.skill_id))
 }
@@ -385,7 +527,117 @@ mod tests {
                 .all(|change| change.state == "on_demand")
         );
         assert_eq!(recommendation.agents[0].positive_signal_count, 1);
+        assert_eq!(recommendation.agents[0].direct_signal_count, 1);
+        assert_eq!(recommendation.agents[0].cross_agent_signal_count, 0);
         assert_eq!(recommendation.agents[0].fallback_core_count, 0);
+    }
+
+    #[test]
+    fn exact_skill_usage_from_another_agent_outranks_fallback() {
+        let mut scan = oversized_scan(51);
+        scan.skills[0].name = "alpha".into();
+        scan.skills[50].name = "zeta".into();
+        scan.usage.push(usage(
+            AgentKind::Cursor,
+            "skill_050",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        let selection = &recommendation.agents[0].core_selections[0];
+        assert_eq!(selection.skill_id, "skill_050");
+        assert_eq!(selection.reason, "cross_agent_observed_loaded");
+        assert_eq!(selection.evidence_scope, "cross_agent");
+        assert_eq!(selection.evidence_agents, ["cursor"]);
+        assert_eq!(recommendation.agents[0].positive_signal_count, 1);
+        assert_eq!(recommendation.agents[0].direct_signal_count, 0);
+        assert_eq!(recommendation.agents[0].cross_agent_signal_count, 1);
+        assert_eq!(recommendation.agents[0].fallback_core_count, 0);
+    }
+
+    #[test]
+    fn target_agent_signal_outranks_stronger_cross_agent_signal() {
+        let mut scan = oversized_scan(51);
+        scan.usage.push(usage(
+            AgentKind::Codex,
+            "skill_049",
+            UsageStage::Matched,
+            EvidenceQuality::Observed,
+        ));
+        scan.usage.push(usage(
+            AgentKind::Cursor,
+            "skill_050",
+            UsageStage::Outcome,
+            EvidenceQuality::Observed,
+        ));
+
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        let selection = &recommendation.agents[0].core_selections[0];
+        assert_eq!(selection.skill_id, "skill_049");
+        assert_eq!(selection.reason, "observed_matched");
+        assert_eq!(selection.evidence_scope, "target_agent");
+        assert_eq!(selection.evidence_agents, ["codex"]);
+    }
+
+    #[test]
+    fn same_name_with_a_different_skill_id_does_not_transfer_usage() {
+        let mut scan = oversized_scan(51);
+        scan.skills[0].name = "zeta".into();
+        scan.skills[1].name = "alpha".into();
+        scan.skills.push(ScannedSkill {
+            id: "foreign_skill".into(),
+            name: "zeta".into(),
+            metadata: SkillMetadata::default(),
+            content_digest: "sha256:foreign".into(),
+            digest_algorithm: "sha256".into(),
+            summary: String::new(),
+            normalized_text: String::new(),
+            modified_at_unix: None,
+        });
+        scan.usage.push(usage(
+            AgentKind::Cursor,
+            "foreign_skill",
+            UsageStage::Outcome,
+            EvidenceQuality::Observed,
+        ));
+
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        let selection = &recommendation.agents[0].core_selections[0];
+        assert_eq!(selection.skill_id, "skill_001");
+        assert_eq!(selection.reason, "stable_fallback");
+        assert_eq!(selection.evidence_scope, "fallback");
+        assert!(selection.evidence_agents.is_empty());
     }
 
     #[test]
@@ -483,6 +735,24 @@ mod tests {
             skills,
             placements,
             ..ScanResult::default()
+        }
+    }
+
+    fn usage(
+        agent: AgentKind,
+        skill_id: &str,
+        stage: UsageStage,
+        quality: EvidenceQuality,
+    ) -> UsageEvidence {
+        UsageEvidence {
+            agent,
+            skill_id: skill_id.into(),
+            stage,
+            quality,
+            event_count: 1,
+            first_seen_unix: Some(10),
+            last_seen_unix: Some(20),
+            source_path_digest: "sha256:usage".into(),
         }
     }
 

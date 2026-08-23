@@ -95,8 +95,10 @@ copying every Skill and placement into the request:
 {"schema_version":1,"finding_roster_changes":[{"finding_id":"finding_...","core_budget":50,"protected_skill_ids":[]}]}
 ```
 
-The CLI preserves declared and protected Core Skills, ranks positive local
-usage evidence, and moves only the remainder to On-demand. Missing usage is not
+The CLI preserves declared and protected Core Skills, ranks target-Agent usage
+first, then usage from another local Agent for the exact same stable Skill ID,
+and moves only the remainder to On-demand. Cross-Agent evidence is labeled with
+its source Agent and never inferred from a matching name. Missing usage is not
 treated as evidence for archiving. A placement without exact owned canonical
 content blocks the semantic Plan; the Agent follows the typed decision to
 confirm source roots or resolve a dependent source link, then rescans instead

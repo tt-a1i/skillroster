@@ -1096,6 +1096,21 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
                     .unwrap_or_default()
             ),
         );
+        let direct = selection
+            .get("direct_signal_core_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let cross_agent = selection
+            .get("cross_agent_signal_core_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if cross_agent > 0 {
+            fact(
+                lines,
+                "Signal scope",
+                format!("{direct} target Agent · {cross_agent} cross-Agent"),
+            );
+        }
         let preview_width = width.saturating_sub(25).max(1);
         let previews = selection
             .get("agents")
@@ -1124,8 +1139,13 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
                 } else {
                     String::new()
                 };
+                let prefix = format!("{}: ", core_agent_label(agent_id));
+                let suffix = format!(" [{reason}]{more}");
+                let name_width = preview_width
+                    .saturating_sub(display_width(&prefix) + display_width(&suffix))
+                    .max(1);
                 Some(middle_truncate(
-                    &format!("{}: {name} [{reason}]{more}", core_agent_label(agent_id)),
+                    &format!("{prefix}{}{suffix}", middle_truncate(name, name_width)),
                     preview_width,
                 ))
             })
@@ -1139,11 +1159,11 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
         .and_then(Value::as_bool)
         == Some(true)
     {
-        fact(
-            lines,
-            "Review required",
-            "fallback-dominated Core selection",
-        );
+        let review = match value.pointer("/uncertainty/code").and_then(Value::as_str) {
+            Some("cross_agent_dominated_core_selection") => "cross-Agent-dominated Core selection",
+            _ => "fallback-dominated Core selection",
+        };
+        fact(lines, "Review required", review);
     }
     fact(lines, "Risk", risk);
     fact(lines, "Reversible", text(value, "reversible"));
@@ -1187,6 +1207,14 @@ fn core_reason_label(reason: &str) -> &str {
         "inferred_applied" => "inferred applied",
         "inferred_loaded" => "inferred loaded",
         "inferred_matched" => "inferred matched",
+        "cross_agent_observed_outcome" => "elsewhere outcome",
+        "cross_agent_observed_applied" => "elsewhere applied",
+        "cross_agent_observed_loaded" => "elsewhere loaded",
+        "cross_agent_observed_matched" => "elsewhere matched",
+        "cross_agent_inferred_outcome" => "elsewhere inferred outcome",
+        "cross_agent_inferred_applied" => "elsewhere inferred applied",
+        "cross_agent_inferred_loaded" => "elsewhere inferred loaded",
+        "cross_agent_inferred_matched" => "elsewhere inferred matched",
         "stable_fallback" => "fallback",
         _ => reason,
     }
@@ -2026,9 +2054,11 @@ mod tests {
                 "blocked_precondition_count": 0
             },
             "selection_evidence": {
-                "positive_signal_core_count": 1,
+                "positive_signal_core_count": 2,
+                "direct_signal_core_count": 1,
+                "cross_agent_signal_core_count": 1,
                 "forced_core_count": 0,
-                "stable_fallback_core_count": 199,
+                "stable_fallback_core_count": 198,
                 "agents": [
                     {
                         "agent": "codex",
@@ -2042,14 +2072,17 @@ mod tests {
                     {
                         "agent": "claude-code",
                         "core_preview": [
-                            {"name": "agent-reach", "reason": "stable_fallback"}
+                            {"name": "code-review", "reason": "cross_agent_observed_loaded"}
                         ],
                         "core_selection_count": 10,
                         "core_preview_truncated": true
                     }
                 ]
             },
-            "uncertainty": {"review_required": true},
+            "uncertainty": {
+                "code": "fallback_dominated_core_selection",
+                "review_required": true
+            },
             "risk": "roster_change",
             "reversible": true,
             "canonical_deletion_count": 0,
@@ -2068,9 +2101,10 @@ mod tests {
                 "create_directory 2",
                 "create_symlink 1",
                 "move_recoverable 307",
-                "1 signal · 0 forced · 199 fallback",
+                "2 signals · 0 forced · 198 fallback",
+                "1 target Agent · 1 cross-Agent",
                 "code-review",
-                "Claude: agent-reach",
+                "elsewhere loaded",
                 "fallback-dominated Core selection",
             ] {
                 assert!(output.contains(expected), "{expected} missing at {width}");

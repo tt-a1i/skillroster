@@ -1800,7 +1800,9 @@ fn finding_roster_planning(
                     json!({
                         "skill_id": selection.skill_id,
                         "name": selection.name,
-                        "reason": selection.reason
+                        "reason": selection.reason,
+                        "evidence_scope": selection.evidence_scope,
+                        "evidence_agents": selection.evidence_agents
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1812,6 +1814,8 @@ fn finding_roster_planning(
                 "proposed_on_demand_count": agent.on_demand_count.saturating_sub(unchanged_blocked_count),
                 "unchanged_blocked_count": unchanged_blocked_count,
                 "positive_signal_count": agent.positive_signal_count,
+                "direct_signal_count": agent.direct_signal_count,
+                "cross_agent_signal_count": agent.cross_agent_signal_count,
                 "fallback_core_count": agent.fallback_core_count,
                 "core_preview": preview,
                 "core_preview_truncated": agent.core_selections.len() > 5
@@ -1909,7 +1913,8 @@ fn finding_roster_planning(
             "protected_by_request",
             "declared_core",
             "skillroster_bootstrap",
-            "positive_usage_evidence",
+            "target_agent_usage_evidence",
+            "cross_agent_same_skill_usage_evidence",
             "stable_fallback"
         ],
         "absence_of_usage_evidence": "not_negative_evidence",
@@ -2885,32 +2890,41 @@ fn roster_selection_evidence(
     let mut core_selection_count = 0_usize;
     let mut forced_core_count = 0_usize;
     let mut positive_signal_core_count = 0_usize;
+    let mut direct_signal_core_count = 0_usize;
+    let mut cross_agent_signal_core_count = 0_usize;
     let mut stable_fallback_core_count = 0_usize;
     let mut fallback_dominated_agent_count = 0_usize;
+    let mut cross_agent_dominated_agent_count = 0_usize;
     let mut reason_counts = std::collections::BTreeMap::<&str, usize>::new();
     let mut summary_agents = Vec::new();
     let mut full_agents = Vec::new();
     for agent in &recommendation.agents {
         let mut forced = 0_usize;
-        let mut positive = 0_usize;
+        let mut direct = 0_usize;
+        let mut cross_agent = 0_usize;
         let mut fallback = 0_usize;
         for selection in &agent.core_selections {
             *reason_counts.entry(selection.reason).or_default() += 1;
-            match selection.reason {
-                "protected_by_request" | "declared_core" | "skillroster_bootstrap" => {
-                    forced += 1;
-                }
-                "stable_fallback" => fallback += 1,
-                _ => positive += 1,
+            match selection.evidence_scope {
+                "forced" => forced += 1,
+                "target_agent" => direct += 1,
+                "cross_agent" => cross_agent += 1,
+                "fallback" => fallback += 1,
+                _ => {}
             }
         }
         let core_count = agent.core_selections.len();
+        let positive = direct + cross_agent;
         let fallback_dominated = fallback > core_count / 2;
+        let cross_agent_dominated = cross_agent > core_count / 2;
         core_selection_count += core_count;
         forced_core_count += forced;
         positive_signal_core_count += positive;
+        direct_signal_core_count += direct;
+        cross_agent_signal_core_count += cross_agent;
         stable_fallback_core_count += fallback;
         fallback_dominated_agent_count += usize::from(fallback_dominated);
+        cross_agent_dominated_agent_count += usize::from(cross_agent_dominated);
         let selections = agent
             .core_selections
             .iter()
@@ -2918,7 +2932,9 @@ fn roster_selection_evidence(
                 json!({
                     "skill_id": selection.skill_id,
                     "name": selection.name,
-                    "reason": selection.reason
+                    "reason": selection.reason,
+                    "evidence_scope": selection.evidence_scope,
+                    "evidence_agents": selection.evidence_agents
                 })
             })
             .collect::<Vec<_>>();
@@ -2927,8 +2943,11 @@ fn roster_selection_evidence(
             "core_selection_count": core_count,
             "forced_core_count": forced,
             "positive_signal_core_count": positive,
+            "direct_signal_core_count": direct,
+            "cross_agent_signal_core_count": cross_agent,
             "stable_fallback_core_count": fallback,
             "fallback_dominated": fallback_dominated,
+            "cross_agent_dominated": cross_agent_dominated,
             "core_preview": selections.iter().take(5).cloned().collect::<Vec<_>>(),
             "core_preview_truncated": selections.len() > 5
         });
@@ -2940,6 +2959,7 @@ fn roster_selection_evidence(
         full_agents.push(full);
     }
     let fallback_dominated = fallback_dominated_agent_count > 0;
+    let cross_agent_dominated = cross_agent_dominated_agent_count > 0;
     let evidence = |detail_level: &str, agents: Vec<Value>| {
         json!({
             "detail_level": detail_level,
@@ -2947,30 +2967,50 @@ fn roster_selection_evidence(
                 "protected_by_request",
                 "declared_core",
                 "skillroster_bootstrap",
-                "positive_usage_evidence",
+                "target_agent_usage_evidence",
+                "cross_agent_same_skill_usage_evidence",
                 "stable_fallback"
             ],
             "core_selection_count": core_selection_count,
             "forced_core_count": forced_core_count,
             "positive_signal_core_count": positive_signal_core_count,
+            "direct_signal_core_count": direct_signal_core_count,
+            "cross_agent_signal_core_count": cross_agent_signal_core_count,
             "stable_fallback_core_count": stable_fallback_core_count,
             "fallback_dominated": fallback_dominated,
             "fallback_dominated_agent_count": fallback_dominated_agent_count,
+            "cross_agent_dominated": cross_agent_dominated,
+            "cross_agent_dominated_agent_count": cross_agent_dominated_agent_count,
             "reason_counts": reason_counts,
             "agents": agents,
             "absence_of_usage_evidence": "not_negative_evidence"
         })
     };
-    let uncertainty = fallback_dominated.then(|| {
-        json!({
+    let uncertainty = if fallback_dominated {
+        Some(json!({
             "code": "fallback_dominated_core_selection",
             "review_required": true,
             "core_selection_count": core_selection_count,
+            "direct_signal_core_count": direct_signal_core_count,
+            "cross_agent_signal_core_count": cross_agent_signal_core_count,
             "stable_fallback_core_count": stable_fallback_core_count,
             "fallback_dominated_agent_count": fallback_dominated_agent_count,
             "absence_of_usage_evidence": "not_negative_evidence"
-        })
-    });
+        }))
+    } else if cross_agent_dominated {
+        Some(json!({
+            "code": "cross_agent_dominated_core_selection",
+            "review_required": true,
+            "core_selection_count": core_selection_count,
+            "direct_signal_core_count": direct_signal_core_count,
+            "cross_agent_signal_core_count": cross_agent_signal_core_count,
+            "stable_fallback_core_count": stable_fallback_core_count,
+            "cross_agent_dominated_agent_count": cross_agent_dominated_agent_count,
+            "absence_of_usage_evidence": "not_negative_evidence"
+        }))
+    } else {
+        None
+    };
     SelectionEvidenceViews {
         summary: evidence("summary", summary_agents),
         full: evidence("full", full_agents),
@@ -4349,6 +4389,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.16",
         "4d46b9699db8490821c1f91be1444dca689cd4b9578a2b732b633de441f8ff59",
     ),
+    (
+        "1.8.17",
+        "5c7cc974e0d83d82993ba1ca9227c0d542288ca3d7ef4e04165794cb41faec33",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5497,22 +5541,30 @@ mod recovery_tests {
                 core_count: 3,
                 on_demand_count: 48,
                 positive_signal_count: 1,
+                direct_signal_count: 1,
+                cross_agent_signal_count: 0,
                 fallback_core_count: 1,
                 core_selections: vec![
                     crate::roster_recommendation::CoreSelection {
                         skill_id: "skill_forced".into(),
                         name: "forced".into(),
                         reason: "protected_by_request",
+                        evidence_scope: "forced",
+                        evidence_agents: vec![],
                     },
                     crate::roster_recommendation::CoreSelection {
                         skill_id: "skill_observed".into(),
                         name: "observed".into(),
                         reason: "observed_loaded",
+                        evidence_scope: "target_agent",
+                        evidence_agents: vec!["codex".into()],
                     },
                     crate::roster_recommendation::CoreSelection {
                         skill_id: "skill_fallback".into(),
                         name: "fallback".into(),
                         reason: "stable_fallback",
+                        evidence_scope: "fallback",
+                        evidence_agents: vec![],
                     },
                 ],
             }],
@@ -5523,6 +5575,8 @@ mod recovery_tests {
         assert_eq!(evidence.summary["core_selection_count"], 3);
         assert_eq!(evidence.summary["forced_core_count"], 1);
         assert_eq!(evidence.summary["positive_signal_core_count"], 1);
+        assert_eq!(evidence.summary["direct_signal_core_count"], 1);
+        assert_eq!(evidence.summary["cross_agent_signal_core_count"], 0);
         assert_eq!(evidence.summary["stable_fallback_core_count"], 1);
         assert_eq!(evidence.summary["fallback_dominated"], false);
         assert_eq!(evidence.summary["detail_level"], "summary");
@@ -5547,6 +5601,62 @@ mod recovery_tests {
             3
         );
         assert!(evidence.uncertainty.is_none());
+    }
+
+    #[test]
+    fn roster_selection_uncertainty_types_a_cross_agent_majority() {
+        let cross_selection =
+            |skill_id: &str, source: &str| crate::roster_recommendation::CoreSelection {
+                skill_id: skill_id.into(),
+                name: skill_id.into(),
+                reason: "cross_agent_observed_loaded",
+                evidence_scope: "cross_agent",
+                evidence_agents: vec![source.into()],
+            };
+        let recommendation = crate::roster_recommendation::RosterRecommendation {
+            changes: vec![],
+            agents: vec![crate::roster_recommendation::AgentRecommendation {
+                agent: AgentKind::ClaudeCode,
+                before_default_exposure: 51,
+                unique_skill_count: 51,
+                core_count: 3,
+                on_demand_count: 48,
+                positive_signal_count: 2,
+                direct_signal_count: 0,
+                cross_agent_signal_count: 2,
+                fallback_core_count: 1,
+                core_selections: vec![
+                    cross_selection("skill_a", "codex"),
+                    cross_selection("skill_b", "cursor"),
+                    crate::roster_recommendation::CoreSelection {
+                        skill_id: "skill_c".into(),
+                        name: "skill_c".into(),
+                        reason: "stable_fallback",
+                        evidence_scope: "fallback",
+                        evidence_agents: vec![],
+                    },
+                ],
+            }],
+        };
+
+        let evidence = roster_selection_evidence(&recommendation);
+
+        assert_eq!(evidence.summary["positive_signal_core_count"], 2);
+        assert_eq!(evidence.summary["direct_signal_core_count"], 0);
+        assert_eq!(evidence.summary["cross_agent_signal_core_count"], 2);
+        assert_eq!(evidence.summary["cross_agent_dominated"], true);
+        assert_eq!(
+            evidence.uncertainty.as_ref().unwrap()["code"],
+            "cross_agent_dominated_core_selection"
+        );
+        assert_eq!(
+            evidence.full["agents"][0]["core_selections"][0]["evidence_scope"],
+            "cross_agent"
+        );
+        assert_eq!(
+            evidence.full["agents"][0]["core_selections"][0]["evidence_agents"],
+            json!(["codex"])
+        );
     }
 
     #[test]

@@ -396,6 +396,20 @@ The new binary also read a v1.8.16 stored Plan without complete-selection data
 and preserved its aggregate evidence. Every inspection and Plan reported
 `files_changed=false`; no Apply was run and no Agent file changed.
 
+The v1.8.18 cross-Agent evidence dogfood rescanned the current home with four
+explicitly reviewed canonical source roots: 231 independent Skills, 871
+placements including those read-only sources, 548 default exposures, and five
+sampled Agent session roots. A budget-10 Plan selected 40 Core Skills with two
+target-Agent observed-loaded selections, 14 cross-Agent observed-loaded
+selections for the exact same stable Skill identities, and 24 stable
+fallbacks. Every cross-Agent selection persisted its source Agent IDs and
+`evidence_scope: cross_agent`; no name-based transfer occurred. The Plan stayed
+typed `review_required` because fallback still dominated all four affected
+Rosters, reduced proposed exposure from 548 to 82, reported zero canonical
+deletions, and kept `files_changed=false`. No Apply was run. The ordinary
+60-, 80-, and 120-column views preserved `target Agent`, `cross-Agent`, and
+`elsewhere loaded` while shortening long Skill names first.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

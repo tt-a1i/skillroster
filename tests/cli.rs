@@ -1183,7 +1183,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.17"
+        "1.8.18"
     );
 
     let undone = json_output(&run(
@@ -1353,7 +1353,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.17");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.18");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -3064,6 +3064,101 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
     assert!(!state.join("library").exists());
+}
+
+#[test]
+fn large_roster_plan_uses_exact_cross_agent_usage_before_fallback() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex_root = home.join(".codex/skills");
+    fs::create_dir_all(&codex_root).unwrap();
+    for index in 0..51 {
+        let name = if index == 0 {
+            "alpha".to_owned()
+        } else if index == 50 {
+            "zeta".to_owned()
+        } else {
+            format!("skill-{index:03}")
+        };
+        let directory = codex_root.join(&name);
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture {index}\n"),
+        )
+        .unwrap();
+    }
+
+    let cursor_skill = home.join(".cursor/skills/zeta");
+    fs::create_dir_all(&cursor_skill).unwrap();
+    fs::copy(
+        codex_root.join("zeta/SKILL.md"),
+        cursor_skill.join("SKILL.md"),
+    )
+    .unwrap();
+    let cursor_sessions = home.join(".cursor/projects");
+    fs::create_dir_all(&cursor_sessions).unwrap();
+    fs::write(
+        cursor_sessions.join("session.jsonl"),
+        json!({
+            "role": "assistant",
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"path": cursor_skill.join("SKILL.md")}
+            }]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 1,
+            "protected_skill_ids": []
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+
+    let evidence = &plan["result"]["selection_evidence"];
+    assert_eq!(evidence["positive_signal_core_count"], 1);
+    assert_eq!(evidence["direct_signal_core_count"], 0);
+    assert_eq!(evidence["cross_agent_signal_core_count"], 1);
+    assert_eq!(evidence["stable_fallback_core_count"], 0);
+    assert_eq!(evidence["reason_counts"]["cross_agent_observed_loaded"], 1);
+    let selected = &evidence["agents"][0]["core_preview"][0];
+    assert_eq!(selected["name"], "zeta");
+    assert_eq!(selected["evidence_scope"], "cross_agent");
+    assert_eq!(selected["evidence_agents"], json!(["cursor"]));
+    assert_eq!(
+        plan["result"]["uncertainty"]["code"],
+        "cross_agent_dominated_core_selection"
+    );
+    assert_eq!(plan["result"]["uncertainty"]["review_required"], true);
+    assert_eq!(plan["result"]["files_changed"], false);
 }
 
 #[test]
