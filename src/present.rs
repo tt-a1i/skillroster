@@ -1096,6 +1096,43 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
                     .unwrap_or_default()
             ),
         );
+        let preview_width = width.saturating_sub(25).max(1);
+        let previews = selection
+            .get("agents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| {
+                let agent_id = agent.get("agent").and_then(Value::as_str)?;
+                let selected = agent
+                    .get("core_preview")
+                    .and_then(Value::as_array)?
+                    .first()?;
+                let name = selected.get("name").and_then(Value::as_str)?;
+                let reason = selected
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(core_reason_label)
+                    .unwrap_or("selected");
+                let remaining = agent
+                    .get("core_selection_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+                let more = if remaining > 0 {
+                    format!(" +{remaining}")
+                } else {
+                    String::new()
+                };
+                Some(middle_truncate(
+                    &format!("{}: {name} [{reason}]{more}", core_agent_label(agent_id)),
+                    preview_width,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !previews.is_empty() {
+            fact_items(lines, "Core preview", previews, width);
+        }
     }
     if value
         .pointer("/uncertainty/review_required")
@@ -1135,6 +1172,38 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Preview only · no files changed",
         "Review the Plan before Apply",
     ));
+}
+
+fn core_reason_label(reason: &str) -> &str {
+    match reason {
+        "protected_by_request" => "protected",
+        "declared_core" => "declared",
+        "skillroster_bootstrap" => "bootstrap",
+        "observed_outcome" => "outcome",
+        "observed_applied" => "applied",
+        "observed_loaded" => "loaded",
+        "observed_matched" => "matched",
+        "inferred_outcome" => "inferred outcome",
+        "inferred_applied" => "inferred applied",
+        "inferred_loaded" => "inferred loaded",
+        "inferred_matched" => "inferred matched",
+        "stable_fallback" => "fallback",
+        _ => reason,
+    }
+}
+
+fn core_agent_label(agent: &str) -> &str {
+    match agent {
+        "codex" => "Codex",
+        "claude-code" => "Claude",
+        "pi" => "Pi",
+        "opencode" => "OpenCode",
+        "hermes" => "Hermes",
+        "cursor" => "Cursor",
+        "gemini-cli" => "Gemini",
+        "github-copilot" => "Copilot",
+        _ => agent,
+    }
 }
 
 fn mutation(value: &Value, lines: &mut Vec<String>) {
@@ -1959,7 +2028,26 @@ mod tests {
             "selection_evidence": {
                 "positive_signal_core_count": 1,
                 "forced_core_count": 0,
-                "stable_fallback_core_count": 199
+                "stable_fallback_core_count": 199,
+                "agents": [
+                    {
+                        "agent": "codex",
+                        "core_preview": [
+                            {"name": "code-review", "reason": "observed_loaded"},
+                            {"name": "agent-reach", "reason": "stable_fallback"}
+                        ],
+                        "core_selection_count": 10,
+                        "core_preview_truncated": true
+                    },
+                    {
+                        "agent": "claude-code",
+                        "core_preview": [
+                            {"name": "agent-reach", "reason": "stable_fallback"}
+                        ],
+                        "core_selection_count": 10,
+                        "core_preview_truncated": true
+                    }
+                ]
             },
             "uncertainty": {"review_required": true},
             "risk": "roster_change",
@@ -1981,6 +2069,8 @@ mod tests {
                 "create_symlink 1",
                 "move_recoverable 307",
                 "1 signal · 0 forced · 199 fallback",
+                "code-review",
+                "Claude: agent-reach",
                 "fallback-dominated Core selection",
             ] {
                 assert!(output.contains(expected), "{expected} missing at {width}");
