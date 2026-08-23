@@ -10,8 +10,10 @@ const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 1;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
+use crate::model::RosterState;
 use crate::scan::{LinkStatus, RootKind, RootStatus, ScanResult, SkillPlacement};
 
+#[derive(Debug)]
 pub struct DerivedRosterPlan {
     pub operations: Vec<Value>,
     pub implicit_library_changes: Vec<LibraryChangeAction>,
@@ -356,6 +358,7 @@ pub fn exclude_unpreservable_demotions(
                     .is_some_and(|agent| demoted_agents.contains(&agent))
             })
             .collect::<Vec<_>>();
+        let provider_managed_removal = removable.iter().any(|placement| !placement.governable);
         let skill = scan
             .skills
             .iter()
@@ -376,14 +379,10 @@ pub fn exclude_unpreservable_demotions(
             .iter()
             .copied()
             .filter(|placement| placement.agent.is_none())
-            .any(|placement| {
-                placement.link_target.as_ref().is_some_and(|target| {
-                    removable.iter().any(|removed| {
-                        target == &removed.directory || target.starts_with(&removed.directory)
-                    })
-                })
-            });
-        let reason = if non_agent_source_dependency {
+            .any(|placement| depends_on_physical_removal(placement, &removable));
+        let reason = if provider_managed_removal {
+            "provider_managed_placement_is_read_only"
+        } else if non_agent_source_dependency {
             "non_agent_source_link_depends_on_removal"
         } else if retained_owned || migratable_owned {
             continue;
@@ -466,9 +465,12 @@ pub fn derive(
         if !placements.iter().any(|placement| placement.governable) {
             bail!("Skill {skill_id} is provider-managed and read-only");
         }
+        for placement in &placements {
+            validate_physical_directory(placement)?;
+        }
         let desired = requests
             .iter()
-            .map(|request| Ok((agent(&request.agent)?, request.state.as_str())))
+            .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
@@ -478,9 +480,12 @@ pub fn derive(
                 placement
                     .agent
                     .and_then(|agent| desired.get(&agent))
-                    .is_some_and(|state| *state != "core")
+                    .is_some_and(|state| state != &RosterState::Core)
             })
             .collect::<Vec<_>>();
+        if removal.iter().any(|placement| !placement.governable) {
+            bail!("Skill {skill_id} includes a provider-managed placement that is read-only");
+        }
         let mut source = verified_real_source(&placements, &removal, &skill.content_digest);
         let mut source_fingerprint = source
             .as_ref()
@@ -532,13 +537,7 @@ pub fn derive(
             .iter()
             .copied()
             .filter(|placement| !removal.iter().any(|removed| removed.id == placement.id))
-            .filter(|placement| {
-                placement.link_target.as_ref().is_some_and(|target| {
-                    removal.iter().any(|removed| {
-                        target == &removed.directory || target.starts_with(&removed.directory)
-                    })
-                })
-            })
+            .filter(|placement| depends_on_physical_removal(placement, &removal))
             .collect::<Vec<_>>();
         if dependent_links
             .iter()
@@ -753,7 +752,7 @@ pub fn derive(
 fn ensure_physical_exposure_compatible(
     skill_id: &str,
     placements: &[&SkillPlacement],
-    desired: &BTreeMap<AgentKind, &str>,
+    desired: &BTreeMap<AgentKind, RosterState>,
 ) -> Result<()> {
     let mut groups = BTreeMap::<PathBuf, Vec<&SkillPlacement>>::new();
     for placement in placements
@@ -771,12 +770,14 @@ fn ensure_physical_exposure_compatible(
             placement
                 .agent
                 .and_then(|agent| desired.get(&agent))
-                .is_some_and(|state| *state != "core")
+                .is_some_and(|state| state != &RosterState::Core)
         });
         let has_retained_exposure = placements.iter().any(|placement| {
-            placement
-                .agent
-                .is_some_and(|agent| desired.get(&agent).is_none_or(|state| *state == "core"))
+            placement.agent.is_some_and(|agent| {
+                desired
+                    .get(&agent)
+                    .is_none_or(|state| state == &RosterState::Core)
+            })
         });
         if has_demotion && has_retained_exposure {
             let agents = placements
@@ -797,20 +798,49 @@ fn ensure_physical_exposure_compatible(
 }
 
 fn physical_mutation_path(placement: &SkillPlacement) -> PathBuf {
-    if std::fs::symlink_metadata(&placement.directory)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        let Some(parent) = placement.directory.parent() else {
-            return placement.directory.clone();
-        };
-        let Some(name) = placement.directory.file_name() else {
-            return placement.directory.clone();
-        };
-        return std::fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(name);
+    if is_symlink(&placement.directory) {
+        return physical_entry_path(&placement.directory);
     }
     placement.physical_directory_or_logical().to_path_buf()
+}
+
+fn validate_physical_directory(placement: &SkillPlacement) -> Result<()> {
+    let expected = placement.physical_directory.as_ref().ok_or_else(|| {
+        anyhow!(
+            "Placement {} has no captured physical source; state may have drifted, run skillroster scan",
+            placement.id
+        )
+    })?;
+    let current_entrypoint = std::fs::canonicalize(&placement.entrypoint).map_err(|error| {
+        anyhow!(
+            "Placement {} physical source drifted; run skillroster scan: {error}",
+            placement.id
+        )
+    })?;
+    let current = current_entrypoint.parent().ok_or_else(|| {
+        anyhow!(
+            "Placement {} physical source drifted; run skillroster scan",
+            placement.id
+        )
+    })?;
+    if current != expected {
+        bail!(
+            "Placement {} physical source drifted from {} to {}; run skillroster scan",
+            placement.id,
+            expected.display(),
+            current.display()
+        );
+    }
+    Ok(())
+}
+
+fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlacement]) -> bool {
+    placement.link_target.is_some()
+        && removal.iter().any(|removed| {
+            let dependency = placement.physical_directory_or_logical();
+            let removed = removed.physical_directory_or_logical();
+            dependency == removed || dependency.starts_with(removed)
+        })
 }
 
 fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
@@ -847,20 +877,20 @@ fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
 }
 
 fn physical_operation_path(path: &Path) -> PathBuf {
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
-        let Some(parent) = path.parent() else {
-            return path.to_path_buf();
-        };
-        let Some(name) = path.file_name() else {
-            return path.to_path_buf();
-        };
-        return std::fs::canonicalize(parent)
-            .unwrap_or_else(|_| parent.to_path_buf())
-            .join(name);
+    if is_symlink(path) {
+        return physical_entry_path(path);
     }
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
+    physical_entry_path(path)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn physical_entry_path(path: &Path) -> PathBuf {
     let Some(parent) = path.parent() else {
         return path.to_path_buf();
     };
@@ -914,6 +944,16 @@ fn agent(value: &str) -> Result<AgentKind> {
         .into_iter()
         .find(|agent| agent.id() == value)
         .ok_or_else(|| anyhow!("unsupported Agent in Roster change: {value}"))
+}
+
+fn roster_state(value: &str) -> Result<RosterState> {
+    match value {
+        "core" => Ok(RosterState::Core),
+        "on_demand" => Ok(RosterState::OnDemand),
+        "explicit_only" => Ok(RosterState::ExplicitOnly),
+        "archived" => Ok(RosterState::Archived),
+        _ => bail!("unsupported Roster state: {value}"),
+    }
 }
 
 fn safe_name(name: &str) -> Result<String> {
@@ -1046,6 +1086,138 @@ mod tests {
         };
 
         assert!(error.downcast_ref::<RosterPhysicalConflict>().is_some());
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_root_drift_requires_a_new_scan() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let home = shared_skill.parent().unwrap().parent().unwrap();
+        let replacement_root = home.join(".replacement_skills");
+        let replacement_skill = replacement_root.join("shared");
+        fs::create_dir_all(&replacement_skill).unwrap();
+        fs::write(
+            replacement_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nreplacement\n",
+        )
+        .unwrap();
+        for root in [
+            home.join(".codex/skills"),
+            home.join(".claude/skills"),
+            home.join(".pi/agent/skills"),
+        ] {
+            fs::remove_file(&root).unwrap();
+            symlink(&replacement_root, root).unwrap();
+        }
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("physical source drifted"));
+        assert!(error.to_string().contains("run skillroster scan"));
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(replacement_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_demotion_blocks_a_dependent_source_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared_root = home.join(".agents_skills");
+        let shared_skill = shared_root.join("shared");
+        fs::create_dir_all(&shared_skill).unwrap();
+        fs::write(
+            shared_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        for (parent, root) in [
+            (home.join(".codex"), home.join(".codex/skills")),
+            (home.join(".claude"), home.join(".claude/skills")),
+            (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+        ] {
+            fs::create_dir_all(parent).unwrap();
+            symlink(&shared_root, root).unwrap();
+        }
+        let source_root = temp.path().join("sources");
+        fs::create_dir(&source_root).unwrap();
+        symlink(&shared_skill, source_root.join("shared")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options.explicit_source_roots.push(source_root.clone());
+        let snapshot = scan(&options).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+        let supported = exclude_unpreservable_demotions(&snapshot, changes.clone()).unwrap();
+        assert!(supported.changes.is_empty());
+        assert!(
+            supported
+                .exclusions
+                .iter()
+                .all(|item| item.reason == "non_agent_source_link_depends_on_removal")
+        );
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("non-Agent source link"));
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(source_root.join("shared/SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_provider_managed_shared_placement_is_read_only() {
+        let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
+        let codex = snapshot
+            .placements
+            .iter_mut()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap();
+        codex.governable = false;
+        codex.provider = Some("fixture-provider".into());
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("provider-managed placement"));
         assert!(shared_skill.join("SKILL.md").is_file());
         assert!(fs::read_dir(&state).unwrap().next().is_none());
     }

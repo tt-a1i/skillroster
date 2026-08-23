@@ -388,12 +388,32 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
             code: classified.0.into(),
             message: error.to_string(),
             retryable: classified.1,
+            details: structured_error_details(error),
             relevant_ids: extract_relevant_ids(&error.to_string()),
             paths: extract_paths(&error.to_string()),
-            details: None,
         },
     ))
     .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
+}
+
+fn structured_error_details(error: &(dyn std::error::Error + 'static)) -> Option<Value> {
+    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterPhysicalConflict>() {
+        return Some(json!({
+            "reason": "shared_physical_state_conflict",
+            "skill_id": conflict.skill_id,
+            "agents": conflict.agents,
+            "files_changed": false
+        }));
+    }
+    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterOperationConflict>() {
+        return Some(json!({
+            "reason": "duplicate_physical_operation_identity",
+            "operation_kind": conflict.operation_kind,
+            "path": conflict.path,
+            "files_changed": false
+        }));
+    }
+    None
 }
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, bool) {
@@ -6606,6 +6626,31 @@ mod recovery_tests {
                 "missing complete --source-root {root} in {complete_argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn roster_operation_conflict_exposes_agent_facts_as_json() {
+        let error = crate::roster_plan::RosterOperationConflict {
+            operation_kind: "target (move_recoverable and create_symlink)".into(),
+            path: PathBuf::from("/tmp/library/shared"),
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_operation_identity_conflict"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "duplicate_physical_operation_identity"
+        );
+        assert_eq!(
+            output["error"]["details"]["operation_kind"],
+            "target (move_recoverable and create_symlink)"
+        );
+        assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
+        assert_eq!(output["error"]["details"]["files_changed"], false);
     }
 }
 

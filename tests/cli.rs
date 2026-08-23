@@ -3968,6 +3968,16 @@ fn shared_physical_roster_plan_moves_once_and_blocks_conflicting_states() {
     assert_eq!(blocked["error"]["code"], "roster_physical_state_conflict");
     assert_eq!(blocked["error"]["retryable"], false);
     assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "shared_physical_state_conflict"
+    );
+    assert_eq!(blocked["error"]["details"]["skill_id"], skill_id);
+    assert_eq!(
+        blocked["error"]["details"]["agents"],
+        json!(["claude-code", "codex", "pi"])
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert_eq!(
         database
             .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get::<_, i64>(0))
             .unwrap(),
