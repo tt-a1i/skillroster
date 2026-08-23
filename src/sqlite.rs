@@ -702,6 +702,57 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn finding_evidence(&self, id: &FindingId) -> StorageResult<Vec<EvidenceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.id, e.scan_id, e.kind, e.quality, e.subject_type, e.subject_id,
+                    e.path, e.digest, e.details_json, e.observed_at
+             FROM finding_evidence fe
+             JOIN evidence e ON e.id = fe.evidence_id
+             WHERE fe.finding_id = ?1",
+        )?;
+        let rows = statement.query_map([id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                id,
+                scan_id,
+                kind,
+                quality,
+                subject_type,
+                subject_id,
+                path,
+                digest,
+                details,
+                observed_at,
+            ) = row?;
+            Ok(EvidenceRecord {
+                id: EvidenceId::parse(id).map_err(invalid_id)?,
+                scan_id: ScanId::parse(scan_id).map_err(invalid_id)?,
+                kind: enum_from_text(&kind)?,
+                quality: enum_from_text(&quality)?,
+                subject_type,
+                subject_id,
+                path,
+                digest,
+                details: from_json(&details)?,
+                observed_at,
+            })
+        })
+        .collect()
+    }
+
     pub fn save_roster_entry(&self, entry: &RosterEntry) -> StorageResult<()> {
         self.connection.execute(
             "INSERT INTO roster_entries (agent_id, skill_id, state, updated_at)

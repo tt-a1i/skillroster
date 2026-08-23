@@ -621,6 +621,27 @@ fn finding_drilldown_is_bounded_and_pageable() {
     assert!(first["result"].get("placements").is_none());
     assert!(first["result"].get("affected_placement_ids").is_none());
     assert!(first["result"].get("evidence_ids").is_none());
+    assert_eq!(
+        first["suggested_actions"][0]["action"],
+        "list_more_finding_detail"
+    );
+    assert_eq!(
+        first["suggested_actions"][0]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--limit",
+                "20",
+                "--offset",
+                "20",
+                "--json",
+            ]
+        )
+    );
 
     let second = json_output(&run(
         &[
@@ -654,6 +675,28 @@ fn finding_drilldown_is_bounded_and_pageable() {
     assert!(full["result"]["evidence"].is_array());
     assert!(full["result"]["affected_placement_ids"].is_array());
     assert!(full_output.stdout.len() > first_output.stdout.len());
+    assert_eq!(
+        full["suggested_actions"][0]["action"],
+        "list_more_finding_detail"
+    );
+    assert_eq!(
+        full["suggested_actions"][0]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--full",
+                "--limit",
+                "20",
+                "--offset",
+                "20",
+                "--json",
+            ]
+        )
+    );
 }
 
 #[test]
@@ -3434,6 +3477,13 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
     ));
     let planning = &detail["result"]["planning"];
     assert_eq!(planning["supported"], true);
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "plan")
+    );
     assert_eq!(planning["snapshot_id"], report["result"]["snapshot_id"]);
     assert_eq!(planning["request_field"], "finding_library_changes");
     let candidates = planning["canonical_candidates"].as_array().unwrap();
