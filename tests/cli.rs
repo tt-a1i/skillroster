@@ -2555,6 +2555,12 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
         plan["result"]["detail"]["command"],
         json!(["plan", "--show", plan_id, "--json"])
     );
+    assert!(
+        !plan["result"]["detail"]["contains"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("complete_core_selections"))
+    );
     let full_output = run(&[&common[..], &["plan", "--show", plan_id]].concat(), None);
     assert!(full_output.stdout.len() > plan_output.stdout.len());
     let full = json_output(&full_output);
@@ -3021,6 +3027,12 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     );
     assert_eq!(plan["result"]["files_changed"], false);
     assert_eq!(detail["result"]["files_changed"], false);
+    assert!(
+        plan["result"]["detail"]["contains"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("complete_core_selections"))
+    );
     let human = run(
         &[
             "--home",

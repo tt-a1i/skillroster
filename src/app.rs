@@ -3990,6 +3990,16 @@ fn prepare_plan(
         &operations_by_kind,
         &impact,
     );
+    let mut detail_contains = vec![
+        "operations",
+        "roster_changes",
+        "source_updates",
+        "library_changes",
+        "before_state",
+    ];
+    if selection_evidence_full.is_some() {
+        detail_contains.push("complete_core_selections");
+    }
     let mut summary = json!({
         "detail_level": "summary",
         "plan_id": prepared.id,
@@ -4008,14 +4018,7 @@ fn prepare_plan(
         "detail": {
             "available": true,
             "command": ["plan", "--show", prepared.id, "--json"],
-            "contains": [
-                "operations",
-                "roster_changes",
-                "source_updates",
-                "library_changes",
-                "before_state",
-                "complete_core_selections"
-            ]
+            "contains": detail_contains
         },
         "risk": risk,
         "reversible": true,
