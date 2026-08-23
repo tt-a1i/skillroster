@@ -184,6 +184,11 @@ Machine results should expose facts, not preformatted prose:
 - risk, reversibility, drift, confirmation, and recovery state;
 - typed `suggested_actions` containing argv, mutation status, confirmation requirement, and reason code.
 
+The bounded Summary exposes one read-only `view_finding` action for each of its
+at most three selected Findings. When more Findings exist, the established
+`list_findings` pagination action remains first; direct drilldowns follow in
+Summary order and bind each stable Finding ID without implying Plan or Apply.
+
 Suggested action argv retains any effective `--state-dir`, `--home`, `--root`,
 and `--source-root` overrides so an Agent can execute the transition against
 the same local Snapshot and discovery trust boundary. It never broadens source

@@ -974,6 +974,36 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
             ]
         )
     );
+    assert_eq!(summary["suggested_actions"].as_array().unwrap().len(), 4);
+    for (finding, suggested_action) in summary["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(
+            summary["suggested_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip(1),
+        )
+    {
+        let finding_id = finding["id"].as_str().unwrap();
+        assert_eq!(suggested_action["action"], "view_finding");
+        assert_eq!(suggested_action["mutates"], false);
+        assert_eq!(suggested_action["requires_confirmation"], false);
+        assert_eq!(suggested_action["reason_code"], "top_finding_selected");
+        assert_eq!(
+            suggested_action["argv"],
+            context_action_argv(
+                &home,
+                &state,
+                &["report", "--finding", finding_id, "--json"]
+            )
+        );
+        let detail = json_output(&run_suggested_action(suggested_action));
+        assert_eq!(detail["result"]["id"], finding_id);
+        assert_eq!(detail["result"]["files_changed"], false);
+    }
 
     let first_output = run(
         &[

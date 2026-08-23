@@ -216,7 +216,10 @@ IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, o
 
 Selector-free `report --json` returns the bounded three-Finding Summary view;
 `--summary` is an explicit alias. The exhaustive diagnostic report requires
-top-level `report --full --json`.
+top-level `report --full --json`. Each selected Summary Finding has a bounded,
+read-only `view_finding` suggested action bound to its stable ID. When the
+Snapshot has more Findings than the Summary, `list_findings` remains the first
+action for pagination and the direct drilldowns follow in Summary order.
 
 `report --finding ID --json` returns compact paged Evidence items by default.
 Each item contains the Evidence ID, subject, path, quality, and decision facts;
