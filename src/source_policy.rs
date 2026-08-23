@@ -129,7 +129,7 @@ pub(crate) fn capture_identity(path: &Path) -> io::Result<RootIdentity> {
             std::ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
-            0,
+            std::ptr::null_mut(),
         )
     };
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {

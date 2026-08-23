@@ -2061,11 +2061,12 @@ fn conservative_source_policy_facts(
         .map(|root| {
             let id = root.permission.id.as_str();
             let mut fact = crate::source_policy::fact_from_frozen(root);
-            if let Some(previous) = before_by_id.get(id)
-                && previous.state != crate::source_policy::SourceRootState::Active
-                && fact.state == crate::source_policy::SourceRootState::Active
-            {
-                fact = crate::source_policy::fact_from_frozen(previous);
+            if let Some(previous) = before_by_id.get(id) {
+                if previous.state != crate::source_policy::SourceRootState::Active
+                    && fact.state == crate::source_policy::SourceRootState::Active
+                {
+                    fact = crate::source_policy::fact_from_frozen(previous);
+                }
             }
             if scan_drifted_permission_ids.contains(id) {
                 fact.state = crate::source_policy::SourceRootState::Inaccessible;
