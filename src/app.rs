@@ -1285,6 +1285,24 @@ fn scan_command(
         .filter_map(|root| root.agent)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let roots = result
+        .roots
+        .iter()
+        .map(|root| {
+            let mut value = json!(root);
+            value["agent"] = json!(root.agent.map(AgentKind::id));
+            value
+        })
+        .collect::<Vec<_>>();
+    let coverage = result
+        .coverage
+        .iter()
+        .map(|coverage| {
+            let mut value = json!(coverage);
+            value["agent"] = json!(coverage.agent.id());
+            value
+        })
+        .collect::<Vec<_>>();
     let warnings = compact_scan_warnings(result.warnings);
     Ok((
         json!({
@@ -1292,8 +1310,8 @@ fn scan_command(
             "agents_checked": agents_checked,
             "skill_count": result.skills.len(),
             "placement_count": result.placements.len(),
-            "roots": result.roots,
-            "coverage": result.coverage,
+            "roots": roots,
+            "coverage": coverage,
             "files_changed": false
         }),
         warnings,
