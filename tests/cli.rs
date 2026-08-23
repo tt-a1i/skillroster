@@ -1094,17 +1094,32 @@ fn source_confirmation_details_follow_public_lifecycle() {
 
     let details = state.join("source-confirmation");
     fs::create_dir(&details).unwrap();
-    let artifact = details.join("fixture.json");
-    fs::write(
-        &artifact,
-        serde_json::to_vec(&json!({
-            "schema_version": 1,
-            "reason": "trusted_canonical_sources_required",
-            "source_roots": [temp.path().join("reviewed")]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let artifact = details.join(format!("{}.json", ulid::Ulid::new()));
+    let reviewed = temp.path().join("reviewed");
+    let artifact_payload = json!({
+        "schema_version": 1,
+        "reason": "trusted_canonical_sources_required",
+        "decision": "confirm_trusted_source_roots",
+        "requested_core_budget": 10,
+        "blocked_change_count": 1,
+        "blocked_changes": [{
+            "agent": "codex",
+            "skill_id": "skill_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "name": "fixture",
+            "reason": "no_owned_exact_content_to_preserve",
+            "state": "unchanged",
+            "observed_source_target": reviewed
+        }],
+        "skill_ids": ["skill_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        "source_root_count": 1,
+        "source_roots": [reviewed],
+        "after_confirmation": {
+            "repeatable_option": "--source-root",
+            "source_roots": [reviewed],
+            "argv": ["skillroster", "--source-root", reviewed, "scan", "--json"]
+        }
+    });
+    fs::write(&artifact, serde_json::to_vec(&artifact_payload).unwrap()).unwrap();
 
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(
@@ -1156,7 +1171,55 @@ fn source_confirmation_details_follow_public_lifecycle() {
     assert!(!details.exists());
 
     fs::create_dir(&details).unwrap();
-    fs::write(&artifact, b"{\"schema_version\":1}").unwrap();
+    let user_json = details.join(format!("{}.json", ulid::Ulid::new()));
+    let mut lookalike_payload = artifact_payload.clone();
+    lookalike_payload["after_confirmation"]["argv"] = json!(["skillroster", "lifecycle", "delete"]);
+    fs::write(&user_json, serde_json::to_vec(&lookalike_payload).unwrap()).unwrap();
+    let refused = run(
+        &[
+            &common[..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(user_json.is_file());
+    assert!(state.join("skillroster.db").is_file());
+    fs::remove_file(&user_json).unwrap();
+    let non_minimal_json = details.join(format!("{}.json", ulid::Ulid::new()));
+    let mut non_minimal_payload = artifact_payload.clone();
+    let child = reviewed.join("child");
+    non_minimal_payload["source_root_count"] = json!(2);
+    non_minimal_payload["source_roots"] = json!([child, reviewed]);
+    non_minimal_payload["after_confirmation"]["source_roots"] = json!([child, reviewed]);
+    non_minimal_payload["after_confirmation"]["argv"] = json!([
+        "skillroster",
+        "--source-root",
+        child,
+        "--source-root",
+        reviewed,
+        "scan",
+        "--json"
+    ]);
+    fs::write(
+        &non_minimal_json,
+        serde_json::to_vec(&non_minimal_payload).unwrap(),
+    )
+    .unwrap();
+    let refused = run(
+        &[
+            &common[..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(non_minimal_json.is_file());
+    assert!(state.join("skillroster.db").is_file());
+    fs::remove_file(&non_minimal_json).unwrap();
+    fs::write(&artifact, serde_json::to_vec(&artifact_payload).unwrap()).unwrap();
     let deleted = json_output(&run(
         &[
             &common[..],
@@ -2990,6 +3053,11 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
         "--source-root"
     );
     assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert_eq!(blocked["error"]["details"]["state_files_changed"], false);
+    assert_eq!(
+        blocked["error"]["details"]["detail_artifact_created"],
+        false
+    );
     assert_eq!(
         blocked["suggested_actions"][0]["action"],
         "scan_with_confirmed_source_roots"

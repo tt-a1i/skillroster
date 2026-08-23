@@ -8,7 +8,13 @@ When a bounded planning error omits source-confirmation blockers, SkillRoster
 writes one versioned JSON detail artifact under
 `~/.skillroster/source-confirmation/`. These derived artifacts contain Skill
 identities and local paths, remain visible to lifecycle commands, and are kept
-until explicitly purged or local state is deleted.
+until explicitly purged or local state is deleted. Artifacts are published by
+same-directory atomic rename; lifecycle operations require the owned ULID file
+name and complete versioned schema before reading or removing them. Unexpected
+entries fail closed and remain untouched. The blocker keeps
+`files_changed=false` for Agent and Library content while reporting
+`state_files_changed=true` and `detail_artifact_created=true` when it retained
+this auxiliary local state.
 
 Session sampling is bounded in memory. Large active files contribute only a
 recent complete-line or structurally complete nested-object tail, and the byte budget is spread across multiple recent

@@ -895,10 +895,116 @@ fn source_confirmation_detail_paths(state_dir: &Path) -> Result<Vec<PathBuf>> {
                 path.display()
             );
         }
+        validate_source_confirmation_detail(&path)?;
         paths.push(path);
     }
     paths.sort();
     Ok(paths)
+}
+
+fn validate_source_confirmation_detail(path: &Path) -> Result<()> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid source-confirmation detail name: {}",
+                path.display()
+            )
+        })?;
+    ulid::Ulid::from_string(stem).map_err(|_| {
+        anyhow!(
+            "invalid source-confirmation detail name: {}",
+            path.display()
+        )
+    })?;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let detail: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    if !recognized_source_confirmation_detail(&detail) {
+        bail!(
+            "refusing unrecognized source-confirmation detail: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn recognized_source_confirmation_detail(detail: &Value) -> bool {
+    (|| -> Option<bool> {
+        let core_budget = detail["requested_core_budget"].as_u64()?;
+        let blocked_changes = detail["blocked_changes"].as_array()?;
+        let blocked_change_count = detail["blocked_change_count"].as_u64()?;
+        let skill_ids = detail["skill_ids"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        let blocker_facts = blocked_changes
+            .iter()
+            .map(|blocker| {
+                let agent = blocker["agent"].as_str()?;
+                parse_agent_kind(agent).ok()?;
+                let skill_id = blocker["skill_id"].as_str()?;
+                SkillId::parse(skill_id.to_owned()).ok()?;
+                (!blocker["name"].as_str()?.trim().is_empty()).then_some(())?;
+                (blocker["reason"] == "no_owned_exact_content_to_preserve").then_some(())?;
+                (blocker["state"] == "unchanged").then_some(())?;
+                let observed_source_target =
+                    if let Some(target) = blocker.get("observed_source_target") {
+                        let target = Path::new(target.as_str()?);
+                        (target.is_absolute() && target.parent().is_some()).then_some(())?;
+                        Some(target.to_path_buf())
+                    } else {
+                        None
+                    };
+                Some((skill_id, observed_source_target))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let blocker_skill_ids = blocker_facts
+            .iter()
+            .map(|(skill_id, _)| *skill_id)
+            .collect::<Vec<_>>();
+        let source_roots = detail["source_roots"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        let source_root_count = detail["source_root_count"].as_u64()?;
+        let expected_source_roots = crate::roster_plan::minimum_reviewed_source_roots(
+            blocker_facts
+                .iter()
+                .filter_map(|(_, target)| target.clone()),
+        )
+        .into_iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>();
+        let mut expected_argv = vec!["skillroster"];
+        for root in &source_roots {
+            expected_argv.extend(["--source-root", *root]);
+        }
+        expected_argv.extend(["scan", "--json"]);
+        let argv = detail["after_confirmation"]["argv"]
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()?;
+        Some(
+            detail["schema_version"] == 1
+                && detail["reason"] == "trusted_canonical_sources_required"
+                && detail["decision"] == "confirm_trusted_source_roots"
+                && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
+                    .contains(&core_budget)
+                && blocked_change_count == blocked_changes.len() as u64
+                && blocker_skill_ids == skill_ids
+                && source_root_count == source_roots.len() as u64
+                && source_roots == expected_source_roots
+                && detail["after_confirmation"]["repeatable_option"] == "--source-root"
+                && detail["after_confirmation"]["source_roots"] == detail["source_roots"]
+                && argv == expected_argv,
+        )
+    })()
+    .unwrap_or(false)
 }
 
 fn source_confirmation_detail_summary(state_dir: &Path) -> Result<Value> {

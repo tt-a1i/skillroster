@@ -120,7 +120,11 @@ pub fn source_confirmation_block(
             ],
             "next": "rescan with only the reported reviewed source roots and retry the same Plan request"
         },
-        "files_changed": false
+        "files_changed": false,
+        "agent_files_changed": false,
+        "library_files_changed": false,
+        "state_files_changed": changes_truncated || roots_truncated,
+        "detail_artifact_created": changes_truncated || roots_truncated
     });
     if changes_truncated || roots_truncated {
         details["detail"] = json!({
@@ -198,7 +202,9 @@ fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result
             return Err(error).with_context(|| format!("cannot inspect {}", directory.display()));
         }
     }
-    let path = directory.join(format!("{}.json", ulid::Ulid::new()));
+    let id = ulid::Ulid::new();
+    let path = directory.join(format!("{id}.json"));
+    let temporary_path = directory.join(format!(".{id}.tmp"));
     let bytes = serde_json::to_vec(&complete)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -208,12 +214,30 @@ fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result
         options.mode(0o600);
     }
     let mut file = options
-        .open(&path)
-        .with_context(|| format!("cannot create {}", path.display()))?;
-    file.write_all(&bytes)
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("cannot sync {}", path.display()))?;
+        .open(&temporary_path)
+        .with_context(|| format!("cannot create {}", temporary_path.display()))?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(&bytes)
+            .with_context(|| format!("cannot write {}", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("cannot sync {}", temporary_path.display()))?;
+        drop(file);
+        std::fs::rename(&temporary_path, &path).with_context(|| {
+            format!(
+                "cannot publish source-confirmation detail {}",
+                path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        match std::fs::remove_file(&temporary_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    write_result?;
     Ok(path)
 }
 
@@ -1112,6 +1136,8 @@ mod tests {
         assert_eq!(blocked.details["blocked_change_count"], 11);
         assert_eq!(blocked.details["blocked_changes_truncated"], true);
         assert_eq!(blocked.details["source_roots_truncated"], true);
+        assert_eq!(blocked.details["state_files_changed"], true);
+        assert_eq!(blocked.details["detail_artifact_created"], true);
         assert_eq!(blocked.relevant_ids.len(), 11);
         let expected_roots = (0..11)
             .map(|index| test_absolute_path(&format!("opt/root-{index:02}/pkg")))
@@ -1130,6 +1156,18 @@ mod tests {
             json!(bounded_roots)
         );
         let detail_path = blocked.details["detail"]["path"].as_str().unwrap();
+        let detail_name = Path::new(detail_path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(ulid::Ulid::from_string(detail_name).is_ok());
+        assert_eq!(
+            fs::read_dir(state.path().join("source-confirmation"))
+                .unwrap()
+                .count(),
+            1,
+            "atomic publication must not leave a temporary artifact"
+        );
         let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
         assert_eq!(complete["schema_version"], 1);
         assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
