@@ -739,6 +739,10 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(scan["ok"], true);
     assert_eq!(scan["result"]["skill_count"], 1);
     assert_eq!(scan["result"]["files_changed"], false);
+    assert_eq!(
+        scan["suggested_actions"][0]["argv"],
+        serde_json::json!(["skillroster", "report", "--json"])
+    );
     let codex_coverage = scan["result"]["coverage"]
         .as_array()
         .unwrap()

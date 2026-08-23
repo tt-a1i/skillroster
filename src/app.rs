@@ -108,7 +108,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 warnings,
                 vec![action(
                     "report",
-                    &["report", "--summary", "--json"],
+                    &["report", "--json"],
                     false,
                     false,
                     "scan_complete",
