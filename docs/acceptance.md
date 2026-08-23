@@ -370,6 +370,18 @@ real read-only probes ranked `code-review`, `computer-history`, and
 native-task preservation regression remained green. Every Find response kept
 both channel ranks and `files_changed=false`.
 
+The v1.8.16 source-root dogfood started from the official v1.8.15 binary and
+three explicitly reviewed local source directories. Passing the final canonical
+directory for one shared Skill source left five high-severity escaping-link
+placements, while passing its symlink alias cleared them; both Snapshots stored
+the same canonical root facts. The scanner now makes trust decisions from the
+resolved destination. Fresh read-only Scans using the canonical path and the
+alias produced identical results: 231 independent Skills, 743 placements, 548
+default exposure, 169 Findings, no escaping-link Finding, and
+`files_changed=false`; the core regression additionally covers supplying both
+forms together. Direct escapes, indirect escapes, and unresolved links remain
+unread; no Apply was run and no Agent file changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
