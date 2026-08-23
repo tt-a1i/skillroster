@@ -6204,6 +6204,57 @@ mod recovery_tests {
         assert_eq!(impact, stored);
         assert_eq!(impact["exposure_reduction_percent"], 55.84);
     }
+
+    #[test]
+    fn source_block_json_keeps_every_suggested_source_root() {
+        let exclusions = (0..11)
+            .map(|index| crate::roster_plan::RosterChangeExclusion {
+                agent: "codex".into(),
+                skill_id: format!("skill_{index:032}"),
+                name: format!("skill-{index:02}"),
+                reason: "no_owned_exact_content_to_preserve",
+                observed_source_target: Some(std::path::PathBuf::from(format!(
+                    "/opt/root-{index:02}/pkg"
+                ))),
+            })
+            .collect::<Vec<_>>();
+        let blocked =
+            crate::roster_plan::source_confirmation_block("finding_fixture", 10, &exclusions);
+        let envelope: Value = serde_json::from_str(&error_json("plan", &blocked)).unwrap();
+        assert_eq!(
+            envelope["error"]["details"]["blocked_changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+        assert_eq!(
+            envelope["error"]["details"]["source_roots"]
+                .as_array()
+                .unwrap()
+                .len(),
+            11
+        );
+        assert_eq!(
+            envelope["error"]["details"]["blocked_changes_truncated"],
+            false
+        );
+        assert_eq!(envelope["error"]["details"]["detail"]["mode"], "complete");
+        let argv = envelope["suggested_actions"][0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        for index in 0..11 {
+            let root = format!("/opt/root-{index:02}/pkg");
+            assert!(
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--source-root" && pair[1] == root),
+                "missing --source-root {root} in {argv:?}"
+            );
+        }
+    }
 }
 
 fn finding_category(value: crate::query::FindingCategory) -> FindingCategory {

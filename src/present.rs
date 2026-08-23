@@ -243,7 +243,7 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
             .and_then(Value::as_array)
             .is_some_and(|items| items.len() > 5)
     {
-        lines.push("  Inspect JSON for remaining blockers".into());
+        lines.push("  Inspect JSON error.details for remaining blockers".into());
     }
     lines.push(String::new());
     lines.push("  Reviewed source directories".into());
@@ -265,8 +265,13 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
     if shown == 0 {
         lines.push("  none disclosed".into());
     }
-    if details["source_roots_truncated"].as_bool() == Some(true) {
-        lines.push("  Inspect JSON for remaining source roots".into());
+    if details["source_roots_truncated"].as_bool() == Some(true)
+        || details
+            .get("source_roots")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.len() > 5)
+    {
+        lines.push("  Inspect JSON error.details for remaining source roots".into());
     }
     lines.extend(summary(
         "Blocked · no automatic change is supported",
@@ -1840,6 +1845,52 @@ mod tests {
                 "line exceeded {width} columns:\n{output}"
             );
         }
+    }
+
+    #[test]
+    fn custom_budget_overflow_points_at_complete_json_details() {
+        let blocked_changes = (0..11)
+            .map(|index| {
+                json!({
+                    "agent": "codex",
+                    "name": format!("skill-{index:02}"),
+                    "observed_source_target": format!("/opt/root-{index:02}/pkg")
+                })
+            })
+            .collect::<Vec<_>>();
+        let source_roots = (0..11)
+            .map(|index| json!(format!("/opt/root-{index:02}/pkg")))
+            .collect::<Vec<_>>();
+        let details = json!({
+            "decision": "confirm_trusted_source_roots",
+            "requested_core_budget": 10,
+            "blocked_change_count": 11,
+            "blocked_changes": blocked_changes,
+            "blocked_changes_truncated": false,
+            "source_roots": source_roots,
+            "source_roots_truncated": false
+        });
+        let mut lines = vec!["SkillRoster · Plan".into(), String::new()];
+        blocked_roster_plan_lines(&details, &mut lines, 80);
+        let output = lines.join("\n");
+        assert!(output.contains("skill-00"), "{output}");
+        assert!(output.contains("skill-04"), "{output}");
+        assert!(!output.contains("skill-05"), "{output}");
+        assert!(output.contains("/opt/root-00/pkg"), "{output}");
+        assert!(!output.contains("/opt/root-05/pkg"), "{output}");
+        assert!(
+            output.contains("Inspect JSON error.details for remaining blockers"),
+            "{output}"
+        );
+        assert!(
+            output.contains("Inspect JSON error.details for remaining source roots"),
+            "{output}"
+        );
+        assert!(!output.to_lowercase().contains("truncated"), "{output}");
+        assert!(
+            output.lines().all(|line| display_width(line) <= 80),
+            "line exceeded 80 columns:\n{output}"
+        );
     }
 
     #[test]
