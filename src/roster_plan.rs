@@ -18,6 +18,44 @@ pub struct DerivedRosterPlan {
     pub impact: Value,
 }
 
+#[derive(Debug)]
+pub struct RosterPhysicalConflict {
+    pub skill_id: String,
+    pub agents: Vec<String>,
+}
+
+impl std::fmt::Display for RosterPhysicalConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Skill {} has incompatible Core and non-Core requests across one shared physical placement for Agents {}; separate the shared Agent roots or request a consistent exposure state",
+            self.skill_id,
+            self.agents.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for RosterPhysicalConflict {}
+
+#[derive(Debug)]
+pub struct RosterOperationConflict {
+    pub operation_kind: String,
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for RosterOperationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Roster Plan contains more than one {} operation for physical path {}; resolve overlapping physical ownership or the same-name variant Finding before retrying",
+            self.operation_kind,
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for RosterOperationConflict {}
+
 #[derive(Clone, Debug)]
 pub struct RosterChangeExclusion {
     pub agent: String,
@@ -432,6 +470,7 @@ pub fn derive(
             .iter()
             .map(|request| Ok((agent(&request.agent)?, request.state.as_str())))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
             .iter()
             .copied()
@@ -447,7 +486,7 @@ pub fn derive(
             .as_ref()
             .map(|path| change::fingerprint(path))
             .transpose()?;
-        let mut migrated_id = None;
+        let mut migrated_source = None;
 
         if source.is_none() && !removal.is_empty() {
             let canonical = removal
@@ -464,17 +503,18 @@ pub fn derive(
                 bail!("Library target {} already exists", library_path.display());
             }
             needs_library_root |= !library_root.exists();
-            let canonical_fingerprint = change::fingerprint(&canonical.directory)?;
+            let canonical_source = physical_mutation_path(canonical);
+            let canonical_fingerprint = change::fingerprint(&canonical_source)?;
             operations.push(json!({
                 "kind": "move_recoverable",
-                "source": canonical.directory,
+                "source": canonical_source,
                 "target": library_path,
                 "expected_fingerprint": canonical_fingerprint
             }));
             *operation_groups.entry("host_canonical").or_default() += 1;
             source = Some(library_path.clone());
             source_fingerprint = Some(canonical_fingerprint);
-            migrated_id = Some(canonical.id.as_str());
+            migrated_source = Some(physical_mutation_path(canonical));
             implicit_library_changes.push(LibraryChangeAction {
                 skill_id: skill_id.to_string(),
                 canonical_placement_id: canonical.id.clone(),
@@ -483,7 +523,7 @@ pub fn derive(
                     .map(|placement| placement.id.clone())
                     .collect(),
                 requested_state: "hosted".into(),
-                canonical_path: canonical.directory.clone(),
+                canonical_path: physical_mutation_path(canonical),
                 library_path: Some(library_path),
             });
         }
@@ -546,19 +586,26 @@ pub fn derive(
             }
         }
 
+        let mut physical_removals = BTreeMap::<PathBuf, &SkillPlacement>::new();
         for placement in &removal {
             before_exposure += usize::from(placement.default_exposed);
             affected_placements.insert(placement.id.clone());
-            if migrated_id == Some(placement.id.as_str()) {
+            physical_removals
+                .entry(physical_mutation_path(placement))
+                .or_insert(placement);
+        }
+        for (physical_source, placement) in physical_removals {
+            if migrated_source.as_ref() == Some(&physical_source) {
                 continue;
             }
             needs_backup_root |= !backup_root.exists();
             let backup = backup_root.join(format!("{nonce}-{}", placement.id));
+            let expected_fingerprint = change::fingerprint(&physical_source)?;
             operations.push(json!({
                 "kind": "move_recoverable",
-                "source": placement.directory,
+                "source": physical_source,
                 "target": backup,
-                "expected_fingerprint": change::fingerprint(&placement.directory)?
+                "expected_fingerprint": expected_fingerprint
             }));
             *operation_groups.entry("remove_exposure").or_default() += 1;
         }
@@ -664,6 +711,7 @@ pub fn derive(
         );
         *operation_groups.entry("create_library").or_default() += 1;
     }
+    ensure_unique_operation_paths(&operations)?;
 
     for placement in &scan.placements {
         if placement.default_exposed
@@ -702,17 +750,143 @@ pub fn derive(
     })
 }
 
+fn ensure_physical_exposure_compatible(
+    skill_id: &str,
+    placements: &[&SkillPlacement],
+    desired: &BTreeMap<AgentKind, &str>,
+) -> Result<()> {
+    let mut groups = BTreeMap::<PathBuf, Vec<&SkillPlacement>>::new();
+    for placement in placements
+        .iter()
+        .copied()
+        .filter(|placement| placement.default_exposed)
+    {
+        groups
+            .entry(physical_mutation_path(placement))
+            .or_default()
+            .push(placement);
+    }
+    for placements in groups.into_values().filter(|group| group.len() > 1) {
+        let has_demotion = placements.iter().any(|placement| {
+            placement
+                .agent
+                .and_then(|agent| desired.get(&agent))
+                .is_some_and(|state| *state != "core")
+        });
+        let has_retained_exposure = placements.iter().any(|placement| {
+            placement
+                .agent
+                .is_some_and(|agent| desired.get(&agent).is_none_or(|state| *state == "core"))
+        });
+        if has_demotion && has_retained_exposure {
+            let agents = placements
+                .iter()
+                .filter_map(|placement| placement.agent.map(AgentKind::id))
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            return Err(RosterPhysicalConflict {
+                skill_id: skill_id.to_owned(),
+                agents,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn physical_mutation_path(placement: &SkillPlacement) -> PathBuf {
+    if std::fs::symlink_metadata(&placement.directory)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        let Some(parent) = placement.directory.parent() else {
+            return placement.directory.clone();
+        };
+        let Some(name) = placement.directory.file_name() else {
+            return placement.directory.clone();
+        };
+        return std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name);
+    }
+    placement.physical_directory_or_logical().to_path_buf()
+}
+
+fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
+    let mut move_sources = BTreeSet::new();
+    let mut targets = BTreeMap::<PathBuf, &str>::new();
+    for operation in operations {
+        if operation["kind"] == "move_recoverable" {
+            let source = operation["source"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Roster move operation has no source"))?;
+            let source = physical_operation_path(Path::new(source));
+            if !move_sources.insert(source.clone()) {
+                return Err(RosterOperationConflict {
+                    operation_kind: "destructive-source".into(),
+                    path: source,
+                }
+                .into());
+            }
+        }
+        let Some(target) = operation["target"].as_str() else {
+            continue;
+        };
+        let target = physical_operation_path(Path::new(target));
+        let kind = operation["kind"].as_str().unwrap_or("unknown");
+        if let Some(first_kind) = targets.insert(target.clone(), kind) {
+            return Err(RosterOperationConflict {
+                operation_kind: format!("target ({first_kind} and {kind})"),
+                path: target,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn physical_operation_path(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        let Some(parent) = path.parent() else {
+            return path.to_path_buf();
+        };
+        let Some(name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        return std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name);
+    }
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    std::fs::canonicalize(parent)
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(name)
+}
+
 fn verified_real_source(
     placements: &[&SkillPlacement],
     excluded: &[&SkillPlacement],
     digest: &str,
 ) -> Option<PathBuf> {
+    let excluded_sources = excluded
+        .iter()
+        .map(|placement| physical_mutation_path(placement))
+        .collect::<BTreeSet<_>>();
     placements
         .iter()
         .copied()
-        .filter(|placement| !excluded.iter().any(|item| item.id == placement.id))
+        .filter(|placement| !excluded_sources.contains(&physical_mutation_path(placement)))
         .find(|placement| is_real_exact(placement, digest))
-        .map(|placement| placement.directory.clone())
+        .map(physical_mutation_path)
 }
 
 fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
@@ -767,6 +941,156 @@ mod tests {
 
     use super::*;
     use crate::scan::{ScanOptions, scan};
+
+    #[cfg(unix)]
+    fn shared_agent_root_fixture() -> (TempDir, ScanResult, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared_root = home.join(".agents_skills");
+        let shared_skill = shared_root.join("shared");
+        fs::create_dir_all(&shared_skill).unwrap();
+        fs::write(
+            shared_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        for (parent, logical_root) in [
+            (home.join(".codex"), home.join(".codex/skills")),
+            (home.join(".claude"), home.join(".claude/skills")),
+            (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+        ] {
+            fs::create_dir_all(parent).unwrap();
+            symlink(&shared_root, logical_root).unwrap();
+        }
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        assert_eq!(
+            snapshot
+                .placements
+                .iter()
+                .filter(|placement| placement.default_exposed)
+                .count(),
+            3
+        );
+        (temp, snapshot, shared_skill)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_demotion_emits_one_recoverable_move() {
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let plan = derive(&snapshot, &state, &changes).unwrap();
+        let moves = plan
+            .operations
+            .iter()
+            .filter(|operation| operation["kind"] == "move_recoverable")
+            .collect::<Vec<_>>();
+
+        assert_eq!(moves.len(), 1);
+        assert_eq!(
+            moves[0]["source"],
+            json!(fs::canonicalize(shared_skill).unwrap())
+        );
+        assert_eq!(plan.impact["before_default_exposure"], 3);
+        assert_eq!(plan.impact["after_default_exposure"], 0);
+        assert_eq!(
+            plan.impact["affected_placement_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_core_and_demotion_fail_closed() {
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+
+        let error = match derive(
+            &snapshot,
+            &state,
+            &[
+                RosterChange {
+                    agent: "codex".into(),
+                    skill_id: skill_id.clone(),
+                    state: "core".into(),
+                },
+                RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id,
+                    state: "on_demand".into(),
+                },
+            ],
+        ) {
+            Ok(_) => panic!("conflicting shared physical states unexpectedly produced a Plan"),
+            Err(error) => error,
+        };
+
+        assert!(error.downcast_ref::<RosterPhysicalConflict>().is_some());
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn same_name_variants_cannot_share_one_library_target() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        for (root, body) in [
+            (home.join(".codex/skills/shared"), "codex variant"),
+            (home.join(".hermes/skills/shared"), "hermes variant"),
+        ] {
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: shared\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir(&state).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let changes = snapshot
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                placement.agent.map(|agent| RosterChange {
+                    agent: agent.id().into(),
+                    skill_id: placement.skill_id.clone(),
+                    state: "on_demand".into(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let error = match derive(&snapshot, &state, &changes) {
+            Ok(_) => panic!("same-name variants unexpectedly shared one Library target"),
+            Err(error) => error,
+        };
+
+        assert!(error.downcast_ref::<RosterOperationConflict>().is_some());
+        assert!(error.to_string().contains("same-name variant Finding"));
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
 
     #[test]
     fn large_roster_proposal_removes_more_than_half_of_default_exposure() {

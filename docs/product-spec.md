@@ -93,6 +93,13 @@ Read-only commands never mutate Agent configuration or Skill contents. Agent rec
 
 The CLI validates targets, ownership, conflicts, and current fingerprints, then stores an immutable Plan. `apply <plan-id>` executes only the approved scope. Cross-filesystem operations use a journal and compensating steps; the CLI never claims atomicity it cannot provide.
 
+Logical placements reached through symlinked Agent roots may resolve to one
+physical filesystem object. A Plan operates on that object at most once while
+retaining every logical Agent/placement impact fact. If the linked logical
+placements request incompatible Core and non-Core exposure, planning fails
+closed with a typed conflict. No Ready Plan may contain duplicate destructive
+sources or operation targets.
+
 Apply fails closed when paths, fingerprints, links, or configuration have drifted. Every successful mutation writes a Receipt. `undo <receipt-id>` is bounded to that Receipt and refuses ambiguous restoration. Canonical deletion is outside normal Apply, requires separate confirmation, and should prefer recoverable archive.
 
 ### 4.5 Source updates

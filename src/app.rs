@@ -413,6 +413,18 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, b
     if let Some(change) = error.downcast_ref::<crate::change::ChangeError>() {
         return (change.code, change.retryable);
     }
+    if error
+        .downcast_ref::<crate::roster_plan::RosterPhysicalConflict>()
+        .is_some()
+    {
+        return ("roster_physical_state_conflict", false);
+    }
+    if error
+        .downcast_ref::<crate::roster_plan::RosterOperationConflict>()
+        .is_some()
+    {
+        return ("roster_operation_identity_conflict", false);
+    }
     if let Some(storage) = error.downcast_ref::<crate::sqlite::StorageError>() {
         return match storage {
             crate::sqlite::StorageError::Sql(rusqlite::Error::SqliteFailure(code, _))
