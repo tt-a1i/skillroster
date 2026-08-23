@@ -1363,7 +1363,7 @@ impl StateStore {
             monthly_usage_rows: table_count(&self.connection, "usage_monthly")?
                 + table_count(&self.connection, "usage_monthly_sources")?,
             oldest_raw_usage_at: self.connection.query_row(
-                "SELECT MIN(occurred_at) FROM usage_events",
+                "SELECT MIN(NULLIF(occurred_at, 0)) FROM usage_events",
                 [],
                 |row| row.get(0),
             )?,
@@ -1414,7 +1414,7 @@ impl StateStore {
                 'evidence_id', evidence_id, 'skill_id', skill_id, 'agent_id', agent_id,
                 'stage', stage, 'quality', quality, 'source_path_digest', source_path_digest,
                 'observed_event_count', observed_event_count,
-                'occurred_at', occurred_at, 'outcome', outcome)
+                'occurred_at', NULLIF(occurred_at, 0), 'outcome', outcome)
              FROM usage_events ORDER BY occurred_at, evidence_id",
         )?;
         let monthly_sources = query_json_rows(
@@ -1448,7 +1448,9 @@ impl StateStore {
     pub fn purge_usage_before(&self, cutoff: i64) -> StorageResult<PurgeCounts> {
         let transaction = self.connection.unchecked_transaction()?;
         let aggregated_raw_usage_rows: u64 = transaction.query_row(
-            "SELECT COUNT(*) FROM usage_events WHERE occurred_at < ?1",
+            "SELECT COUNT(*)
+             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             WHERE COALESCE(NULLIF(u.occurred_at, 0), e.observed_at) < ?1",
             [cutoff],
             |row| row.get(0),
         )?;
@@ -1456,12 +1458,16 @@ impl StateStore {
             "INSERT INTO usage_monthly_sources
                 (month_start, skill_id, agent_id, stage, quality, source_path_digest,
                  max_observed_event_count, first_seen_at, last_seen_at)
-             SELECT CAST(strftime('%s', strftime('%Y-%m-01', u.occurred_at, 'unixepoch')) AS INTEGER),
+             SELECT CAST(strftime('%s', strftime('%Y-%m-01', u.retention_at, 'unixepoch')) AS INTEGER),
                     u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest,
-                    MAX(u.observed_event_count), MIN(u.occurred_at), MAX(u.occurred_at)
-             FROM usage_events u
-             WHERE u.occurred_at < ?1
-             GROUP BY strftime('%Y-%m', u.occurred_at, 'unixepoch'),
+                    MAX(u.observed_event_count), MIN(u.retention_at), MAX(u.retention_at)
+             FROM (
+                SELECT u.*,
+                       COALESCE(NULLIF(u.occurred_at, 0), e.observed_at) AS retention_at
+                FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             ) u
+             WHERE u.retention_at < ?1
+             GROUP BY strftime('%Y-%m', u.retention_at, 'unixepoch'),
                       u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest
              ON CONFLICT(month_start, skill_id, agent_id, stage, quality, source_path_digest)
              DO UPDATE SET
@@ -1479,7 +1485,9 @@ impl StateStore {
         )?;
         transaction.execute(
             "INSERT INTO purge_usage_evidence (evidence_id)
-             SELECT evidence_id FROM usage_events WHERE occurred_at < ?1
+             SELECT u.evidence_id
+             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             WHERE COALESCE(NULLIF(u.occurred_at, 0), e.observed_at) < ?1
              UNION
              SELECT id FROM evidence
              WHERE kind = 'usage'
@@ -1491,9 +1499,11 @@ impl StateStore {
              WHERE evidence_id IN (SELECT evidence_id FROM purge_usage_evidence)",
             [],
         )?;
-        let deleted_raw_usage_rows = transaction
-            .execute("DELETE FROM usage_events WHERE occurred_at < ?1", [cutoff])?
-            as u64;
+        let deleted_raw_usage_rows = transaction.execute(
+            "DELETE FROM usage_events
+                 WHERE evidence_id IN (SELECT evidence_id FROM purge_usage_evidence)",
+            [],
+        )? as u64;
         let deleted_evidence_rows = transaction.execute(
             "DELETE FROM evidence
              WHERE id IN (SELECT evidence_id FROM purge_usage_evidence)",
@@ -1504,7 +1514,8 @@ impl StateStore {
         let deleted_payload_usage_summaries: u64 = transaction.query_row(
             "SELECT COALESCE(SUM((
                 SELECT COUNT(*) FROM json_each(p.payload_json, '$.usage') AS usage
-                WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) < ?1
+                WHERE COALESCE(
+                    json_extract(usage.value, '$.last_seen_unix'), p.updated_at) < ?1
              )), 0) FROM scan_payloads p",
             [cutoff],
             |row| row.get(0),
@@ -1517,13 +1528,17 @@ impl StateStore {
                     COALESCE((
                         SELECT json_group_array(json(usage.value))
                         FROM json_each(scan_payloads.payload_json, '$.usage') AS usage
-                        WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) >= ?1
+                        WHERE COALESCE(
+                            json_extract(usage.value, '$.last_seen_unix'),
+                            scan_payloads.updated_at) >= ?1
                     ), json('[]'))
                  ),
                  updated_at = CAST(strftime('%s', 'now') AS INTEGER) + 1
              WHERE EXISTS (
                 SELECT 1 FROM json_each(scan_payloads.payload_json, '$.usage') AS usage
-                WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) < ?1
+                WHERE COALESCE(
+                    json_extract(usage.value, '$.last_seen_unix'),
+                    scan_payloads.updated_at) < ?1
              )",
             [cutoff],
         )?;
@@ -2719,5 +2734,109 @@ mod tests {
             store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"], serde_json::json!([]));
         assert_eq!(payload["coverage"][0]["denominator_reliable"], false);
+    }
+
+    #[test]
+    fn unknown_event_time_uses_observation_time_only_for_retention() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        store
+            .save_scan_payload(
+                &scan.id,
+                &serde_json::json!({
+                    "usage": [{
+                        "agent": "codex",
+                        "skill_id": "skill_fixture",
+                        "stage": "loaded",
+                        "quality": "observed",
+                        "event_count": 1,
+                        "first_seen_unix": null,
+                        "last_seen_unix": null,
+                        "source_path_digest": "private"
+                    }]
+                }),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE scan_payloads SET updated_at = 200", [])
+            .unwrap();
+        let agent_id = store
+            .save_agent(&AgentRecord {
+                id: AgentId::new(),
+                kind: AgentKind::Codex,
+                display_name: "Codex".to_owned(),
+            })
+            .unwrap();
+        let skill_id = store
+            .save_skill(&SkillRecord {
+                id: SkillId::new(),
+                identity_key: "content:unknown-time".to_owned(),
+                name: "unknown-time".to_owned(),
+                description: None,
+                declared_source: None,
+                declared_revision: None,
+                content_digest: "sha256:unknown-time".to_owned(),
+                digest_version: 1,
+                governance_state: GovernanceState::Observed,
+                canonical_path: None,
+            })
+            .unwrap();
+        let evidence = EvidenceRecord {
+            id: EvidenceId::new(),
+            scan_id: scan.id,
+            kind: EvidenceKind::Usage,
+            quality: EvidenceQuality::Observed,
+            subject_type: "skill".to_owned(),
+            subject_id: skill_id.to_string(),
+            path: None,
+            digest: None,
+            details: serde_json::json!({
+                "event_count": 1,
+                "first_seen_unix": null,
+                "last_seen_unix": null
+            }),
+            observed_at: 200,
+        };
+        store.save_evidence(&evidence).unwrap();
+        store
+            .save_usage_event(&UsageEvent {
+                evidence_id: evidence.id,
+                skill_id,
+                agent_id,
+                stage: UsageStage::Loaded,
+                quality: EvidenceQuality::Observed,
+                source_path_digest: "sha256:unknown-time-source".to_owned(),
+                observed_event_count: 1,
+                occurred_at: 0,
+                outcome: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.lifecycle_counts().unwrap().oldest_raw_usage_at, None);
+        assert_eq!(
+            store.export_lifecycle().unwrap()["usage_events"][0]["occurred_at"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            store
+                .purge_usage_before(100)
+                .unwrap()
+                .deleted_raw_usage_rows,
+            0
+        );
+        assert_eq!(store.lifecycle_counts().unwrap().raw_usage_rows, 1);
+
+        let purged = store.purge_usage_before(300).unwrap();
+        assert_eq!(purged.aggregated_raw_usage_rows, 1);
+        assert_eq!(purged.deleted_raw_usage_rows, 1);
+        assert_eq!(purged.deleted_evidence_rows, 1);
+        let export = store.export_lifecycle().unwrap();
+        assert_eq!(export["usage_monthly_sources"][0]["first_seen_at"], 200);
+        assert_eq!(export["usage_monthly_sources"][0]["last_seen_at"], 200);
+        let (_, payload): (ScanId, serde_json::Value) =
+            store.latest_scan_payload().unwrap().unwrap();
+        assert_eq!(payload["usage"], serde_json::json!([]));
     }
 }
