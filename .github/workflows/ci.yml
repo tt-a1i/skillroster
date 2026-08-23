@@ -14,21 +14,51 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux x86_64
-            os: ubuntu-24.04
-          - name: Windows x86_64
-            os: windows-2025
-          - name: macOS arm64
-            os: macos-15
-          - name: macOS x86_64
-            os: macos-15-intel
-    runs-on: ${{ matrix.os }}
+  changes:
+    name: Change scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.scope.outputs.full }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify change scope
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          full=true
+          if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
+            git diff --check "$BASE_SHA" "$HEAD_SHA"
+            changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+            if [[ -n "$changed" ]] && ! grep -Evq '(\.md$|^LICENSE$)' <<<"$changed"; then
+              full=false
+            fi
+            {
+              echo "### Change scope"
+              echo
+              echo "Full Rust checks: \`$full\`"
+              echo
+              echo '```text'
+              printf '%s\n' "$changed"
+              echo '```'
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+          echo "full=$full" >>"$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux x86_64
+    needs: changes
+    if: needs.changes.outputs.full == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out source
@@ -50,3 +80,58 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+  portability:
+    name: ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.full == 'true' && github.event_name != 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            os: windows-2025
+          - name: macOS arm64
+            os: macos-15
+          - name: macOS x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.85
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          rustup default 1.85.0
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+  gate:
+    name: CI gate
+    needs: [changes, linux, portability]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      EVENT_NAME: ${{ github.event_name }}
+      FULL: ${{ needs.changes.outputs.full }}
+      LINUX_RESULT: ${{ needs.linux.result }}
+      PORTABILITY_RESULT: ${{ needs.portability.result }}
+      SCOPE_RESULT: ${{ needs.changes.result }}
+    steps:
+      - name: Verify required checks
+        shell: bash
+        run: |
+          [[ "$SCOPE_RESULT" == "success" ]] || exit 1
+          if [[ "$FULL" == "true" ]]; then
+            [[ "$LINUX_RESULT" == "success" ]] || exit 1
+            if [[ "$EVENT_NAME" != "push" ]]; then
+              [[ "$PORTABILITY_RESULT" == "success" ]] || exit 1
+            fi
+          fi
