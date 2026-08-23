@@ -506,6 +506,12 @@ pub fn derive(
             }
             .into());
         }
+        for placement in placements
+            .iter()
+            .filter(|placement| placement.physical_directory.is_some())
+        {
+            placement.validated_physical_directory()?;
+        }
         let desired = requests
             .iter()
             .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
@@ -1170,6 +1176,60 @@ mod tests {
         assert!(error.to_string().contains("run skillroster scan"));
         assert!(shared_skill.join("SKILL.md").is_file());
         assert!(replacement_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_source_drift_into_a_removal_requires_a_new_scan() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
+        let source_skill = temp.path().join("sources/shared");
+        fs::create_dir_all(&source_skill).unwrap();
+        fs::write(
+            source_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut source = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap()
+            .clone();
+        source.id = "placement_source_fixture".into();
+        source.agent = None;
+        source.root = source_skill.parent().unwrap().to_path_buf();
+        source.directory = source_skill.clone();
+        source.entrypoint = source_skill.join("SKILL.md");
+        source.physical_directory = Some(fs::canonicalize(&source_skill).unwrap());
+        source.link_target = None;
+        source.default_exposed = false;
+        snapshot.placements.push(source);
+        fs::remove_dir_all(&source_skill).unwrap();
+        symlink(&shared_skill, &source_skill).unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<crate::scan::PhysicalDirectoryDrift>()
+                .is_some()
+        );
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(source_skill.join("SKILL.md").is_file());
         assert!(fs::read_dir(&state).unwrap().next().is_none());
     }
 
