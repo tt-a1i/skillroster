@@ -5816,8 +5816,8 @@ fn plan_record(
             "library_before": library_before,
             "summary": summary,
             "selection_evidence_full": selection_evidence_full,
-            "reuse_identity": reuse_identity
-            ,"physical_placement_bindings": physical_bindings
+            "reuse_identity": reuse_identity,
+            "physical_placement_bindings": physical_bindings
         }),
         fingerprint: prepared.digest.clone(),
         operations,
