@@ -369,7 +369,9 @@ pub struct UsageEvent {
     pub agent_id: AgentId,
     pub stage: UsageStage,
     pub quality: EvidenceQuality,
-    pub occurred_at: i64,
+    pub source_path_digest: String,
+    pub observed_event_count: u64,
+    pub occurred_at: Option<i64>,
     pub outcome: Option<String>,
 }
 

@@ -1,5 +1,6 @@
 use crate::harness::{AgentKind, SessionSignal, known_agent_roots, session_record_observations};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -171,8 +172,26 @@ pub struct UsageEvidence {
     pub event_count: u64,
     pub first_seen_unix: Option<u64>,
     pub last_seen_unix: Option<u64>,
+    /// UTC month containing the observed records, or `None` when their event
+    /// time could not be established without guessing.
+    #[serde(default)]
+    pub month_start_unix: Option<u64>,
     /// A stable digest of the source path, never session content.
     pub source_path_digest: String,
+}
+
+impl UsageEvidence {
+    pub fn evidence_reference(&self) -> String {
+        format!(
+            "usage:{}:{}:{:?}:{}:{}",
+            self.agent.id(),
+            self.skill_id,
+            self.stage,
+            self.source_path_digest,
+            self.month_start_unix
+                .map_or_else(|| "unknown".to_owned(), |month| month.to_string())
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1416,7 +1435,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
         .ascii_case_insensitive(true)
         .build(&reference_patterns)
         .ok();
-    let mut events = BTreeMap::<(String, UsageStage, String), UsageEvidence>::new();
+    let mut events = BTreeMap::<(String, UsageStage, String, Option<u64>), UsageEvidence>::new();
     let mut bytes_observed = 0_u64;
     let mut lines_observed = 0_usize;
 
@@ -1541,6 +1560,8 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     break;
                 }
                 lines_observed += physical_lines;
+                let record_timestamp = session_record_timestamp(agent, &line);
+                let record_month = record_timestamp.and_then(month_start_unix);
                 let observations = session_record_observations(agent, &line);
                 if !observations.is_empty() {
                     let mut seen_event_skill_stages = BTreeSet::new();
@@ -1576,18 +1597,29 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                             )) {
                                 continue;
                             }
-                            let key = (skill_id.clone(), stage, source_path_digest.clone());
+                            let key = (
+                                skill_id.clone(),
+                                stage,
+                                source_path_digest.clone(),
+                                record_month,
+                            );
                             let event = events.entry(key).or_insert_with(|| UsageEvidence {
                                 agent,
                                 skill_id,
                                 stage,
                                 quality,
                                 event_count: 0,
-                                first_seen_unix: timestamp,
-                                last_seen_unix: timestamp,
+                                first_seen_unix: None,
+                                last_seen_unix: None,
+                                month_start_unix: record_month,
                                 source_path_digest: source_path_digest.clone(),
                             });
                             event.event_count += 1;
+                            update_window(
+                                &mut event.first_seen_unix,
+                                &mut event.last_seen_unix,
+                                record_timestamp,
+                            );
                         }
                     }
                     continue;
@@ -1598,18 +1630,29 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     let (skill_id, _) = &skill_lookup[matched.pattern().as_usize()];
                     let stage = UsageStage::Exposed;
                     let quality = EvidenceQuality::Inferred;
-                    let key = (skill_id.clone(), stage, source_path_digest.clone());
+                    let key = (
+                        skill_id.clone(),
+                        stage,
+                        source_path_digest.clone(),
+                        record_month,
+                    );
                     let event = events.entry(key).or_insert_with(|| UsageEvidence {
                         agent,
                         skill_id: skill_id.clone(),
                         stage,
                         quality,
                         event_count: 0,
-                        first_seen_unix: timestamp,
-                        last_seen_unix: timestamp,
+                        first_seen_unix: None,
+                        last_seen_unix: None,
+                        month_start_unix: record_month,
                         source_path_digest: source_path_digest.clone(),
                     });
                     event.event_count += 1;
+                    update_window(
+                        &mut event.first_seen_unix,
+                        &mut event.last_seen_unix,
+                        record_timestamp,
+                    );
                 }
             }
             if file_partially_observed {
@@ -1821,6 +1864,78 @@ fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Opt
     let Some(timestamp) = timestamp else { return };
     *first = Some(first.map_or(timestamp, |current| current.min(timestamp)));
     *last = Some(last.map_or(timestamp, |current| current.max(timestamp)));
+}
+
+fn session_record_timestamp(agent: AgentKind, record: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(record).ok()?;
+    let mut timestamps = BTreeSet::new();
+    for field in ["timestamp", "created_at", "createdAt"] {
+        if let Some(timestamp) = value.get(field).and_then(timestamp_value_unix) {
+            timestamps.insert(timestamp);
+        }
+    }
+    // Codex wraps some JSONL record metadata in `payload`. This is an Agent
+    // envelope, unlike arbitrary tool arguments or message content, which must
+    // never be treated as event time.
+    if agent == AgentKind::Codex {
+        if let Some(payload) = value.get("payload") {
+            for field in ["timestamp", "created_at", "createdAt"] {
+                if let Some(timestamp) = payload.get(field).and_then(timestamp_value_unix) {
+                    timestamps.insert(timestamp);
+                }
+            }
+        }
+    }
+    (timestamps.len() == 1).then(|| *timestamps.iter().next().expect("length checked"))
+}
+
+fn timestamp_value_unix(value: &serde_json::Value) -> Option<u64> {
+    if let Some(value) = value.as_f64() {
+        return normalize_numeric_unix_timestamp(value);
+    }
+    let value = value.as_str()?;
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .and_then(|timestamp| timestamp.timestamp().try_into().ok())
+        .or_else(|| {
+            value
+                .parse::<f64>()
+                .ok()
+                .and_then(normalize_numeric_unix_timestamp)
+        })
+}
+
+fn normalize_numeric_unix_timestamp(value: f64) -> Option<u64> {
+    // Numeric timestamp units are not self-describing. Accept only the single
+    // seconds/milliseconds/microseconds/nanoseconds interpretation that lands
+    // in the era in which local coding-agent sessions can exist.
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    const EARLIEST_AGENT_SESSION: f64 = 946_684_800.0; // 2000-01-01 UTC
+    const LATEST_AGENT_SESSION: f64 = 4_102_444_800.0; // 2100-01-01 UTC
+    let candidates = [
+        value,
+        value / 1_000.0,
+        value / 1_000_000.0,
+        value / 1_000_000_000.0,
+    ]
+    .into_iter()
+    .filter(|candidate| *candidate >= EARLIEST_AGENT_SESSION && *candidate < LATEST_AGENT_SESSION)
+    .map(|candidate| candidate.floor() as u64)
+    .collect::<BTreeSet<_>>();
+    (candidates.len() == 1).then(|| *candidates.iter().next().expect("length checked"))
+}
+
+fn month_start_unix(timestamp: u64) -> Option<u64> {
+    let timestamp = i64::try_from(timestamp).ok()?;
+    let date = Utc.timestamp_opt(timestamp, 0).single()?.date_naive();
+    date.with_day(1)?
+        .and_hms_opt(0, 0, 0)?
+        .and_utc()
+        .timestamp()
+        .try_into()
+        .ok()
 }
 
 pub fn skill_search_text(skill: &ScannedSkill) -> String {
@@ -2556,6 +2671,80 @@ enabled = true
     }
 
     #[test]
+    fn record_timestamps_are_nested_unit_aware_and_fail_closed() {
+        assert_eq!(
+            session_record_timestamp(
+                AgentKind::Codex,
+                r#"{"payload":{"createdAt":"2024-02-03T04:05:06Z"}}"#
+            ),
+            Some(1_706_933_106)
+        );
+        assert_eq!(
+            session_record_timestamp(AgentKind::ClaudeCode, r#"{"timestamp":1706933106000.0}"#),
+            Some(1_706_933_106)
+        );
+        assert_eq!(
+            session_record_timestamp(AgentKind::Pi, r#"{"timestamp":"1706933106000000"}"#),
+            Some(1_706_933_106)
+        );
+        assert_eq!(
+            session_record_timestamp(AgentKind::OpenCode, r#"{"time":30}"#),
+            None
+        );
+        assert_eq!(
+            session_record_timestamp(AgentKind::Hermes, r#"{"timestamp":0}"#),
+            None
+        );
+        assert_eq!(
+            session_record_timestamp(
+                AgentKind::Codex,
+                r#"{"timestamp":"2024-01-01T00:00:00Z","payload":{"created_at":"2024-02-01T00:00:00Z"}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            session_record_timestamp(
+                AgentKind::Codex,
+                r#"{"tool":{"arguments":{"created_at":"2024-02-03T04:05:06Z"}}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn session_usage_is_partitioned_by_event_month_before_persistence() {
+        let home = temp_directory("usage-event-months");
+        let skill = home.join(".codex/skills/example");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: example\n---\n").unwrap();
+        fs::write(
+            sessions.join("session.jsonl"),
+            [
+                r#"{"timestamp":"2024-01-15T00:00:00Z","invoked_skill":"example"}"#,
+                r#"{"timestamp":"2024-02-15T00:00:00Z","invoked_skill":"example"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let observed = result
+            .usage
+            .iter()
+            .filter(|usage| usage.stage == UsageStage::Applied)
+            .map(|usage| (usage.month_start_unix, usage.event_count))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed,
+            BTreeSet::from([(Some(1_704_067_200), 1), (Some(1_706_745_600), 1)])
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn large_current_session_tail_contributes_observed_usage() {
         let home = temp_directory("large-current-session");
         let skill = home.join(".codex/skills/research");
@@ -3109,6 +3298,7 @@ enabled = true
             event_count: 1,
             first_seen_unix: None,
             last_seen_unix: None,
+            month_start_unix: None,
             source_path_digest: "sha256:fixture".into(),
         });
         assert!(agents_with_usage(&result).is_empty());
@@ -3121,6 +3311,7 @@ enabled = true
             event_count: 1,
             first_seen_unix: None,
             last_seen_unix: None,
+            month_start_unix: None,
             source_path_digest: "sha256:fixture".into(),
         });
         assert_eq!(

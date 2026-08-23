@@ -824,15 +824,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let evidence = scan
         .usage
         .iter()
-        .map(|usage| {
-            format!(
-                "usage:{}:{}:{:?}:{}",
-                usage.agent.id(),
-                usage.skill_id,
-                usage.stage,
-                usage.source_path_digest
-            )
-        })
+        .map(crate::scan::UsageEvidence::evidence_reference)
         .chain(
             scan.coverage
                 .iter()
@@ -2148,6 +2140,7 @@ mod tests {
                 event_count,
                 first_seen_unix: Some(1),
                 last_seen_unix,
+                month_start_unix: None,
                 source_path_digest: format!("source-{event_count}"),
             });
         }
@@ -2162,6 +2155,7 @@ mod tests {
             event_count: 7,
             first_seen_unix: Some(2),
             last_seen_unix: Some(30),
+            month_start_unix: None,
             source_path_digest: "source-distinct".into(),
         });
 
@@ -2754,6 +2748,7 @@ mod tests {
             event_count: 1,
             first_seen_unix: Some(1),
             last_seen_unix: Some(1),
+            month_start_unix: None,
             source_path_digest: "fixture".into(),
         });
 

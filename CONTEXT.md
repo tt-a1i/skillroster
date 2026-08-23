@@ -54,6 +54,13 @@ _Avoid_: Imported Skill, owned Skill
 A traceable fact supporting a Finding, such as a path, source declaration, symlink target, exposure record, or local usage event.
 _Avoid_: Proof, confidence
 
+**Usage Observation**:
+A privacy-preserving bounded observation for one Skill, Agent, usage stage,
+quality, and session-source path. Unchanged observations deduplicate across
+Scans; lifecycle retention keeps the maximum observation per source and month.
+It does not infer additive events and never stores raw conversation text.
+_Avoid_: Scan hit, invocation log
+
 **Finding**:
 An evidence-backed condition discovered during analysis. A Finding describes a condition; it does not authorize a change.
 _Avoid_: Error, recommendation

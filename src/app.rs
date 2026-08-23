@@ -672,11 +672,22 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
 fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path) -> Result<Value> {
     let source_confirmation_details = read_source_confirmation_details(state_dir)?;
     let export = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": Utc::now().timestamp(),
         "retention": {
             "raw_usage_days": 180,
             "older_usage": "monthly_aggregates_retained",
+        },
+        "usage_history": {
+            "stable_identity_fields": [
+                "skill_id", "agent_id", "stage", "quality", "source_path_digest",
+                "observed_event_count", "occurred_at"
+            ],
+            "raw_value_field": "observed_event_count",
+            "monthly_value_field": "max_observed_event_count",
+            "aggregation": "maximum observation per source and month",
+            "observations_additive": false,
+            "legacy_monthly_combinable": false,
         },
         "data": store.export_lifecycle()?,
         "evidence_exclusions": store.evidence_exclusions()?,
@@ -5196,13 +5207,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             continue;
         };
         let agent_id = agent_ids[&usage.agent].clone();
-        let reference = format!(
-            "usage:{}:{}:{:?}:{}",
-            usage.agent.id(),
-            usage.skill_id,
-            usage.stage,
-            usage.source_path_digest
-        );
+        let reference = usage.evidence_reference();
         let evidence_id = save_reference_evidence(
             store,
             scan_id,
@@ -5222,6 +5227,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "event_count": usage.event_count,
                 "first_seen_unix": usage.first_seen_unix,
                 "last_seen_unix": usage.last_seen_unix,
+                "month_start_unix": usage.month_start_unix,
                 "source_path_digest": usage.source_path_digest,
             }),
             observed_at,
@@ -5232,7 +5238,11 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             agent_id,
             stage: usage_stage(usage.stage),
             quality: evidence_quality(usage.quality),
-            occurred_at: usage.last_seen_unix.unwrap_or_default() as i64,
+            source_path_digest: usage.source_path_digest.clone(),
+            observed_event_count: usage.event_count,
+            occurred_at: usage
+                .last_seen_unix
+                .and_then(|value| i64::try_from(value).ok()),
             outcome: None,
         })?;
     }

@@ -173,6 +173,16 @@ Healthy `status` output with a completed Snapshot does not prescribe another
 Scan; it exposes `latest_snapshot_at` so the Agent can judge freshness from the
 user's task and current context.
 
+Lifecycle exports name their usage aggregation contract in `usage_history`.
+This source-observation contract is lifecycle export schema version 2.
+`data.usage_events[].observed_event_count` is a bounded source observation,
+not an additive event delta. Retention stores the maximum observation per
+source and month in `data.usage_monthly_sources`; those maxima are not
+cumulative across sources or months. Pre-v9 Scan aggregates remain separately
+labeled in `data.usage_monthly_legacy` and must not be combined with the new
+source observations. Snapshot-scoped Usage Evidence is traceability context,
+not an additive history stream.
+
 The Agent decides wording and information order from these fields. The CLI must not send ANSI, Markdown, localized prose, TUI frames, or an opaque “health score” through JSON. The first complete release does not include a human TUI.
 
 ## 10. Acceptance scenarios

@@ -10,7 +10,7 @@ use crate::model::{
     RosterEntry, ScanId, ScanRun, SkillId, SkillRecord, UsageEvent,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LifecycleCounts {
@@ -210,6 +210,13 @@ impl StateStore {
         if current == 7 {
             let transaction = self.connection.transaction()?;
             migration_v8(&transaction)?;
+            transaction.pragma_update(None, "user_version", 8_i64)?;
+            transaction.commit()?;
+            current = 8;
+        }
+        if current == 8 {
+            let transaction = self.connection.transaction()?;
+            migration_v9(&transaction)?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             transaction.commit()?;
         }
@@ -594,16 +601,34 @@ impl StateStore {
     }
 
     pub fn save_usage_event(&self, event: &UsageEvent) -> StorageResult<()> {
+        let stage = enum_text(&event.stage)?;
+        let quality = enum_text(&event.quality)?;
+        let event_count = i64::try_from(event.observed_event_count).map_err(|_| {
+            StorageError::InvalidData("usage event count exceeds SQLite range".to_owned())
+        })?;
+        let conflict_clause = if event.occurred_at.is_some() {
+            "ON CONFLICT(skill_id, agent_id, stage, quality, source_path_digest,
+                         observed_event_count, occurred_at) DO NOTHING"
+        } else {
+            "ON CONFLICT(skill_id, agent_id, stage, quality, source_path_digest,
+                         observed_event_count) WHERE occurred_at IS NULL DO NOTHING"
+        };
         self.connection.execute(
-            "INSERT INTO usage_events
-                (evidence_id, skill_id, agent_id, stage, quality, occurred_at, outcome)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &format!(
+                "INSERT INTO usage_events
+                (evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
+                 observed_event_count, occurred_at, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 {conflict_clause}"
+            ),
             params![
                 event.evidence_id.as_str(),
                 event.skill_id.as_str(),
                 event.agent_id.as_str(),
-                enum_text(&event.stage)?,
-                enum_text(&event.quality)?,
+                stage,
+                quality,
+                event.source_path_digest,
+                event_count,
                 event.occurred_at,
                 event.outcome,
             ],
@@ -1342,7 +1367,8 @@ impl StateStore {
         Ok(LifecycleCounts {
             evidence_rows: table_count(&self.connection, "evidence")?,
             raw_usage_rows: table_count(&self.connection, "usage_events")?,
-            monthly_usage_rows: table_count(&self.connection, "usage_monthly")?,
+            monthly_usage_rows: table_count(&self.connection, "usage_monthly")?
+                + table_count(&self.connection, "usage_monthly_sources")?,
             oldest_raw_usage_at: self.connection.query_row(
                 "SELECT MIN(occurred_at) FROM usage_events",
                 [],
@@ -1393,48 +1419,70 @@ impl StateStore {
             &self.connection,
             "SELECT json_object(
                 'evidence_id', evidence_id, 'skill_id', skill_id, 'agent_id', agent_id,
-                'stage', stage, 'quality', quality, 'occurred_at', occurred_at,
-                'outcome', outcome)
+                'stage', stage, 'quality', quality, 'source_path_digest', source_path_digest,
+                'observed_event_count', observed_event_count,
+                'occurred_at', occurred_at, 'outcome', outcome)
              FROM usage_events ORDER BY occurred_at, evidence_id",
         )?;
-        let monthly = query_json_rows(
+        let monthly_sources = query_json_rows(
+            &self.connection,
+            "SELECT json_object(
+                'month_start', month_start, 'skill_id', skill_id, 'agent_id', agent_id,
+                'stage', stage, 'quality', quality,
+                'source_path_digest', source_path_digest,
+                'max_observed_event_count', max_observed_event_count,
+                'first_seen_at', first_seen_at, 'last_seen_at', last_seen_at)
+             FROM usage_monthly_sources
+             ORDER BY month_start, skill_id, agent_id, stage, quality, source_path_digest",
+        )?;
+        let monthly_legacy = query_json_rows(
             &self.connection,
             "SELECT json_object(
                 'month_start', month_start, 'skill_id', skill_id, 'agent_id', agent_id,
                 'stage', stage, 'quality', quality, 'event_count', event_count,
-                'first_seen_at', first_seen_at, 'last_seen_at', last_seen_at)
+                'first_seen_at', first_seen_at, 'last_seen_at', last_seen_at,
+                'derivation', derivation)
              FROM usage_monthly ORDER BY month_start, skill_id, agent_id, stage, quality",
         )?;
         Ok(serde_json::json!({
             "evidence": evidence,
             "usage_events": usage,
-            "usage_monthly": monthly,
+            "usage_monthly_sources": monthly_sources,
+            "usage_monthly_legacy": monthly_legacy,
         }))
     }
 
     pub fn purge_usage_before(&self, cutoff: i64) -> StorageResult<PurgeCounts> {
         let transaction = self.connection.unchecked_transaction()?;
         let aggregated_raw_usage_rows: u64 = transaction.query_row(
-            "SELECT COUNT(*) FROM usage_events WHERE occurred_at < ?1",
+            "SELECT COUNT(*)
+             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             WHERE COALESCE(u.occurred_at, e.observed_at) < ?1",
             [cutoff],
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO usage_monthly
-                (month_start, skill_id, agent_id, stage, quality, event_count,
-                 first_seen_at, last_seen_at)
-             SELECT CAST(strftime('%s', strftime('%Y-%m-01', u.occurred_at, 'unixepoch')) AS INTEGER),
-                    u.skill_id, u.agent_id, u.stage, u.quality,
-                    SUM(COALESCE(json_extract(e.details_json, '$.event_count'), 1)),
-                    MIN(u.occurred_at), MAX(u.occurred_at)
-             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
-             WHERE u.occurred_at < ?1
-             GROUP BY strftime('%Y-%m', u.occurred_at, 'unixepoch'),
-                      u.skill_id, u.agent_id, u.stage, u.quality
-             ON CONFLICT(month_start, skill_id, agent_id, stage, quality) DO UPDATE SET
-                event_count = usage_monthly.event_count + excluded.event_count,
-                first_seen_at = MIN(usage_monthly.first_seen_at, excluded.first_seen_at),
-                last_seen_at = MAX(usage_monthly.last_seen_at, excluded.last_seen_at)",
+            "INSERT INTO usage_monthly_sources
+                (month_start, skill_id, agent_id, stage, quality, source_path_digest,
+                 max_observed_event_count, first_seen_at, last_seen_at)
+             SELECT CAST(strftime('%s', strftime('%Y-%m-01', u.retention_at, 'unixepoch')) AS INTEGER),
+                    u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest,
+                    MAX(u.observed_event_count), MIN(u.retention_at), MAX(u.retention_at)
+             FROM (
+                SELECT u.*,
+                       COALESCE(u.occurred_at, e.observed_at) AS retention_at
+                FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             ) u
+             WHERE u.retention_at < ?1
+             GROUP BY strftime('%Y-%m', u.retention_at, 'unixepoch'),
+                      u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest
+             ON CONFLICT(month_start, skill_id, agent_id, stage, quality, source_path_digest)
+             DO UPDATE SET
+                max_observed_event_count = MAX(
+                    usage_monthly_sources.max_observed_event_count,
+                    excluded.max_observed_event_count),
+                first_seen_at = MIN(usage_monthly_sources.first_seen_at, excluded.first_seen_at),
+                last_seen_at = MAX(usage_monthly_sources.last_seen_at, excluded.last_seen_at)",
             [cutoff],
         )?;
         transaction.execute_batch(
@@ -1444,7 +1492,13 @@ impl StateStore {
         )?;
         transaction.execute(
             "INSERT INTO purge_usage_evidence (evidence_id)
-             SELECT evidence_id FROM usage_events WHERE occurred_at < ?1",
+             SELECT u.evidence_id
+             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+             WHERE COALESCE(u.occurred_at, e.observed_at) < ?1
+             UNION
+             SELECT id FROM evidence
+             WHERE kind = 'usage'
+               AND COALESCE(json_extract(details_json, '$.last_seen_unix'), observed_at) < ?1",
             [cutoff],
         )?;
         transaction.execute(
@@ -1452,9 +1506,11 @@ impl StateStore {
              WHERE evidence_id IN (SELECT evidence_id FROM purge_usage_evidence)",
             [],
         )?;
-        let deleted_raw_usage_rows = transaction
-            .execute("DELETE FROM usage_events WHERE occurred_at < ?1", [cutoff])?
-            as u64;
+        let deleted_raw_usage_rows = transaction.execute(
+            "DELETE FROM usage_events
+                 WHERE evidence_id IN (SELECT evidence_id FROM purge_usage_evidence)",
+            [],
+        )? as u64;
         let deleted_evidence_rows = transaction.execute(
             "DELETE FROM evidence
              WHERE id IN (SELECT evidence_id FROM purge_usage_evidence)",
@@ -1465,7 +1521,8 @@ impl StateStore {
         let deleted_payload_usage_summaries: u64 = transaction.query_row(
             "SELECT COALESCE(SUM((
                 SELECT COUNT(*) FROM json_each(p.payload_json, '$.usage') AS usage
-                WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) < ?1
+                WHERE COALESCE(
+                    json_extract(usage.value, '$.last_seen_unix'), p.updated_at) < ?1
              )), 0) FROM scan_payloads p",
             [cutoff],
             |row| row.get(0),
@@ -1478,13 +1535,17 @@ impl StateStore {
                     COALESCE((
                         SELECT json_group_array(json(usage.value))
                         FROM json_each(scan_payloads.payload_json, '$.usage') AS usage
-                        WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) >= ?1
+                        WHERE COALESCE(
+                            json_extract(usage.value, '$.last_seen_unix'),
+                            scan_payloads.updated_at) >= ?1
                     ), json('[]'))
                  ),
                  updated_at = CAST(strftime('%s', 'now') AS INTEGER) + 1
              WHERE EXISTS (
                 SELECT 1 FROM json_each(scan_payloads.payload_json, '$.usage') AS usage
-                WHERE COALESCE(json_extract(usage.value, '$.last_seen_unix'), 0) < ?1
+                WHERE COALESCE(
+                    json_extract(usage.value, '$.last_seen_unix'),
+                    scan_payloads.updated_at) < ?1
              )",
             [cutoff],
         )?;
@@ -1780,6 +1841,68 @@ fn migration_v8(transaction: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn migration_v9(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE usage_monthly ADD COLUMN derivation TEXT NOT NULL
+            DEFAULT 'legacy_scan_aggregate';
+         DROP INDEX usage_events_skill_time;
+         ALTER TABLE usage_events RENAME TO usage_events_v8;
+         CREATE TABLE usage_events (
+            evidence_id TEXT PRIMARY KEY REFERENCES evidence(id),
+            skill_id TEXT NOT NULL REFERENCES skills(id),
+            agent_id TEXT NOT NULL REFERENCES agents(id),
+            stage TEXT NOT NULL,
+            quality TEXT NOT NULL,
+            source_path_digest TEXT NOT NULL,
+            observed_event_count INTEGER NOT NULL,
+            occurred_at INTEGER,
+            outcome TEXT,
+            UNIQUE(skill_id, agent_id, stage, quality, source_path_digest,
+                   observed_event_count, occurred_at)
+         );
+         CREATE UNIQUE INDEX usage_events_unknown_identity
+            ON usage_events(skill_id, agent_id, stage, quality, source_path_digest,
+                            observed_event_count)
+            WHERE occurred_at IS NULL;
+         INSERT INTO usage_events
+            (evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
+             observed_event_count, occurred_at, outcome)
+         SELECT evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
+                observed_event_count, occurred_at, outcome
+         FROM (
+            SELECT u.evidence_id, u.skill_id, u.agent_id, u.stage, u.quality,
+                   COALESCE(json_extract(e.details_json, '$.source_path_digest'), e.digest, '')
+                       AS source_path_digest,
+                   COALESCE(json_extract(e.details_json, '$.event_count'), 1)
+                       AS observed_event_count,
+                   u.occurred_at, u.outcome,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY u.skill_id, u.agent_id, u.stage, u.quality,
+                           COALESCE(json_extract(e.details_json, '$.source_path_digest'), e.digest, ''),
+                           COALESCE(json_extract(e.details_json, '$.event_count'), 1),
+                           u.occurred_at
+                       ORDER BY u.evidence_id DESC
+                   ) AS rank
+            FROM usage_events_v8 u JOIN evidence e ON e.id = u.evidence_id
+         ) WHERE rank = 1;
+         DROP TABLE usage_events_v8;
+         CREATE INDEX usage_events_skill_time ON usage_events(skill_id, occurred_at);
+         CREATE TABLE usage_monthly_sources (
+            month_start INTEGER NOT NULL,
+            skill_id TEXT NOT NULL REFERENCES skills(id),
+            agent_id TEXT NOT NULL REFERENCES agents(id),
+            stage TEXT NOT NULL,
+            quality TEXT NOT NULL,
+            source_path_digest TEXT NOT NULL,
+            max_observed_event_count INTEGER NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            PRIMARY KEY(month_start, skill_id, agent_id, stage, quality, source_path_digest)
+         );",
+    )?;
+    Ok(())
+}
+
 fn table_count(connection: &Connection, table: &str) -> StorageResult<u64> {
     let query = format!("SELECT COUNT(*) FROM {table}");
     Ok(connection.query_row(&query, [], |row| row.get(0))?)
@@ -2004,7 +2127,7 @@ mod tests {
 
     #[test]
     fn migration_upgrades_prior_states_sequentially() {
-        for starting_version in [1_i64, 2, 3, 4, 5] {
+        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8] {
             let mut connection = Connection::open_in_memory().unwrap();
             let transaction = connection.transaction().unwrap();
             migration_v1(&transaction).unwrap();
@@ -2020,6 +2143,15 @@ mod tests {
             if starting_version >= 5 {
                 migration_v5(&transaction).unwrap();
             }
+            if starting_version >= 6 {
+                migration_v6(&transaction).unwrap();
+            }
+            if starting_version >= 7 {
+                migration_v7(&transaction).unwrap();
+            }
+            if starting_version >= 8 {
+                migration_v8(&transaction).unwrap();
+            }
             transaction
                 .pragma_update(None, "user_version", starting_version)
                 .unwrap();
@@ -2029,6 +2161,115 @@ mod tests {
             assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
             assert_eq!(store.lifecycle_counts().unwrap().monthly_usage_rows, 0);
         }
+    }
+
+    #[test]
+    fn migration_preserves_distinct_v8_observations_without_combining_legacy_totals() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        migration_v1(&transaction).unwrap();
+        migration_v2(&transaction).unwrap();
+        migration_v3(&transaction).unwrap();
+        migration_v4(&transaction).unwrap();
+        migration_v5(&transaction).unwrap();
+        migration_v6(&transaction).unwrap();
+        migration_v7(&transaction).unwrap();
+        migration_v8(&transaction).unwrap();
+        transaction
+            .execute(
+                "INSERT INTO scans VALUES ('scan_v8', 1, 2, 'completed', '[]')",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO agents VALUES ('agent_v8', 'codex', 'Codex')",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO skills
+                    (id, identity_key, name, content_digest, digest_version, governance_state)
+                 VALUES ('skill_v8', 'content:v8', 'v8', 'sha256:v8', 1, 'observed')",
+                [],
+            )
+            .unwrap();
+        for (evidence_id, event_count, observed_at) in
+            [("evidence_v8_a", 1_i64, 10_i64), ("evidence_v8_b", 2, 20)]
+        {
+            transaction
+                .execute(
+                    "INSERT INTO evidence
+                        (id, scan_id, kind, quality, subject_type, subject_id, digest,
+                         details_json, observed_at)
+                     VALUES (?1, 'scan_v8', 'usage', 'observed', 'skill', 'skill_v8',
+                             'sha256:source', ?2, ?3)",
+                    params![
+                        evidence_id,
+                        serde_json::json!({
+                            "source_path_digest": "sha256:source",
+                            "event_count": event_count,
+                            "first_seen_unix": 10,
+                            "last_seen_unix": observed_at,
+                        })
+                        .to_string(),
+                        observed_at,
+                    ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO usage_events
+                        (evidence_id, skill_id, agent_id, stage, quality, occurred_at)
+                     VALUES (?1, 'skill_v8', 'agent_v8', 'loaded', 'observed', ?2)",
+                    params![evidence_id, observed_at],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO usage_monthly
+                    (month_start, skill_id, agent_id, stage, quality, event_count,
+                     first_seen_at, last_seen_at)
+                 VALUES (1000, 'skill_v8', 'agent_v8', 'loaded', 'observed', 7, 1, 2)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .pragma_update(None, "user_version", 8_i64)
+            .unwrap();
+        transaction.commit().unwrap();
+
+        let store = StateStore::initialize(connection).unwrap();
+        let export = store.export_lifecycle().unwrap();
+        assert_eq!(export["usage_events"].as_array().unwrap().len(), 2);
+        assert_eq!(export["usage_events"][0]["observed_event_count"], 1);
+        assert_eq!(export["usage_events"][1]["observed_event_count"], 2);
+        assert_eq!(
+            export["usage_monthly_legacy"][0]["derivation"],
+            "legacy_scan_aggregate"
+        );
+        assert_eq!(
+            store
+                .purge_usage_before(100)
+                .unwrap()
+                .aggregated_raw_usage_rows,
+            2
+        );
+        let retained = store.export_lifecycle().unwrap();
+        assert_eq!(
+            retained["usage_monthly_sources"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            retained["usage_monthly_sources"][0]["max_observed_event_count"],
+            2
+        );
+        assert_eq!(retained["usage_monthly_legacy"][0]["event_count"], 7);
     }
 
     #[test]
@@ -2442,11 +2683,13 @@ mod tests {
         store
             .save_usage_event(&UsageEvent {
                 evidence_id: evidence.id,
-                skill_id,
-                agent_id,
+                skill_id: skill_id.clone(),
+                agent_id: agent_id.clone(),
                 stage: UsageStage::Loaded,
                 quality: EvidenceQuality::Observed,
-                occurred_at: 10,
+                source_path_digest: "sha256:retention-source".to_owned(),
+                observed_event_count: 3,
+                occurred_at: Some(10),
                 outcome: None,
             })
             .unwrap();
@@ -2460,10 +2703,214 @@ mod tests {
         assert_eq!(counts.raw_usage_rows, 0);
         assert_eq!(counts.monthly_usage_rows, 1);
         let export = store.export_lifecycle().unwrap();
-        assert_eq!(export["usage_monthly"][0]["event_count"], 3);
+        assert_eq!(
+            export["usage_monthly_sources"][0]["max_observed_event_count"],
+            3
+        );
+
+        let repeated_evidence = EvidenceRecord {
+            id: EvidenceId::new(),
+            scan_id: scan.id.clone(),
+            kind: EvidenceKind::Usage,
+            quality: EvidenceQuality::Observed,
+            subject_type: "skill".to_owned(),
+            subject_id: skill_id.to_string(),
+            path: None,
+            digest: None,
+            details: serde_json::json!({"event_count": 3}),
+            observed_at: 20,
+        };
+        store.save_evidence(&repeated_evidence).unwrap();
+        store
+            .save_usage_event(&UsageEvent {
+                evidence_id: repeated_evidence.id,
+                skill_id,
+                agent_id,
+                stage: UsageStage::Loaded,
+                quality: EvidenceQuality::Observed,
+                source_path_digest: "sha256:retention-source".to_owned(),
+                observed_event_count: 3,
+                occurred_at: Some(20),
+                outcome: None,
+            })
+            .unwrap();
+        store.purge_usage_before(100).unwrap();
+        let repeated_export = store.export_lifecycle().unwrap();
+        assert_eq!(
+            repeated_export["usage_monthly_sources"][0]["max_observed_event_count"],
+            3
+        );
+
         let (_, payload): (ScanId, serde_json::Value) =
             store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"], serde_json::json!([]));
         assert_eq!(payload["coverage"][0]["denominator_reliable"], false);
+    }
+
+    #[test]
+    fn unknown_event_time_uses_observation_time_only_for_retention() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        store
+            .save_scan_payload(
+                &scan.id,
+                &serde_json::json!({
+                    "usage": [{
+                        "agent": "codex",
+                        "skill_id": "skill_fixture",
+                        "stage": "loaded",
+                        "quality": "observed",
+                        "event_count": 1,
+                        "first_seen_unix": null,
+                        "last_seen_unix": null,
+                        "source_path_digest": "private"
+                    }]
+                }),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE scan_payloads SET updated_at = 200", [])
+            .unwrap();
+        let agent_id = store
+            .save_agent(&AgentRecord {
+                id: AgentId::new(),
+                kind: AgentKind::Codex,
+                display_name: "Codex".to_owned(),
+            })
+            .unwrap();
+        let skill_id = store
+            .save_skill(&SkillRecord {
+                id: SkillId::new(),
+                identity_key: "content:unknown-time".to_owned(),
+                name: "unknown-time".to_owned(),
+                description: None,
+                declared_source: None,
+                declared_revision: None,
+                content_digest: "sha256:unknown-time".to_owned(),
+                digest_version: 1,
+                governance_state: GovernanceState::Observed,
+                canonical_path: None,
+            })
+            .unwrap();
+        let evidence = EvidenceRecord {
+            id: EvidenceId::new(),
+            scan_id: scan.id.clone(),
+            kind: EvidenceKind::Usage,
+            quality: EvidenceQuality::Observed,
+            subject_type: "skill".to_owned(),
+            subject_id: skill_id.to_string(),
+            path: None,
+            digest: None,
+            details: serde_json::json!({
+                "event_count": 1,
+                "first_seen_unix": null,
+                "last_seen_unix": null
+            }),
+            observed_at: 200,
+        };
+        store.save_evidence(&evidence).unwrap();
+        store
+            .save_usage_event(&UsageEvent {
+                evidence_id: evidence.id.clone(),
+                skill_id: skill_id.clone(),
+                agent_id: agent_id.clone(),
+                stage: UsageStage::Loaded,
+                quality: EvidenceQuality::Observed,
+                source_path_digest: "sha256:unknown-time-source".to_owned(),
+                observed_event_count: 1,
+                occurred_at: None,
+                outcome: None,
+            })
+            .unwrap();
+        assert!(
+            store
+                .save_usage_event(&UsageEvent {
+                    evidence_id: evidence.id,
+                    skill_id: skill_id.clone(),
+                    agent_id: agent_id.clone(),
+                    stage: UsageStage::Loaded,
+                    quality: EvidenceQuality::Observed,
+                    source_path_digest: "sha256:different-identity".to_owned(),
+                    observed_event_count: 2,
+                    occurred_at: None,
+                    outcome: None,
+                })
+                .is_err(),
+            "a primary-key collision with a different observation identity must fail closed"
+        );
+
+        assert_eq!(store.lifecycle_counts().unwrap().oldest_raw_usage_at, None);
+        assert_eq!(
+            store.export_lifecycle().unwrap()["usage_events"][0]["occurred_at"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            store
+                .purge_usage_before(100)
+                .unwrap()
+                .deleted_raw_usage_rows,
+            0
+        );
+        assert_eq!(store.lifecycle_counts().unwrap().raw_usage_rows, 1);
+
+        let epoch_evidence = EvidenceRecord {
+            id: EvidenceId::new(),
+            scan_id: scan.id,
+            kind: EvidenceKind::Usage,
+            quality: EvidenceQuality::Observed,
+            subject_type: "skill".to_owned(),
+            subject_id: skill_id.to_string(),
+            path: None,
+            digest: None,
+            details: serde_json::json!({"event_count": 1, "last_seen_unix": 0}),
+            observed_at: 200,
+        };
+        store.save_evidence(&epoch_evidence).unwrap();
+        store
+            .save_usage_event(&UsageEvent {
+                evidence_id: epoch_evidence.id,
+                skill_id,
+                agent_id,
+                stage: UsageStage::Loaded,
+                quality: EvidenceQuality::Observed,
+                source_path_digest: "sha256:epoch-time-source".to_owned(),
+                observed_event_count: 1,
+                occurred_at: Some(0),
+                outcome: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.lifecycle_counts().unwrap().oldest_raw_usage_at,
+            Some(0)
+        );
+        assert!(
+            store.export_lifecycle().unwrap()["usage_events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["occurred_at"] == 0)
+        );
+        let epoch_purge = store.purge_usage_before(100).unwrap();
+        assert_eq!(epoch_purge.deleted_raw_usage_rows, 1);
+        assert_eq!(store.lifecycle_counts().unwrap().raw_usage_rows, 1);
+
+        let purged = store.purge_usage_before(300).unwrap();
+        assert_eq!(purged.aggregated_raw_usage_rows, 1);
+        assert_eq!(purged.deleted_raw_usage_rows, 1);
+        assert_eq!(purged.deleted_evidence_rows, 1);
+        let export = store.export_lifecycle().unwrap();
+        let unknown_month = export["usage_monthly_sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["source_path_digest"] == "sha256:unknown-time-source")
+            .unwrap();
+        assert_eq!(unknown_month["first_seen_at"], 200);
+        assert_eq!(unknown_month["last_seen_at"], 200);
+        let (_, payload): (ScanId, serde_json::Value) =
+            store.latest_scan_payload().unwrap().unwrap();
+        assert_eq!(payload["usage"], serde_json::json!([]));
     }
 }
