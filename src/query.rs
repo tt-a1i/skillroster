@@ -8,6 +8,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub const SAME_NAME_DIVERGENT_FINDING_KIND: &str = "same_name_divergent_content";
+pub const SAME_NAME_DIVERGENT_FINDING_TITLE: &str = "Same-name Skills have different content";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCategory {
@@ -470,7 +473,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 findings,
                 FindingCategory::Layout,
                 Severity::Medium,
-                "Same-name Skills have different content",
+                SAME_NAME_DIVERGENT_FINDING_TITLE,
                 format!(
                     "{name} resolves to {} distinct content digests.",
                     digests.len()

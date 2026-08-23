@@ -1654,6 +1654,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
         .map(|(finding, stored)| {
             json!({
                 "id": stored.id,
+                "kind": stored.details["kind"],
                 "category": finding.category,
                 "severity": finding.severity,
                 "title": finding.title,
@@ -1762,8 +1763,8 @@ fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
 }
 
 fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &ScanResult) {
-    if object.get("title").and_then(Value::as_str)
-        != Some("Same-name Skills have different content")
+    if object.get("kind").and_then(Value::as_str)
+        != Some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
     {
         return;
     }
@@ -2327,6 +2328,7 @@ fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
 fn compact_finding_summary(finding: &Value) -> Value {
     json!({
         "id": finding["id"],
+        "kind": finding["kind"],
         "category": finding["category"],
         "severity": finding["severity"],
         "title": finding["title"],
@@ -2519,12 +2521,16 @@ fn finding_json(
     evidence_ids: &[EvidenceId],
     scan: &ScanResult,
 ) -> Value {
+    let category = finding_category(finding.category);
+    let kind =
+        crate::roster_recommendation::finding_kind(&category, &finding.title).or_else(|| {
+            (finding.category == crate::query::FindingCategory::Layout
+                && finding.title == crate::query::SAME_NAME_DIVERGENT_FINDING_TITLE)
+                .then_some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
+        });
     let mut value = json!({
         "id": id,
-        "kind": crate::roster_recommendation::finding_kind(
-            &finding_category(finding.category),
-            &finding.title
-        ),
+        "kind": kind,
         "category": finding.category,
         "severity": finding.severity,
         "title": finding.title,
@@ -2645,7 +2651,6 @@ fn find_command(
     };
     let mut warnings = Vec::new();
     let mut rescan_required = false;
-    let mut drifted_variant_skill_ids = BTreeSet::new();
     for found in &mut matches {
         let mut drifted_variants = 0_usize;
         if found.variants.is_empty() {
@@ -2653,9 +2658,6 @@ fn find_command(
             found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
             let current = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
             found.paths = current.paths;
-            if current.drifted {
-                drifted_variant_skill_ids.insert(found.skill_id.clone());
-            }
             drifted_variants += usize::from(current.drifted);
         } else {
             for variant in &mut found.variants {
@@ -2664,9 +2666,6 @@ fn find_command(
                     current_roster_state(&store.roster_states_for_skill(&skill_id)?);
                 let current = current_readable_skill_paths(&scan, state_dir, &variant.skill_id)?;
                 variant.paths = current.paths;
-                if current.drifted {
-                    drifted_variant_skill_ids.insert(variant.skill_id.clone());
-                }
                 drifted_variants += usize::from(current.drifted);
             }
             if let Some(representative) = found
@@ -2694,14 +2693,15 @@ fn find_command(
             });
         }
     }
-    let actions = bind_variant_findings(
+    let (actions, variant_rescan_required) = bind_variant_findings(
         store,
+        state_dir,
         &scan_id,
         &scan,
         &routable_ids,
-        &drifted_variant_skill_ids,
         &mut matches,
     )?;
+    rescan_required |= variant_rescan_required;
     for found in matches
         .iter()
         .take(3)
@@ -2765,17 +2765,18 @@ fn find_command(
 
 fn bind_variant_findings(
     store: &StateStore,
+    state_dir: &Path,
     scan_id: &ScanId,
     scan: &ScanResult,
     routable_ids: &BTreeSet<String>,
-    drifted_variant_skill_ids: &BTreeSet<String>,
     matches: &mut [crate::query::FindMatch],
-) -> Result<Vec<SuggestedAction>> {
+) -> Result<(Vec<SuggestedAction>, bool)> {
     let report = store
         .latest_report()?
         .filter(|report| report.scan_id == *scan_id);
     let mut actions = Vec::new();
     let mut action_argvs = BTreeSet::new();
+    let mut rescan_required = false;
 
     for (index, found) in matches
         .iter_mut()
@@ -2790,7 +2791,12 @@ fn bind_variant_findings(
             .filter(|skill| routable_ids.contains(&skill.id))
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
-        let (reference, suggested) = if !variant_ids.is_disjoint(drifted_variant_skill_ids) {
+        let mut variant_drifted = false;
+        for skill_id in &variant_ids {
+            variant_drifted |= current_readable_skill_paths(scan, state_dir, skill_id)?.drifted;
+        }
+        rescan_required |= variant_drifted;
+        let (reference, suggested) = if variant_drifted {
             let suggested = action(
                 "refresh_drifted_snapshot",
                 &["scan", "--json"],
@@ -2879,7 +2885,7 @@ fn bind_variant_findings(
             actions.push(suggested);
         }
     }
-    Ok(actions)
+    Ok((actions, rescan_required))
 }
 
 fn matching_variant_finding_id(
@@ -2892,9 +2898,7 @@ fn matching_variant_finding_id(
         .into_iter()
         .flatten()
         .find_map(|finding| {
-            if finding["category"] != "layout"
-                || finding["title"] != "Same-name Skills have different content"
-            {
+            if finding["kind"] != crate::query::SAME_NAME_DIVERGENT_FINDING_KIND {
                 return None;
             }
             let affected = finding["affected_skill_ids"]
@@ -2923,7 +2927,7 @@ fn matching_variant_finding_id(
         .collect::<BTreeSet<_>>();
     Ok((stored.report_id == report.id
         && stored.category == FindingCategory::Layout
-        && stored.title == "Same-name Skills have different content"
+        && stored.details["kind"] == crate::query::SAME_NAME_DIVERGENT_FINDING_KIND
         && stored_variant_ids == *variant_ids)
         .then(|| id.to_string()))
 }

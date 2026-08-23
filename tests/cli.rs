@@ -797,8 +797,16 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         false
     );
 
-    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
-    let finding = report["result"]["findings"]
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let report = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--findings", "--category", "layout"],
+        ]
+        .concat(),
+        None,
+    ));
+    let finding = report["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -912,6 +920,111 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         None,
     ));
     assert_eq!(full["result"]["placements"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for index in 0..11 {
+        let skill = root.join(format!("variant-{index:02}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: shared-many\ndescription: Many variant route\n---\nvariant {index}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot_id = scan["result"]["snapshot_id"].as_str().unwrap();
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "same_name_divergent_content")
+        .unwrap();
+    let found = json_output(&run(
+        &[&common[..], &["find", "many variant route"]].concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["variant_count"], 11);
+    assert_eq!(
+        found["result"]["matches"][0]["variants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let displayed_ids = found["result"]["matches"][0]["variant_skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let finding_detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--finding",
+                finding["id"].as_str().unwrap(),
+                "--full",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let omitted_id = finding_detail["result"]["affected_skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|skill_id| !displayed_ids.contains(skill_id))
+        .unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let omitted_entrypoint = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["skill_id"] == omitted_id)
+        .and_then(|placement| placement["entrypoint"].as_str())
+        .unwrap();
+    fs::write(
+        omitted_entrypoint,
+        "---\nname: shared-many\ndescription: Many variant route\n---\ndrifted\n",
+    )
+    .unwrap();
+
+    let drifted = json_output(&run(
+        &[&common[..], &["find", "many variant route"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    assert!(drifted["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
 }
 
 #[test]
