@@ -1706,6 +1706,8 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     coverage.bytes_observed = bytes_observed;
     coverage.lines_observed = lines_observed;
     coverage.denominator_reliable = coverage.roots_present > 0
+        && coverage.roots_missing == 0
+        && coverage.roots_inaccessible == 0
         && coverage.files_skipped == 0
         && coverage.files_partially_observed == 0
         && !coverage.discovery_truncated;
@@ -2824,6 +2826,29 @@ enabled = true
         assert_eq!(result.coverage[0].files_partially_observed, 1);
         assert!(result.coverage[0].truncated);
         assert!(!result.coverage[0].denominator_reliable);
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn session_denominator_requires_every_known_root_to_be_observable() {
+        let home = temp_directory("mixed-session-roots");
+        let included = home.join("included");
+        let missing = home.join("missing");
+        fs::create_dir_all(&included).unwrap();
+        let mut result = ScanResult::default();
+
+        scan_sessions(AgentKind::Codex, &[included.clone(), missing], &mut result);
+
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|coverage| coverage.agent == AgentKind::Codex)
+            .unwrap();
+        assert_eq!(coverage.roots_present, 1);
+        assert_eq!(coverage.roots_missing, 1);
+        assert_eq!(coverage.roots_inaccessible, 0);
+        assert!(!coverage.denominator_reliable);
 
         fs::remove_dir_all(home).unwrap();
     }

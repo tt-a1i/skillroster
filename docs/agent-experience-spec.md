@@ -74,6 +74,12 @@ stage, quality, event count, and observation window together; the opaque Skill
 ID remains the stable identity, not the user-facing label. Incomplete coverage
 still forbids usage percentages and “unused” conclusions.
 
+Read each Finding's `coverage.basis` before explaining confidence.
+`skill_root_scan` qualifies structural counts using Skill-root states;
+`session_usage` qualifies usage or archive inference using observable-session
+states. Never use missing session history to discount an observed filesystem
+Finding, and never use a complete Skill-root scan to claim complete usage.
+
 Suggested actions are factual continuations, not generic guesses. Offer Plan
 only when the Finding explicitly reports `planning.supported: true`; otherwise
 follow the typed decision or open full detail. A paged Finding action preserves

@@ -1093,6 +1093,105 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
         None,
     ));
     assert!(!detail["result"]["items"].as_array().unwrap().is_empty());
+    assert_eq!(detail["result"]["coverage"]["basis"], "skill_root_scan");
+    assert_eq!(detail["result"]["coverage"]["denominator_reliable"], true);
+    assert!(
+        detail["result"]["coverage"]["missing_root_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let stored_details: String = connection
+        .query_row(
+            "SELECT details_json FROM findings WHERE id = ?1",
+            [finding_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut stored_details: Value = serde_json::from_str(&stored_details).unwrap();
+    stored_details["coverage"] = json!({
+        "denominator_reliable": false,
+        "limited_agents": ["codex", "claude-code"]
+    });
+    connection
+        .execute(
+            "UPDATE findings SET details_json = ?1 WHERE id = ?2",
+            (serde_json::to_string(&stored_details).unwrap(), finding_id),
+        )
+        .unwrap();
+    drop(connection);
+    let migrated_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        migrated_detail["result"]["coverage"]["basis"],
+        "skill_root_scan"
+    );
+    assert_eq!(
+        migrated_detail["result"]["coverage"]["denominator_reliable"],
+        true
+    );
+
+    let usage_findings = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--findings",
+                "--category",
+                "usage",
+                "--limit",
+                "20",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let usage_finding_id = usage_findings["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Usage coverage is incomplete")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let stored_usage_details: String = connection
+        .query_row(
+            "SELECT details_json FROM findings WHERE id = ?1",
+            [usage_finding_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut stored_usage_details: Value = serde_json::from_str(&stored_usage_details).unwrap();
+    stored_usage_details["coverage"] = json!({"denominator_reliable": true});
+    connection
+        .execute(
+            "UPDATE findings SET details_json = ?1 WHERE id = ?2",
+            (
+                serde_json::to_string(&stored_usage_details).unwrap(),
+                usage_finding_id,
+            ),
+        )
+        .unwrap();
+    drop(connection);
+    let usage_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", usage_finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(usage_detail["result"]["coverage"]["basis"], "session_usage");
+    assert_eq!(
+        usage_detail["result"]["coverage"]["denominator_reliable"],
+        false
+    );
+    assert!(
+        !usage_detail["result"]["coverage"]["missing_agents"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     for invalid in [
         vec!["report", "--category", "overlap"],
