@@ -981,6 +981,31 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn ready_plan_with_fingerprint(
+        &self,
+        scan_id: &ScanId,
+        fingerprint: &str,
+    ) -> StorageResult<Option<PlanRecord>> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT immutable_json, status FROM plans
+                 WHERE scan_id = ?1 AND fingerprint = ?2 AND status = 'ready'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![scan_id.as_str(), fingerprint],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        stored
+            .map(|(encoded, status)| {
+                let mut plan: PlanRecord = from_json(&encoded)?;
+                plan.status = enum_from_text(&status)?;
+                Ok(plan)
+            })
+            .transpose()
+    }
+
     pub fn update_plan_status(&self, id: &PlanId, next: PlanStatus) -> StorageResult<()> {
         let current: Option<String> = self
             .connection

@@ -341,7 +341,7 @@ pub fn run(cli: Cli) -> Result<Output> {
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
     matches!(
         command,
-        Some(Command::Apply(_) | Command::Undo(_))
+        Some(Command::Apply(_) | Command::Undo(_) | Command::Setup(_))
             | Some(Command::Lifecycle(crate::cli::LifecycleArgs {
                 command: LifecycleCommand::Purge(_),
             }))
@@ -4234,6 +4234,16 @@ fn prepare_plan(
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
     validate_plan_evidence(store, &prepared, &scan_id)?;
+    if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
+        let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
+        if let Some(existing) =
+            store.ready_plan_with_fingerprint(&prepared_scan_id, &prepared.digest)?
+            && existing.input.get("raw") == Some(&input)
+            && let Some(summary) = existing.input.get("summary")
+        {
+            return Ok(summary.clone());
+        }
+    }
     let roster_before = capture_roster_state(store, &prepared)?;
     let library_before = capture_library_state(store, &prepared)?;
     let roster_after = serde_json::to_value(&prepared.roster_changes)?

@@ -121,7 +121,10 @@ for automatic planning. Unknown content is treated as a local modification and
 requires an explicit retain/adopt choice before any Plan is created. Links,
 non-files, and unreadable targets are blocked. In JSON mode setup never prompts
 or mutates; every write remains a normal Plan completed through Apply and
-recoverable through Undo.
+recoverable through Undo. Repeating an unchanged setup preview on the same
+Snapshot reuses an equivalent Ready Plan instead of accumulating duplicate
+pending Plans. Terminal Plans, newer Snapshots, and changed setup inputs are
+never reused.
 
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or
