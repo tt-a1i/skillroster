@@ -1584,7 +1584,7 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
-            let all_variant_skill_ids = variants_by_name.get(&name.trim().to_lowercase());
+            let all_variant_skill_ids = variants_by_name.get(&normalize_skill_name(&name));
             let variant_count = all_variant_skill_ids.map_or(1, Vec::len);
             let variants_truncated = variant_count > 10;
             let variant_skill_ids = if variant_count > 1 {
@@ -2904,7 +2904,19 @@ mod tests {
                 path: root.clone(),
             });
         options.include_session_evidence = false;
-        let scan = scan(&options).unwrap();
+        let mut scan = scan(&options).unwrap();
+        let diagram_skill_id = scan
+            .skills
+            .iter()
+            .find(|skill| skill.normalized_text.contains("diagrams"))
+            .unwrap()
+            .id
+            .clone();
+        for skill in &mut scan.skills {
+            if skill.id != diagram_skill_id {
+                skill.name = "  TECH-ESSAY-WRITER  ".into();
+            }
+        }
 
         let matches = find(&scan, "diagrams", 10);
 
