@@ -359,7 +359,7 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
         {
             return Err(ChangeError::new(
                 "invalid_setup_operation",
-                "bootstrap setup may only create or replace its package directory and SKILL.md",
+                "bootstrap setup may only create directories and write or replace files in its fixed package",
             ));
         }
         OperationPolicy::SourceUpdate
@@ -406,6 +406,23 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     }
 
     let state_dir = canonical_directory(&ctx.state_dir, "state_dir")?;
+    let bootstrap_roots = if matches!(ctx.operation_policy, OperationPolicy::BootstrapSetup) {
+        let roots = ctx
+            .approved_roots
+            .iter()
+            .filter(|root| {
+                !is_controlled_state_root(root, &ctx.state_dir)
+                    && !is_controlled_state_root(root, &state_dir)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        normalize_roots(&roots, &state_dir)?
+            .into_iter()
+            .filter(|root| !is_controlled_state_root(root, &state_dir))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let roots = normalize_roots(&ctx.approved_roots, &state_dir)?;
     if roots.iter().any(|root| {
         (state_dir.starts_with(root) || root.starts_with(&state_dir))
@@ -424,6 +441,9 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     let mut projected_fingerprints = HashMap::new();
     for raw in input.operations {
         let operation = normalize_operation(raw, &roots, &projected_present)?;
+        if matches!(ctx.operation_policy, OperationPolicy::BootstrapSetup) {
+            validate_bootstrap_operation_target(&operation, &bootstrap_roots)?;
+        }
         let target = operation.target().to_path_buf();
         if !targets.insert(target.clone()) {
             return Err(ChangeError::new(
@@ -866,6 +886,34 @@ fn normalize_operation(
         },
     };
     Ok(normalized)
+}
+
+fn validate_bootstrap_operation_target(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
+    let allowed = roots.iter().any(|root| {
+        let Ok(relative) = operation.target().strip_prefix(root) else {
+            return false;
+        };
+        match operation {
+            Operation::CreateDirectory { .. } => {
+                relative == Path::new("skillroster")
+                    || relative == Path::new("skillroster/references")
+            }
+            Operation::WriteFile { .. } | Operation::ReplaceFile { .. } => {
+                crate::bootstrap::is_managed_target(relative)
+            }
+            _ => false,
+        }
+    });
+    if !allowed {
+        return Err(ChangeError::new(
+            "invalid_setup_target",
+            format!(
+                "bootstrap setup target {} is outside the fixed managed package",
+                operation.target().display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_current_state(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
@@ -1966,6 +2014,97 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "operations_not_declarative");
+    }
+
+    #[test]
+    fn bootstrap_setup_accepts_only_fixed_package_targets() {
+        let (_temp, root, state) = fixture();
+        let library = state.join("library");
+        let plan_backups = state.join("plan-backups");
+        fs::create_dir(&library).unwrap();
+        fs::create_dir(&plan_backups).unwrap();
+        let context = PrepareContext {
+            approved_roots: vec![root.clone(), library.clone(), plan_backups.clone()],
+            state_dir: state,
+            operation_policy: OperationPolicy::BootstrapSetup,
+        };
+        let allowed = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": root.join("skillroster/references/../references/routing.md"),
+                "content": "routing",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+        assert!(prepare(&allowed, &context).is_ok());
+
+        for target in [
+            root.join("skillroster/notes.md"),
+            root.join("other/SKILL.md"),
+            library.join("skillroster/SKILL.md"),
+            plan_backups.join("skillroster/SKILL.md"),
+        ] {
+            let refused = serde_json::json!({
+                "schema_version": 1,
+                "scan_id": "scan_1",
+                "operations": [{
+                    "kind": "write_file",
+                    "target": target,
+                    "content": "unexpected",
+                    "expected_fingerprint": "missing"
+                }]
+            })
+            .to_string();
+            assert_eq!(
+                prepare(&refused, &context).unwrap_err().code,
+                "invalid_setup_target"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_setup_rejects_agent_root_aliases_to_controlled_state_roots() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, root, state) = fixture();
+        let library = state.join("library");
+        let plan_backups = state.join("plan-backups");
+        fs::create_dir(&library).unwrap();
+        fs::create_dir(&plan_backups).unwrap();
+        let library_alias = root.join("library-alias");
+        let backups_alias = root.join("backups-alias");
+        symlink(&library, &library_alias).unwrap();
+        symlink(&plan_backups, &backups_alias).unwrap();
+        let context = PrepareContext {
+            approved_roots: vec![library_alias.clone(), backups_alias.clone()],
+            state_dir: state,
+            operation_policy: OperationPolicy::BootstrapSetup,
+        };
+
+        for target in [
+            library_alias.join("skillroster/SKILL.md"),
+            backups_alias.join("skillroster/SKILL.md"),
+        ] {
+            let input = serde_json::json!({
+                "schema_version": 1,
+                "scan_id": "scan_1",
+                "operations": [{
+                    "kind": "write_file",
+                    "target": target,
+                    "content": "unexpected",
+                    "expected_fingerprint": "missing"
+                }]
+            })
+            .to_string();
+            assert_eq!(
+                prepare(&input, &context).unwrap_err().code,
+                "invalid_setup_target"
+            );
+        }
     }
 
     #[test]
