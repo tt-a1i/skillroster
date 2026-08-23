@@ -141,6 +141,201 @@ fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
 }
 
 #[test]
+fn semantic_overlap_detail_is_decision_complete_for_agent_comparison() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let left_path = root.join("browser-tabs/SKILL.md");
+    let right_path = root.join("browser-session/SKILL.md");
+    let long_description = " authenticated browser context".repeat(80);
+    let long_source = "source-system-".repeat(80);
+    let triggers = (0..12)
+        .map(|index| format!("inspect-page-{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let left = format!(
+        "---\nname: 浏览器标签\ndescription: Control existing logged in browser tabs and inspect page state{long_description}\nsource: {long_source}\ntriggers: [{triggers}]\n---\nOperate visible tabs safely.\n"
+    );
+    let right = format!(
+        "---\nname: 浏览器会话\ndescription: Inspect existing logged in browser session tabs and page state{long_description}\nsource: {long_source}\ntriggers: [{triggers}]\n---\nReview authenticated browser state.\n"
+    );
+    fs::create_dir_all(left_path.parent().unwrap()).unwrap();
+    fs::create_dir_all(right_path.parent().unwrap()).unwrap();
+    fs::write(&left_path, &left).unwrap();
+    fs::write(&right_path, &right).unwrap();
+    let mut explicit_roots = vec![format!("codex={}", root.display())];
+    for (index, agent) in ["claude-code", "pi", "opencode", "hermes", "cursor"]
+        .into_iter()
+        .enumerate()
+    {
+        let extra_root = temp.path().join(format!("skills-{index}"));
+        let extra_left = extra_root.join("browser-tabs/SKILL.md");
+        let extra_right = extra_root.join("browser-session/SKILL.md");
+        fs::create_dir_all(extra_left.parent().unwrap()).unwrap();
+        fs::create_dir_all(extra_right.parent().unwrap()).unwrap();
+        fs::write(extra_left, &left).unwrap();
+        fs::write(extra_right, &right).unwrap();
+        explicit_roots.push(format!("{agent}={}", extra_root.display()));
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let mut scan_args = common.to_vec();
+    for explicit_root in &explicit_roots {
+        scan_args.extend(["--root", explicit_root]);
+    }
+    scan_args.push("scan");
+    json_output(&run(&scan_args, None));
+    let findings = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--findings",
+                "--category",
+                "overlap",
+                "--severity",
+                "low",
+                "--limit",
+                "100",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let finding_id = findings["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Semantic overlap candidate")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let compact = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--finding", finding_id, "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    let comparison = &compact["result"]["comparison"];
+    assert_eq!(comparison["decision"], "compare_skill_meaning");
+    assert_eq!(comparison["automatic_change_supported"], false);
+    assert_eq!(comparison["semantic_conclusion_owner"], "agent_or_user");
+    assert_eq!(comparison["basis"]["metric"], "routing_vocabulary_jaccard");
+    assert!(comparison["basis"]["score"].as_f64().unwrap() >= 0.45);
+    assert!(comparison["basis"]["intersection_count"].as_u64().unwrap() >= 3);
+    assert!(
+        comparison["basis"]["union_count"].as_u64().unwrap()
+            >= comparison["basis"]["intersection_count"].as_u64().unwrap()
+    );
+    assert!(
+        comparison["basis"]["shared_terms"]
+            .as_array()
+            .unwrap()
+            .len()
+            <= 20
+    );
+    let skills = comparison["skills"].as_array().unwrap();
+    assert_eq!(skills.len(), 2);
+    let mut names = skills
+        .iter()
+        .map(|skill| skill["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["浏览器会话", "浏览器标签"]);
+    assert!(skills.iter().all(|skill| {
+        skill["description"].as_str().unwrap().chars().count() == 512
+            && skill["description_truncated"] == true
+            && skill["trigger_count"] == 12
+            && skill["triggers"].as_array().unwrap().len() == 10
+            && skill["triggers_truncated"] == true
+            && skill["source"].as_str().unwrap().chars().count() == 256
+            && skill["source_truncated"] == true
+            && skill["summary"].as_str().is_some()
+            && skill["agents"]
+                == json!(["claude-code", "codex", "cursor", "hermes", "opencode", "pi"])
+            && skill["agent_count"] == 6
+            && skill["agents_truncated"] == false
+            && skill["providers"] == json!([])
+            && skill["provider_count"] == 0
+            && skill["providers_truncated"] == false
+            && skill["governable"] == true
+            && skill["readable_path_count"] == 6
+            && skill["readable_paths_truncated"] == true
+            && skill["current_content_available"] == true
+            && skill["readable_paths"].as_array().unwrap().len() == 5
+            && skill["readable_placement_count"] == 6
+            && skill["readable_placements_truncated"] == false
+            && skill["readable_placements"].as_array().unwrap().len() == 6
+            && skill["readable_placements"][0]["provider"].is_null()
+            && skill["readable_placements"][0]["provider_truncated"] == false
+            && skill["readable_placements"][0]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("SKILL.md"))
+    }));
+    assert!(
+        compact["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+    let full = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--finding", finding_id, "--full", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        full["result"]["affected_skill_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        full["result"]["comparison"]["skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let complete_full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    let mut expected_skill_ids = complete_full["result"]["affected_skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    expected_skill_ids.sort_unstable();
+    let mut actual_skill_ids = skills
+        .iter()
+        .map(|skill| skill["skill_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    actual_skill_ids.sort_unstable();
+    assert_eq!(actual_skill_ids, expected_skill_ids);
+    assert_eq!(
+        full["result"]["comparison"],
+        compact["result"]["comparison"]
+    );
+    assert_eq!(full["result"]["files_changed"], false);
+    assert_eq!(fs::read_to_string(left_path).unwrap(), left);
+    assert_eq!(fs::read_to_string(right_path).unwrap(), right);
+}
+
+#[test]
 fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
