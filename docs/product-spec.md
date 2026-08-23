@@ -235,7 +235,14 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 
 - Source sessions are read-only and remain in their original locations.
 - Derived event summaries are retained for 180 days by default.
+- Usage Observations have a stable identity across Scans. An unchanged rescan
+  does not increase historical counts; growth in the same observable source
+  contributes only the newly observed delta. Snapshot Evidence remains
+  immutable and traceable independently of this lifecycle high-water state.
 - Older usage is reduced to monthly aggregates.
+- Monthly rows created by the delta model expose `derivation=source_delta`.
+  Pre-v9 monthly rows cannot be safely reconstructed by source and are retained
+  with `derivation=legacy_scan_aggregate` instead of being presented as exact.
 - Plans and Receipts remain until explicitly purged.
 - Overflow source-confirmation details are versioned local artifacts retained until explicitly purged or local state is deleted.
 - `status` exposes storage location, retention state, and retained source-confirmation artifact counts and bytes.

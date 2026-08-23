@@ -1,8 +1,9 @@
 use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{FileTimes, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 use fs2::FileExt;
 use serde_json::{Value, json};
@@ -2109,6 +2110,142 @@ fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
     let rebuilt = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     assert_eq!(rebuilt["result"]["skill_count"], 1);
     assert!(state.join("skillroster.db").is_file());
+}
+
+#[test]
+fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/example");
+    let session = home.join(".codex/sessions/session.jsonl");
+    fs::create_dir_all(&skill).unwrap();
+    fs::create_dir_all(session.parent().unwrap()).unwrap();
+    fs::write(skill.join("SKILL.md"), "---\nname: example\n---\nbody\n").unwrap();
+    fs::write(
+        &session,
+        "{\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}\n",
+    )
+    .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&session)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(10)))
+        .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let first_export = temp.path().join("first-export.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                first_export.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let first: Value = serde_json::from_slice(&fs::read(&first_export).unwrap()).unwrap();
+    assert_eq!(first["data"]["usage_events"].as_array().unwrap().len(), 1);
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let second_export = temp.path().join("second-export.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                second_export.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let second: Value = serde_json::from_slice(&fs::read(&second_export).unwrap()).unwrap();
+    assert_eq!(second["data"]["usage_events"].as_array().unwrap().len(), 1);
+
+    let mut session_file = OpenOptions::new().append(true).open(&session).unwrap();
+    writeln!(
+        session_file,
+        "{{\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}}"
+    )
+    .unwrap();
+    session_file
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(20)))
+        .unwrap();
+    drop(session_file);
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let third_export = temp.path().join("third-export.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                third_export.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let third: Value = serde_json::from_slice(&fs::read(&third_export).unwrap()).unwrap();
+    assert_eq!(third["data"]["usage_events"].as_array().unwrap().len(), 2);
+
+    json_output(&run(
+        &[&common[..], &["lifecycle", "purge", "--raw-days", "1"]].concat(),
+        None,
+    ));
+    let retained_export = temp.path().join("retained-export.json");
+    json_output(&run(
+        &[
+            &common[..],
+            &[
+                "lifecycle",
+                "export",
+                "--output",
+                retained_export.to_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let retained: Value = serde_json::from_slice(&fs::read(&retained_export).unwrap()).unwrap();
+    assert_eq!(retained["usage_history"]["raw_value_field"], "event_delta");
+    assert_eq!(
+        retained["usage_history"]["snapshot_evidence_additive"],
+        false
+    );
+    assert_eq!(retained["data"]["usage_events"], json!([]));
+    assert!(
+        retained["data"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|evidence| evidence["kind"] != "usage")
+    );
+    assert_eq!(
+        retained["data"]["usage_monthly"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(retained["data"]["usage_monthly"][0]["event_count"], 2);
+    assert_eq!(
+        retained["data"]["usage_monthly"][0]["derivation"],
+        "source_delta"
+    );
 }
 
 #[test]
