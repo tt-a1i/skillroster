@@ -10,13 +10,87 @@ const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 1;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
+use crate::model::RosterState;
 use crate::scan::{LinkStatus, RootKind, RootStatus, ScanResult, SkillPlacement};
 
+#[derive(Debug)]
 pub struct DerivedRosterPlan {
     pub operations: Vec<Value>,
     pub implicit_library_changes: Vec<LibraryChangeAction>,
     pub impact: Value,
 }
+
+#[derive(Debug)]
+pub struct RosterPhysicalConflict {
+    pub skill_id: String,
+    pub agents: Vec<String>,
+}
+
+impl std::fmt::Display for RosterPhysicalConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Skill {} has incompatible Core and non-Core requests across one shared physical placement for Agents {}; separate the shared Agent roots or request a consistent exposure state",
+            self.skill_id,
+            self.agents.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for RosterPhysicalConflict {}
+
+#[derive(Debug)]
+pub struct RosterOperationConflict {
+    pub identity_role: &'static str,
+    pub operation_kinds: Vec<String>,
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for RosterOperationConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Roster Plan contains conflicting {} operations ({}) for physical path {}; resolve overlapping physical ownership or the same-name variant Finding before retrying",
+            self.identity_role,
+            self.operation_kinds.join(", "),
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for RosterOperationConflict {}
+
+#[derive(Clone, Debug)]
+pub enum RosterSafetyBlocker {
+    ProviderManaged {
+        skill_id: String,
+        placement_ids: Vec<String>,
+        paths: Vec<PathBuf>,
+        providers: Vec<String>,
+    },
+    DependentSource {
+        skill_id: String,
+        placement_ids: Vec<String>,
+        paths: Vec<PathBuf>,
+    },
+}
+
+impl std::fmt::Display for RosterSafetyBlocker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderManaged { skill_id, .. } => write!(
+                formatter,
+                "Skill {skill_id} includes a provider-managed placement that is read-only"
+            ),
+            Self::DependentSource { skill_id, .. } => write!(
+                formatter,
+                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RosterSafetyBlocker {}
 
 #[derive(Clone, Debug)]
 pub struct RosterChangeExclusion {
@@ -25,6 +99,7 @@ pub struct RosterChangeExclusion {
     pub name: String,
     pub reason: &'static str,
     pub observed_source_target: Option<PathBuf>,
+    pub safety_blocker: Option<RosterSafetyBlocker>,
 }
 
 pub struct SupportedRosterChanges {
@@ -318,6 +393,8 @@ pub fn exclude_unpreservable_demotions(
                     .is_some_and(|agent| demoted_agents.contains(&agent))
             })
             .collect::<Vec<_>>();
+        let provider_managed_removals =
+            provider_placements_on_physical_removal(&placements, &removable).collect::<Vec<_>>();
         let skill = scan
             .skills
             .iter()
@@ -334,23 +411,52 @@ pub fn exclude_unpreservable_demotions(
             .iter()
             .copied()
             .any(|placement| is_real_exact(placement, exact_digest));
-        let non_agent_source_dependency = placements
+        let non_agent_source_dependencies = placements
             .iter()
             .copied()
             .filter(|placement| placement.agent.is_none())
-            .any(|placement| {
-                placement.link_target.as_ref().is_some_and(|target| {
-                    removable.iter().any(|removed| {
-                        target == &removed.directory || target.starts_with(&removed.directory)
-                    })
-                })
-            });
-        let reason = if non_agent_source_dependency {
-            "non_agent_source_link_depends_on_removal"
+            .filter(|placement| depends_on_physical_removal(placement, &removable))
+            .collect::<Vec<_>>();
+        let (reason, safety_blocker) = if !provider_managed_removals.is_empty() {
+            (
+                "provider_managed_placement_is_read_only",
+                Some(RosterSafetyBlocker::ProviderManaged {
+                    skill_id: skill_id.to_owned(),
+                    placement_ids: provider_managed_removals
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: provider_managed_removals
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                    providers: provider_managed_removals
+                        .iter()
+                        .filter_map(|placement| placement.provider.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                }),
+            )
+        } else if !non_agent_source_dependencies.is_empty() {
+            (
+                "non_agent_source_link_depends_on_removal",
+                Some(RosterSafetyBlocker::DependentSource {
+                    skill_id: skill_id.to_owned(),
+                    placement_ids: non_agent_source_dependencies
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: non_agent_source_dependencies
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                }),
+            )
         } else if retained_owned || migratable_owned {
             continue;
         } else {
-            "no_owned_exact_content_to_preserve"
+            ("no_owned_exact_content_to_preserve", None)
         };
         for request in requests
             .into_iter()
@@ -363,6 +469,7 @@ pub fn exclude_unpreservable_demotions(
                 name: name.to_owned(),
                 reason,
                 observed_source_target: safe_observed_source_target(&removable),
+                safety_blocker: safety_blocker.clone(),
             });
         }
     }
@@ -426,12 +533,36 @@ pub fn derive(
             bail!("Skill {skill_id} has no verified placement");
         }
         if !placements.iter().any(|placement| placement.governable) {
-            bail!("Skill {skill_id} is provider-managed and read-only");
+            return Err(RosterSafetyBlocker::ProviderManaged {
+                skill_id: skill_id.to_owned(),
+                placement_ids: placements
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                paths: placements
+                    .iter()
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+                providers: placements
+                    .iter()
+                    .filter_map(|placement| placement.provider.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            }
+            .into());
+        }
+        for placement in placements
+            .iter()
+            .filter(|placement| placement.physical_directory.is_some())
+        {
+            placement.validated_physical_directory()?;
         }
         let desired = requests
             .iter()
-            .map(|request| Ok((agent(&request.agent)?, request.state.as_str())))
+            .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
             .iter()
             .copied()
@@ -439,15 +570,40 @@ pub fn derive(
                 placement
                     .agent
                     .and_then(|agent| desired.get(&agent))
-                    .is_some_and(|state| *state != "core")
+                    .is_some_and(|state| state != &RosterState::Core)
             })
             .collect::<Vec<_>>();
+        for placement in &removal {
+            placement.validated_physical_directory()?;
+        }
+        let provider_placement_ids = provider_placements_on_physical_removal(&placements, &removal)
+            .map(|placement| placement.id.clone())
+            .collect::<Vec<_>>();
+        if !provider_placement_ids.is_empty() {
+            return Err(RosterSafetyBlocker::ProviderManaged {
+                skill_id: skill_id.to_owned(),
+                placement_ids: provider_placement_ids.clone(),
+                paths: placements
+                    .iter()
+                    .filter(|placement| provider_placement_ids.contains(&placement.id))
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+                providers: placements
+                    .iter()
+                    .filter(|placement| provider_placement_ids.contains(&placement.id))
+                    .filter_map(|placement| placement.provider.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            }
+            .into());
+        }
         let mut source = verified_real_source(&placements, &removal, &skill.content_digest);
         let mut source_fingerprint = source
             .as_ref()
             .map(|path| change::fingerprint(path))
             .transpose()?;
-        let mut migrated_id = None;
+        let mut migrated_source = None;
 
         if source.is_none() && !removal.is_empty() {
             let canonical = removal
@@ -464,17 +620,18 @@ pub fn derive(
                 bail!("Library target {} already exists", library_path.display());
             }
             needs_library_root |= !library_root.exists();
-            let canonical_fingerprint = change::fingerprint(&canonical.directory)?;
+            let canonical_source = physical_mutation_path(canonical);
+            let canonical_fingerprint = change::fingerprint(&canonical_source)?;
             operations.push(json!({
                 "kind": "move_recoverable",
-                "source": canonical.directory,
+                "source": canonical_source,
                 "target": library_path,
                 "expected_fingerprint": canonical_fingerprint
             }));
             *operation_groups.entry("host_canonical").or_default() += 1;
             source = Some(library_path.clone());
             source_fingerprint = Some(canonical_fingerprint);
-            migrated_id = Some(canonical.id.as_str());
+            migrated_source = Some(physical_mutation_path(canonical));
             implicit_library_changes.push(LibraryChangeAction {
                 skill_id: skill_id.to_string(),
                 canonical_placement_id: canonical.id.clone(),
@@ -483,7 +640,7 @@ pub fn derive(
                     .map(|placement| placement.id.clone())
                     .collect(),
                 requested_state: "hosted".into(),
-                canonical_path: canonical.directory.clone(),
+                canonical_path: physical_mutation_path(canonical),
                 library_path: Some(library_path),
             });
         }
@@ -492,21 +649,26 @@ pub fn derive(
             .iter()
             .copied()
             .filter(|placement| !removal.iter().any(|removed| removed.id == placement.id))
-            .filter(|placement| {
-                placement.link_target.as_ref().is_some_and(|target| {
-                    removal.iter().any(|removed| {
-                        target == &removed.directory || target.starts_with(&removed.directory)
-                    })
-                })
-            })
+            .filter(|placement| depends_on_physical_removal(placement, &removal))
             .collect::<Vec<_>>();
         if dependent_links
             .iter()
             .any(|placement| placement.agent.is_none())
         {
-            bail!(
-                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
-            );
+            return Err(RosterSafetyBlocker::DependentSource {
+                skill_id: skill_id.to_owned(),
+                placement_ids: dependent_links
+                    .iter()
+                    .filter(|placement| placement.agent.is_none())
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                paths: dependent_links
+                    .iter()
+                    .filter(|placement| placement.agent.is_none())
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+            }
+            .into());
         }
         if !dependent_links.is_empty() {
             let source = source
@@ -546,19 +708,26 @@ pub fn derive(
             }
         }
 
+        let mut physical_removals = BTreeMap::<PathBuf, &SkillPlacement>::new();
         for placement in &removal {
             before_exposure += usize::from(placement.default_exposed);
             affected_placements.insert(placement.id.clone());
-            if migrated_id == Some(placement.id.as_str()) {
+            physical_removals
+                .entry(physical_mutation_path(placement))
+                .or_insert(placement);
+        }
+        for (physical_source, placement) in physical_removals {
+            if migrated_source.as_ref() == Some(&physical_source) {
                 continue;
             }
             needs_backup_root |= !backup_root.exists();
             let backup = backup_root.join(format!("{nonce}-{}", placement.id));
+            let expected_fingerprint = change::fingerprint(&physical_source)?;
             operations.push(json!({
                 "kind": "move_recoverable",
-                "source": placement.directory,
+                "source": physical_source,
                 "target": backup,
-                "expected_fingerprint": change::fingerprint(&placement.directory)?
+                "expected_fingerprint": expected_fingerprint
             }));
             *operation_groups.entry("remove_exposure").or_default() += 1;
         }
@@ -664,6 +833,7 @@ pub fn derive(
         );
         *operation_groups.entry("create_library").or_default() += 1;
     }
+    ensure_unique_operation_paths(&operations)?;
 
     for placement in &scan.placements {
         if placement.default_exposed
@@ -702,17 +872,159 @@ pub fn derive(
     })
 }
 
+fn ensure_physical_exposure_compatible(
+    skill_id: &str,
+    placements: &[&SkillPlacement],
+    desired: &BTreeMap<AgentKind, RosterState>,
+) -> Result<()> {
+    let mut groups = BTreeMap::<PathBuf, Vec<&SkillPlacement>>::new();
+    for placement in placements
+        .iter()
+        .copied()
+        .filter(|placement| placement.default_exposed)
+    {
+        groups
+            .entry(physical_mutation_path(placement))
+            .or_default()
+            .push(placement);
+    }
+    for placements in groups.into_values().filter(|group| group.len() > 1) {
+        let has_demotion = placements.iter().any(|placement| {
+            placement
+                .agent
+                .and_then(|agent| desired.get(&agent))
+                .is_some_and(|state| state != &RosterState::Core)
+        });
+        let has_retained_exposure = placements.iter().any(|placement| {
+            placement.agent.is_some_and(|agent| {
+                desired
+                    .get(&agent)
+                    .is_none_or(|state| state == &RosterState::Core)
+            })
+        });
+        if has_demotion && has_retained_exposure {
+            let agents = placements
+                .iter()
+                .filter_map(|placement| placement.agent.map(AgentKind::id))
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            return Err(RosterPhysicalConflict {
+                skill_id: skill_id.to_owned(),
+                agents,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn physical_mutation_path(placement: &SkillPlacement) -> PathBuf {
+    if is_symlink(&placement.directory) {
+        return physical_entry_path(&placement.directory);
+    }
+    placement.physical_directory_or_logical().to_path_buf()
+}
+
+fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlacement]) -> bool {
+    placement.link_target.is_some()
+        && removal.iter().any(|removed| {
+            let dependency = placement.physical_directory_or_logical();
+            let removed = removed.physical_directory_or_logical();
+            dependency == removed || dependency.starts_with(removed)
+        })
+}
+
+fn provider_placements_on_physical_removal<'a>(
+    placements: &'a [&SkillPlacement],
+    removal: &[&SkillPlacement],
+) -> impl Iterator<Item = &'a SkillPlacement> {
+    let removal_paths = removal
+        .iter()
+        .map(|placement| physical_mutation_path(placement))
+        .collect::<BTreeSet<_>>();
+    placements.iter().copied().filter(move |placement| {
+        !placement.governable && removal_paths.contains(&physical_mutation_path(placement))
+    })
+}
+
+fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
+    let mut move_sources = BTreeSet::new();
+    let mut targets = BTreeMap::<PathBuf, &str>::new();
+    for operation in operations {
+        if operation["kind"] == "move_recoverable" {
+            let source = operation["source"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Roster move operation has no source"))?;
+            let source = physical_operation_path(Path::new(source));
+            if !move_sources.insert(source.clone()) {
+                return Err(RosterOperationConflict {
+                    identity_role: "source",
+                    operation_kinds: vec!["move_recoverable".into(), "move_recoverable".into()],
+                    path: source,
+                }
+                .into());
+            }
+        }
+        let Some(target) = operation["target"].as_str() else {
+            continue;
+        };
+        let target = physical_operation_path(Path::new(target));
+        let kind = operation["kind"].as_str().unwrap_or("unknown");
+        if let Some(first_kind) = targets.insert(target.clone(), kind) {
+            return Err(RosterOperationConflict {
+                identity_role: "target",
+                operation_kinds: vec![first_kind.into(), kind.into()],
+                path: target,
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn physical_operation_path(path: &Path) -> PathBuf {
+    if is_symlink(path) {
+        return physical_entry_path(path);
+    }
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    physical_entry_path(path)
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn physical_entry_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    std::fs::canonicalize(parent)
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(name)
+}
+
 fn verified_real_source(
     placements: &[&SkillPlacement],
     excluded: &[&SkillPlacement],
     digest: &str,
 ) -> Option<PathBuf> {
+    let excluded_sources = excluded
+        .iter()
+        .map(|placement| physical_mutation_path(placement))
+        .collect::<BTreeSet<_>>();
     placements
         .iter()
         .copied()
-        .filter(|placement| !excluded.iter().any(|item| item.id == placement.id))
+        .filter(|placement| !excluded_sources.contains(&physical_mutation_path(placement)))
         .find(|placement| is_real_exact(placement, digest))
-        .map(|placement| placement.directory.clone())
+        .map(physical_mutation_path)
 }
 
 fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
@@ -742,6 +1054,16 @@ fn agent(value: &str) -> Result<AgentKind> {
         .ok_or_else(|| anyhow!("unsupported Agent in Roster change: {value}"))
 }
 
+fn roster_state(value: &str) -> Result<RosterState> {
+    match value {
+        "core" => Ok(RosterState::Core),
+        "on_demand" => Ok(RosterState::OnDemand),
+        "explicit_only" => Ok(RosterState::ExplicitOnly),
+        "archived" => Ok(RosterState::Archived),
+        _ => bail!("unsupported Roster state: {value}"),
+    }
+}
+
 fn safe_name(name: &str) -> Result<String> {
     let safe = name
         .chars()
@@ -767,6 +1089,378 @@ mod tests {
 
     use super::*;
     use crate::scan::{ScanOptions, scan};
+
+    #[cfg(unix)]
+    fn shared_agent_root_fixture() -> (TempDir, ScanResult, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared_root = home.join(".agents_skills");
+        let shared_skill = shared_root.join("shared");
+        fs::create_dir_all(&shared_skill).unwrap();
+        fs::write(
+            shared_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        for (parent, logical_root) in [
+            (home.join(".codex"), home.join(".codex/skills")),
+            (home.join(".claude"), home.join(".claude/skills")),
+            (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+        ] {
+            fs::create_dir_all(parent).unwrap();
+            symlink(&shared_root, logical_root).unwrap();
+        }
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        assert_eq!(
+            snapshot
+                .placements
+                .iter()
+                .filter(|placement| placement.default_exposed)
+                .count(),
+            3
+        );
+        (temp, snapshot, shared_skill)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_demotion_emits_one_recoverable_move() {
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let plan = derive(&snapshot, &state, &changes).unwrap();
+        let moves = plan
+            .operations
+            .iter()
+            .filter(|operation| operation["kind"] == "move_recoverable")
+            .collect::<Vec<_>>();
+
+        assert_eq!(moves.len(), 1);
+        assert_eq!(
+            moves[0]["source"],
+            json!(fs::canonicalize(shared_skill).unwrap())
+        );
+        assert_eq!(plan.impact["before_default_exposure"], 3);
+        assert_eq!(plan.impact["after_default_exposure"], 0);
+        assert_eq!(
+            plan.impact["affected_placement_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_core_and_demotion_fail_closed() {
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+
+        let error = match derive(
+            &snapshot,
+            &state,
+            &[
+                RosterChange {
+                    agent: "codex".into(),
+                    skill_id: skill_id.clone(),
+                    state: "core".into(),
+                },
+                RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id,
+                    state: "on_demand".into(),
+                },
+            ],
+        ) {
+            Ok(_) => panic!("conflicting shared physical states unexpectedly produced a Plan"),
+            Err(error) => error,
+        };
+
+        assert!(error.downcast_ref::<RosterPhysicalConflict>().is_some());
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_root_drift_requires_a_new_scan() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, snapshot, shared_skill) = shared_agent_root_fixture();
+        let home = shared_skill.parent().unwrap().parent().unwrap();
+        let replacement_root = home.join(".replacement_skills");
+        let replacement_skill = replacement_root.join("shared");
+        fs::create_dir_all(&replacement_skill).unwrap();
+        fs::write(
+            replacement_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nreplacement\n",
+        )
+        .unwrap();
+        for root in [
+            home.join(".codex/skills"),
+            home.join(".claude/skills"),
+            home.join(".pi/agent/skills"),
+        ] {
+            fs::remove_file(&root).unwrap();
+            symlink(&replacement_root, root).unwrap();
+        }
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("physical source drifted"));
+        assert!(error.to_string().contains("run skillroster scan"));
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(replacement_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_source_drift_into_a_removal_requires_a_new_scan() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
+        let source_skill = temp.path().join("sources/shared");
+        fs::create_dir_all(&source_skill).unwrap();
+        fs::write(
+            source_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut source = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap()
+            .clone();
+        source.id = "placement_source_fixture".into();
+        source.agent = None;
+        source.root = source_skill.parent().unwrap().to_path_buf();
+        source.directory = source_skill.clone();
+        source.entrypoint = source_skill.join("SKILL.md");
+        source.physical_directory = Some(fs::canonicalize(&source_skill).unwrap());
+        source.link_target = None;
+        source.default_exposed = false;
+        snapshot.placements.push(source);
+        fs::remove_dir_all(&source_skill).unwrap();
+        symlink(&shared_skill, &source_skill).unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<crate::scan::PhysicalDirectoryDrift>()
+                .is_some()
+        );
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(source_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_demotion_blocks_a_dependent_source_link() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared_root = home.join(".agents_skills");
+        let shared_skill = shared_root.join("shared");
+        fs::create_dir_all(&shared_skill).unwrap();
+        fs::write(
+            shared_skill.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        for (parent, root) in [
+            (home.join(".codex"), home.join(".codex/skills")),
+            (home.join(".claude"), home.join(".claude/skills")),
+            (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+        ] {
+            fs::create_dir_all(parent).unwrap();
+            symlink(&shared_root, root).unwrap();
+        }
+        let source_root = temp.path().join("sources");
+        fs::create_dir(&source_root).unwrap();
+        symlink(&shared_skill, source_root.join("shared")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options.explicit_source_roots.push(source_root.clone());
+        let snapshot = scan(&options).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+        let supported = exclude_unpreservable_demotions(&snapshot, changes.clone()).unwrap();
+        assert!(supported.changes.is_empty());
+        assert!(
+            supported
+                .exclusions
+                .iter()
+                .all(|item| item.reason == "non_agent_source_link_depends_on_removal")
+        );
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("non-Agent source link"));
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(source_root.join("shared/SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mixed_provider_managed_shared_placement_is_read_only() {
+        let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
+        let mut provider = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap()
+            .clone();
+        provider.id = "placement_provider_fixture".into();
+        provider.agent = None;
+        provider.governable = false;
+        provider.provider = Some("fixture-provider".into());
+        let provider_directory = provider.directory.clone();
+        snapshot.placements.push(provider.clone());
+        let unrelated_directory = temp.path().join("provider-cache/unrelated");
+        fs::create_dir_all(&unrelated_directory).unwrap();
+        fs::write(
+            unrelated_directory.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut unrelated_provider = provider;
+        unrelated_provider.id = "placement_unrelated_provider_fixture".into();
+        unrelated_provider.root = unrelated_directory.parent().unwrap().to_path_buf();
+        unrelated_provider.directory = unrelated_directory.clone();
+        unrelated_provider.entrypoint = unrelated_directory.join("SKILL.md");
+        unrelated_provider.physical_directory =
+            Some(fs::canonicalize(&unrelated_directory).unwrap());
+        unrelated_provider.provider = Some("unrelated-provider".into());
+        snapshot.placements.push(unrelated_provider);
+        let skill_id = snapshot.skills[0].id.clone();
+        let changes = ["codex", "claude-code", "pi"]
+            .into_iter()
+            .map(|agent| RosterChange {
+                agent: agent.into(),
+                skill_id: skill_id.clone(),
+                state: "on_demand".into(),
+            })
+            .collect::<Vec<_>>();
+        let supported = exclude_unpreservable_demotions(&snapshot, changes.clone()).unwrap();
+        let blocker = supported.exclusions[0].safety_blocker.as_ref().unwrap();
+        match blocker {
+            RosterSafetyBlocker::ProviderManaged {
+                placement_ids,
+                paths,
+                providers,
+                ..
+            } => {
+                assert_eq!(placement_ids, &["placement_provider_fixture"]);
+                assert_eq!(paths, &[provider_directory]);
+                assert_eq!(providers, &["fixture-provider"]);
+            }
+            other => panic!("expected provider-managed blocker, got {other:?}"),
+        }
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+
+        assert!(error.to_string().contains("provider-managed placement"));
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn same_name_variants_cannot_share_one_library_target() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        for (root, body) in [
+            (home.join(".codex/skills/shared"), "codex variant"),
+            (home.join(".hermes/skills/shared"), "hermes variant"),
+        ] {
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: shared\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir(&state).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let changes = snapshot
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                placement.agent.map(|agent| RosterChange {
+                    agent: agent.id().into(),
+                    skill_id: placement.skill_id.clone(),
+                    state: "on_demand".into(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let error = match derive(&snapshot, &state, &changes) {
+            Ok(_) => panic!("same-name variants unexpectedly shared one Library target"),
+            Err(error) => error,
+        };
+
+        assert!(error.downcast_ref::<RosterOperationConflict>().is_some());
+        assert!(error.to_string().contains("same-name variant Finding"));
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
 
     #[test]
     fn large_roster_proposal_removes_more_than_half_of_default_exposure() {
@@ -848,6 +1542,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn retained_escaping_link_without_mutation_does_not_require_physical_validation() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".codex/skills");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: external\n---\nfixture\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("external")).unwrap();
+        let snapshot = scan(&ScanOptions::for_home(&home)).unwrap();
+        assert!(snapshot.placements[0].physical_directory.is_none());
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let plan = derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "codex".into(),
+                skill_id: snapshot.skills[0].id.clone(),
+                state: "core".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(plan.operations.is_empty());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+        assert!(outside.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn semantic_bulk_changes_exclude_a_non_agent_link_to_a_removed_placement() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("home");
@@ -861,7 +1591,7 @@ mod tests {
         let mut options = ScanOptions::for_home(&home);
         options.include_session_evidence = false;
         options.explicit_source_roots.push(source_root);
-        let snapshot = scan(&options).unwrap();
+        let mut snapshot = scan(&options).unwrap();
         let skill_id = snapshot
             .placements
             .iter()
@@ -869,6 +1599,29 @@ mod tests {
             .unwrap()
             .skill_id
             .clone();
+        let dependent = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent.is_none())
+            .unwrap()
+            .clone();
+        let dependent_id = dependent.id.clone();
+        let dependent_directory = dependent.directory.clone();
+        let unrelated_directory = temp.path().join("unrelated/shared");
+        fs::create_dir_all(&unrelated_directory).unwrap();
+        fs::write(
+            unrelated_directory.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut unrelated_source = dependent;
+        unrelated_source.id = "placement_unrelated_source_fixture".into();
+        unrelated_source.root = unrelated_directory.parent().unwrap().to_path_buf();
+        unrelated_source.directory = unrelated_directory.clone();
+        unrelated_source.entrypoint = unrelated_directory.join("SKILL.md");
+        unrelated_source.physical_directory = Some(fs::canonicalize(&unrelated_directory).unwrap());
+        unrelated_source.link_target = Some(unrelated_directory.clone());
+        snapshot.placements.push(unrelated_source);
 
         let supported = exclude_unpreservable_demotions(
             &snapshot,
@@ -888,6 +1641,17 @@ mod tests {
             "non_agent_source_link_depends_on_removal"
         );
         assert!(supported.exclusions[0].observed_source_target.is_none());
+        match supported.exclusions[0].safety_blocker.as_ref().unwrap() {
+            RosterSafetyBlocker::DependentSource {
+                placement_ids,
+                paths,
+                ..
+            } => {
+                assert_eq!(placement_ids, &[dependent_id]);
+                assert_eq!(paths, &[dependent_directory]);
+            }
+            other => panic!("expected dependent-source blocker, got {other:?}"),
+        }
     }
 
     #[test]
@@ -959,7 +1723,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("provider-managed and read-only"));
+        let blocker = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+        assert!(matches!(
+            blocker,
+            RosterSafetyBlocker::ProviderManaged { .. }
+        ));
         assert!(!codex_root.join("control-browser").exists());
     }
 
@@ -1076,6 +1844,7 @@ mod tests {
                 name: "alpha".into(),
                 reason: "no_owned_exact_content_to_preserve",
                 observed_source_target: Some(test_absolute_path("opt/reviewed/alpha")),
+                safety_blocker: None,
             },
             RosterChangeExclusion {
                 agent: "codex".into(),
@@ -1083,6 +1852,7 @@ mod tests {
                 name: "beta".into(),
                 reason: "no_owned_exact_content_to_preserve",
                 observed_source_target: Some(test_absolute_path("opt/reviewed/beta")),
+                safety_blocker: None,
             },
         ];
         let blocked =
@@ -1127,6 +1897,7 @@ mod tests {
                 observed_source_target: Some(test_absolute_path(&format!(
                     "opt/root-{index:02}/pkg"
                 ))),
+                safety_blocker: None,
             })
             .collect::<Vec<_>>();
         let blocked =
@@ -1222,6 +1993,7 @@ mod tests {
                 observed_source_target: Some(test_absolute_path(&format!(
                     "opt/root-{index:02}/pkg"
                 ))),
+                safety_blocker: None,
             })
             .collect::<Vec<_>>();
 
@@ -1263,6 +2035,7 @@ mod tests {
             name: "rootish".into(),
             reason: "no_owned_exact_content_to_preserve",
             observed_source_target: Some(PathBuf::from("/")),
+            safety_blocker: None,
         }];
         let state = TempDir::new().unwrap();
         let blocked =

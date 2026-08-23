@@ -3680,12 +3680,18 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     );
     assert!(!blocked.status.success());
     let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert!(
-        blocked["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("source link depends on a placement scheduled for removal")
+    assert_eq!(blocked["error"]["code"], "roster_dependent_source_conflict");
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "dependent_source_would_break"
     );
+    assert_eq!(
+        blocked["error"]["details"]["paths"],
+        json!([fs::canonicalize(&source_root)
+            .unwrap()
+            .join("dependent-source")])
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
 }
 
 #[test]
@@ -3897,6 +3903,179 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
     assert!(!state.join("library").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn shared_physical_roster_plan_moves_once_and_blocks_conflicting_states() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let shared_root = home.join(".agents_skills");
+    let shared_skill = shared_root.join("shared");
+    fs::create_dir_all(&shared_skill).unwrap();
+    fs::write(
+        shared_skill.join("SKILL.md"),
+        "---\nname: shared\n---\nfixture\n",
+    )
+    .unwrap();
+    for (parent, logical_root) in [
+        (home.join(".codex"), home.join(".codex/skills")),
+        (home.join(".claude"), home.join(".claude/skills")),
+        (home.join(".pi/agent"), home.join(".pi/agent/skills")),
+    ] {
+        fs::create_dir_all(parent).unwrap();
+        symlink(&shared_root, logical_root).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let skill_id = payload["skills"][0]["id"].as_str().unwrap();
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let conflict = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "roster_changes": [
+            {"agent": "codex", "skill_id": skill_id, "state": "core"},
+            {"agent": "claude-code", "skill_id": skill_id, "state": "on_demand"}
+        ]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&conflict.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "roster_physical_state_conflict");
+    assert_eq!(blocked["error"]["retryable"], false);
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "shared_physical_state_conflict"
+    );
+    assert_eq!(blocked["error"]["details"]["skill_id"], skill_id);
+    assert_eq!(
+        blocked["error"]["details"]["agents"],
+        json!(["claude-code", "codex", "pi"])
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(shared_skill.join("SKILL.md").is_file());
+
+    let roster_changes = ["codex", "claude-code", "pi"]
+        .into_iter()
+        .map(|agent| {
+            json!({
+                "agent": agent,
+                "skill_id": skill_id,
+                "state": "on_demand"
+            })
+        })
+        .collect::<Vec<_>>();
+    let demotion = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "roster_changes": roster_changes
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&demotion.to_string()),
+    ));
+    assert_eq!(plan["result"]["change_summary"]["roster_change_count"], 3);
+    assert_eq!(plan["result"]["affected"]["placement_count"], 4);
+    assert_eq!(plan["result"]["impact"]["before_default_exposure"], 3);
+    assert_eq!(plan["result"]["impact"]["after_default_exposure"], 0);
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        detail["result"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|operation| operation["kind"] == "move_recoverable")
+            .count(),
+        1
+    );
+
+    let alternate_root = home.join("alternate-skills");
+    let alternate_skill = alternate_root.join("shared");
+    fs::create_dir_all(&alternate_skill).unwrap();
+    fs::write(
+        alternate_skill.join("SKILL.md"),
+        "---\nname: shared\n---\nalternate\n",
+    )
+    .unwrap();
+    let codex_root = home.join(".codex/skills");
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&alternate_root, &codex_root).unwrap();
+    let drifted_apply = run(&[&common[..], &["apply", plan_id]].concat(), None);
+    assert!(!drifted_apply.status.success());
+    let drifted_apply: Value = serde_json::from_slice(&drifted_apply.stdout).unwrap();
+    assert_eq!(drifted_apply["error"]["code"], "state_drift");
+    assert_eq!(
+        drifted_apply["error"]["details"]["reason"],
+        "physical_source_drift"
+    );
+    assert_eq!(drifted_apply["error"]["details"]["files_changed"], false);
+    assert!(shared_skill.join("SKILL.md").is_file());
+    assert!(alternate_skill.join("SKILL.md").is_file());
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM receipts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&shared_root, &codex_root).unwrap();
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert!(!shared_skill.exists());
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(shared_skill.join("SKILL.md").is_file());
+    for logical_skill in [
+        home.join(".codex/skills/shared"),
+        home.join(".claude/skills/shared"),
+        home.join(".pi/agent/skills/shared"),
+    ] {
+        assert!(logical_skill.join("SKILL.md").is_file());
+    }
 }
 
 #[test]
