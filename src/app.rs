@@ -29,12 +29,92 @@ use crate::sqlite::StateStore;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
 
+/// Global discovery and state options that a suggested action must retain to
+/// operate on the same local analysis context as the command that produced it.
+#[derive(Clone, Debug, Default)]
+pub struct ActionContext {
+    argv: Vec<String>,
+}
+
+impl ActionContext {
+    pub fn from_cli(cli: &Cli) -> Self {
+        let mut argv = Vec::new();
+        if let Some(state_dir) = &cli.state_dir {
+            argv.extend([
+                "--state-dir".to_owned(),
+                state_dir.to_string_lossy().into_owned(),
+            ]);
+        }
+        if let Some(home) = &cli.home {
+            argv.extend(["--home".to_owned(), home.to_string_lossy().into_owned()]);
+        }
+        for root in &cli.roots {
+            argv.extend(["--root".to_owned(), root.clone()]);
+        }
+        for source_root in &cli.source_roots {
+            argv.extend([
+                "--source-root".to_owned(),
+                source_root.to_string_lossy().into_owned(),
+            ]);
+        }
+        Self { argv }
+    }
+
+    fn apply(&self, actions: &mut [SuggestedAction]) {
+        if self.argv.is_empty() {
+            return;
+        }
+        for action in actions {
+            let insertion =
+                usize::from(action.argv.first().is_some_and(|arg| arg == "skillroster"));
+            action.argv.splice(insertion..insertion, self.argv.clone());
+        }
+    }
+
+    fn apply_json_argv(&self, argv: &mut Value) {
+        let Some(values) = argv.as_array_mut() else {
+            return;
+        };
+        if self.argv.is_empty() {
+            return;
+        }
+        let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
+        values.splice(
+            insertion..insertion,
+            self.argv.iter().cloned().map(Value::String),
+        );
+    }
+
+    fn apply_result(&self, command: &str, result: &mut Value) {
+        match command {
+            "find" => {
+                if let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) {
+                    for found in matches {
+                        if let Some(argv) = found.pointer_mut("/variant_finding/argv") {
+                            self.apply_json_argv(argv);
+                        }
+                    }
+                }
+            }
+            "report" => {
+                if let Some(argv) =
+                    result.pointer_mut("/resolution/after_confirmation/argv_template")
+                {
+                    self.apply_json_argv(argv);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct Output {
     pub json: String,
     pub human: String,
 }
 
 pub fn run(cli: Cli) -> Result<Output> {
+    let action_context = ActionContext::from_cli(&cli);
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
@@ -73,7 +153,7 @@ pub fn run(cli: Cli) -> Result<Output> {
     };
     let store = StateStore::open(&database_path)?;
 
-    let (command, result, warnings, actions) = match cli.command {
+    let (command, mut result, warnings, actions) = match cli.command {
         None => ("home", home_result(&store, &state_dir)?, vec![], vec![]),
         Some(Command::Status) => {
             let result = status_result(&store, &database_path, &state_dir)?;
@@ -331,9 +411,11 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
     };
 
+    action_context.apply_result(command, &mut result);
     let mut envelope = JsonEnvelope::success(command, result.clone());
     envelope.warnings = warnings;
     envelope.suggested_actions = actions;
+    action_context.apply(&mut envelope.suggested_actions);
     Ok(Output {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
@@ -351,6 +433,14 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    error_json_with_context(command, error, &ActionContext::default())
+}
+
+pub fn error_json_with_context(
+    command: &str,
+    error: &(dyn std::error::Error + 'static),
+    action_context: &ActionContext,
+) -> String {
     if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -377,6 +467,16 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
                 true,
                 "trusted_canonical_sources_required",
             )];
+            action_context.apply(&mut envelope.suggested_actions);
+        }
+        if let Some(details) = envelope
+            .error
+            .as_mut()
+            .and_then(|error| error.details.as_mut())
+        {
+            if let Some(argv) = details.pointer_mut("/after_confirmation/argv_template") {
+                action_context.apply_json_argv(argv);
+            }
         }
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());

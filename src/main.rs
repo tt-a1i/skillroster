@@ -35,6 +35,7 @@ fn main() {
     };
     let json = cli.json;
     let command = cli.command_name();
+    let action_context = app::ActionContext::from_cli(&cli);
     // Apply and Undo start progress inside `app::run`, after human confirmation.
     let progress = (!matches!(command, "apply" | "undo"))
         .then(|| skillroster::present::ProgressGuard::start(command, json));
@@ -51,7 +52,11 @@ fn main() {
                 progress.finish();
             }
             if json {
-                write_stdout_or_exit(&app::error_json(command, error.as_ref()));
+                write_stdout_or_exit(&app::error_json_with_context(
+                    command,
+                    error.as_ref(),
+                    &action_context,
+                ));
             } else if let Some(blocked) =
                 error.downcast_ref::<skillroster::roster_plan::RosterPlanBlocked>()
             {

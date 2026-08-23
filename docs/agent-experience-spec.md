@@ -168,6 +168,11 @@ Machine results should expose facts, not preformatted prose:
 - risk, reversibility, drift, confirmation, and recovery state;
 - typed `suggested_actions` containing argv, mutation status, confirmation requirement, and reason code.
 
+Suggested action argv retains any effective `--state-dir`, `--home`, `--root`,
+and `--source-root` overrides so an Agent can execute the transition against
+the same local Snapshot and discovery trust boundary. It never broadens source
+trust or treats a suggested mutation as authorization.
+
 Suggested actions must represent a required or evidence-backed transition.
 Healthy `status` output with a completed Snapshot does not prescribe another
 Scan; it exposes `latest_snapshot_at` so the Agent can judge freshness from the
