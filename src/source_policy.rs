@@ -79,11 +79,12 @@ impl fmt::Display for SourcePermissionId {
 
 /// Stable filesystem identity captured when a permission is granted.
 ///
-/// POSIX uses device + inode plus the inode change-time epoch so immediate
-/// inode reuse cannot make a replacement look like the approved object.
-/// Windows pairs volume + file index with the object's creation time for the
-/// same reason. A platform without these facts reports `Unavailable`, and
-/// drift detection then degrades to exact resolved-path equality.
+/// POSIX uses device + inode plus the inode change time as a conservative reuse
+/// guard. Windows pairs volume + file index with the object's creation time for
+/// the same purpose. These fields reduce common object-reuse false negatives;
+/// their precision and guarantees still depend on the filesystem. A platform
+/// without these facts reports `Unavailable`, and drift detection then degrades
+/// to exact resolved-path equality.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootIdentity {
     Posix {
