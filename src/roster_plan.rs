@@ -65,10 +65,13 @@ pub enum RosterSafetyBlocker {
     ProviderManaged {
         skill_id: String,
         placement_ids: Vec<String>,
+        paths: Vec<PathBuf>,
+        providers: Vec<String>,
     },
     DependentSource {
         skill_id: String,
         placement_ids: Vec<String>,
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -503,6 +506,16 @@ pub fn derive(
                     .iter()
                     .map(|placement| placement.id.clone())
                     .collect(),
+                paths: placements
+                    .iter()
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+                providers: placements
+                    .iter()
+                    .filter_map(|placement| placement.provider.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             }
             .into());
         }
@@ -536,7 +549,19 @@ pub fn derive(
         if !provider_placement_ids.is_empty() {
             return Err(RosterSafetyBlocker::ProviderManaged {
                 skill_id: skill_id.to_owned(),
-                placement_ids: provider_placement_ids,
+                placement_ids: provider_placement_ids.clone(),
+                paths: placements
+                    .iter()
+                    .filter(|placement| provider_placement_ids.contains(&placement.id))
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+                providers: placements
+                    .iter()
+                    .filter(|placement| provider_placement_ids.contains(&placement.id))
+                    .filter_map(|placement| placement.provider.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
             }
             .into());
         }
@@ -603,6 +628,11 @@ pub fn derive(
                     .iter()
                     .filter(|placement| placement.agent.is_none())
                     .map(|placement| placement.id.clone())
+                    .collect(),
+                paths: dependent_links
+                    .iter()
+                    .filter(|placement| placement.agent.is_none())
+                    .map(|placement| placement.directory.clone())
                     .collect(),
             }
             .into());

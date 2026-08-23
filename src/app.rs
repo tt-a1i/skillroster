@@ -431,25 +431,32 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
         };
     }
     if let Some(blocker) = error.downcast_ref::<crate::roster_plan::RosterSafetyBlocker>() {
-        let (code, reason, skill_id, placement_ids, next_action) = match blocker {
+        let (code, reason, skill_id, placement_ids, paths, providers, next_action) = match blocker {
             crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
                 skill_id,
                 placement_ids,
+                paths,
+                providers,
             } => (
                 "roster_provider_managed_read_only",
                 "provider_managed_placement_is_read_only",
                 skill_id,
                 placement_ids,
+                paths,
+                Some(providers),
                 "exclude_provider_managed_placement",
             ),
             crate::roster_plan::RosterSafetyBlocker::DependentSource {
                 skill_id,
                 placement_ids,
+                paths,
             } => (
                 "roster_dependent_source_conflict",
                 "dependent_source_would_break",
                 skill_id,
                 placement_ids,
+                paths,
+                None,
                 "preserve_or_retarget_dependent_source",
             ),
         };
@@ -460,6 +467,8 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "reason": reason,
                 "skill_id": skill_id,
                 "placement_ids": placement_ids,
+                "paths": paths,
+                "providers": providers,
                 "files_changed": false,
                 "next_action": next_action
             })),
@@ -3497,14 +3506,8 @@ fn expand_finding_roster_changes(
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     if !supported.exclusions.is_empty() {
-        if supported
-            .exclusions
-            .iter()
-            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal")
-        {
-            bail!(
-                "Finding {finding_id} is blocked because a non-Agent source link depends on a placement scheduled for removal; resolve the reported source dependency, rescan, and use the new Finding"
-            );
+        if let Some(blocker) = finding_roster_safety_blocker(scan, &supported.exclusions) {
+            return Err(blocker.into());
         }
         return Err(crate::roster_plan::source_confirmation_block(
             finding_id.as_str(),
@@ -3530,6 +3533,63 @@ fn expand_finding_roster_changes(
             uncertainty: selection_evidence.uncertainty,
         }),
     ))
+}
+
+fn finding_roster_safety_blocker(
+    scan: &ScanResult,
+    exclusions: &[crate::roster_plan::RosterChangeExclusion],
+) -> Option<crate::roster_plan::RosterSafetyBlocker> {
+    for exclusion in exclusions {
+        let placements = scan
+            .placements
+            .iter()
+            .filter(|placement| placement.skill_id == exclusion.skill_id)
+            .collect::<Vec<_>>();
+        match exclusion.reason {
+            "provider_managed_placement_is_read_only" => {
+                let protected = placements
+                    .into_iter()
+                    .filter(|placement| !placement.governable)
+                    .collect::<Vec<_>>();
+                return Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+                    skill_id: exclusion.skill_id.clone(),
+                    placement_ids: protected
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: protected
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                    providers: protected
+                        .iter()
+                        .filter_map(|placement| placement.provider.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                });
+            }
+            "non_agent_source_link_depends_on_removal" => {
+                let dependent = placements
+                    .into_iter()
+                    .filter(|placement| placement.agent.is_none())
+                    .collect::<Vec<_>>();
+                return Some(crate::roster_plan::RosterSafetyBlocker::DependentSource {
+                    skill_id: exclusion.skill_id.clone(),
+                    placement_ids: dependent
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: dependent
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn exact_duplicate_finding_scope(
@@ -4446,6 +4506,7 @@ fn prepare_plan(
     if let Some(uncertainty) = uncertainty {
         summary_object.insert("uncertainty".into(), uncertainty);
     }
+    let physical_bindings = capture_physical_placement_bindings(&prepared, &scan);
     store.save_plan(&plan_record(
         &prepared,
         input,
@@ -4456,6 +4517,7 @@ fn prepare_plan(
         summary.clone(),
         selection_evidence_full,
         reuse_identity,
+        physical_bindings,
     )?)?;
     Ok(summary)
 }
@@ -4477,6 +4539,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
     if latest_scan_id != record.scan_id {
         bail!("Plan {id} is stale; a newer Snapshot exists");
     }
+    validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
@@ -5395,6 +5458,81 @@ fn validate_roster_changes(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PhysicalPlacementBinding {
+    placement_id: String,
+    entrypoint: PathBuf,
+    expected_physical_directory: PathBuf,
+}
+
+fn capture_physical_placement_bindings(
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+) -> Vec<PhysicalPlacementBinding> {
+    let skill_ids = plan
+        .roster_changes
+        .iter()
+        .map(|change| change.skill_id.as_str())
+        .chain(
+            plan.library_changes
+                .iter()
+                .map(|change| change.skill_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut bindings = scan
+        .placements
+        .iter()
+        .filter(|placement| skill_ids.contains(placement.skill_id.as_str()))
+        .filter_map(|placement| {
+            Some(PhysicalPlacementBinding {
+                placement_id: placement.id.clone(),
+                entrypoint: placement.entrypoint.clone(),
+                expected_physical_directory: placement.physical_directory.clone()?,
+            })
+        })
+        .collect::<Vec<_>>();
+    bindings.sort_by(|left, right| left.placement_id.cmp(&right.placement_id));
+    bindings
+}
+
+fn validate_physical_placement_bindings(
+    record: &PlanRecord,
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+) -> Result<()> {
+    let expected = capture_physical_placement_bindings(plan, scan);
+    let Some(stored) = record.input.get("physical_placement_bindings").cloned() else {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        bail!("Plan {} has no physical placement bindings", record.id);
+    };
+    let stored: Vec<PhysicalPlacementBinding> = serde_json::from_value(stored)?;
+    if stored != expected {
+        bail!(
+            "Plan {} physical placement bindings are incomplete or stale",
+            record.id
+        );
+    }
+    for binding in stored {
+        let placement = scan
+            .placements
+            .iter()
+            .find(|placement| placement.id == binding.placement_id)
+            .ok_or_else(|| anyhow!("Plan placement {} disappeared", binding.placement_id))?;
+        if placement.entrypoint != binding.entrypoint
+            || placement.physical_directory.as_ref() != Some(&binding.expected_physical_directory)
+        {
+            bail!(
+                "Plan placement {} no longer matches its physical binding",
+                binding.placement_id
+            );
+        }
+        placement.validated_physical_directory()?;
+    }
+    Ok(())
+}
+
 fn validate_source_update_preconditions(plan: &PreparedPlan, scan: &ScanResult) -> Result<()> {
     for update in &plan.source_updates {
         let placement = scan
@@ -5627,6 +5765,7 @@ fn plan_record(
     summary: Value,
     selection_evidence_full: Option<Value>,
     reuse_identity: Option<Value>,
+    physical_bindings: Vec<PhysicalPlacementBinding>,
 ) -> Result<PlanRecord> {
     let operations = prepared
         .operations
@@ -5678,6 +5817,7 @@ fn plan_record(
             "summary": summary,
             "selection_evidence_full": selection_evidence_full,
             "reuse_identity": reuse_identity
+            ,"physical_placement_bindings": physical_bindings
         }),
         fingerprint: prepared.digest.clone(),
         operations,
@@ -6169,6 +6309,35 @@ mod recovery_tests {
         assert_eq!(planning["supported"], false);
         assert_eq!(planning["reason"], "external_observed_placements");
         assert_eq!(planning["protected_placement_count"], 1);
+
+        let blocker = finding_roster_safety_blocker(
+            &scan,
+            &[crate::roster_plan::RosterChangeExclusion {
+                agent: "codex".into(),
+                skill_id: "skill_shared".into(),
+                name: "shared".into(),
+                reason: "provider_managed_placement_is_read_only",
+                observed_source_target: None,
+            }],
+        )
+        .unwrap();
+        let blocked: Value = serde_json::from_str(&error_json("plan", &blocker)).unwrap();
+        assert_eq!(
+            blocked["error"]["code"],
+            "roster_provider_managed_read_only"
+        );
+        assert_eq!(
+            blocked["error"]["details"]["placement_ids"],
+            json!(["placement_plugin"])
+        );
+        assert_eq!(
+            blocked["error"]["details"]["paths"],
+            json!(["/fixture/placement_plugin"])
+        );
+        assert_eq!(
+            blocked["error"]["details"]["providers"],
+            json!(["plugin@market"])
+        );
     }
 
     #[test]
@@ -6689,6 +6858,8 @@ mod recovery_tests {
         let provider = crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
             skill_id: "skill_fixture".into(),
             placement_ids: vec!["placement_provider".into()],
+            paths: vec![PathBuf::from("/provider/skill")],
+            providers: vec!["fixture-provider".into()],
         };
         let provider: Value = serde_json::from_str(&error_json("plan", &provider)).unwrap();
         assert_eq!(
@@ -6704,6 +6875,14 @@ mod recovery_tests {
             json!(["placement_provider"])
         );
         assert_eq!(
+            provider["error"]["details"]["paths"],
+            json!(["/provider/skill"])
+        );
+        assert_eq!(
+            provider["error"]["details"]["providers"],
+            json!(["fixture-provider"])
+        );
+        assert_eq!(
             provider["error"]["details"]["next_action"],
             "exclude_provider_managed_placement"
         );
@@ -6711,6 +6890,7 @@ mod recovery_tests {
         let dependent = crate::roster_plan::RosterSafetyBlocker::DependentSource {
             skill_id: "skill_fixture".into(),
             placement_ids: vec!["placement_source".into()],
+            paths: vec![PathBuf::from("/sources/skill")],
         };
         let dependent: Value = serde_json::from_str(&error_json("plan", &dependent)).unwrap();
         assert_eq!(

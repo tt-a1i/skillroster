@@ -99,7 +99,9 @@ retaining every logical Agent/placement impact fact. If the linked logical
 placements request incompatible Core and non-Core exposure, planning fails
 closed with a typed conflict. No Ready Plan may contain duplicate destructive
 sources or operation targets. Before deriving operations, planning revalidates
-each captured physical source against the current logical entrypoint. A
+each captured physical source against the current logical entrypoint and stores
+those logical-entrypoint-to-physical-source bindings in the immutable Plan.
+Apply revalidates the complete binding set before entering Applying. A
 physical object shared with any provider-managed placement remains read-only,
 and a non-Agent source link that would be broken blocks the Plan. These
 blockers expose stable reasons, IDs, paths, and next actions in `error.details`;

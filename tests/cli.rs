@@ -3680,12 +3680,18 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     );
     assert!(!blocked.status.success());
     let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert!(
-        blocked["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("source link depends on a placement scheduled for removal")
+    assert_eq!(blocked["error"]["code"], "roster_dependent_source_conflict");
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "dependent_source_would_break"
     );
+    assert_eq!(
+        blocked["error"]["details"]["paths"],
+        json!([fs::canonicalize(&source_root)
+            .unwrap()
+            .join("dependent-source")])
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
 }
 
 #[test]
@@ -4023,6 +4029,38 @@ fn shared_physical_roster_plan_moves_once_and_blocks_conflicting_states() {
             .count(),
         1
     );
+
+    let alternate_root = home.join("alternate-skills");
+    let alternate_skill = alternate_root.join("shared");
+    fs::create_dir_all(&alternate_skill).unwrap();
+    fs::write(
+        alternate_skill.join("SKILL.md"),
+        "---\nname: shared\n---\nalternate\n",
+    )
+    .unwrap();
+    let codex_root = home.join(".codex/skills");
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&alternate_root, &codex_root).unwrap();
+    let drifted_apply = run(&[&common[..], &["apply", plan_id]].concat(), None);
+    assert!(!drifted_apply.status.success());
+    let drifted_apply: Value = serde_json::from_slice(&drifted_apply.stdout).unwrap();
+    assert_eq!(drifted_apply["error"]["code"], "state_drift");
+    assert_eq!(
+        drifted_apply["error"]["details"]["reason"],
+        "physical_source_drift"
+    );
+    assert_eq!(drifted_apply["error"]["details"]["files_changed"], false);
+    assert!(shared_skill.join("SKILL.md").is_file());
+    assert!(alternate_skill.join("SKILL.md").is_file());
+    assert_eq!(
+        database
+            .query_row("SELECT COUNT(*) FROM receipts", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    fs::remove_file(&codex_root).unwrap();
+    symlink(&shared_root, &codex_root).unwrap();
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(applied["result"]["verification"], "passed");
