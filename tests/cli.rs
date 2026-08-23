@@ -270,17 +270,28 @@ fn public_find_hinted_ranking_is_prefix_stable_across_limits() {
             "---\nname: Spreadsheets\ndescription: Create, edit, analyze, and verify standalone spreadsheet files and workbooks, including Excel files.\n---\n",
         ),
         (
-            "cowork-publish",
-            "---\nname: cowork-publish\ndescription: 创建本地表格数据管理工具和数据质量可视化系统。\n---\n",
+            "local-data-quality",
+            "---\nname: local-data-quality\ndescription: 分析本地表格数据和数据质量。\n---\n",
         ),
         (
-            "hi-pan",
-            "---\nname: hi-pan\ndescription: 管理本地表格数据和数据质量报告文件。\n---\n",
+            "local-report-storage",
+            "---\nname: local-report-storage\ndescription: 管理本地表格数据和数据质量报告文件。\n---\n",
         ),
     ] {
         let path = skill_root.join(directory);
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    for index in 0..24 {
+        let path = skill_root.join(format!("spreadsheet-helper-{index:02}"));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("SKILL.md"),
+            format!(
+                "---\nname: spreadsheet-helper-{index:02}\ndescription: Generic spreadsheet helper number {index}.\n---\n"
+            ),
+        )
+        .unwrap();
     }
     let common = [
         "--home",
@@ -319,8 +330,20 @@ fn public_find_hinted_ranking_is_prefix_stable_across_limits() {
             .collect::<Vec<_>>()
     };
 
-    let complete_ranking = find_names("4");
-    for limit in 1..=4 {
+    let complete_ranking = find_names("10");
+    assert_eq!(complete_ranking[0], "Spreadsheets");
+    assert!(
+        complete_ranking[..3]
+            .iter()
+            .any(|name| name == "local-data-quality")
+    );
+    assert!(complete_ranking.iter().any(|name| name == "Spreadsheets"));
+    assert!(
+        complete_ranking
+            .iter()
+            .any(|name| name == "analyze-data-quality")
+    );
+    for limit in 1..=10 {
         let bounded = find_names(&limit.to_string());
         assert_eq!(bounded, complete_ranking[..bounded.len()]);
     }
