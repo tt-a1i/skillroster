@@ -2491,10 +2491,11 @@ fn finding_roster_planning(
             "latest_snapshot_id": latest_scan_id
         })));
     }
+    let declared_core = declared_core_pairs(store, scan)?;
     let recommendation = match crate::roster_recommendation::recommend(
         finding,
         scan,
-        &declared_core_pairs(store, scan)?,
+        &declared_core,
         &crate::roster_recommendation::RecommendationRequest {
             core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
             protected_skill_ids: BTreeSet::new(),
@@ -2587,26 +2588,41 @@ fn finding_roster_planning(
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         if source_dependency {
-            let protection_available = !blocked_skills.truncated
-                && blocked_skills.count <= crate::roster_recommendation::MAX_CORE_BUDGET;
+            let protected_skill_ids = blocked_skills.displayed_skill_ids.clone();
+            let (protection_available, protection_unavailable_reason, protection_detail) =
+                if blocked_skills.truncated {
+                    (false, Some("blocked_skill_set_incomplete"), None)
+                } else {
+                    match crate::roster_recommendation::recommend(
+                        finding,
+                        scan,
+                        &declared_core,
+                        &crate::roster_recommendation::RecommendationRequest {
+                            core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
+                            protected_skill_ids: protected_skill_ids.iter().cloned().collect(),
+                        },
+                    ) {
+                        Ok(_) => (true, None, None),
+                        Err(error) => (
+                            false,
+                            Some("protected_core_selection_unavailable"),
+                            Some(error.to_string()),
+                        ),
+                    }
+                };
             let mut protect_choice = json!({
                 "choice": "protect_blocked_skills_as_core",
                 "requires_confirmation": true,
                 "available": protection_available,
-                "unavailable_reason": if blocked_skills.truncated {
-                    Some("blocked_skill_set_incomplete")
-                } else if blocked_skills.count > crate::roster_recommendation::MAX_CORE_BUDGET {
-                    Some("blocked_skill_count_exceeds_max_core_budget")
-                } else {
-                    None
-                },
-                "protected_skill_ids": blocked_skills.displayed_skill_ids,
+                "unavailable_reason": protection_unavailable_reason,
+                "unavailable_detail": protection_detail,
+                "protected_skill_ids": protected_skill_ids,
                 "protected_skill_ids_complete": !blocked_skills.truncated,
                 "plan_request_template_available": protection_available,
                 "next": if blocked_skills.truncated {
                     "open the full Finding before constructing a complete protected-Skill Plan request"
                 } else if !protection_available {
-                    "Core protection cannot contain every blocked Skill within the maximum budget; use the source-link preservation choice"
+                    "the production Recommendation constraints reject this Core protection set; use the source-link preservation choice"
                 } else {
                     "after user confirmation, retry Plan with these protected Skill identities; another independent blocker may still fail closed"
                 }
@@ -2617,7 +2633,7 @@ fn finding_roster_planning(
                     "finding_roster_changes": [{
                         "finding_id": finding.id,
                         "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                        "protected_skill_ids": blocked_skills.displayed_skill_ids
+                        "protected_skill_ids": protected_skill_ids
                     }]
                 });
             }
@@ -2629,7 +2645,7 @@ fn finding_roster_planning(
                 "next": if blocked_skills.truncated {
                     "open the full Finding before changing any dependent source link"
                 } else {
-                    "after user-approved manual preservation or retargeting, rescan and reopen the new large-Roster Finding"
+                    "after user-approved manual preservation or retargeting, rescan and reopen the new large-Roster Finding; another independent blocker may still fail closed"
                 }
             });
             return Ok(Some(json!({
@@ -2653,7 +2669,11 @@ fn finding_roster_planning(
                 "dependent_link_targets": observed_link_targets,
                 "resolution_choices": [protect_choice, source_choice],
                 "after_resolution": {
-                    "next": "choose either explicit Core protection or user-approved source-link preservation, then retry from fresh evidence"
+                    "next": if protection_available {
+                        "choose either explicit Core protection or user-approved source-link preservation, then retry from fresh evidence; another independent blocker may still fail closed"
+                    } else {
+                        "use user-approved source-link preservation, then retry from fresh evidence; another independent blocker may still fail closed"
+                    }
                 }
             })));
         }
