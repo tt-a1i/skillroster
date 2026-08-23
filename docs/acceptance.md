@@ -439,6 +439,19 @@ complete identity set; a 100-dependent-Skill plus bootstrap regression proves
 an over-budget set is typed unavailable and has no Plan template. No choice was
 made, no Apply ran, and no real Agent file changed.
 
+The v1.8.20 fact-and-routing dogfood reused a retained read-only Snapshot of
+the real home: 8 supported Agents, 180 independent Skills, 676 placements, and
+548 default exposures. Structural inventory coverage and session evidence
+coverage remained separate facts instead of allowing a present Skill root to
+imply observable usage. One exact-duplicate Plan now reported physical sources
+3→1, placements 6→6, default exposure 5→5, and two relinks; this rejected the
+earlier implication that consolidation also reduced exposure. With three Ready
+Plans retained for the same current Snapshot, Status selected the first item
+from its existing bounded lifecycle ordering and returned a context-preserving,
+read-only `plan --show` action instead of suggesting a Scan that would stale
+those Plans. The 40-column terminal view wrapped the opaque Plan ID and avoided
+printing a context-free command. No Plan was applied and no Agent file changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
