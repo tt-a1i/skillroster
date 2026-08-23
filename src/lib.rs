@@ -9,4 +9,5 @@ pub mod query;
 pub mod roster_plan;
 pub mod roster_recommendation;
 pub mod scan;
+pub mod source_policy;
 pub mod sqlite;

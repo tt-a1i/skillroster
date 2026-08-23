@@ -15,6 +15,7 @@ use crate::change::{
 };
 use crate::cli::{
     Cli, Command, LifecycleCommand, ModifiedBootstrapChoice, ReportCategory, ReportSeverity,
+    SourceRootCommand,
 };
 use crate::harness::{self, AgentKind};
 use crate::model::{
@@ -209,6 +210,128 @@ pub fn run(cli: Cli) -> Result<Output> {
             };
             ("status", result, vec![], actions)
         }
+        Some(Command::SourceRoot(args)) => match args.command {
+            SourceRootCommand::Confirm(args) => {
+                if !args.path.is_absolute() {
+                    bail!("source root must be absolute: {}", args.path.display());
+                }
+                if !cli.json
+                    && !require_human_confirmation(
+                        &format!("Permit local reads of exactly {}?", args.path.display()),
+                        "This records one local read permission only. It does not endorse the content, raise Evidence quality, authorize a Plan, or change Agent/Skill files.",
+                    )?
+                {
+                    return cancelled_output("source-root");
+                }
+                let finding_id = FindingId::parse(args.finding)?;
+                let finding = store.get_finding(&finding_id)?.ok_or_else(|| {
+                    crate::source_policy::SourceRootPolicyError::FindingNotFound {
+                        finding_id: finding_id.to_string(),
+                    }
+                })?;
+                let (_, snapshot) = latest_scan(&store)?;
+                let outcome = crate::source_policy::confirm_source_root(
+                    &store, &finding, &snapshot, &args.path,
+                )?;
+                let result = json!({
+                    "operation": "confirm",
+                    "permission": crate::source_policy::permission_json(&outcome.permission, None),
+                    "already_permitted": outcome.already_permitted,
+                    "permission_scope": "exact_local_read_only",
+                    "content_endorsed": false,
+                    "evidence_quality_changed": false,
+                    "governance_authorized": false,
+                    "plan_apply_authorized": false,
+                    "local_state_changed": !outcome.already_permitted,
+                    "state_files_changed": !outcome.already_permitted,
+                    "agent_files_changed": false,
+                    "skill_files_changed": false,
+                    "files_changed": false,
+                });
+                (
+                    "source-root",
+                    result,
+                    vec![],
+                    vec![action(
+                        "scan",
+                        &["scan", "--json"],
+                        false,
+                        false,
+                        "source_root_permission_recorded",
+                    )],
+                )
+            }
+            SourceRootCommand::Inspect(args) => {
+                let mut result = crate::source_policy::policy_value(
+                    &store,
+                    true,
+                    usize::from(args.limit),
+                    usize::try_from(args.offset)?,
+                )?;
+                result["operation"] = json!("inspect");
+                result["permission_scope"] = json!("exact_local_read_only");
+                result["content_endorsed"] = json!(false);
+                result["evidence_quality_changed"] = json!(false);
+                result["governance_authorized"] = json!(false);
+                result["files_changed"] = json!(false);
+                result["state_files_changed"] = json!(false);
+                let actions = result["next_offset"]
+                    .as_u64()
+                    .map(|offset| {
+                        action(
+                            "inspect_more_source_root_permissions",
+                            &[
+                                "source-root",
+                                "inspect",
+                                "--limit",
+                                &args.limit.to_string(),
+                                "--offset",
+                                &offset.to_string(),
+                                "--json",
+                            ],
+                            false,
+                            false,
+                            "more_source_root_permissions_available",
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                ("source-root", result, vec![], actions)
+            }
+            SourceRootCommand::Revoke(args) => {
+                if !cli.json
+                    && !require_human_confirmation(
+                        &format!("Revoke source-root read permission {}?", args.id),
+                        "Future Scans will fail closed for this exact root unless separately permitted. Agent and Skill files are not changed.",
+                    )?
+                {
+                    return cancelled_output("source-root");
+                }
+                let permission = crate::source_policy::revoke_permission(&store, &args.id)?;
+                let result = json!({
+                    "operation": "revoke",
+                    "permission": crate::source_policy::permission_json(&permission, None),
+                    "permission_scope": "exact_local_read_only",
+                    "local_state_changed": true,
+                    "state_files_changed": true,
+                    "agent_files_changed": false,
+                    "skill_files_changed": false,
+                    "files_changed": false,
+                });
+                (
+                    "source-root",
+                    result,
+                    vec![],
+                    vec![action(
+                        "scan",
+                        &["scan", "--json"],
+                        false,
+                        false,
+                        "source_root_permission_revoked",
+                    )],
+                )
+            }
+        },
         Some(Command::Scan) => {
             let (result, warnings) = scan_command(
                 &store,
@@ -457,6 +580,9 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
     matches!(
         command,
         Some(Command::Apply(_) | Command::Undo(_) | Command::Setup(_))
+            | Some(Command::SourceRoot(crate::cli::SourceRootArgs {
+                command: SourceRootCommand::Confirm(_) | SourceRootCommand::Revoke(_),
+            }))
             | Some(Command::Lifecycle(crate::cli::LifecycleArgs {
                 command: LifecycleCommand::Purge(_),
             }))
@@ -652,6 +778,60 @@ fn fingerprint_remediation(completeness: scan::FingerprintCompleteness) -> Value
 }
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(policy) = error.downcast_ref::<crate::source_policy::SourceRootPolicyError>() {
+        use crate::source_policy::SourceRootPolicyError as PolicyError;
+        let facts = match policy {
+            PolicyError::FindingNotFound { finding_id }
+            | PolicyError::NotEscapingLinkFinding { finding_id } => {
+                json!({"finding_id": finding_id})
+            }
+            PolicyError::FindingSnapshotNotCurrent {
+                finding_id,
+                finding_snapshot,
+                current_snapshot,
+            } => json!({
+                "finding_id": finding_id,
+                "finding_snapshot_id": finding_snapshot,
+                "current_snapshot_id": current_snapshot,
+            }),
+            PolicyError::PathNotResolvable { path, reason } => {
+                json!({"path": path, "reason": reason})
+            }
+            PolicyError::PathNotObservedTarget { path }
+            | PolicyError::PathNotDirectory { path } => json!({"path": path}),
+            PolicyError::PermissionNotFound { permission_id }
+            | PolicyError::PermissionAlreadyRevoked { permission_id } => {
+                json!({"permission_id": permission_id})
+            }
+            PolicyError::ActivePermissionIdentityDrift {
+                permission_id,
+                path,
+            } => json!({"permission_id": permission_id, "path": path}),
+        };
+        let mut details = json!({
+            "permission_scope": "exact_local_read_only",
+            "content_endorsed": false,
+            "evidence_quality_changed": false,
+            "governance_authorized": false,
+            "plan_apply_authorized": false,
+            "files_changed": false,
+            "state_files_changed": false,
+            "next_action": match policy {
+                PolicyError::FindingSnapshotNotCurrent { .. } => "scan_then_open_current_finding",
+                PolicyError::PermissionAlreadyRevoked { .. } => "inspect_source_root_permissions",
+                PolicyError::ActivePermissionIdentityDrift { .. } => "revoke_then_confirm_current_observed_target",
+                _ => "inspect_exact_source_root_facts",
+            }
+        });
+        if let (Some(details), Some(facts)) = (details.as_object_mut(), facts.as_object()) {
+            details.extend(facts.clone());
+        }
+        return ClassifiedError {
+            code: policy.code(),
+            retryable: false,
+            details: Some(details),
+        };
+    }
     if let Some(blocker) = error.downcast_ref::<IncompleteFingerprintBlocker>() {
         return ClassifiedError {
             code: "incomplete_package_fingerprint",
@@ -1095,6 +1275,7 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
             "source_confirmation_details": source_confirmation_detail_summary(state_dir)?,
             "current": lifecycle,
         },
+        "source_root_permissions": crate::source_policy::policy_value(store, true, 100, 0)?,
         "files_changed": false
     }))
 }
@@ -1122,6 +1303,7 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
         "data": store.export_lifecycle()?,
         "evidence_exclusions": store.evidence_exclusions()?,
         "source_confirmation_details": source_confirmation_details,
+        "source_root_permissions": crate::source_policy::policy_export_value(store)?,
         "privacy": "derived summaries only; no raw conversation text",
     });
     let parent = output
@@ -1152,6 +1334,7 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
         "output_path": output,
         "counts": store.lifecycle_counts()?,
         "source_confirmation_detail_count": source_confirmation_details.len(),
+        "source_root_permission_count": store.list_source_root_permissions()?.len(),
         "files_changed": true,
     }))
 }
@@ -1169,6 +1352,7 @@ fn lifecycle_inspect_command(
         "database_path": database_path,
         "counts": counts,
         "source_confirmation_details": source_confirmation_details,
+        "source_root_permissions": crate::source_policy::policy_value(store, true, 100, 0)?,
         "evidence_exclusions": store.evidence_exclusions()?,
         "recovery_state": recovery_text(store, state_dir)?,
         "privacy": "derived summaries only; no raw conversation text",
@@ -1706,6 +1890,23 @@ fn scan_command(
 ) -> Result<(Value, Vec<String>)> {
     let started = Utc::now().timestamp();
     let id = ScanId::new();
+    // Freeze durable read permissions once before discovery. Only exact roots
+    // whose path and stable filesystem identity still match enter the Scan;
+    // drift is local to that permission and persists as typed Snapshot facts.
+    let frozen_permissions = crate::source_policy::freeze_active_roots(store)?;
+    let durable_read_roots = frozen_permissions
+        .iter()
+        .filter(|root| root.state == crate::source_policy::SourceRootState::Active)
+        .filter_map(|root| {
+            root.resolved_path
+                .clone()
+                .map(|path| crate::scan::DurableReadRoot {
+                    permission_id: root.permission.id.as_str().to_owned(),
+                    path,
+                    identity: root.permission.identity.clone(),
+                })
+        })
+        .collect::<Vec<_>>();
     store.save_scan(&ScanRun {
         id: id.clone(),
         started_at: started,
@@ -1716,13 +1917,14 @@ fn scan_command(
     let mut options = ScanOptions::for_home(home);
     options.explicit_skill_roots = explicit;
     options.explicit_source_roots = source_roots;
+    options.durable_read_roots = durable_read_roots;
     options.managed_source_roots = vec![state_dir.join("library")];
     options.excluded_session_agents = store
         .evidence_exclusions()?
         .iter()
         .map(|agent| parse_agent_kind(agent))
         .collect::<Result<_>>()?;
-    let result = match scan::scan(&options) {
+    let mut result = match scan::scan(&options) {
         Ok(result) => result,
         Err(error) => {
             store.save_scan(&ScanRun {
@@ -1735,6 +1937,38 @@ fn scan_command(
             return Err(error.into());
         }
     };
+    let post_scan_permissions = match crate::source_policy::freeze_active_roots(store) {
+        Ok(permissions) => permissions,
+        Err(error) => {
+            store.save_scan(&ScanRun {
+                id,
+                started_at: started,
+                completed_at: Some(Utc::now().timestamp()),
+                status: ScanStatus::Failed,
+                coverage_notes: vec![error.to_string()],
+            })?;
+            return Err(error.into());
+        }
+    };
+    let policy_facts = conservative_source_policy_facts(
+        &frozen_permissions,
+        &post_scan_permissions,
+        &result.durable_read_drifted_permission_ids,
+    );
+    for fact in policy_facts
+        .iter()
+        .filter(|fact| fact.state != crate::source_policy::SourceRootState::Active)
+    {
+        result.warnings.push(format!(
+            "source-root permission {} is {} and was excluded: {}",
+            fact.permission_id,
+            serde_json::to_value(fact.state)?
+                .as_str()
+                .unwrap_or("drifted"),
+            fact.drift_reason.as_deref().unwrap_or("identity drift")
+        ));
+    }
+    result.source_root_policy = policy_facts;
     store.begin_scan_snapshot()?;
     let persistence = (|| -> Result<()> {
         persist_index(store, &id, &result)?;
@@ -1796,10 +2030,54 @@ fn scan_command(
             "placement_count": result.placements.len(),
             "roots": roots,
             "coverage": coverage,
+            "source_root_policy": {
+                "scope": "exact_local_read_only",
+                "content_endorsed": false,
+                "evidence_quality_changed": false,
+                "governance_authorized": false,
+                "permissions": result.source_root_policy,
+            },
             "files_changed": false
         }),
         warnings,
     ))
+}
+
+/// Merge policy observations conservatively across a Scan. Once a permission
+/// is observed drifted at any bounded checkpoint, a later path check cannot
+/// promote it back to Active. This also carries drift detected inside Scan
+/// discovery/consumption into the persisted Snapshot fact.
+fn conservative_source_policy_facts(
+    before: &[crate::source_policy::FrozenSourceRoot],
+    after: &[crate::source_policy::FrozenSourceRoot],
+    scan_drifted_permission_ids: &BTreeSet<String>,
+) -> Vec<crate::source_policy::SourceRootPolicyFact> {
+    let before_by_id = before
+        .iter()
+        .map(|root| (root.permission.id.as_str(), root))
+        .collect::<BTreeMap<_, _>>();
+    after
+        .iter()
+        .map(|root| {
+            let id = root.permission.id.as_str();
+            let mut fact = crate::source_policy::fact_from_frozen(root);
+            if let Some(previous) = before_by_id.get(id) {
+                if previous.state != crate::source_policy::SourceRootState::Active
+                    && fact.state == crate::source_policy::SourceRootState::Active
+                {
+                    fact = crate::source_policy::fact_from_frozen(previous);
+                }
+            }
+            if scan_drifted_permission_ids.contains(id) {
+                fact.state = crate::source_policy::SourceRootState::Inaccessible;
+                fact.resolved_path = None;
+                fact.drift_reason = Some(
+                    "drift detected during bounded Scan checks; source root was excluded".into(),
+                );
+            }
+            fact
+        })
+        .collect()
 }
 
 fn compact_scan_warnings(warnings: Vec<String>) -> Vec<String> {
@@ -2194,6 +2472,12 @@ fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
         "resolution".into(),
         json!({
             "decision": "confirm_trusted_source_roots",
+            "decision_semantics": "confirm_exact_local_read_permission",
+            "permission_scope": "exact_local_read_only",
+            "content_endorsed": false,
+            "evidence_quality_changed": false,
+            "governance_authorized": false,
+            "plan_apply_authorized": false,
             "automatic_change_supported": false,
             "observed_link_targets": observed_link_targets,
             "after_confirmation": {
@@ -2664,6 +2948,31 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                     "finding_action_available",
                 ));
             }
+            if requires_trust_decision {
+                for path in result["resolution"]["observed_link_targets"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(10)
+                {
+                    actions.push(action(
+                        "confirm_source_root_read_permission",
+                        &[
+                            "source-root",
+                            "confirm",
+                            "--finding",
+                            id,
+                            "--path",
+                            path,
+                            "--json",
+                        ],
+                        true,
+                        true,
+                        "exact_local_source_read_permission_required",
+                    ));
+                }
+            }
             if !full {
                 let limit = limit.to_string();
                 let offset = offset.to_string();
@@ -3111,6 +3420,12 @@ fn finding_roster_planning(
             "supported": false,
             "reason": "trusted_canonical_sources_required",
             "decision": "confirm_trusted_source_roots",
+            "decision_semantics": "confirm_exact_local_read_permission",
+            "permission_scope": "exact_local_read_only",
+            "content_endorsed": false,
+            "evidence_quality_changed": false,
+            "governance_authorized": false,
+            "plan_apply_authorized": false,
             "automatic_change_supported": false,
             "snapshot_id": scan_id,
             "request_field": "finding_roster_changes",
@@ -7615,6 +7930,42 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn scan_detected_source_root_drift_cannot_be_promoted_back_to_active() {
+        let permission = crate::source_policy::SourceRootPermission {
+            id: crate::source_policy::SourcePermissionId::parse("sroot_fixture").unwrap(),
+            path: PathBuf::from("/fixture/source"),
+            finding_id: "finding_fixture".into(),
+            snapshot_id: "scan_fixture".into(),
+            identity: crate::source_policy::RootIdentity::Unavailable,
+            granted_at: 1,
+            revoked_at: None,
+        };
+        let active = crate::source_policy::FrozenSourceRoot {
+            permission,
+            state: crate::source_policy::SourceRootState::Active,
+            resolved_path: Some(PathBuf::from("/fixture/source")),
+            drift_reason: None,
+        };
+        let facts = conservative_source_policy_facts(
+            std::slice::from_ref(&active),
+            std::slice::from_ref(&active),
+            &BTreeSet::from(["sroot_fixture".into()]),
+        );
+
+        assert_eq!(
+            facts[0].state,
+            crate::source_policy::SourceRootState::Inaccessible
+        );
+        assert!(facts[0].resolved_path.is_none());
+        assert!(
+            facts[0]
+                .drift_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("during bounded Scan"))
+        );
+    }
 
     fn coverage_finding(basis: crate::query::FindingCoverageBasis) -> crate::query::Finding {
         crate::query::Finding {

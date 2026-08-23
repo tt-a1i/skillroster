@@ -25,7 +25,7 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 
 ```bash
 skillroster scan --json
-skillroster --source-root /absolute/trusted/source scan --json
+skillroster --source-root /absolute/confirmed/source scan --json
 skillroster report --json
 skillroster report --findings --limit 20 --json
 skillroster report --findings --category usage --json
@@ -42,6 +42,9 @@ skillroster apply <plan-id> --json
 skillroster undo <receipt-id> --json
 skillroster setup --json
 skillroster status --json
+skillroster source-root confirm --finding <finding-id> --path /absolute/observed/source --json
+skillroster source-root inspect --json
+skillroster source-root revoke <permission-id> --json
 skillroster lifecycle inspect --json
 skillroster lifecycle export --output ./skillroster-export.json --json
 skillroster lifecycle exclude codex --json
@@ -68,6 +71,15 @@ preserved and reported as blocked.
 that Agent's default exposure. `--source-root PATH` approves a non-exposed
 canonical source directory for the current Scan. Neither option crawls outside
 the exact supplied path.
+
+For a reusable decision, `source-root confirm` records one exact local read
+permission bound to the current escaping-link Finding and stable filesystem
+identity. It does not endorse the source, raise Evidence quality, or authorize
+Plan/Apply. Missing, replaced, or retargeted roots fail closed; inspect or
+revoke the local audit record explicitly. Scan checks the frozen identity and
+entrypoint binding before and after bounded discovery/consumption and discards
+facts when it observes drift. This detects accidental or persistent local
+drift; it is not a sandbox against a malicious same-user ABA race.
 
 Agent-authored Plans are declarative: they reference the latest Snapshot and
 Evidence IDs, then request Roster states, managed/hosted Library placement, or a

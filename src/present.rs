@@ -167,6 +167,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         "plan" => plan(result, &mut lines, options.width),
         "apply" | "undo" => mutation(result, &mut lines),
         "lifecycle" => lifecycle(result, &mut lines),
+        "source-root" => source_root(result, &mut lines),
         "setup" => setup(result, &mut lines, options.width),
         _ => home(result, &mut lines),
     }
@@ -194,11 +195,11 @@ pub fn blocked_roster_plan(details: &Value) -> String {
 
 fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Status", "blocked");
-    fact(
-        lines,
-        "Decision",
-        text(details, "decision").replace('_', " "),
-    );
+    let decision = match text(details, "decision").as_str() {
+        "confirm_trusted_source_roots" => "confirm exact local reads".to_owned(),
+        other => other.replace('_', " "),
+    };
+    fact(lines, "Decision", decision);
     fact(lines, "Core budget", text(details, "requested_core_budget"));
     fact(
         lines,
@@ -281,7 +282,7 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
     }
     lines.extend(summary(
         "Blocked · no automatic change is supported",
-        "Confirm the reported source directories before rescanning",
+        "Permit exact local reads, then rescan",
     ));
 }
 
@@ -642,7 +643,7 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
         lines.extend(summary(
             "Blocked · no automatic change is supported",
-            "Confirm trusted source directories before rescanning",
+            "Permit exact local reads before rescanning",
         ));
     } else if value["resolution"]["decision"].as_str() == Some("choose_same_name_variant") {
         lines.push(String::new());
@@ -1673,6 +1674,48 @@ fn lifecycle(value: &Value, lines: &mut Vec<String>) {
             "Inspect JSON for details",
         )),
     }
+}
+
+fn source_root(value: &Value, lines: &mut Vec<String>) {
+    let operation = text(value, "operation");
+    fact(lines, "Operation", &operation);
+    fact(lines, "Scope", "exact local reads only");
+    match operation.as_str() {
+        "confirm" | "revoke" => {
+            fact(
+                lines,
+                "Permission",
+                text(&value["permission"], "permission_id"),
+            );
+            fact(lines, "Path", text(&value["permission"], "path"));
+            fact(lines, "State", text(&value["permission"], "state"));
+        }
+        "inspect" => {
+            fact(lines, "Active", text(value, "active_count"));
+            fact(lines, "Revoked", text(value, "revoked_count"));
+            for permission in value["permissions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(5)
+            {
+                fact(
+                    lines,
+                    &text(permission, "state"),
+                    format!(
+                        "{} · {}",
+                        text(permission, "permission_id"),
+                        text(permission, "path")
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+    lines.extend(summary(
+        "Local policy only · no Agent or Skill files changed",
+        "Read permission does not endorse content, raise Evidence quality, or authorize governance",
+    ));
 }
 
 fn home(value: &Value, lines: &mut Vec<String>) {

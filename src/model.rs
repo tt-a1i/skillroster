@@ -74,6 +74,15 @@ pub struct InvalidId {
     value: String,
 }
 
+impl InvalidId {
+    pub(crate) fn new(expected_prefix: &'static str, value: impl Into<String>) -> Self {
+        Self {
+            expected_prefix,
+            value: value.into(),
+        }
+    }
+}
+
 impl fmt::Display for InvalidId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

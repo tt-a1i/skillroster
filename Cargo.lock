@@ -768,6 +768,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "ulid",
+ "windows-sys",
 ]
 
 [[package]]
