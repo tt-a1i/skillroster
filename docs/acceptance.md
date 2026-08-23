@@ -473,6 +473,11 @@ a new semantic engine or a routing-recall claim.
 The frozen inputs, hashes, event chain, and safety limitation are recorded in
 [the Pi cold-routing canary ledger](acceptance/cold-routing-canary-v1.8.20.md).
 
+The subsequent [sealed Pi paired pilot](acceptance/pi-cold-routing-pilot-v2.md)
+ran all eight Core and On-demand arms. Cold retrieval and target loading passed
+4/4, while the overall task-success gate failed because two Core controls also
+failed. The result is preserved as a failed holdout rather than tuned or rerun.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
