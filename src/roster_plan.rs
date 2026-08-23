@@ -41,7 +41,8 @@ impl std::error::Error for RosterPhysicalConflict {}
 
 #[derive(Debug)]
 pub struct RosterOperationConflict {
-    pub operation_kind: String,
+    pub identity_role: &'static str,
+    pub operation_kinds: Vec<String>,
     pub path: PathBuf,
 }
 
@@ -49,14 +50,44 @@ impl std::fmt::Display for RosterOperationConflict {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "Roster Plan contains more than one {} operation for physical path {}; resolve overlapping physical ownership or the same-name variant Finding before retrying",
-            self.operation_kind,
+            "Roster Plan contains conflicting {} operations ({}) for physical path {}; resolve overlapping physical ownership or the same-name variant Finding before retrying",
+            self.identity_role,
+            self.operation_kinds.join(", "),
             self.path.display()
         )
     }
 }
 
 impl std::error::Error for RosterOperationConflict {}
+
+#[derive(Debug)]
+pub enum RosterSafetyBlocker {
+    ProviderManaged {
+        skill_id: String,
+        placement_ids: Vec<String>,
+    },
+    DependentSource {
+        skill_id: String,
+        placement_ids: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for RosterSafetyBlocker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderManaged { skill_id, .. } => write!(
+                formatter,
+                "Skill {skill_id} includes a provider-managed placement that is read-only"
+            ),
+            Self::DependentSource { skill_id, .. } => write!(
+                formatter,
+                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RosterSafetyBlocker {}
 
 #[derive(Clone, Debug)]
 pub struct RosterChangeExclusion {
@@ -358,7 +389,10 @@ pub fn exclude_unpreservable_demotions(
                     .is_some_and(|agent| demoted_agents.contains(&agent))
             })
             .collect::<Vec<_>>();
-        let provider_managed_removal = removable.iter().any(|placement| !placement.governable);
+        let provider_managed_removal =
+            provider_placements_on_physical_removal(&placements, &removable)
+                .next()
+                .is_some();
         let skill = scan
             .skills
             .iter()
@@ -463,10 +497,17 @@ pub fn derive(
             bail!("Skill {skill_id} has no verified placement");
         }
         if !placements.iter().any(|placement| placement.governable) {
-            bail!("Skill {skill_id} is provider-managed and read-only");
+            return Err(RosterSafetyBlocker::ProviderManaged {
+                skill_id: skill_id.to_owned(),
+                placement_ids: placements
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+            }
+            .into());
         }
         for placement in &placements {
-            validate_physical_directory(placement)?;
+            placement.validated_physical_directory()?;
         }
         let desired = requests
             .iter()
@@ -483,8 +524,15 @@ pub fn derive(
                     .is_some_and(|state| state != &RosterState::Core)
             })
             .collect::<Vec<_>>();
-        if removal.iter().any(|placement| !placement.governable) {
-            bail!("Skill {skill_id} includes a provider-managed placement that is read-only");
+        let provider_placement_ids = provider_placements_on_physical_removal(&placements, &removal)
+            .map(|placement| placement.id.clone())
+            .collect::<Vec<_>>();
+        if !provider_placement_ids.is_empty() {
+            return Err(RosterSafetyBlocker::ProviderManaged {
+                skill_id: skill_id.to_owned(),
+                placement_ids: provider_placement_ids,
+            }
+            .into());
         }
         let mut source = verified_real_source(&placements, &removal, &skill.content_digest);
         let mut source_fingerprint = source
@@ -543,9 +591,15 @@ pub fn derive(
             .iter()
             .any(|placement| placement.agent.is_none())
         {
-            bail!(
-                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
-            );
+            return Err(RosterSafetyBlocker::DependentSource {
+                skill_id: skill_id.to_owned(),
+                placement_ids: dependent_links
+                    .iter()
+                    .filter(|placement| placement.agent.is_none())
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+            }
+            .into());
         }
         if !dependent_links.is_empty() {
             let source = source
@@ -804,36 +858,6 @@ fn physical_mutation_path(placement: &SkillPlacement) -> PathBuf {
     placement.physical_directory_or_logical().to_path_buf()
 }
 
-fn validate_physical_directory(placement: &SkillPlacement) -> Result<()> {
-    let expected = placement.physical_directory.as_ref().ok_or_else(|| {
-        anyhow!(
-            "Placement {} has no captured physical source; state may have drifted, run skillroster scan",
-            placement.id
-        )
-    })?;
-    let current_entrypoint = std::fs::canonicalize(&placement.entrypoint).map_err(|error| {
-        anyhow!(
-            "Placement {} physical source drifted; run skillroster scan: {error}",
-            placement.id
-        )
-    })?;
-    let current = current_entrypoint.parent().ok_or_else(|| {
-        anyhow!(
-            "Placement {} physical source drifted; run skillroster scan",
-            placement.id
-        )
-    })?;
-    if current != expected {
-        bail!(
-            "Placement {} physical source drifted from {} to {}; run skillroster scan",
-            placement.id,
-            expected.display(),
-            current.display()
-        );
-    }
-    Ok(())
-}
-
 fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlacement]) -> bool {
     placement.link_target.is_some()
         && removal.iter().any(|removed| {
@@ -841,6 +865,19 @@ fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlac
             let removed = removed.physical_directory_or_logical();
             dependency == removed || dependency.starts_with(removed)
         })
+}
+
+fn provider_placements_on_physical_removal<'a>(
+    placements: &'a [&SkillPlacement],
+    removal: &[&SkillPlacement],
+) -> impl Iterator<Item = &'a SkillPlacement> {
+    let removal_paths = removal
+        .iter()
+        .map(|placement| physical_mutation_path(placement))
+        .collect::<BTreeSet<_>>();
+    placements.iter().copied().filter(move |placement| {
+        !placement.governable && removal_paths.contains(&physical_mutation_path(placement))
+    })
 }
 
 fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
@@ -854,7 +891,8 @@ fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
             let source = physical_operation_path(Path::new(source));
             if !move_sources.insert(source.clone()) {
                 return Err(RosterOperationConflict {
-                    operation_kind: "destructive-source".into(),
+                    identity_role: "source",
+                    operation_kinds: vec!["move_recoverable".into(), "move_recoverable".into()],
                     path: source,
                 }
                 .into());
@@ -867,7 +905,8 @@ fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
         let kind = operation["kind"].as_str().unwrap_or("unknown");
         if let Some(first_kind) = targets.insert(target.clone(), kind) {
             return Err(RosterOperationConflict {
-                operation_kind: format!("target ({first_kind} and {kind})"),
+                identity_role: "target",
+                operation_kinds: vec![first_kind.into(), kind.into()],
                 path: target,
             }
             .into());
@@ -1196,13 +1235,17 @@ mod tests {
     #[test]
     fn mixed_provider_managed_shared_placement_is_read_only() {
         let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
-        let codex = snapshot
+        let mut provider = snapshot
             .placements
-            .iter_mut()
+            .iter()
             .find(|placement| placement.agent == Some(AgentKind::Codex))
-            .unwrap();
-        codex.governable = false;
-        codex.provider = Some("fixture-provider".into());
+            .unwrap()
+            .clone();
+        provider.id = "placement_provider_fixture".into();
+        provider.agent = None;
+        provider.governable = false;
+        provider.provider = Some("fixture-provider".into());
+        snapshot.placements.push(provider);
         let skill_id = snapshot.skills[0].id.clone();
         let changes = ["codex", "claude-code", "pi"]
             .into_iter()
@@ -1455,7 +1498,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("provider-managed and read-only"));
+        let blocker = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+        assert!(matches!(
+            blocker,
+            RosterSafetyBlocker::ProviderManaged { .. }
+        ));
         assert!(!codex_root.join("control-browser").exists());
     }
 

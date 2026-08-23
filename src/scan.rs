@@ -123,11 +123,54 @@ pub struct SkillPlacement {
     pub declared_name_matches_directory: Option<bool>,
 }
 
+#[derive(Debug)]
+pub struct PhysicalDirectoryDrift {
+    pub placement_id: String,
+    pub expected: Option<PathBuf>,
+    pub current: Option<PathBuf>,
+}
+
+impl std::fmt::Display for PhysicalDirectoryDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Placement {} physical source drifted; run skillroster scan",
+            self.placement_id
+        )
+    }
+}
+
+impl std::error::Error for PhysicalDirectoryDrift {}
+
 impl SkillPlacement {
     pub fn physical_directory_or_logical(&self) -> &Path {
         self.physical_directory
             .as_deref()
             .unwrap_or(&self.directory)
+    }
+
+    pub fn validated_physical_directory(
+        &self,
+    ) -> std::result::Result<PathBuf, PhysicalDirectoryDrift> {
+        let expected = self
+            .physical_directory
+            .clone()
+            .ok_or_else(|| PhysicalDirectoryDrift {
+                placement_id: self.id.clone(),
+                expected: None,
+                current: None,
+            })?;
+        let current = std::fs::canonicalize(&self.entrypoint)
+            .ok()
+            .and_then(|entrypoint| entrypoint.parent().map(Path::to_path_buf));
+        if current.as_ref() != Some(&expected) {
+            return Err(PhysicalDirectoryDrift {
+                placement_id: self.id.clone(),
+                expected: Some(expected),
+                current,
+            });
+        }
+        Ok(expected)
     }
 }
 

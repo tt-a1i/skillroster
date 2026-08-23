@@ -98,7 +98,12 @@ physical filesystem object. A Plan operates on that object at most once while
 retaining every logical Agent/placement impact fact. If the linked logical
 placements request incompatible Core and non-Core exposure, planning fails
 closed with a typed conflict. No Ready Plan may contain duplicate destructive
-sources or operation targets.
+sources or operation targets. Before deriving operations, planning revalidates
+each captured physical source against the current logical entrypoint. A
+physical object shared with any provider-managed placement remains read-only,
+and a non-Agent source link that would be broken blocks the Plan. These
+blockers expose stable reasons, IDs, paths, and next actions in `error.details`;
+Agent callers never need to parse the human message.
 
 Apply fails closed when paths, fingerprints, links, or configuration have drifted. Every successful mutation writes a Receipt. `undo <receipt-id>` is bounded to that Receipt and refuses ambiguous restoration. Canonical deletion is outside normal Apply, requires separate confirmation, and should prefer recoverable archive.
 

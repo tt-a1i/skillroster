@@ -385,10 +385,10 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
     serde_json::to_string(&JsonEnvelope::<Value>::failure(
         command,
         ApiError {
-            code: classified.0.into(),
+            code: classified.code.into(),
             message: error.to_string(),
-            retryable: classified.1,
-            details: structured_error_details(error),
+            retryable: classified.retryable,
+            details: classified.details,
             relevant_ids: extract_relevant_ids(&error.to_string()),
             paths: extract_paths(&error.to_string()),
         },
@@ -396,27 +396,98 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
     .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
 }
 
-fn structured_error_details(error: &(dyn std::error::Error + 'static)) -> Option<Value> {
-    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterPhysicalConflict>() {
-        return Some(json!({
-            "reason": "shared_physical_state_conflict",
-            "skill_id": conflict.skill_id,
-            "agents": conflict.agents,
-            "files_changed": false
-        }));
-    }
-    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterOperationConflict>() {
-        return Some(json!({
-            "reason": "duplicate_physical_operation_identity",
-            "operation_kind": conflict.operation_kind,
-            "path": conflict.path,
-            "files_changed": false
-        }));
-    }
-    None
+struct ClassifiedError {
+    code: &'static str,
+    retryable: bool,
+    details: Option<Value>,
 }
 
-fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, bool) {
+fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterPhysicalConflict>() {
+        return ClassifiedError {
+            code: "roster_physical_state_conflict",
+            retryable: false,
+            details: Some(json!({
+                "reason": "shared_physical_state_conflict",
+                "skill_id": conflict.skill_id,
+                "agents": conflict.agents,
+                "files_changed": false,
+                "next_action": "request_consistent_exposure_or_separate_shared_roots"
+            })),
+        };
+    }
+    if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterOperationConflict>() {
+        return ClassifiedError {
+            code: "roster_operation_identity_conflict",
+            retryable: false,
+            details: Some(json!({
+                "reason": "duplicate_physical_operation_identity",
+                "identity_role": conflict.identity_role,
+                "conflicting_operation_kinds": conflict.operation_kinds,
+                "path": conflict.path,
+                "files_changed": false,
+                "next_action": "resolve_same_name_variant_or_shared_ownership"
+            })),
+        };
+    }
+    if let Some(blocker) = error.downcast_ref::<crate::roster_plan::RosterSafetyBlocker>() {
+        let (code, reason, skill_id, placement_ids, next_action) = match blocker {
+            crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+                skill_id,
+                placement_ids,
+            } => (
+                "roster_provider_managed_read_only",
+                "provider_managed_placement_is_read_only",
+                skill_id,
+                placement_ids,
+                "exclude_provider_managed_placement",
+            ),
+            crate::roster_plan::RosterSafetyBlocker::DependentSource {
+                skill_id,
+                placement_ids,
+            } => (
+                "roster_dependent_source_conflict",
+                "dependent_source_would_break",
+                skill_id,
+                placement_ids,
+                "preserve_or_retarget_dependent_source",
+            ),
+        };
+        return ClassifiedError {
+            code,
+            retryable: false,
+            details: Some(json!({
+                "reason": reason,
+                "skill_id": skill_id,
+                "placement_ids": placement_ids,
+                "files_changed": false,
+                "next_action": next_action
+            })),
+        };
+    }
+    if let Some(drift) = error.downcast_ref::<crate::scan::PhysicalDirectoryDrift>() {
+        return ClassifiedError {
+            code: "state_drift",
+            retryable: false,
+            details: Some(json!({
+                "reason": "physical_source_drift",
+                "placement_id": drift.placement_id,
+                "expected_path": drift.expected,
+                "current_path": drift.current,
+                "files_changed": false,
+                "next_action": "scan"
+            })),
+        };
+    }
+    let (code, retryable) = classify_generic_error(error);
+    ClassifiedError {
+        code,
+        retryable,
+        details: None,
+    }
+}
+
+fn classify_generic_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, bool) {
     let message = error.to_string().to_lowercase();
     if error
         .downcast_ref::<crate::roster_plan::RosterPlanBlocked>()
@@ -432,18 +503,6 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> (&'static str, b
     }
     if let Some(change) = error.downcast_ref::<crate::change::ChangeError>() {
         return (change.code, change.retryable);
-    }
-    if error
-        .downcast_ref::<crate::roster_plan::RosterPhysicalConflict>()
-        .is_some()
-    {
-        return ("roster_physical_state_conflict", false);
-    }
-    if error
-        .downcast_ref::<crate::roster_plan::RosterOperationConflict>()
-        .is_some()
-    {
-        return ("roster_operation_identity_conflict", false);
     }
     if let Some(storage) = error.downcast_ref::<crate::sqlite::StorageError>() {
         return match storage {
@@ -3898,36 +3957,6 @@ fn normalized_digest(value: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
-fn validated_physical_directory(placement: &scan::SkillPlacement) -> Result<PathBuf> {
-    let expected = placement.physical_directory.as_ref().ok_or_else(|| {
-        anyhow!(
-            "Placement {} has no captured physical source; state may have drifted, run skillroster scan",
-            placement.id
-        )
-    })?;
-    let current_entrypoint = std::fs::canonicalize(&placement.entrypoint).map_err(|error| {
-        anyhow!(
-            "Placement {} physical source drifted; run skillroster scan: {error}",
-            placement.id
-        )
-    })?;
-    let current = current_entrypoint.parent().ok_or_else(|| {
-        anyhow!(
-            "Placement {} physical source drifted; run skillroster scan",
-            placement.id
-        )
-    })?;
-    if current != expected {
-        bail!(
-            "Placement {} physical source drifted from {} to {}; run skillroster scan",
-            placement.id,
-            expected.display(),
-            current.display()
-        );
-    }
-    Ok(expected.clone())
-}
-
 fn normalize_library_plan(
     mut input: Value,
     scan: &ScanResult,
@@ -4002,11 +4031,11 @@ fn normalize_library_plan(
             std::collections::BTreeMap::<PathBuf, Vec<&scan::SkillPlacement>>::new();
         for placement in &all_placements {
             physical_groups
-                .entry(validated_physical_directory(placement)?)
+                .entry(placement.validated_physical_directory()?)
                 .or_default()
                 .push(*placement);
         }
-        let canonical_physical = validated_physical_directory(canonical)?;
+        let canonical_physical = canonical.validated_physical_directory()?;
         if !placement_owns_physical_source(canonical) {
             bail!("canonical placement must be the owned physical source directory");
         }
@@ -6629,9 +6658,10 @@ mod recovery_tests {
     }
 
     #[test]
-    fn roster_operation_conflict_exposes_agent_facts_as_json() {
+    fn roster_operation_conflict_exposes_operation_facts_as_json() {
         let error = crate::roster_plan::RosterOperationConflict {
-            operation_kind: "target (move_recoverable and create_symlink)".into(),
+            identity_role: "target",
+            operation_kinds: vec!["move_recoverable".into(), "create_symlink".into()],
             path: PathBuf::from("/tmp/library/shared"),
         };
 
@@ -6646,10 +6676,82 @@ mod recovery_tests {
             "duplicate_physical_operation_identity"
         );
         assert_eq!(
-            output["error"]["details"]["operation_kind"],
-            "target (move_recoverable and create_symlink)"
+            output["error"]["details"]["conflicting_operation_kinds"],
+            json!(["move_recoverable", "create_symlink"])
         );
+        assert_eq!(output["error"]["details"]["identity_role"], "target");
         assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
+        assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn roster_safety_blockers_expose_stable_agent_actions() {
+        let provider = crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+            skill_id: "skill_fixture".into(),
+            placement_ids: vec!["placement_provider".into()],
+        };
+        let provider: Value = serde_json::from_str(&error_json("plan", &provider)).unwrap();
+        assert_eq!(
+            provider["error"]["code"],
+            "roster_provider_managed_read_only"
+        );
+        assert_eq!(
+            provider["error"]["details"]["reason"],
+            "provider_managed_placement_is_read_only"
+        );
+        assert_eq!(
+            provider["error"]["details"]["placement_ids"],
+            json!(["placement_provider"])
+        );
+        assert_eq!(
+            provider["error"]["details"]["next_action"],
+            "exclude_provider_managed_placement"
+        );
+
+        let dependent = crate::roster_plan::RosterSafetyBlocker::DependentSource {
+            skill_id: "skill_fixture".into(),
+            placement_ids: vec!["placement_source".into()],
+        };
+        let dependent: Value = serde_json::from_str(&error_json("plan", &dependent)).unwrap();
+        assert_eq!(
+            dependent["error"]["code"],
+            "roster_dependent_source_conflict"
+        );
+        assert_eq!(
+            dependent["error"]["details"]["next_action"],
+            "preserve_or_retarget_dependent_source"
+        );
+        assert_eq!(dependent["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn physical_drift_exposes_expected_and_current_paths() {
+        let drift = crate::scan::PhysicalDirectoryDrift {
+            placement_id: "placement_fixture".into(),
+            expected: Some(PathBuf::from("/tmp/shared-a/skill")),
+            current: Some(PathBuf::from("/tmp/shared-b/skill")),
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &drift)).unwrap();
+
+        assert_eq!(output["error"]["code"], "state_drift");
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "physical_source_drift"
+        );
+        assert_eq!(
+            output["error"]["details"]["placement_id"],
+            "placement_fixture"
+        );
+        assert_eq!(
+            output["error"]["details"]["expected_path"],
+            "/tmp/shared-a/skill"
+        );
+        assert_eq!(
+            output["error"]["details"]["current_path"],
+            "/tmp/shared-b/skill"
+        );
+        assert_eq!(output["error"]["details"]["next_action"], "scan");
         assert_eq!(output["error"]["details"]["files_changed"], false);
     }
 }
