@@ -945,9 +945,25 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                 .and_then(Value::as_array)
                 .filter(|variants| !variants.is_empty());
             if has_variants {
+                let next = item.get("variant_finding");
+                let resolution = next
+                    .and_then(|value| value.get("finding_id"))
+                    .and_then(Value::as_str)
+                    .map(|finding_id| format!("Finding {finding_id}"))
+                    .or_else(|| {
+                        match next
+                            .and_then(|value| value.get("state"))
+                            .and_then(Value::as_str)
+                        {
+                            Some("rescan_required") => Some("refresh Snapshot first".into()),
+                            Some("report_required") => Some("current Report required".into()),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or_else(|| "inspect layout Finding".into());
                 lines.push(format!(
-                    "     variants {} · inspect layout Finding",
-                    text(item, "variant_count")
+                    "     variants {} · {resolution}",
+                    text(item, "variant_count"),
                 ));
             }
             lines.push(format!("     reasons {reasons}"));
@@ -2391,6 +2407,10 @@ mod tests {
                 "roster_state": "core",
                 "source": "github:owner/repo",
                 "variant_count": 2,
+                "variant_finding": {
+                    "state": "available",
+                    "finding_id": "finding_variants"
+                },
                 "match_reasons": ["declared_trigger", "token_overlap:2"],
                 "paths": ["/skills/research/SKILL.md"]
             }], "warnings": ["research has two content variants"]}),
@@ -2400,7 +2420,7 @@ mod tests {
             },
         );
         assert!(found.contains("roster core · source github:owner/repo"));
-        assert!(found.contains("variants 2 · inspect layout Finding"));
+        assert!(found.contains("variants 2 · Finding finding_variants"));
         assert!(found.contains("declared_trigger"));
         assert!(found.contains("Retrieval notes"));
 

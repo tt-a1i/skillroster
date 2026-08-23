@@ -110,6 +110,7 @@ fn public_cli_exits_quietly_when_the_output_consumer_closes() {
         "--json",
     ];
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
     let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
     let finding_id = report["result"]["findings"][0]["id"].as_str().unwrap();
 
@@ -772,8 +773,40 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         "--json",
     ];
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
-    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
-    let finding = report["result"]["findings"]
+
+    let before_report = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        before_report["result"]["matches"][0]["variant_finding"]["state"],
+        "report_required"
+    );
+    assert_eq!(
+        before_report["result"]["matches"][0]["variant_finding"]["reason_code"],
+        "current_snapshot_report_missing"
+    );
+    assert!(before_report["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert_eq!(
+        before_report["suggested_actions"][0]["argv"],
+        json!(["skillroster", "report", "--summary", "--json"])
+    );
+    assert_eq!(before_report["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        before_report["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let report = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--findings", "--category", "layout"],
+        ]
+        .concat(),
+        None,
+    ));
+    let finding = report["result"]["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -788,6 +821,68 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert_eq!(finding["affected_skill_count"], 2);
     assert_eq!(finding["affected_placement_count"], 2);
     let finding_id = finding["id"].as_str().unwrap();
+
+    let linked_find = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    let variant_finding = &linked_find["result"]["matches"][0]["variant_finding"];
+    assert_eq!(variant_finding["state"], "available");
+    assert_eq!(variant_finding["finding_id"], finding_id);
+    assert_eq!(variant_finding["report_id"], report["result"]["report_id"]);
+    assert_eq!(
+        variant_finding["snapshot_id"],
+        report["result"]["snapshot_id"]
+    );
+    assert_eq!(variant_finding["resolution"], "choose_same_name_variant");
+    assert_eq!(
+        variant_finding["argv"],
+        json!(["skillroster", "report", "--finding", finding_id, "--json"])
+    );
+    assert_eq!(
+        linked_find["suggested_actions"][0]["argv"],
+        variant_finding["argv"]
+    );
+    assert_eq!(linked_find["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        linked_find["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
+    fs::write(
+        codex.join("SKILL.md"),
+        "---\nname: shared-capability\ndescription: First implementation\n---\nchanged after report\n",
+    )
+    .unwrap();
+    let drifted_find = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted_find["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted_find["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    assert_eq!(
+        drifted_find["result"]["matches"][0]["variant_finding"]["reason_code"],
+        "routable_variant_drift_detected"
+    );
+    assert!(drifted_find["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert_eq!(
+        drifted_find["suggested_actions"][0]["argv"],
+        json!(["skillroster", "scan", "--json"])
+    );
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let after_rescan = json_output(&run(
+        &[&common[..], &["find", "first implementation"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        after_rescan["result"]["matches"][0]["variant_finding"]["state"],
+        "report_required"
+    );
+    assert!(after_rescan["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
 
     let compact = json_output(&run(
         &[&common[..], &["report", "--finding", finding_id]].concat(),
@@ -825,6 +920,111 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         None,
     ));
     assert_eq!(full["result"]["placements"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for index in 0..11 {
+        let skill = root.join(format!("variant-{index:02}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: shared-many\ndescription: Many variant route\n---\nvariant {index}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot_id = scan["result"]["snapshot_id"].as_str().unwrap();
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "same_name_divergent_content")
+        .unwrap();
+    let found = json_output(&run(
+        &[&common[..], &["find", "many variant route"]].concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["variant_count"], 11);
+    assert_eq!(
+        found["result"]["matches"][0]["variants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let displayed_ids = found["result"]["matches"][0]["variant_skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let finding_detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--finding",
+                finding["id"].as_str().unwrap(),
+                "--full",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let omitted_id = finding_detail["result"]["affected_skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|skill_id| !displayed_ids.contains(skill_id))
+        .unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let omitted_entrypoint = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["skill_id"] == omitted_id)
+        .and_then(|placement| placement["entrypoint"].as_str())
+        .unwrap();
+    fs::write(
+        omitted_entrypoint,
+        "---\nname: shared-many\ndescription: Many variant route\n---\ndrifted\n",
+    )
+    .unwrap();
+
+    let drifted = json_output(&run(
+        &[&common[..], &["find", "many variant route"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    assert!(drifted["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
 }
 
 #[test]
@@ -4715,6 +4915,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     ));
     assert_eq!(after["result"]["matches"][0]["variant_count"], 1);
     assert!(after["result"]["matches"][0]["variants"].is_null());
+    assert!(after["result"]["matches"][0]["variant_finding"].is_null());
 
     json_output(&run(
         &[
