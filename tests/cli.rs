@@ -1709,6 +1709,14 @@ fn repeated_setup_reuses_the_same_ready_plan() {
     );
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(status["result"]["pending_plan_count"], 2);
+
+    let default_after_explicit = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(
+        default_after_explicit["result"]["plan_id"],
+        after_terminal_state["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 2);
 }
 
 #[test]

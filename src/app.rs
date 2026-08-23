@@ -4238,13 +4238,14 @@ fn prepare_plan(
     validate_plan_evidence(store, &prepared, &scan_id)?;
     if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
         let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
-        for existing in store.ready_plans_with_fingerprint(&prepared_scan_id, &prepared.digest)? {
-            if existing.input.get("raw") == Some(&input)
-                && existing.input.get("reuse_identity") == reuse_identity.as_ref()
-            {
-                if let Some(summary) = existing.input.get("summary") {
-                    return Ok(summary.clone());
-                }
+        if let Some(existing) = store.ready_plan_with_reuse_identity(
+            &prepared_scan_id,
+            &prepared.digest,
+            &input,
+            reuse_identity.as_ref(),
+        )? {
+            if let Some(summary) = existing.input.get("summary") {
+                return Ok(summary.clone());
             }
         }
     }

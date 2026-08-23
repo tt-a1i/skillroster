@@ -981,11 +981,13 @@ impl StateStore {
             .transpose()
     }
 
-    pub fn ready_plans_with_fingerprint(
+    pub fn ready_plan_with_reuse_identity(
         &self,
         scan_id: &ScanId,
         fingerprint: &str,
-    ) -> StorageResult<Vec<PlanRecord>> {
+        raw: &serde_json::Value,
+        reuse_identity: Option<&serde_json::Value>,
+    ) -> StorageResult<Option<PlanRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT immutable_json, status FROM plans
              WHERE scan_id = ?1 AND fingerprint = ?2 AND status = 'ready'
@@ -994,14 +996,17 @@ impl StateStore {
         let rows = statement.query_map(params![scan_id.as_str(), fingerprint], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        let mut plans = Vec::new();
         for row in rows {
             let (encoded, status) = row?;
             let mut plan: PlanRecord = from_json(&encoded)?;
             plan.status = enum_from_text(&status)?;
-            plans.push(plan);
+            if plan.input.get("raw") == Some(raw)
+                && plan.input.get("reuse_identity") == reuse_identity
+            {
+                return Ok(Some(plan));
+            }
         }
-        Ok(plans)
+        Ok(None)
     }
 
     pub fn update_plan_status(&self, id: &PlanId, next: PlanStatus) -> StorageResult<()> {
