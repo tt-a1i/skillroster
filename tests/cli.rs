@@ -1950,11 +1950,40 @@ fn repeated_setup_reuses_the_same_ready_plan() {
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(status["result"]["pending_plan_count"], 2);
 
-    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let newer_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let after_new_snapshot = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_ne!(
         after_new_snapshot["result"]["plan_id"],
         default_after_explicit["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 1);
+    assert_eq!(
+        status["result"]["pending_plans"][0]["plan_id"],
+        after_new_snapshot["result"]["plan_id"]
+    );
+    assert_eq!(
+        status["result"]["pending_plans"][0]["snapshot_id"],
+        newer_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(status["result"]["files_changed"], false);
+
+    let old_plan_id = default_after_explicit["result"]["plan_id"]
+        .as_str()
+        .unwrap();
+    let retained = json_output(&run(
+        &[&common[..], &["plan", "--show", old_plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(retained["result"]["plan_id"], old_plan_id);
+    let stale_apply = run(&[&common[..], &["apply", old_plan_id]].concat(), None);
+    assert!(!stale_apply.status.success());
+    let stale_apply: Value = serde_json::from_slice(&stale_apply.stdout).unwrap();
+    assert!(
+        stale_apply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("newer Snapshot exists")
     );
 }
 

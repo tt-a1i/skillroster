@@ -270,6 +270,9 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 - Plans and Receipts remain until explicitly purged.
 - Overflow source-confirmation details are versioned local artifacts retained until explicitly purged or local state is deleted.
 - `status` exposes storage location, retention state, and retained source-confirmation artifact counts and bytes.
+- `status.pending_plans` contains only actionable Ready Plans for the latest
+  Snapshot plus any Applying or Recovery-required Plans. Ready Plans from older
+  Snapshots remain inspectable history but are not presented as pending work.
 - `status` suggests Scan only when no completed Snapshot exists. A healthy
   state with a Snapshot exposes its timestamp and leaves refresh judgment to
   the Agent instead of creating an unconditional Status-to-Scan loop.

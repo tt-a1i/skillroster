@@ -726,12 +726,15 @@ fn home_result(store: &StateStore, state_dir: &Path) -> Result<Value> {
 
 fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> Result<Value> {
     let latest = store.latest_completed_scan()?;
+    let latest_scan_id = latest.as_ref().map(|scan| &scan.id);
     let pending_plans = store
         .pending_plans()?
         .into_iter()
+        .filter(|plan| plan.status != PlanStatus::Ready || latest_scan_id == Some(&plan.scan_id))
         .map(|plan| {
             json!({
                 "plan_id": plan.id,
+                "snapshot_id": plan.scan_id,
                 "status": plan.status,
                 "created_at": plan.created_at,
             })
