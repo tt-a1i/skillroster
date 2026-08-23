@@ -682,9 +682,11 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
             "stable_identity_fields": [
                 "skill_id", "agent_id", "stage", "quality", "source_path_digest"
             ],
-            "raw_value_field": "event_delta",
-            "monthly_value_field": "event_count",
-            "snapshot_evidence_additive": false,
+            "raw_value_field": "observed_event_count",
+            "monthly_value_field": "max_observed_event_count",
+            "aggregation": "maximum observation per source and month",
+            "observations_additive": false,
+            "legacy_monthly_combinable": false,
         },
         "data": store.export_lifecycle()?,
         "evidence_exclusions": store.evidence_exclusions()?,
@@ -5242,8 +5244,6 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             quality: evidence_quality(usage.quality),
             source_path_digest: usage.source_path_digest.clone(),
             observed_event_count: usage.event_count,
-            first_seen_at: usage.first_seen_unix.unwrap_or_default() as i64,
-            last_seen_at: usage.last_seen_unix.unwrap_or_default() as i64,
             occurred_at: usage.last_seen_unix.unwrap_or_default() as i64,
             outcome: None,
         })?;

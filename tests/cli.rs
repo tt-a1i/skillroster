@@ -2224,11 +2224,11 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
         None,
     ));
     let retained: Value = serde_json::from_slice(&fs::read(&retained_export).unwrap()).unwrap();
-    assert_eq!(retained["usage_history"]["raw_value_field"], "event_delta");
     assert_eq!(
-        retained["usage_history"]["snapshot_evidence_additive"],
-        false
+        retained["usage_history"]["raw_value_field"],
+        "observed_event_count"
     );
+    assert_eq!(retained["usage_history"]["observations_additive"], false);
     assert_eq!(retained["data"]["usage_events"], json!([]));
     assert!(
         retained["data"]["evidence"]
@@ -2238,14 +2238,17 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
             .all(|evidence| evidence["kind"] != "usage")
     );
     assert_eq!(
-        retained["data"]["usage_monthly"].as_array().unwrap().len(),
+        retained["data"]["usage_monthly_sources"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
-    assert_eq!(retained["data"]["usage_monthly"][0]["event_count"], 2);
     assert_eq!(
-        retained["data"]["usage_monthly"][0]["derivation"],
-        "source_delta"
+        retained["data"]["usage_monthly_sources"][0]["max_observed_event_count"],
+        2
     );
+    assert_eq!(retained["data"]["usage_monthly_legacy"], json!([]));
 }
 
 #[test]

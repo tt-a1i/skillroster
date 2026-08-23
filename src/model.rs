@@ -371,8 +371,6 @@ pub struct UsageEvent {
     pub quality: EvidenceQuality,
     pub source_path_digest: String,
     pub observed_event_count: u64,
-    pub first_seen_at: i64,
-    pub last_seen_at: i64,
     pub occurred_at: i64,
     pub outcome: Option<String>,
 }

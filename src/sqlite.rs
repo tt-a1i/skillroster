@@ -606,60 +606,24 @@ impl StateStore {
         let event_count = i64::try_from(event.observed_event_count).map_err(|_| {
             StorageError::InvalidData("usage event count exceeds SQLite range".to_owned())
         })?;
-        let previous: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT event_count FROM usage_observation_totals
-                 WHERE skill_id = ?1 AND agent_id = ?2 AND stage = ?3
-                   AND quality = ?4 AND source_path_digest = ?5",
-                params![
-                    event.skill_id.as_str(),
-                    event.agent_id.as_str(),
-                    stage,
-                    quality,
-                    event.source_path_digest,
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let delta = event_count.saturating_sub(previous.unwrap_or_default());
-        if delta > 0 {
-            self.connection.execute(
-                "INSERT INTO usage_events
-                    (evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
-                     event_delta, occurred_at, outcome)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    event.evidence_id.as_str(),
-                    event.skill_id.as_str(),
-                    event.agent_id.as_str(),
-                    stage,
-                    quality,
-                    event.source_path_digest,
-                    delta,
-                    event.occurred_at,
-                    event.outcome,
-                ],
-            )?;
-        }
         self.connection.execute(
-            "INSERT INTO usage_observation_totals
-                (skill_id, agent_id, stage, quality, source_path_digest,
-                 event_count, first_seen_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(skill_id, agent_id, stage, quality, source_path_digest)
-             DO UPDATE SET event_count = MAX(event_count, excluded.event_count),
-                first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
-                last_seen_at = MAX(last_seen_at, excluded.last_seen_at)",
+            "INSERT INTO usage_events
+                (evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
+                 observed_event_count, occurred_at, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(skill_id, agent_id, stage, quality, source_path_digest,
+                         observed_event_count, occurred_at)
+             DO NOTHING",
             params![
+                event.evidence_id.as_str(),
                 event.skill_id.as_str(),
                 event.agent_id.as_str(),
                 stage,
                 quality,
                 event.source_path_digest,
                 event_count,
-                event.first_seen_at,
-                event.last_seen_at,
+                event.occurred_at,
+                event.outcome,
             ],
         )?;
         Ok(())
@@ -1396,7 +1360,8 @@ impl StateStore {
         Ok(LifecycleCounts {
             evidence_rows: table_count(&self.connection, "evidence")?,
             raw_usage_rows: table_count(&self.connection, "usage_events")?,
-            monthly_usage_rows: table_count(&self.connection, "usage_monthly")?,
+            monthly_usage_rows: table_count(&self.connection, "usage_monthly")?
+                + table_count(&self.connection, "usage_monthly_sources")?,
             oldest_raw_usage_at: self.connection.query_row(
                 "SELECT MIN(occurred_at) FROM usage_events",
                 [],
@@ -1448,10 +1413,22 @@ impl StateStore {
             "SELECT json_object(
                 'evidence_id', evidence_id, 'skill_id', skill_id, 'agent_id', agent_id,
                 'stage', stage, 'quality', quality, 'source_path_digest', source_path_digest,
-                'event_delta', event_delta, 'occurred_at', occurred_at, 'outcome', outcome)
+                'observed_event_count', observed_event_count,
+                'occurred_at', occurred_at, 'outcome', outcome)
              FROM usage_events ORDER BY occurred_at, evidence_id",
         )?;
-        let monthly = query_json_rows(
+        let monthly_sources = query_json_rows(
+            &self.connection,
+            "SELECT json_object(
+                'month_start', month_start, 'skill_id', skill_id, 'agent_id', agent_id,
+                'stage', stage, 'quality', quality,
+                'source_path_digest', source_path_digest,
+                'max_observed_event_count', max_observed_event_count,
+                'first_seen_at', first_seen_at, 'last_seen_at', last_seen_at)
+             FROM usage_monthly_sources
+             ORDER BY month_start, skill_id, agent_id, stage, quality, source_path_digest",
+        )?;
+        let monthly_legacy = query_json_rows(
             &self.connection,
             "SELECT json_object(
                 'month_start', month_start, 'skill_id', skill_id, 'agent_id', agent_id,
@@ -1463,7 +1440,8 @@ impl StateStore {
         Ok(serde_json::json!({
             "evidence": evidence,
             "usage_events": usage,
-            "usage_monthly": monthly,
+            "usage_monthly_sources": monthly_sources,
+            "usage_monthly_legacy": monthly_legacy,
         }))
     }
 
@@ -1475,26 +1453,23 @@ impl StateStore {
             |row| row.get(0),
         )?;
         transaction.execute(
-            "INSERT INTO usage_monthly
-                (month_start, skill_id, agent_id, stage, quality, event_count,
-                 first_seen_at, last_seen_at, derivation)
+            "INSERT INTO usage_monthly_sources
+                (month_start, skill_id, agent_id, stage, quality, source_path_digest,
+                 max_observed_event_count, first_seen_at, last_seen_at)
              SELECT CAST(strftime('%s', strftime('%Y-%m-01', u.occurred_at, 'unixepoch')) AS INTEGER),
-                    u.skill_id, u.agent_id, u.stage, u.quality,
-                    SUM(u.event_delta),
-                    MIN(u.occurred_at), MAX(u.occurred_at), 'source_delta'
-             FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
+                    u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest,
+                    MAX(u.observed_event_count), MIN(u.occurred_at), MAX(u.occurred_at)
+             FROM usage_events u
              WHERE u.occurred_at < ?1
              GROUP BY strftime('%Y-%m', u.occurred_at, 'unixepoch'),
-                      u.skill_id, u.agent_id, u.stage, u.quality
-             ON CONFLICT(month_start, skill_id, agent_id, stage, quality) DO UPDATE SET
-                event_count = usage_monthly.event_count + excluded.event_count,
-                first_seen_at = MIN(usage_monthly.first_seen_at, excluded.first_seen_at),
-                last_seen_at = MAX(usage_monthly.last_seen_at, excluded.last_seen_at),
-                derivation = CASE
-                    WHEN usage_monthly.derivation = excluded.derivation
-                    THEN usage_monthly.derivation
-                    ELSE 'mixed_legacy_and_source_delta'
-                END",
+                      u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest
+             ON CONFLICT(month_start, skill_id, agent_id, stage, quality, source_path_digest)
+             DO UPDATE SET
+                max_observed_event_count = MAX(
+                    usage_monthly_sources.max_observed_event_count,
+                    excluded.max_observed_event_count),
+                first_seen_at = MIN(usage_monthly_sources.first_seen_at, excluded.first_seen_at),
+                last_seen_at = MAX(usage_monthly_sources.last_seen_at, excluded.last_seen_at)",
             [cutoff],
         )?;
         transaction.execute_batch(
@@ -1857,52 +1832,47 @@ fn migration_v9(transaction: &Transaction<'_>) -> StorageResult<()> {
             stage TEXT NOT NULL,
             quality TEXT NOT NULL,
             source_path_digest TEXT NOT NULL,
-            event_delta INTEGER NOT NULL,
+            observed_event_count INTEGER NOT NULL,
             occurred_at INTEGER NOT NULL,
-            outcome TEXT
+            outcome TEXT,
+            UNIQUE(skill_id, agent_id, stage, quality, source_path_digest,
+                   observed_event_count, occurred_at)
          );
          INSERT INTO usage_events
             (evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
-             event_delta, occurred_at, outcome)
+             observed_event_count, occurred_at, outcome)
          SELECT evidence_id, skill_id, agent_id, stage, quality, source_path_digest,
-                event_delta, occurred_at, outcome
+                observed_event_count, occurred_at, outcome
          FROM (
             SELECT u.evidence_id, u.skill_id, u.agent_id, u.stage, u.quality,
                    COALESCE(json_extract(e.details_json, '$.source_path_digest'), e.digest, '')
                        AS source_path_digest,
-                   COALESCE(json_extract(e.details_json, '$.event_count'), 1) AS event_delta,
+                   COALESCE(json_extract(e.details_json, '$.event_count'), 1)
+                       AS observed_event_count,
                    u.occurred_at, u.outcome,
                    ROW_NUMBER() OVER (
                        PARTITION BY u.skill_id, u.agent_id, u.stage, u.quality,
-                           COALESCE(json_extract(e.details_json, '$.source_path_digest'), e.digest, '')
-                       ORDER BY COALESCE(json_extract(e.details_json, '$.event_count'), 1) DESC,
-                                u.occurred_at DESC, u.evidence_id DESC
+                           COALESCE(json_extract(e.details_json, '$.source_path_digest'), e.digest, ''),
+                           COALESCE(json_extract(e.details_json, '$.event_count'), 1),
+                           u.occurred_at
+                       ORDER BY u.evidence_id DESC
                    ) AS rank
             FROM usage_events_v8 u JOIN evidence e ON e.id = u.evidence_id
          ) WHERE rank = 1;
          DROP TABLE usage_events_v8;
          CREATE INDEX usage_events_skill_time ON usage_events(skill_id, occurred_at);
-         CREATE TABLE usage_observation_totals (
+         CREATE TABLE usage_monthly_sources (
+            month_start INTEGER NOT NULL,
             skill_id TEXT NOT NULL REFERENCES skills(id),
             agent_id TEXT NOT NULL REFERENCES agents(id),
             stage TEXT NOT NULL,
             quality TEXT NOT NULL,
             source_path_digest TEXT NOT NULL,
-            event_count INTEGER NOT NULL,
+            max_observed_event_count INTEGER NOT NULL,
             first_seen_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
-            PRIMARY KEY(skill_id, agent_id, stage, quality, source_path_digest)
-         );
-         INSERT INTO usage_observation_totals
-            (skill_id, agent_id, stage, quality, source_path_digest,
-             event_count, first_seen_at, last_seen_at)
-         SELECT u.skill_id, u.agent_id, u.stage, u.quality, u.source_path_digest,
-                u.event_delta,
-                MIN(COALESCE(json_extract(e.details_json, '$.first_seen_unix'), u.occurred_at)),
-                MAX(COALESCE(json_extract(e.details_json, '$.last_seen_unix'), u.occurred_at))
-         FROM usage_events u JOIN evidence e ON e.id = u.evidence_id
-         GROUP BY u.skill_id, u.agent_id, u.stage, u.quality,
-                  u.source_path_digest;",
+            PRIMARY KEY(month_start, skill_id, agent_id, stage, quality, source_path_digest)
+         );",
     )?;
     Ok(())
 }
@@ -2168,7 +2138,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_deduplicates_unchanged_v8_usage_observations_conservatively() {
+    fn migration_preserves_distinct_v8_observations_without_combining_legacy_totals() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
             .pragma_update(None, "foreign_keys", true)
@@ -2250,10 +2220,11 @@ mod tests {
 
         let store = StateStore::initialize(connection).unwrap();
         let export = store.export_lifecycle().unwrap();
-        assert_eq!(export["usage_events"].as_array().unwrap().len(), 1);
-        assert_eq!(export["usage_events"][0]["event_delta"], 2);
+        assert_eq!(export["usage_events"].as_array().unwrap().len(), 2);
+        assert_eq!(export["usage_events"][0]["observed_event_count"], 1);
+        assert_eq!(export["usage_events"][1]["observed_event_count"], 2);
         assert_eq!(
-            export["usage_monthly"][0]["derivation"],
+            export["usage_monthly_legacy"][0]["derivation"],
             "legacy_scan_aggregate"
         );
         assert_eq!(
@@ -2261,16 +2232,18 @@ mod tests {
                 .purge_usage_before(100)
                 .unwrap()
                 .aggregated_raw_usage_rows,
-            1
+            2
         );
         let retained = store.export_lifecycle().unwrap();
-        let source_delta = retained["usage_monthly"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["derivation"] == "source_delta")
-            .unwrap();
-        assert_eq!(source_delta["event_count"], 2);
+        assert_eq!(
+            retained["usage_monthly_sources"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            retained["usage_monthly_sources"][0]["max_observed_event_count"],
+            2
+        );
+        assert_eq!(retained["usage_monthly_legacy"][0]["event_count"], 7);
     }
 
     #[test]
@@ -2684,14 +2657,12 @@ mod tests {
         store
             .save_usage_event(&UsageEvent {
                 evidence_id: evidence.id,
-                skill_id,
-                agent_id,
+                skill_id: skill_id.clone(),
+                agent_id: agent_id.clone(),
                 stage: UsageStage::Loaded,
                 quality: EvidenceQuality::Observed,
                 source_path_digest: "sha256:retention-source".to_owned(),
                 observed_event_count: 3,
-                first_seen_at: 10,
-                last_seen_at: 10,
                 occurred_at: 10,
                 outcome: None,
             })
@@ -2706,7 +2677,44 @@ mod tests {
         assert_eq!(counts.raw_usage_rows, 0);
         assert_eq!(counts.monthly_usage_rows, 1);
         let export = store.export_lifecycle().unwrap();
-        assert_eq!(export["usage_monthly"][0]["event_count"], 3);
+        assert_eq!(
+            export["usage_monthly_sources"][0]["max_observed_event_count"],
+            3
+        );
+
+        let repeated_evidence = EvidenceRecord {
+            id: EvidenceId::new(),
+            scan_id: scan.id.clone(),
+            kind: EvidenceKind::Usage,
+            quality: EvidenceQuality::Observed,
+            subject_type: "skill".to_owned(),
+            subject_id: skill_id.to_string(),
+            path: None,
+            digest: None,
+            details: serde_json::json!({"event_count": 3}),
+            observed_at: 20,
+        };
+        store.save_evidence(&repeated_evidence).unwrap();
+        store
+            .save_usage_event(&UsageEvent {
+                evidence_id: repeated_evidence.id,
+                skill_id,
+                agent_id,
+                stage: UsageStage::Loaded,
+                quality: EvidenceQuality::Observed,
+                source_path_digest: "sha256:retention-source".to_owned(),
+                observed_event_count: 3,
+                occurred_at: 20,
+                outcome: None,
+            })
+            .unwrap();
+        store.purge_usage_before(100).unwrap();
+        let repeated_export = store.export_lifecycle().unwrap();
+        assert_eq!(
+            repeated_export["usage_monthly_sources"][0]["max_observed_event_count"],
+            3
+        );
+
         let (_, payload): (ScanId, serde_json::Value) =
             store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"], serde_json::json!([]));

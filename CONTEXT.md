@@ -55,9 +55,10 @@ A traceable fact supporting a Finding, such as a path, source declaration, symli
 _Avoid_: Proof, confidence
 
 **Usage Observation**:
-A privacy-preserving aggregate for one Skill, Agent, usage stage, quality, and
-session-source path. Its high-water count is stable across Scans; lifecycle
-history records only newly observed deltas and never raw conversation text.
+A privacy-preserving bounded observation for one Skill, Agent, usage stage,
+quality, and session-source path. Unchanged observations deduplicate across
+Scans; lifecycle retention keeps the maximum observation per source and month.
+It does not infer additive events and never stores raw conversation text.
 _Avoid_: Scan hit, invocation log
 
 **Finding**:
