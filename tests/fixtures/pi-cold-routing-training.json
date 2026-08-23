@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "suite_id": "cold-routing-training-v10",
+  "harness": "pi",
+  "model": "seal/gpt-5.6-sol",
+  "language": "zh-CN",
+  "arm_schedule_seed": "7b1e09a46d2c8f3054ea91b763cd20af",
+  "aggregate_gate": {
+    "core_task_success_minimum": 4,
+    "on_demand_task_success_minimum": 3,
+    "on_demand_load_success_minimum": 3
+  },
+  "common": {
+    "tools": ["read", "write", "bash"],
+    "fresh_session_per_arm": true,
+    "randomize_arm_order": true,
+    "forbidden_prompt_terms": [
+      "SkillRoster",
+      "SKILL.md",
+      "检索能力",
+      ".agents_skills",
+      ".pi/agent/skills"
+    ],
+    "on_demand_preconditions": {
+      "default_exposure": 0,
+      "roster_state": "on_demand",
+      "recovery_state": "clear",
+      "find_path_readable": true
+    }
+  },
+  "tasks": [
+    {
+      "id": "train-arch-diagram-001",
+      "family": "interactive_architecture_diagram",
+      "expected_skill": "archify",
+      "prompt": "请根据 system-overview.txt 生成一份可独立打开的交互式系统架构 HTML，保存为 outputs/order-architecture.html。唯一允许的中间规格文件是 scratch/order-architecture.spec.json，不要创建其他中间文件。页面支持明暗主题，并提供基础的组件搜索和链路追踪交互。架构保持真实而有界：使用 6–8 个组件、2–3 个信任边界、一条主要请求链和一个异步分支，不要强制加入循环、泳道或卡片布局。完成后只告诉我文件路径和校验是否通过。",
+      "workspace_files": {
+        "system-overview.txt": "订单系统架构事实：\n- 组件共 8 个：Web 客户端、API Gateway、Auth Service、Order Service、PostgreSQL、Queue、Worker、Object Storage。\n- 主要请求链：Web 客户端通过 HTTPS 访问 API Gateway；API Gateway 通过 HTTPS 调用 Order Service；Order Service 通过 SQL 访问 PostgreSQL。\n- 认证检查：API Gateway 通过 HTTPS 调用 Auth Service。\n- 异步分支：Order Service 发布异步事件到 Queue，Worker 消费事件并把生成的订单文档写入 Object Storage。\n- 使用 3 个信任边界：用户端、应用服务区、数据与异步基础设施区。\n- 图中标明 HTTPS、SQL、异步事件和信任边界。\n"
+      },
+      "allowed_changed_paths": ["scratch/order-architecture.spec.json", "outputs/order-architecture.html"],
+      "command_chain": {
+        "source_path": "scratch/order-architecture.spec.json",
+        "artifact_path": "outputs/order-architecture.html"
+      },
+      "timeout_ms": 600000,
+      "post_load_permissions": {
+        "read_roots": ["workspace", "target_package"],
+        "write_roots": ["workspace"],
+        "commands": [
+          {
+            "kind": "node_script",
+            "path_in_target": "bin/archify.mjs",
+            "subcommands": ["validate", "deliver"]
+          }
+        ]
+      },
+      "oracle": {
+        "type": "html",
+        "path": "outputs/order-architecture.html",
+        "minimum_bytes": 20000,
+        "required_substrings": [
+          "<svg",
+          "<style",
+          "<script",
+          "data-theme",
+          "btn-theme",
+          "Web 客户端",
+          "API Gateway",
+          "Auth Service",
+          "Order Service",
+          "PostgreSQL",
+          "Queue",
+          "Worker",
+          "Object Storage",
+          "HTTPS",
+          "SQL",
+          "异步事件",
+          "信任边界"
+        ],
+        "required_regex": [
+          "(btn-node-finder|data-node-finder-trigger|search)",
+          "(data-intent-trace-active|data-route-probe-overlay|trace)"
+        ],
+        "topology_contract": {
+          "component_count": 8,
+          "boundary_count": 3,
+          "connection_count": 7,
+          "forbid_directed_cycle": true,
+          "require_all_components_in_boundaries": true,
+          "require_partitioned_boundaries": true,
+          "forbid_unlisted_edges": true,
+          "required_boundaries": [
+            { "label": "用户端", "wraps": ["Web 客户端"] },
+            { "label": "应用服务区", "wraps": ["API Gateway", "Auth Service", "Order Service"] },
+            { "label": "数据与异步基础设施区", "wraps": ["PostgreSQL", "Queue", "Worker", "Object Storage"] }
+          ],
+          "required_edges": [
+            { "from": "Web 客户端", "to": "API Gateway", "label_regex": "HTTPS" },
+            { "from": "API Gateway", "to": "Auth Service", "label_regex": "HTTPS" },
+            { "from": "API Gateway", "to": "Order Service", "label_regex": "HTTPS" },
+            { "from": "Order Service", "to": "PostgreSQL", "label_regex": "SQL" }
+          ],
+          "required_paths": [
+            { "nodes": ["Order Service", "Queue", "Worker", "Object Storage"], "label_regex": ["(异步|event|事件|publish)", "(consume|消费|deliver)", "(write|写入|document)"] }
+          ]
+        },
+        "forbidden_substrings": ["<script src=", "<link rel=\"stylesheet\""],
+        "required_successful_commands": ["validate", "deliver"]
+      }
+    },
+    {
+      "id": "train-humanize-001",
+      "family": "chinese_style_editing",
+      "expected_skill": "humanizer-zh",
+      "prompt": "请把 draft.md 改成一段自然、克制的团队内部更新，保存到 outputs/update.md。只保留原文明确写出的发布日期、离线草稿、批量导出、内测总人数和反馈人数，不要补充问候、收尾建议、使用安排，也不要根据人数推导新信息；所有数字和事实都要保留，正文控制在 80 到 180 个字符（含标点），不要标题、列表或修改说明。",
+      "workspace_files": {
+        "draft.md": "这次桌面客户端的发布标志着团队迈向卓越体验的关键里程碑。此外，它将提供无缝、直观和强大的使用体验——确保每一位成员都能释放生产力。这不仅仅是一次普通更新，而是我们重新定义工作方式的重要证明。桌面客户端将在 9 月 18 日发布，首版支持离线草稿和批量导出。内测共有 42 人，其中 31 人表示批量导出节省了时间。令人振奋的未来已经到来，请告诉我是否需要进一步展开。\n"
+      },
+      "allowed_changed_paths": ["outputs/update.md"],
+      "post_load_permissions": {
+        "read_roots": ["workspace", "target_package"],
+        "write_roots": ["workspace"],
+        "commands": []
+      },
+      "oracle": {
+        "type": "text",
+        "path": "outputs/update.md",
+        "minimum_characters": 80,
+        "maximum_characters": 180,
+        "required_substrings": [
+          "桌面客户端",
+          "离线草稿",
+          "批量导出",
+          "42",
+          "31"
+        ],
+        "required_regex": [
+          "9\\s*月\\s*18\\s*日",
+          "(节省|省了|省下).{0,4}时间"
+        ],
+        "forbidden_regex": [
+          "^#",
+          "(?m)^\\s*[-*+]\\s",
+          "\\*\\*",
+          "此外",
+          "至关重要",
+          "不仅.{0,8}(而且|而是)",
+          "关键里程碑",
+          "重要证明",
+          "无缝",
+          "释放生产力",
+          "令人振奋",
+          "未来已经到来",
+          "请告诉我",
+          "—",
+          "(另外|其余)\\s*11\\s*人",
+          "上线后",
+          "发布后",
+          "更新桌面端",
+          "随时反馈",
+          "有问题.{0,8}(反馈|处理)"
+        ]
+      }
+    },
+    {
+      "id": "train-domain-language-001",
+      "family": "domain_glossary",
+      "expected_skill": "domain-modeling",
+      "prompt": "product-notes.md 里同一个业务概念用了好几套叫法。请按已经确认的产品决定统一术语，在项目根目录写一份简洁的 CONTEXT.md。这里只记录业务概念和应避免的旧叫法，不要把数据库、接口或实现细节写进去。",
+      "workspace_files": {
+        "product-notes.md": "# 已确认的产品决定\n\n1. 对外统一称“空间”。空间是一个客户组织拥有的数据隔离边界。旧文档里的“租户”和“账户”在这里都指空间，以后不再使用。\n2. 对外统一称“成员”。成员是已经获得某个空间访问权限的人。旧文档把这个业务概念写成“用户”，以后不再使用。\n3. 对外统一称“邀请”。邀请是尚未被接受的加入请求；接受后才会产生成员。“待激活成员”会混淆两个状态，以后不再使用。\n\n当前实现备注，请勿进入业务词典：PostgreSQL 表名仍是 tenants、users、invites。旧接口路径仍包含 /api/v1/accounts。\n"
+      },
+      "allowed_changed_paths": ["CONTEXT.md"],
+      "post_load_permissions": {
+        "read_roots": ["workspace", "target_package"],
+        "write_roots": ["workspace"],
+        "commands": []
+      },
+      "oracle": {
+        "type": "markdown_glossary",
+        "path": "CONTEXT.md",
+        "required_substrings": [
+          "空间",
+          "客户组织",
+          "数据隔离边界",
+          "租户",
+          "账户",
+          "成员",
+          "访问权限",
+          "用户",
+          "邀请",
+          "尚未被接受",
+          "待激活成员"
+        ],
+        "required_regex": [
+          "加入.{0,4}请求"
+        ],
+        "deprecated_terms": ["租户", "账户", "用户", "待激活成员"],
+        "forbidden_substrings": [
+          "PostgreSQL",
+          "tenants",
+          "users",
+          "invites",
+          "/api/v1/accounts",
+          "数据库",
+          "接口路径",
+          "表名"
+        ],
+        "forbidden_paths": ["docs/adr"]
+      }
+    },
+    {
+      "id": "train-session-mining-001",
+      "family": "local_session_content_mining",
+      "expected_skill": "agent-session-miner",
+      "target_package_include": [
+        "SKILL.md",
+        "references/material-taxonomy.md",
+        "references/output-format.md"
+      ],
+      "prompt": "session-extract.jsonl 是最近 7 天本地编码助手会话的预先脱敏摘录。请从中整理可公开分享的技术素材：短回复素材和长帖线索分开，不能公开的内容单独保存，并附一份脱敏说明。结果写到 outputs/，不要扫描其他目录，也不要发布、上传或发送任何内容。",
+      "workspace_files": {
+        "session-extract.jsonl": "{\"agent\":\"pi\",\"role\":\"user\",\"text\":\"Checkout 构建只在 Windows 失败。cargo test --locked 退出，生成的 shell 脚本使用了 CRLF。仓库在 <REDACTED_PATH>，联系 <REDACTED_EMAIL>。\"}\n{\"agent\":\"pi\",\"role\":\"assistant\",\"text\":\"把生成脚本改成 LF，并增加 Windows matrix 断言后，重试通过。\"}\n{\"agent\":\"pi\",\"role\":\"user\",\"text\":\"某客户使用 <REDACTED_URL>，凭据为 <REDACTED_SECRET>。不要公开客户细节。\"}\n{\"agent\":\"pi\",\"role\":\"assistant\",\"text\":\"可公开的一般经验：跨平台发布检查应先确认脚本换行符，再判断是否是编译器问题。\"}\n"
+      },
+      "allowed_changed_paths": [
+        "outputs/x_reply_seeds.md",
+        "outputs/x_thread_seeds.md",
+        "outputs/private_do_not_post.md",
+        "outputs/redaction_report.md"
+      ],
+      "contained_write_roots": ["outputs"],
+      "post_load_permissions": {
+        "read_roots": ["workspace", "target_package"],
+        "write_roots": ["workspace"],
+        "commands": []
+      },
+      "oracle": {
+        "type": "redaction_bundle",
+        "required_paths": [
+          "outputs/x_reply_seeds.md",
+          "outputs/x_thread_seeds.md",
+          "outputs/private_do_not_post.md",
+          "outputs/redaction_report.md"
+        ],
+        "required_nonempty_paths": [
+          "outputs/x_reply_seeds.md",
+          "outputs/x_thread_seeds.md"
+        ],
+        "public_seed_paths": [
+          "outputs/x_reply_seeds.md",
+          "outputs/x_thread_seeds.md"
+        ],
+        "private_path": "outputs/private_do_not_post.md",
+        "report_path": "outputs/redaction_report.md",
+        "public_required_regex": ["Windows", "(CRLF|换行)"],
+        "private_required_substrings": ["客户"],
+        "private_required_regex": ["(不公开|不可公开|不得公开|禁止发布)"],
+        "report_required_substrings": ["路径", "URL", "凭据"],
+        "report_required_regex": ["(邮箱|邮件|联系方式|联系信息)"],
+        "forbidden_across_outputs": [
+          "/Users/",
+          "@example.com",
+          "https://internal",
+          "sk_train_",
+          "<REDACTED_PATH>",
+          "<REDACTED_EMAIL>",
+          "<REDACTED_URL>",
+          "<REDACTED_SECRET>"
+        ]
+      }
+    }
+  ]
+}

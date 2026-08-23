@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "suite_id": "cold-routing-holdout-v2",
+  "harness": "pi",
+  "model": "seal/gpt-5.6-sol",
+  "language": "zh-CN",
+  "seal_contract": "pi-cold-routing-holdout-v2.seal.json",
+  "arm_schedule_seed": "4d9f318a6c72e501b8d4430faec96725",
+  "aggregate_gate": {
+    "core_task_success_minimum": 4,
+    "on_demand_task_success_minimum": 4,
+    "on_demand_load_success_minimum": 3
+  },
+  "common": {
+    "tools": ["read", "write", "bash"],
+    "fresh_session_per_arm": true,
+    "randomize_arm_order": true,
+    "forbidden_prompt_terms": ["SkillRoster", "SKILL.md", "检索能力", ".agents_skills", ".pi/agent/skills", "expected_skill", "命令行", "CLI", "Skill", "技能", "搜索"],
+    "on_demand_preconditions": { "default_exposure": 0, "roster_state": "on_demand", "recovery_state": "clear", "find_path_readable": true }
+  },
+  "tasks": [
+    {
+      "id": "holdout-relay-topology-002",
+      "family": "interactive_architecture_diagram",
+      "expected_skill": "archify",
+      "prompt": "根据 relay-network.txt 制作一份可离线打开的交互架构页面，交付到 deliverables/relay-map.html。中间规格只能写入 scratch/relay-map.spec.json。页面应支持浅色和深色外观切换、节点定位及路径高亮。用八个节点表达枢纽辐射结构，画出控制枢纽的同步依赖和一条遥测告警支线，并区分三个安全区域；不要添加回环。完成后仅报告交付位置和校验结论。",
+      "workspace_files": {
+        "relay-network.txt": "远端中继网络事实：\n- 节点共 8 个：Operations Desk、Relay Hub、Identity Authority、Field Node East、Field Node West、Telemetry Vault、Rule Engine、Pager Channel。\n- 主控制路径：Operations Desk 通过 HTTPS 访问 Relay Hub；Relay Hub 每次下发前同步通过 gRPC 查询 Identity Authority；通过 mTLS 分别连接 East 与 West 两个辐射节点。\n- 后台支线：两个 Field Node 以 MQTT 上报遥测到 Telemetry Vault；Vault 发出异步事件给 Rule Engine，命中规则后通知 Pager Channel。\n- 三个区域：操作终端区、中央控制区、远端与遥测区。\n- 标示 HTTPS、gRPC、mTLS、MQTT、异步事件以及区域边界。\n"
+      },
+      "allowed_changed_paths": ["scratch/relay-map.spec.json", "deliverables/relay-map.html"],
+      "command_chain": { "source_path": "scratch/relay-map.spec.json", "artifact_path": "deliverables/relay-map.html" },
+      "timeout_ms": 600000,
+      "post_load_permissions": {
+        "read_roots": ["workspace", "target_package"], "write_roots": ["workspace"],
+        "commands": [{ "kind": "node_script", "path_in_target": "bin/archify.mjs", "subcommands": ["validate", "deliver"] }]
+      },
+      "oracle": {
+        "type": "html", "path": "deliverables/relay-map.html", "minimum_bytes": 20000,
+        "required_substrings": ["<svg", "<style", "<script", "data-theme", "Operations Desk", "Relay Hub", "Identity Authority", "Field Node East", "Field Node West", "Telemetry Vault", "Rule Engine", "Pager Channel", "HTTPS", "gRPC", "mTLS", "MQTT", "异步事件"],
+        "required_regex": ["(btn-theme|data-theme-control|theme-toggle)", "(node-finder|component-locator|find-node)", "(trace-active|route-probe|path-highlight)"],
+        "topology_contract": {
+          "component_count": 8,
+          "boundary_count": 3,
+          "connection_count": 8,
+          "forbid_directed_cycle": true,
+          "require_all_components_in_boundaries": true,
+          "require_partitioned_boundaries": true,
+          "forbid_unlisted_edges": true,
+          "required_boundaries": [
+            { "label": "操作终端区", "wraps": ["Operations Desk"] },
+            { "label": "中央控制区", "wraps": ["Relay Hub", "Identity Authority"] },
+            { "label": "远端与遥测区", "wraps": ["Field Node East", "Field Node West", "Telemetry Vault", "Rule Engine", "Pager Channel"] }
+          ],
+          "hub": "Relay Hub",
+          "spokes": ["Identity Authority", "Field Node East", "Field Node West"],
+          "required_edges": [
+            { "from": "Operations Desk", "to": "Relay Hub", "label_regex": "HTTPS" },
+            { "from": "Relay Hub", "to": "Identity Authority", "label_regex": "gRPC" },
+            { "from": "Relay Hub", "to": "Field Node East", "label_regex": "mTLS" },
+            { "from": "Relay Hub", "to": "Field Node West", "label_regex": "mTLS" },
+            { "from": "Field Node West", "to": "Telemetry Vault", "label_regex": "MQTT" }
+          ],
+          "required_paths": [
+            { "nodes": ["Field Node East", "Telemetry Vault", "Rule Engine", "Pager Channel"], "label_regex": ["MQTT", "(异步|event|事件)", "(notify|通知|page)"] }
+          ]
+        },
+        "forbidden_substrings": ["<script src=", "<link rel=\"stylesheet\""], "required_successful_commands": ["validate", "deliver"]
+      }
+    },
+    {
+      "id": "holdout-humanize-device-002",
+      "family": "chinese_style_editing",
+      "expected_skill": "humanizer-zh",
+      "prompt": "请将 maintenance-note.md 整理成一段平实的内部进展，写入 deliverables/device-brief.txt。必须保留维护日期、两项改动、参与试用与明确认可的人数，以及原文给出的效果；不要计算比例，也不要增加后续安排、问候或建议。正文控制在 80 至 180 个字符（含标点），不要使用标题、列表或修改说明。",
+      "workspace_files": {
+        "maintenance-note.md": "这次手持终端维护象征着仓储体验跨越式升级，我们将以前所未有的方式点亮每一次操作。它不仅带来无缝效率，更彻底重塑现场节奏。此外，这也是团队持续追求卓越的有力证明。维护定于 2 月 14 日进行，首批改动包含离线队列和高对比扫码框。试用共有 76 人，其中 52 人明确表示高对比扫码框减少了重复扫描。让我们共同迎接这次激动人心的变化，如需展开请随时告诉我。\n"
+      },
+      "allowed_changed_paths": ["deliverables/device-brief.txt"],
+      "post_load_permissions": { "read_roots": ["workspace", "target_package"], "write_roots": ["workspace"], "commands": [] },
+      "oracle": {
+        "type": "text", "path": "deliverables/device-brief.txt", "minimum_characters": 80, "maximum_characters": 180,
+        "required_substrings": ["手持终端", "离线队列", "高对比扫码框", "76", "52"],
+        "required_regex": ["2\\s*月\\s*14\\s*日", "(减少|降低|省去).{0,8}(重复扫描|反复扫描)"],
+        "forbidden_regex": ["^#", "(?m)^\\s*[-*+]\\s", "\\*\\*", "此外", "不仅.{0,8}(而且|更)", "跨越式升级", "前所未有", "彻底重塑", "有力证明", "激动人心", "共同迎接", "请随时告诉我", "—", "(另外|其余)\\s*24\\s*人", "维护后", "后续安排", "欢迎.{0,6}反馈"]
+      }
+    },
+    {
+      "id": "holdout-domain-rights-002",
+      "family": "domain_glossary",
+      "expected_skill": "domain-modeling",
+      "prompt": "rights-decisions.md 已确定发行团队的统一业务语言，旧资料仍混用了若干叫法。请在 language/TERMS.md 中整理正式概念、业务含义和应停用的旧称。不要写入存储结构、消息机制或服务地址。",
+      "workspace_files": {
+        "rights-decisions.md": "# 发行权益决定\n\n1. 统一称“发行单元”。它是一份内容在特定市场销售时采用的确定版本。旧资料中的“片源包”和“版本包”均指发行单元，今后停用。\n2. 统一称“可售窗口”。它是一项发行单元可以在某市场销售的起止时间范围。旧称“授权期”不再使用。\n3. 统一称“权益范围”。它描述发行单元获准覆盖的渠道、地区和设备类别。“播放权限”和“渠道权限”只表达了其中一部分，今后停用。\n\n实现备注不得进入词典：DynamoDB 表 rights_units、Kafka topic licensing.changed、服务地址 /internal/windows。\n"
+      },
+      "allowed_changed_paths": ["language/TERMS.md"],
+      "post_load_permissions": { "read_roots": ["workspace", "target_package"], "write_roots": ["workspace"], "commands": [] },
+      "oracle": {
+        "type": "markdown_glossary", "path": "language/TERMS.md",
+        "required_substrings": ["发行单元", "片源包", "版本包", "可售窗口", "授权期", "权益范围", "播放权限", "渠道权限"],
+        "required_regex": ["发行单元[\\s\\S]{0,100}(特定市场|确定版本)", "可售窗口[\\s\\S]{0,100}(起止时间|销售)", "权益范围[\\s\\S]{0,140}(渠道|地区)[\\s\\S]{0,50}设备"],
+        "deprecated_terms": ["片源包", "版本包", "授权期", "播放权限", "渠道权限"],
+        "forbidden_substrings": ["DynamoDB", "rights_units", "Kafka", "licensing.changed", "/internal/windows", "数据库", "消息主题", "服务地址"],
+        "forbidden_paths": ["docs/adr"]
+      }
+    },
+    {
+      "id": "holdout-session-watcher-002",
+      "family": "local_session_content_mining",
+      "expected_skill": "agent-session-miner",
+      "target_package_include": ["SKILL.md", "references/material-taxonomy.md", "references/output-format.md"],
+      "prompt": "redacted-assistant-sample.jsonl 是一份范围固定并已预先脱敏的近期助手记录。请将可公开复用的短经验整理到 deliverables/quick_notes.md，将适合深入展开的线索放到 deliverables/deep_dive_outlines.md；不可披露内容和脱敏说明分别写入 deliverables/restricted_material.md 与 deliverables/privacy_audit.md。不要读取其他位置，也不要发布、上传或发送任何内容。",
+      "workspace_files": {
+        "redacted-assistant-sample.jsonl": "{\"agent\":\"pi\",\"role\":\"user\",\"text\":\"overlayfs 下的文件监视测试偶发丢失 rename 事件对，本地位置为 <SEALED_LOCAL_PATH>，维护邮箱 <SEALED_CONTACT>。\"}\n{\"agent\":\"pi\",\"role\":\"assistant\",\"text\":\"将断言改为有界轮询最终目录状态，并把原始事件序列仅作为诊断后，连续重跑稳定。\"}\n{\"agent\":\"pi\",\"role\":\"user\",\"text\":\"外部审计方端点 <SEALED_ENDPOINT>，访问令牌 <SEALED_TOKEN>，合作资料不可披露。\"}\n{\"agent\":\"pi\",\"role\":\"assistant\",\"text\":\"可公开经验：文件监视器在合并事件时，应验证最终状态而不是依赖每个中间事件都出现。\"}\n"
+      },
+      "allowed_changed_paths": ["deliverables/quick_notes.md", "deliverables/deep_dive_outlines.md", "deliverables/restricted_material.md", "deliverables/privacy_audit.md"],
+      "contained_write_roots": ["deliverables"],
+      "post_load_permissions": { "read_roots": ["workspace", "target_package"], "write_roots": ["workspace"], "commands": [] },
+      "oracle": {
+        "type": "redaction_bundle",
+        "required_paths": ["deliverables/quick_notes.md", "deliverables/deep_dive_outlines.md", "deliverables/restricted_material.md", "deliverables/privacy_audit.md"],
+        "required_nonempty_paths": ["deliverables/quick_notes.md", "deliverables/deep_dive_outlines.md"],
+        "public_seed_paths": ["deliverables/quick_notes.md", "deliverables/deep_dive_outlines.md"],
+        "private_path": "deliverables/restricted_material.md", "report_path": "deliverables/privacy_audit.md",
+        "public_required_regex": ["overlayfs", "(rename|重命名|事件合并)", "(最终状态|有界轮询|最终目录)"],
+        "private_required_regex": ["(外部审计|审计方|合作方)", "(不可披露|不得外传|禁止公开|不公开|保密)"],
+        "report_required_regex": ["(路径|位置|目录)", "(邮箱|联系方式|联系信息)", "(URL|端点|地址|endpoint)", "(令牌|token|凭据|密钥)"],
+        "forbidden_across_outputs": ["/Users/", "https://audit", "tok_sealed_", "<SEALED_LOCAL_PATH>", "<SEALED_CONTACT>", "<SEALED_ENDPOINT>", "<SEALED_TOKEN>"]
+      }
+    }
+  ]
+}
