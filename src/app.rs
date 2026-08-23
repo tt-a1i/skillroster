@@ -1196,6 +1196,7 @@ fn validate_source_confirmation_detail(path: &Path) -> Result<()> {
 
 fn recognized_source_confirmation_detail(detail: &Value) -> bool {
     (|| -> Option<bool> {
+        let schema_version = detail["schema_version"].as_u64()?;
         let core_budget = detail["requested_core_budget"].as_u64()?;
         let blocked_changes = detail["blocked_changes"].as_array()?;
         let blocked_change_count = detail["blocked_change_count"].as_u64()?;
@@ -1243,7 +1244,18 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         .into_iter()
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>();
+        let action_context_argv = match schema_version {
+            1 => Vec::new(),
+            2 => detail["action_context_argv"]
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        recognized_action_context_argv(&action_context_argv).then_some(())?;
         let mut expected_argv = vec!["skillroster"];
+        expected_argv.extend(action_context_argv);
         for root in &source_roots {
             expected_argv.extend(["--source-root", *root]);
         }
@@ -1254,7 +1266,7 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()?;
         Some(
-            detail["schema_version"] == 1
+            matches!(schema_version, 1 | 2)
                 && detail["reason"] == "trusted_canonical_sources_required"
                 && detail["decision"] == "confirm_trusted_source_roots"
                 && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
@@ -1269,6 +1281,31 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         )
     })()
     .unwrap_or(false)
+}
+
+fn recognized_action_context_argv(argv: &[&str]) -> bool {
+    if argv.len() % 2 != 0 {
+        return false;
+    }
+    let mut state_dir_seen = false;
+    let mut home_seen = false;
+    argv.chunks_exact(2).all(|pair| match pair {
+        ["--state-dir", path] => {
+            let unique = !state_dir_seen;
+            state_dir_seen = true;
+            unique && Path::new(path).is_absolute()
+        }
+        ["--home", path] => {
+            let unique = !home_seen;
+            home_seen = true;
+            unique && Path::new(path).is_absolute()
+        }
+        ["--root", root] => root.split_once('=').is_some_and(|(agent, path)| {
+            parse_agent_kind(agent).is_ok() && Path::new(path).is_absolute()
+        }),
+        ["--source-root", path] => Path::new(path).is_absolute(),
+        _ => false,
+    })
 }
 
 fn source_confirmation_detail_summary(state_dir: &Path) -> Result<Value> {
@@ -7213,6 +7250,8 @@ mod recovery_tests {
             .as_str()
             .unwrap();
         let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["schema_version"], 2);
+        assert_eq!(complete["action_context_argv"], json!(action_argv_prefix));
         assert_eq!(complete["source_roots"], json!(expected_roots));
         let complete_argv = complete["after_confirmation"]["argv"]
             .as_array()
@@ -7232,6 +7271,10 @@ mod recovery_tests {
                 "missing complete --source-root {root} in {complete_argv:?}"
             );
         }
+        validate_source_confirmation_detail(Path::new(detail_path)).unwrap();
+        let mut unrecognized = complete.clone();
+        unrecognized["action_context_argv"] = json!(["--yes", "true"]);
+        assert!(!recognized_source_confirmation_detail(&unrecognized));
     }
 
     #[test]

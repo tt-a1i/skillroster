@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
-const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 1;
+const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 2;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
@@ -214,6 +214,7 @@ pub fn source_confirmation_block(
                     "skill_ids": skill_ids,
                     "source_root_count": source_root_count,
                     "source_roots": source_root_paths,
+                    "action_context_argv": action_argv_prefix,
                     "after_confirmation": {
                         "repeatable_option": "--source-root",
                         "source_roots": source_root_paths,
@@ -1945,7 +1946,8 @@ mod tests {
             "atomic publication must not leave a temporary artifact"
         );
         let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
-        assert_eq!(complete["schema_version"], 1);
+        assert_eq!(complete["schema_version"], 2);
+        assert_eq!(complete["action_context_argv"], json!([]));
         assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
         assert_eq!(complete["source_roots"], json!(expected_roots));
         assert_eq!(
