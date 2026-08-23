@@ -1795,6 +1795,8 @@ pub(crate) fn fuse_retrieval_channels(
         .filter(|matched| protected_task_capabilities.contains(&matched.name.trim().to_lowercase()))
         .cloned()
         .collect::<Vec<_>>();
+    // This order defines the stable ranking: trim the fixed pool, restore and
+    // promote the strongest task match, then take the requested prefix.
     trim_low_confidence_tail(&mut fused, tokens(task.text()).len());
     for matched in protected_task_matches {
         if !fused

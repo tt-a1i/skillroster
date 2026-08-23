@@ -2475,8 +2475,6 @@ fn find_command(
     hints: &[String],
     limit: usize,
 ) -> Result<Value> {
-    const HINTED_RETRIEVAL_POOL_LIMIT: usize = 100;
-
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
@@ -2507,7 +2505,7 @@ fn find_command(
     let pool_limit = if retrieval_hints.is_empty() {
         limit
     } else {
-        HINTED_RETRIEVAL_POOL_LIMIT
+        usize::from(crate::cli::MAX_FIND_RESULTS)
     };
     let augmented_matches = crate::query::find_matching(
         &scan,
