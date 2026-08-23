@@ -133,9 +133,11 @@ deterministic reciprocal-rank fusion over a bounded candidate pool. The JSON
 that decision inspectable. Rank position remains discriminating within these
 small candidate pools: a high-ranked Agent hint match outranks weak lexical
 overlap that merely appears in both channels, while a strong original-task
-match remains protected in the bounded result. A hint can therefore surface English metadata
-without letting its raw token count set one global cutoff that discards a
-strong native-task result. Each task or hint also remains a separate phrase for
+match remains protected in the bounded result. For the same Snapshot, task,
+and hints, changing `--limit` only bounds the returned matches: each smaller
+result is a prefix of a larger result. A hint can therefore surface English
+metadata without letting its raw token count set one global cutoff that
+discards a strong native-task result. Each task or hint also remains a separate phrase for
 exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars. Ranking uses
 top-level `triggers` and the semicolon-separated string

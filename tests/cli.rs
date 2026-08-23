@@ -255,6 +255,78 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
 }
 
 #[test]
+fn public_find_hinted_ranking_is_prefix_stable_across_limits() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "analyze-data-quality",
+            "---\nname: analyze-data-quality\ndescription: Assess whether structured data and analytical evidence are trustworthy. Use when the task is to check data quality.\n---\n",
+        ),
+        (
+            "spreadsheets",
+            "---\nname: Spreadsheets\ndescription: Create, edit, analyze, and verify standalone spreadsheet files and workbooks, including Excel files.\n---\n",
+        ),
+        (
+            "cowork-publish",
+            "---\nname: cowork-publish\ndescription: 创建本地表格数据管理工具和数据质量可视化系统。\n---\n",
+        ),
+        (
+            "hi-pan",
+            "---\nname: hi-pan\ndescription: 管理本地表格数据和数据质量报告文件。\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "分析一个本地表格的数据质量";
+    let hint = "analyze standalone spreadsheet workbook data quality";
+    let find_names = |limit: &str| {
+        let found = json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "find",
+                    task,
+                    "--hint",
+                    hint,
+                    "--hint",
+                    "Spreadsheets",
+                    "--limit",
+                    limit,
+                ],
+            ]
+            .concat(),
+            None,
+        ));
+        found["result"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|matched| matched["name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let complete_ranking = find_names("4");
+    for limit in 1..=4 {
+        let bounded = find_names(&limit.to_string());
+        assert_eq!(bounded, complete_ranking[..bounded.len()]);
+    }
+}
+
+#[test]
 fn public_find_routes_natural_cjk_paraphrases_against_cjk_metadata() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

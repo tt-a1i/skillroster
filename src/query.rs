@@ -1700,6 +1700,7 @@ pub(crate) fn fuse_retrieval_channels(
     // high-ranked capability hint.
     const RECIPROCAL_RANK_OFFSET: f64 = 1.0;
     const AUGMENTED_CHANNEL_WEIGHT: f64 = 3.0;
+    const PROTECTED_TASK_MAX_RANK: usize = 3;
 
     if limit == 0 {
         return Vec::new();
@@ -1785,8 +1786,7 @@ pub(crate) fn fuse_retrieval_channels(
     let protected_task_capabilities = fused
         .iter()
         .filter(|matched| {
-            matched.task_channel_rank.is_some_and(|rank| rank <= limit)
-                && has_protectable_task_evidence(matched)
+            matched.task_channel_rank == Some(1) && has_protectable_task_evidence(matched)
         })
         .map(|matched| matched.name.trim().to_lowercase())
         .collect::<BTreeSet<_>>();
@@ -1804,19 +1804,19 @@ pub(crate) fn fuse_retrieval_channels(
             fused.push(matched);
         }
     }
-    while fused.len() > limit {
-        let removable = fused.iter().rposition(|matched| {
-            !protected_task_capabilities.contains(&matched.name.trim().to_lowercase())
-        });
-        match removable {
-            Some(index) => {
-                fused.remove(index);
-            }
-            None => {
-                fused.truncate(limit);
-            }
+    for protected in &protected_task_capabilities {
+        let Some(index) = fused
+            .iter()
+            .position(|matched| matched.name.trim().eq_ignore_ascii_case(protected))
+        else {
+            continue;
+        };
+        if index >= PROTECTED_TASK_MAX_RANK {
+            let matched = fused.remove(index);
+            fused.insert(PROTECTED_TASK_MAX_RANK - 1, matched);
         }
     }
+    fused.truncate(limit);
     for (index, matched) in fused.iter_mut().enumerate() {
         matched.rank = index + 1;
     }
