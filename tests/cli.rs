@@ -1985,6 +1985,25 @@ fn repeated_setup_reuses_the_same_ready_plan() {
             .unwrap()
             .contains("newer Snapshot exists")
     );
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for lifecycle_status in ["applying", "recovery_required"] {
+        database
+            .execute(
+                "UPDATE plans SET status = ?1 WHERE id = ?2",
+                rusqlite::params![lifecycle_status, old_plan_id],
+            )
+            .unwrap();
+        let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+        assert_eq!(status["result"]["pending_plan_count"], 2);
+        let retained_lifecycle = status["result"]["pending_plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|plan| plan["plan_id"] == old_plan_id)
+            .unwrap();
+        assert_eq!(retained_lifecycle["status"], lifecycle_status);
+    }
 }
 
 #[test]
