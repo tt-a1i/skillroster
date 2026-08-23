@@ -1640,6 +1640,93 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
 }
 
 #[test]
+fn repeated_setup_reuses_the_same_ready_plan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/skills")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let first = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let retry = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(first["result"]["state"], "preview_ready");
+    assert_eq!(retry["result"]["state"], "preview_ready");
+    assert_eq!(retry["result"]["plan_id"], first["result"]["plan_id"]);
+    assert_eq!(first["result"]["files_changed"], false);
+    assert_eq!(retry["result"]["files_changed"], false);
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 1);
+    assert_eq!(
+        status["result"]["pending_plans"][0]["plan_id"],
+        first["result"]["plan_id"]
+    );
+
+    let first_plan_id = first["result"]["plan_id"].as_str().unwrap();
+    let applied = json_output(&run(
+        &[&common[..], &["apply", first_plan_id]].concat(),
+        None,
+    ));
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+
+    let after_terminal_state = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(after_terminal_state["result"]["state"], "preview_ready");
+    assert_ne!(
+        after_terminal_state["result"]["plan_id"],
+        first["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 1);
+    assert_eq!(
+        status["result"]["pending_plans"][0]["plan_id"],
+        after_terminal_state["result"]["plan_id"]
+    );
+
+    let explicit_choice = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_ne!(
+        explicit_choice["result"]["plan_id"],
+        after_terminal_state["result"]["plan_id"]
+    );
+    let explicit_retry = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        explicit_retry["result"]["plan_id"],
+        explicit_choice["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 2);
+
+    let default_after_explicit = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(
+        default_after_explicit["result"]["plan_id"],
+        after_terminal_state["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 2);
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let after_new_snapshot = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_ne!(
+        after_new_snapshot["result"]["plan_id"],
+        default_after_explicit["result"]["plan_id"]
+    );
+}
+
+#[test]
 fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
