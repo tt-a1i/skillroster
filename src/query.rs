@@ -996,10 +996,18 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .iter()
         .map(|skill| tokens(&skill_search_text(skill)))
         .collect::<Vec<_>>();
+    let normalized_names = scan
+        .skills
+        .iter()
+        .map(|skill| skill.name.trim().to_lowercase())
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for (index, left) in scan.skills.iter().enumerate() {
         let left_tokens = &vocabularies[index];
         for (right_index, right) in scan.skills.iter().enumerate().skip(index + 1) {
+            if normalized_names[index] == normalized_names[right_index] {
+                continue;
+            }
             if left.content_digest == right.content_digest {
                 continue;
             }
@@ -2312,6 +2320,30 @@ mod tests {
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("review-only candidate evidence"));
         assert!(finding.summary.contains("not a confirmed duplicate"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn semantic_overlap_excludes_same_name_variants() {
+        let (root, mut scan) = fixture();
+        let original = scan.skills[0].clone();
+        let mut same_name_variant = original.clone();
+        same_name_variant.id = "skill_same_name_variant".into();
+        same_name_variant.content_digest = "different_digest".into();
+        scan.skills.push(same_name_variant.clone());
+
+        let report = build_report(&scan);
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.title == SAME_NAME_DIVERGENT_FINDING_TITLE
+                && finding.affected_skill_ids.contains(&original.id)
+                && finding.affected_skill_ids.contains(&same_name_variant.id)
+        }));
+        assert!(!report.findings.iter().any(|finding| {
+            finding.title == "Semantic overlap candidate"
+                && finding.affected_skill_ids.contains(&original.id)
+                && finding.affected_skill_ids.contains(&same_name_variant.id)
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
