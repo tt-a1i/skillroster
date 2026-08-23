@@ -2959,11 +2959,12 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
         blocked["error"]["details"]["blocked_changes_truncated"],
         false
     );
+    let exact_sources = [reviewed.join("mid-a"), reviewed.join("mid-b")];
     assert_eq!(
         blocked["error"]["details"]["source_roots"],
-        json!([reviewed])
+        json!(exact_sources)
     );
-    assert_eq!(blocked["error"]["paths"], json!([reviewed]));
+    assert_eq!(blocked["error"]["paths"], json!(exact_sources));
     let names = blocked["error"]["details"]["blocked_changes"]
         .as_array()
         .unwrap()
@@ -2998,13 +2999,37 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
         true
     );
     assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
+    let suggested_argv = blocked["suggested_actions"][0]["argv"].as_array().unwrap();
+    for exact_source in &exact_sources {
+        assert!(suggested_argv.windows(2).any(|pair| {
+            pair[0] == "--source-root" && pair[1] == exact_source.to_str().unwrap()
+        }));
+    }
     assert!(
-        blocked["suggested_actions"][0]["argv"]
-            .as_array()
-            .unwrap()
+        !suggested_argv
             .windows(2)
-            .any(|pair| pair[0] == "--source-root" && pair[1] == reviewed.to_str().unwrap())
+            .any(|pair| { pair[0] == "--source-root" && pair[1] == reviewed.to_str().unwrap() })
     );
+    let suggested_roots = suggested_argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--source-root")
+        .map(|pair| {
+            pair[1]
+                .as_str()
+                .expect("source-root argument must be a string")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        suggested_roots,
+        exact_sources
+            .iter()
+            .map(|path| path.to_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    let retry_source_args = suggested_roots
+        .iter()
+        .flat_map(|root| ["--source-root", *root])
+        .collect::<Vec<_>>();
     assert!(root.join("mid-a").exists());
     assert!(root.join("aaa-000").exists());
 
@@ -3048,19 +3073,11 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
     }
 
     json_output(&run(
-        &[
-            &common[..],
-            &["--source-root", reviewed.to_str().unwrap(), "scan"],
-        ]
-        .concat(),
+        &[&common[..], &retry_source_args, &["scan"]].concat(),
         None,
     ));
     let report = json_output(&run(
-        &[
-            &common[..],
-            &["--source-root", reviewed.to_str().unwrap(), "report"],
-        ]
-        .concat(),
+        &[&common[..], &retry_source_args, &["report"]].concat(),
         None,
     ));
     let finding_id = report["result"]["findings"]
@@ -3080,16 +3097,7 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
         }]
     });
     let plan = json_output(&run(
-        &[
-            &common[..],
-            &[
-                "--source-root",
-                reviewed.to_str().unwrap(),
-                "plan",
-                "--stdin",
-            ],
-        ]
-        .concat(),
+        &[&common[..], &retry_source_args, &["plan", "--stdin"]].concat(),
         Some(&retry.to_string()),
     ));
     assert_eq!(plan["ok"], true);

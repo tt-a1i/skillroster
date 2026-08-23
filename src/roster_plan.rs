@@ -228,39 +228,14 @@ pub fn test_absolute_path(relative: &str) -> PathBuf {
     path
 }
 
-/// Collapse observed escaping-link targets to the fewest `--source-root` directories.
+/// Keep the narrowest observed `--source-root` set without synthesizing broader trust.
 pub fn minimum_reviewed_source_roots(targets: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let unique = targets
         .into_iter()
         .filter(|path| path.is_absolute() && path.parent().is_some())
         .collect::<BTreeSet<_>>();
-    let mut by_parent = BTreeMap::<PathBuf, BTreeSet<PathBuf>>::new();
-    for target in unique {
-        match target.parent() {
-            Some(parent) if parent.parent().is_some() => {
-                by_parent
-                    .entry(parent.to_path_buf())
-                    .or_default()
-                    .insert(target);
-            }
-            _ => {
-                by_parent.entry(target.clone()).or_default().insert(target);
-            }
-        }
-    }
-    let mut roots = by_parent
-        .into_iter()
-        .map(|(parent, members)| {
-            if members.len() > 1 {
-                parent
-            } else {
-                members.into_iter().next().expect("group is non-empty")
-            }
-        })
-        .collect::<Vec<_>>();
-    roots.sort();
     let mut kept = Vec::new();
-    for root in roots {
+    for root in unique {
         if kept
             .iter()
             .any(|existing: &PathBuf| root.starts_with(existing))
@@ -1051,12 +1026,20 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_source_roots_collapse_sibling_packages_and_keep_singletons() {
+    fn reviewed_source_roots_keep_siblings_exact_and_only_dedupe_observed_ancestors() {
         let shared = test_absolute_path("opt/reviewed/alpha");
         let sibling = test_absolute_path("opt/reviewed/beta");
         let unique = test_absolute_path("elsewhere/one-off");
-        let roots = minimum_reviewed_source_roots([shared, sibling, unique.clone()]);
-        assert_eq!(roots, vec![unique, test_absolute_path("opt/reviewed")]);
+        let observed_ancestor = test_absolute_path("explicit/root");
+        let observed_descendant = observed_ancestor.join("nested");
+        let roots = minimum_reviewed_source_roots([
+            shared.clone(),
+            sibling.clone(),
+            unique.clone(),
+            observed_ancestor.clone(),
+            observed_descendant,
+        ]);
+        assert_eq!(roots, vec![unique, observed_ancestor, shared, sibling]);
     }
 
     #[test]
@@ -1080,14 +1063,23 @@ mod tests {
         ];
         let blocked =
             source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
-        let reviewed = test_absolute_path("opt/reviewed");
-        assert_eq!(blocked.paths, vec![reviewed.display().to_string()]);
+        let reviewed = [
+            test_absolute_path("opt/reviewed/alpha"),
+            test_absolute_path("opt/reviewed/beta"),
+        ];
+        assert_eq!(
+            blocked.paths,
+            reviewed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
         assert!(blocked.relevant_ids.contains(&"finding_fixture".into()));
         assert_eq!(blocked.details["decision"], "confirm_trusted_source_roots");
         assert_eq!(blocked.details["requested_core_budget"], 10);
         assert_eq!(blocked.details["blocked_change_count"], 2);
         assert_eq!(blocked.details["blocked_changes_truncated"], false);
-        assert_eq!(blocked.details["source_roots"], json!([reviewed]));
+        assert_eq!(blocked.details["source_roots"], json!(reviewed));
         assert_eq!(blocked.details["blocked_changes"][0]["name"], "alpha");
         assert_eq!(
             blocked.details["blocked_changes"][0]["observed_source_target"],
