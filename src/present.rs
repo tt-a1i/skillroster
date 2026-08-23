@@ -1147,15 +1147,13 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
                 .iter()
                 .filter_map(|item| item.pointer(item_pointer).and_then(Value::as_str))
                 .collect::<BTreeSet<_>>();
-            if states.len() == 1 {
-                states
+            match states.len() {
+                0 => fallback.to_owned(),
+                1 => states
                     .iter()
                     .next()
-                    .map_or_else(|| fallback.to_owned(), |state| (*state).to_owned())
-            } else if states.len() > 1 {
-                "mixed".to_owned()
-            } else {
-                fallback.to_owned()
+                    .map_or_else(|| fallback.to_owned(), |state| (*state).to_owned()),
+                _ => "mixed".to_owned(),
             }
         };
         let before = aggregate_state(
