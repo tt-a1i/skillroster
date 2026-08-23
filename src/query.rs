@@ -449,7 +449,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let mut by_name = BTreeMap::<String, Vec<&ScannedSkill>>::new();
     for skill in &scan.skills {
         by_name
-            .entry(skill.name.to_lowercase())
+            .entry(skill.name.trim().to_lowercase())
             .or_default()
             .push(skill);
     }
@@ -2329,6 +2329,7 @@ mod tests {
         let original = scan.skills[0].clone();
         let mut same_name_variant = original.clone();
         same_name_variant.id = "skill_same_name_variant".into();
+        same_name_variant.name = format!("  {}  ", original.name.to_uppercase());
         same_name_variant.content_digest = "different_digest".into();
         scan.skills.push(same_name_variant.clone());
 
