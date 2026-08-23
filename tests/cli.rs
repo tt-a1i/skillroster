@@ -42,6 +42,91 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
+    let mut argv = vec![
+        "skillroster".to_owned(),
+        "--state-dir".to_owned(),
+        state.to_string_lossy().into_owned(),
+        "--home".to_owned(),
+        home.to_string_lossy().into_owned(),
+    ];
+    argv.extend(tail.iter().map(|value| (*value).to_owned()));
+    json!(argv)
+}
+
+fn run_suggested_action(action: &Value) -> std::process::Output {
+    let argv = action["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(argv.first().map(String::as_str), Some("skillroster"));
+    let args = argv[1..].iter().map(String::as_str).collect::<Vec<_>>();
+    run(&args, None)
+}
+
+#[test]
+fn suggested_action_argv_replays_the_same_discovery_context() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let agent_root = temp.path().join("agent-root");
+    let source_root = temp.path().join("source-root");
+    fs::create_dir_all(agent_root.join("visible-skill")).unwrap();
+    fs::create_dir_all(source_root.join("library-skill")).unwrap();
+    fs::write(
+        agent_root.join("visible-skill/SKILL.md"),
+        "---\nname: visible-skill\ndescription: visible fixture\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        source_root.join("library-skill/SKILL.md"),
+        "---\nname: library-skill\ndescription: library fixture\n---\n",
+    )
+    .unwrap();
+    let root = format!("codex={}", agent_root.display());
+
+    let scan = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--root",
+            &root,
+            "--source-root",
+            source_root.to_str().unwrap(),
+            "--json",
+            "scan",
+        ],
+        None,
+    ));
+    assert_eq!(
+        scan["suggested_actions"][0]["argv"],
+        json!([
+            "skillroster",
+            "--state-dir",
+            state,
+            "--home",
+            home,
+            "--root",
+            root,
+            "--source-root",
+            source_root,
+            "report",
+            "--json"
+        ])
+    );
+
+    let report = json_output(&run_suggested_action(&scan["suggested_actions"][0]));
+    assert_eq!(
+        report["result"]["snapshot_id"],
+        scan["result"]["snapshot_id"]
+    );
+    assert_eq!(report["result"]["skill_count"], 2);
+}
+
 #[test]
 fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
     let output = run(&["report", "--help"], None);
@@ -72,7 +157,7 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     let missing_snapshot = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["argv"],
-        json!(["skillroster", "scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--json"])
     );
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["reason_code"],
@@ -637,16 +722,19 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
     assert_eq!(summary["suggested_actions"][0]["action"], "list_findings");
     assert_eq!(
         summary["suggested_actions"][0]["argv"],
-        json!([
-            "skillroster",
-            "report",
-            "--findings",
-            "--limit",
-            "20",
-            "--offset",
-            "0",
-            "--json"
-        ])
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--findings",
+                "--limit",
+                "20",
+                "--offset",
+                "0",
+                "--json",
+            ]
+        )
     );
 
     let first_output = run(
@@ -688,20 +776,23 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
     );
     assert_eq!(
         first["suggested_actions"][0]["argv"],
-        json!([
-            "skillroster",
-            "report",
-            "--findings",
-            "--category",
-            "overlap",
-            "--severity",
-            "medium",
-            "--limit",
-            "10",
-            "--offset",
-            "10",
-            "--json"
-        ])
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--findings",
+                "--category",
+                "overlap",
+                "--severity",
+                "medium",
+                "--limit",
+                "10",
+                "--offset",
+                "10",
+                "--json",
+            ]
+        )
     );
 
     let second = json_output(&run(
@@ -789,7 +880,7 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert!(before_report["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
     assert_eq!(
         before_report["suggested_actions"][0]["argv"],
-        json!(["skillroster", "report", "--summary", "--json"])
+        context_action_argv(&home, &state, &["report", "--summary", "--json"])
     );
     assert_eq!(before_report["suggested_actions"][0]["mutates"], false);
     assert_eq!(
@@ -837,7 +928,11 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert_eq!(variant_finding["resolution"], "choose_same_name_variant");
     assert_eq!(
         variant_finding["argv"],
-        json!(["skillroster", "report", "--finding", finding_id, "--json"])
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--json"],
+        )
     );
     assert_eq!(
         linked_find["suggested_actions"][0]["argv"],
@@ -870,7 +965,7 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert!(drifted_find["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
     assert_eq!(
         drifted_find["suggested_actions"][0]["argv"],
-        json!(["skillroster", "scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--json"])
     );
 
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
@@ -1068,7 +1163,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(scan["result"]["files_changed"], false);
     assert_eq!(
         scan["suggested_actions"][0]["argv"],
-        serde_json::json!(["skillroster", "report", "--json"])
+        context_action_argv(&home, &state, &["report", "--json"])
     );
     let codex_coverage = scan["result"]["coverage"]
         .as_array()
@@ -1650,13 +1745,11 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_eq!(blocked["suggested_actions"].as_array().unwrap().len(), 2);
     assert_eq!(
         blocked["suggested_actions"][0]["argv"],
-        serde_json::json!([
-            "skillroster",
-            "setup",
-            "--modified-choice",
-            "retain-local",
-            "--json"
-        ])
+        context_action_argv(
+            &home,
+            &state,
+            &["setup", "--modified-choice", "retain-local", "--json",]
+        )
     );
     assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
     assert_eq!(
@@ -1665,13 +1758,11 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     );
     assert_eq!(
         blocked["suggested_actions"][1]["argv"],
-        serde_json::json!([
-            "skillroster",
-            "setup",
-            "--modified-choice",
-            "adopt-current",
-            "--json"
-        ])
+        context_action_argv(
+            &home,
+            &state,
+            &["setup", "--modified-choice", "adopt-current", "--json",]
+        )
     );
     assert_eq!(fs::read_to_string(&bootstrap).unwrap(), modified);
 
@@ -2043,7 +2134,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
-        serde_json::json!(["skillroster", "scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--json"])
     );
 }
 
@@ -3754,6 +3845,18 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
     );
     assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
     let suggested_argv = blocked["suggested_actions"][0]["argv"].as_array().unwrap();
+    assert_eq!(
+        &suggested_argv[..5],
+        &json!(["skillroster", "--state-dir", state, "--home", home])
+            .as_array()
+            .unwrap()[..]
+    );
+    assert_eq!(
+        &blocked["error"]["details"]["after_confirmation"]["argv_template"]
+            .as_array()
+            .unwrap()[..5],
+        &suggested_argv[..5]
+    );
     for exact_source in &exact_sources {
         assert!(suggested_argv.windows(2).any(|pair| {
             pair[0] == "--source-root" && pair[1] == exact_source.to_str().unwrap()

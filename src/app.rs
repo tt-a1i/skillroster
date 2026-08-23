@@ -29,12 +29,109 @@ use crate::sqlite::StateStore;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
 
+/// Global discovery and state options that a suggested action must retain to
+/// operate on the same local analysis context as the command that produced it.
+#[derive(Clone, Debug, Default)]
+pub struct ActionContext {
+    argv: Vec<String>,
+}
+
+impl ActionContext {
+    pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let mut argv = Vec::new();
+        if let Some(state_dir) = &cli.state_dir {
+            let state_dir = if state_dir.is_absolute() {
+                state_dir.clone()
+            } else {
+                std::path::absolute(state_dir).with_context(|| {
+                    format!("cannot resolve --state-dir {}", state_dir.display())
+                })?
+            };
+            argv.extend([
+                "--state-dir".to_owned(),
+                action_path(&state_dir, "--state-dir")?,
+            ]);
+        }
+        if let Some(home) = &cli.home {
+            argv.extend(["--home".to_owned(), action_path(home, "--home")?]);
+        }
+        for root in &cli.roots {
+            argv.extend(["--root".to_owned(), root.clone()]);
+        }
+        for source_root in &cli.source_roots {
+            argv.extend([
+                "--source-root".to_owned(),
+                action_path(source_root, "--source-root")?,
+            ]);
+        }
+        Ok(Self { argv })
+    }
+
+    fn apply(&self, actions: &mut [SuggestedAction]) {
+        if self.argv.is_empty() {
+            return;
+        }
+        for action in actions {
+            let insertion =
+                usize::from(action.argv.first().is_some_and(|arg| arg == "skillroster"));
+            action.argv.splice(insertion..insertion, self.argv.clone());
+        }
+    }
+
+    fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    fn apply_json_argv(&self, argv: &mut Value) {
+        let Some(values) = argv.as_array_mut() else {
+            return;
+        };
+        if self.argv.is_empty() {
+            return;
+        }
+        let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
+        values.splice(
+            insertion..insertion,
+            self.argv.iter().cloned().map(Value::String),
+        );
+    }
+
+    fn apply_result(&self, command: &str, result: &mut Value) {
+        match command {
+            "find" => {
+                if let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) {
+                    for found in matches {
+                        if let Some(argv) = found.pointer_mut("/variant_finding/argv") {
+                            self.apply_json_argv(argv);
+                        }
+                    }
+                }
+            }
+            "report" => {
+                if let Some(argv) =
+                    result.pointer_mut("/resolution/after_confirmation/argv_template")
+                {
+                    self.apply_json_argv(argv);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn action_path(path: &Path, option: &str) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{option} path must be valid Unicode for suggested action argv"))
+}
+
 pub struct Output {
     pub json: String,
     pub human: String,
 }
 
 pub fn run(cli: Cli) -> Result<Output> {
+    let action_context = ActionContext::from_cli(&cli)?;
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
@@ -73,7 +170,7 @@ pub fn run(cli: Cli) -> Result<Output> {
     };
     let store = StateStore::open(&database_path)?;
 
-    let (command, result, warnings, actions) = match cli.command {
+    let (command, mut result, warnings, actions) = match cli.command {
         None => ("home", home_result(&store, &state_dir)?, vec![], vec![]),
         Some(Command::Status) => {
             let result = status_result(&store, &database_path, &state_dir)?;
@@ -159,7 +256,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             let showing_detail = args.show.is_some();
             let result = match args.show.as_deref() {
                 Some(id) => plan_detail_command(&store, id)?,
-                None => plan_command(&store, &state_dir)?,
+                None => plan_command(&store, &state_dir, action_context.argv())?,
             };
             let id = result["plan_id"].as_str().unwrap_or_default().to_string();
             let mut actions = Vec::new();
@@ -331,9 +428,11 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
     };
 
+    action_context.apply_result(command, &mut result);
     let mut envelope = JsonEnvelope::success(command, result.clone());
     envelope.warnings = warnings;
     envelope.suggested_actions = actions;
+    action_context.apply(&mut envelope.suggested_actions);
     Ok(Output {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
@@ -351,6 +450,14 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    error_json_with_context(command, error, &ActionContext::default())
+}
+
+pub fn error_json_with_context(
+    command: &str,
+    error: &(dyn std::error::Error + 'static),
+    action_context: &ActionContext,
+) -> String {
     if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -377,6 +484,7 @@ pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> S
                 true,
                 "trusted_canonical_sources_required",
             )];
+            action_context.apply(&mut envelope.suggested_actions);
         }
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
@@ -581,7 +689,10 @@ fn classify_generic_error(error: &(dyn std::error::Error + 'static)) -> (&'stati
         ("state_drift", false)
     } else if message.contains("cancelled") {
         ("cancelled", false)
-    } else if message.contains("must be absolute") || message.contains("unsupported agent") {
+    } else if message.contains("must be absolute")
+        || message.contains("must be valid unicode")
+        || message.contains("unsupported agent")
+    {
         ("invalid_input", false)
     } else {
         ("command_failed", false)
@@ -1085,6 +1196,7 @@ fn validate_source_confirmation_detail(path: &Path) -> Result<()> {
 
 fn recognized_source_confirmation_detail(detail: &Value) -> bool {
     (|| -> Option<bool> {
+        let schema_version = detail["schema_version"].as_u64()?;
         let core_budget = detail["requested_core_budget"].as_u64()?;
         let blocked_changes = detail["blocked_changes"].as_array()?;
         let blocked_change_count = detail["blocked_change_count"].as_u64()?;
@@ -1132,7 +1244,18 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         .into_iter()
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>();
+        let action_context_argv = match schema_version {
+            1 => Vec::new(),
+            2 => detail["action_context_argv"]
+                .as_array()?
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        };
+        recognized_action_context_argv(&action_context_argv).then_some(())?;
         let mut expected_argv = vec!["skillroster"];
+        expected_argv.extend(action_context_argv);
         for root in &source_roots {
             expected_argv.extend(["--source-root", *root]);
         }
@@ -1143,7 +1266,7 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()?;
         Some(
-            detail["schema_version"] == 1
+            matches!(schema_version, 1 | 2)
                 && detail["reason"] == "trusted_canonical_sources_required"
                 && detail["decision"] == "confirm_trusted_source_roots"
                 && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
@@ -1158,6 +1281,31 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         )
     })()
     .unwrap_or(false)
+}
+
+fn recognized_action_context_argv(argv: &[&str]) -> bool {
+    if argv.len() % 2 != 0 {
+        return false;
+    }
+    let mut state_dir_seen = false;
+    let mut home_seen = false;
+    argv.chunks_exact(2).all(|pair| match pair {
+        ["--state-dir", path] => {
+            let unique = !state_dir_seen;
+            state_dir_seen = true;
+            unique && Path::new(path).is_absolute()
+        }
+        ["--home", path] => {
+            let unique = !home_seen;
+            home_seen = true;
+            unique && Path::new(path).is_absolute()
+        }
+        ["--root", root] => root.split_once('=').is_some_and(|(agent, path)| {
+            parse_agent_kind(agent).is_ok() && Path::new(path).is_absolute()
+        }),
+        ["--source-root", path] => Path::new(path).is_absolute(),
+        _ => false,
+    })
 }
 
 fn source_confirmation_detail_summary(state_dir: &Path) -> Result<Value> {
@@ -3077,7 +3225,11 @@ struct CurrentSkillPaths {
     drifted: bool,
 }
 
-fn plan_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
+fn plan_command(
+    store: &StateStore,
+    state_dir: &Path,
+    action_argv_prefix: &[String],
+) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
     }
@@ -3089,6 +3241,7 @@ fn plan_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
         serde_json::from_str(&input)?,
         PlanOrigin::Agent,
         None,
+        action_argv_prefix,
     )
 }
 
@@ -3695,6 +3848,7 @@ fn expand_finding_roster_changes(
     latest_scan_id: &ScanId,
     scan: &ScanResult,
     state_dir: &Path,
+    action_argv_prefix: &[String],
 ) -> Result<(Value, Option<FindingPlanProvenance>)> {
     let object = input
         .as_object_mut()
@@ -3764,6 +3918,7 @@ fn expand_finding_roster_changes(
             request.core_budget,
             &supported.exclusions,
             state_dir,
+            action_argv_prefix,
         )?
         .into());
     }
@@ -4501,14 +4656,21 @@ fn prepare_plan(
     input: Value,
     origin: PlanOrigin,
     reuse_identity: Option<Value>,
+    action_argv_prefix: &[String],
 ) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
     }
     let (scan_id, scan) = latest_scan(store)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
-        let (input, roster_provenance) =
-            expand_finding_roster_changes(store, input, &scan_id, &scan, state_dir)?;
+        let (input, roster_provenance) = expand_finding_roster_changes(
+            store,
+            input,
+            &scan_id,
+            &scan,
+            state_dir,
+            action_argv_prefix,
+        )?;
         let (input, library_provenance) =
             expand_finding_library_changes(store, input, &scan_id, &scan)?;
         (input, roster_provenance.or(library_provenance))
@@ -5287,6 +5449,7 @@ fn setup_command(
                 Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
             }
         })),
+        &[],
     )?;
     let operation_count = plan["change_summary"]["operation_count"]
         .as_u64()
@@ -6230,6 +6393,47 @@ mod recovery_tests {
     use tempfile::TempDir;
 
     #[test]
+    fn action_context_absolutizes_a_relative_state_directory() {
+        let cli = Cli {
+            json: true,
+            state_dir: Some(PathBuf::from("relative-state")),
+            home: None,
+            roots: vec![],
+            source_roots: vec![],
+            command: Some(Command::Status),
+        };
+
+        let context = ActionContext::from_cli(&cli).unwrap();
+
+        assert_eq!(context.argv[0], "--state-dir");
+        assert_eq!(
+            PathBuf::from(&context.argv[1]),
+            std::path::absolute("relative-state").unwrap()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_context_refuses_a_non_unicode_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let cli = Cli {
+            json: true,
+            state_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(vec![
+                b'/', b't', b'm', b'p', b'/', 0xff,
+            ]))),
+            home: None,
+            roots: vec![],
+            source_roots: vec![],
+            command: Some(Command::Status),
+        };
+
+        let error = ActionContext::from_cli(&cli).unwrap_err();
+
+        assert!(error.to_string().contains("must be valid Unicode"));
+    }
+
+    #[test]
     fn finding_rollups_count_unique_affected_subjects() {
         let findings = vec![
             json!({
@@ -6954,6 +7158,14 @@ mod recovery_tests {
     #[test]
     fn source_block_json_keeps_complete_roots_in_the_detail_file() {
         let state = TempDir::new().unwrap();
+        let action_argv_prefix = vec![
+            "--state-dir".to_owned(),
+            state.path().display().to_string(),
+            "--home".to_owned(),
+            crate::roster_plan::test_absolute_path("home")
+                .display()
+                .to_string(),
+        ];
         let exclusions = (0..11)
             .map(|index| crate::roster_plan::RosterChangeExclusion {
                 agent: "codex".into(),
@@ -6971,9 +7183,17 @@ mod recovery_tests {
             10,
             &exclusions,
             state.path(),
+            &action_argv_prefix,
         )
         .unwrap();
-        let envelope: Value = serde_json::from_str(&error_json("plan", &blocked)).unwrap();
+        let envelope: Value = serde_json::from_str(&error_json_with_context(
+            "plan",
+            &blocked,
+            &ActionContext {
+                argv: action_argv_prefix.clone(),
+            },
+        ))
+        .unwrap();
         assert_eq!(
             envelope["error"]["details"]["blocked_changes"]
                 .as_array()
@@ -7000,6 +7220,17 @@ mod recovery_tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert_eq!(argv[1..=action_argv_prefix.len()], action_argv_prefix);
+        let bounded_template = envelope["error"]["details"]["after_confirmation"]["argv_template"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bounded_template[1..=action_argv_prefix.len()],
+            action_argv_prefix
+        );
         let expected_roots = (0..11)
             .map(|index| {
                 crate::roster_plan::test_absolute_path(&format!("opt/root-{index:02}/pkg"))
@@ -7019,6 +7250,8 @@ mod recovery_tests {
             .as_str()
             .unwrap();
         let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
+        assert_eq!(complete["schema_version"], 2);
+        assert_eq!(complete["action_context_argv"], json!(action_argv_prefix));
         assert_eq!(complete["source_roots"], json!(expected_roots));
         let complete_argv = complete["after_confirmation"]["argv"]
             .as_array()
@@ -7026,6 +7259,10 @@ mod recovery_tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert_eq!(
+            complete_argv[1..=action_argv_prefix.len()],
+            action_argv_prefix
+        );
         for root in &expected_roots {
             assert!(
                 complete_argv
@@ -7034,6 +7271,10 @@ mod recovery_tests {
                 "missing complete --source-root {root} in {complete_argv:?}"
             );
         }
+        validate_source_confirmation_detail(Path::new(detail_path)).unwrap();
+        let mut unrecognized = complete.clone();
+        unrecognized["action_context_argv"] = json!(["--yes", "true"]);
+        assert!(!recognized_source_confirmation_detail(&unrecognized));
     }
 
     #[test]
