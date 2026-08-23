@@ -529,7 +529,37 @@ impl std::fmt::Display for PlanSnapshotDrift {
 
 impl std::error::Error for PlanSnapshotDrift {}
 
+#[derive(Debug)]
+struct StoredFindingCoverageInvalid {
+    finding_id: FindingId,
+    reason: &'static str,
+}
+
+impl std::fmt::Display for StoredFindingCoverageInvalid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Finding {} has invalid stored coverage facts; run scan again",
+            self.finding_id
+        )
+    }
+}
+
+impl std::error::Error for StoredFindingCoverageInvalid {}
+
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(invalid) = error.downcast_ref::<StoredFindingCoverageInvalid>() {
+        return ClassifiedError {
+            code: "stored_finding_coverage_invalid",
+            retryable: false,
+            details: Some(json!({
+                "finding_id": invalid.finding_id,
+                "reason": invalid.reason,
+                "files_changed": false,
+                "next_action": "scan"
+            })),
+        };
+    }
     if let Some(drift) = error.downcast_ref::<PlanSnapshotDrift>() {
         return ClassifiedError {
             code: "state_drift",
@@ -1701,6 +1731,15 @@ fn report_command(
             let scan: ScanResult = store
                 .scan_payload(&report.scan_id)?
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            let coverage_basis = stored_finding_coverage_basis(&stored, object)?;
+            let evidence_quality = object
+                .get("evidence_quality")
+                .cloned()
+                .unwrap_or_else(|| json!("unknown"));
+            object.insert(
+                "coverage".into(),
+                finding_coverage_facts(coverage_basis, evidence_quality, &scan),
+            );
             let latest_scan_id = store
                 .latest_completed_scan()?
                 .ok_or_else(|| anyhow!("no completed Snapshot exists"))?
@@ -3264,24 +3303,185 @@ fn finding_impact(finding: &crate::query::Finding) -> Value {
 }
 
 fn finding_coverage(finding: &crate::query::Finding, scan: &ScanResult) -> Value {
-    let reliable_agents = scan
-        .coverage
+    finding_coverage_facts(
+        finding.coverage_basis,
+        json!(finding.evidence_quality),
+        scan,
+    )
+}
+
+fn stored_finding_coverage_basis(
+    finding: &FindingRecord,
+    details: &serde_json::Map<String, Value>,
+) -> Result<crate::query::FindingCoverageBasis> {
+    let stored_basis = match details.get("coverage") {
+        None => None,
+        Some(Value::Object(coverage)) => coverage.get("basis"),
+        Some(_) => {
+            return Err(StoredFindingCoverageInvalid {
+                finding_id: finding.id.clone(),
+                reason: "malformed_coverage",
+            }
+            .into());
+        }
+    };
+    match stored_basis {
+        Some(Value::String(basis)) if basis == "skill_root_scan" => {
+            return Ok(crate::query::FindingCoverageBasis::SkillRootScan);
+        }
+        Some(Value::String(basis)) if basis == "session_usage" => {
+            return Ok(crate::query::FindingCoverageBasis::SessionUsage);
+        }
+        Some(_) => {
+            return Err(StoredFindingCoverageInvalid {
+                finding_id: finding.id.clone(),
+                reason: "unsupported_coverage_basis",
+            }
+            .into());
+        }
+        None => {}
+    }
+
+    // Records written before coverage dimensions were introduced have no typed basis.
+    // Reconstruct only those legacy records from the stable Finding identity.
+    Ok(match finding.category {
+        FindingCategory::Usage => crate::query::FindingCoverageBasis::SessionUsage,
+        FindingCategory::Lifecycle
+            if matches!(
+                finding.title.as_str(),
+                crate::query::STALE_ARCHIVE_FINDING_TITLE
+                    | crate::query::UNKNOWN_ARCHIVE_FINDING_TITLE
+            ) =>
+        {
+            crate::query::FindingCoverageBasis::SessionUsage
+        }
+        _ => crate::query::FindingCoverageBasis::SkillRootScan,
+    })
+}
+
+fn finding_coverage_facts(
+    basis: crate::query::FindingCoverageBasis,
+    evidence_quality: Value,
+    scan: &ScanResult,
+) -> Value {
+    match basis {
+        crate::query::FindingCoverageBasis::SkillRootScan => {
+            structural_finding_coverage(basis, evidence_quality, scan)
+        }
+        crate::query::FindingCoverageBasis::SessionUsage => {
+            session_finding_coverage(basis, evidence_quality, scan)
+        }
+    }
+}
+
+fn structural_finding_coverage(
+    basis: crate::query::FindingCoverageBasis,
+    evidence_quality: Value,
+    scan: &ScanResult,
+) -> Value {
+    let roots = scan
+        .roots
         .iter()
-        .filter(|coverage| coverage.denominator_reliable)
-        .map(|coverage| coverage.agent.id())
+        .filter(|root| root.kind == RootKind::Skills)
         .collect::<Vec<_>>();
-    let limited_agents = scan
-        .coverage
+    let agents_for_status = |status: scan::RootStatus| {
+        roots
+            .iter()
+            .filter(|root| root.status == status)
+            .filter_map(|root| root.agent.map(AgentKind::id))
+            .collect::<BTreeSet<_>>()
+    };
+    let included_agents = agents_for_status(scan::RootStatus::Included);
+    let missing_agents = agents_for_status(scan::RootStatus::Missing);
+    let inaccessible_agents = agents_for_status(scan::RootStatus::Inaccessible);
+    let limited_agents = inaccessible_agents.clone();
+    let reliable_agents = AgentKind::ALL
         .iter()
-        .filter(|coverage| !coverage.denominator_reliable)
-        .map(|coverage| coverage.agent.id())
+        .copied()
+        .filter(|agent| !limited_agents.contains(agent.id()))
+        .map(AgentKind::id)
         .collect::<Vec<_>>();
+    let root_count = |status| roots.iter().filter(|root| root.status == status).count();
+    let inaccessible_root_count = root_count(scan::RootStatus::Inaccessible);
     json!({
-        "evidence_quality": finding.evidence_quality,
+        "basis": basis,
+        "evidence_quality": evidence_quality,
+        "scope": "configured_and_discovered_skill_roots",
         "reliable_agents": reliable_agents,
         "limited_agents": limited_agents,
+        "included_agents": included_agents,
+        "missing_agents": missing_agents,
+        "inaccessible_agents": inaccessible_agents,
         "supported_agent_count": AgentKind::ALL.len(),
-        "denominator_reliable": limited_agents.is_empty()
+        "included_root_count": root_count(scan::RootStatus::Included),
+        "missing_root_count": root_count(scan::RootStatus::Missing),
+        "inaccessible_root_count": inaccessible_root_count,
+        "denominator_reliable": inaccessible_root_count == 0
+    })
+}
+
+fn session_finding_coverage(
+    basis: crate::query::FindingCoverageBasis,
+    evidence_quality: Value,
+    scan: &ScanResult,
+) -> Value {
+    let session_roots = scan
+        .roots
+        .iter()
+        .filter(|root| root.kind == RootKind::Sessions)
+        .collect::<Vec<_>>();
+    let mut reliable_agents = Vec::new();
+    let mut limited_agents = Vec::new();
+    let mut missing_agents = Vec::new();
+    let mut excluded_agents = Vec::new();
+    let mut inaccessible_agents = Vec::new();
+    for agent in AgentKind::ALL {
+        let has_status = |status| {
+            session_roots
+                .iter()
+                .any(|root| root.agent == Some(agent) && root.status == status)
+        };
+        if has_status(scan::RootStatus::Inaccessible) {
+            inaccessible_agents.push(agent.id());
+        } else if has_status(scan::RootStatus::Excluded) {
+            excluded_agents.push(agent.id());
+        } else if has_status(scan::RootStatus::Missing) {
+            missing_agents.push(agent.id());
+        } else {
+            match scan
+                .coverage
+                .iter()
+                .find(|coverage| coverage.agent == agent)
+            {
+                Some(coverage) if coverage.denominator_reliable => {
+                    reliable_agents.push(agent.id());
+                }
+                Some(_) => limited_agents.push(agent.id()),
+                None => missing_agents.push(agent.id()),
+            }
+        }
+    }
+    let denominator_reliable = reliable_agents.len() == AgentKind::ALL.len();
+    let root_count = |status| {
+        session_roots
+            .iter()
+            .filter(|root| root.status == status)
+            .count()
+    };
+    json!({
+        "basis": basis,
+        "evidence_quality": evidence_quality,
+        "reliable_agents": reliable_agents,
+        "limited_agents": limited_agents,
+        "missing_agents": missing_agents,
+        "excluded_agents": excluded_agents,
+        "inaccessible_agents": inaccessible_agents,
+        "supported_agent_count": AgentKind::ALL.len(),
+        "included_root_count": root_count(scan::RootStatus::Included),
+        "missing_root_count": root_count(scan::RootStatus::Missing),
+        "excluded_root_count": root_count(scan::RootStatus::Excluded),
+        "inaccessible_root_count": root_count(scan::RootStatus::Inaccessible),
+        "denominator_reliable": denominator_reliable
     })
 }
 
@@ -6913,6 +7113,204 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn coverage_finding(basis: crate::query::FindingCoverageBasis) -> crate::query::Finding {
+        crate::query::Finding {
+            id: "finding_coverage".into(),
+            category: crate::query::FindingCategory::Overlap,
+            severity: crate::query::Severity::Medium,
+            title: "Exact duplicate Skill placements".into(),
+            summary: String::new(),
+            affected_skill_ids: vec!["skill_one".into()],
+            affected_placement_ids: vec!["placement_one".into()],
+            evidence: Vec::new(),
+            evidence_quality: scan::EvidenceQuality::Observed,
+            coverage_basis: basis,
+        }
+    }
+
+    #[test]
+    fn finding_coverage_keeps_skill_roots_separate_from_sessions() {
+        let root = |agent, status, suffix: &str| scan::RootObservation {
+            agent,
+            kind: RootKind::Skills,
+            path: PathBuf::from(format!("/fixture/{suffix}")),
+            status,
+            explicit: false,
+            detail: None,
+        };
+        let session_root = |agent, status, suffix: &str| scan::RootObservation {
+            agent: Some(agent),
+            kind: RootKind::Sessions,
+            path: PathBuf::from(format!("/fixture/{suffix}")),
+            status,
+            explicit: false,
+            detail: None,
+        };
+        let session =
+            |agent, roots_present, roots_missing, roots_inaccessible| scan::SessionCoverage {
+                agent,
+                roots_present,
+                roots_missing,
+                roots_inaccessible,
+                files_discovered: 0,
+                files_observed: 0,
+                files_partially_observed: 0,
+                files_skipped: 0,
+                denominator_reliable: false,
+                bytes_observed: 0,
+                lines_observed: 0,
+                truncated: false,
+                discovery_truncated: false,
+                first_seen_unix: None,
+                last_seen_unix: None,
+            };
+        let mut scan = ScanResult {
+            roots: vec![
+                root(Some(AgentKind::Codex), scan::RootStatus::Included, "codex"),
+                root(Some(AgentKind::Cursor), scan::RootStatus::Missing, "cursor"),
+                session_root(
+                    AgentKind::Codex,
+                    scan::RootStatus::Included,
+                    "codex-sessions",
+                ),
+                session_root(
+                    AgentKind::Cursor,
+                    scan::RootStatus::Missing,
+                    "cursor-sessions",
+                ),
+            ],
+            coverage: vec![
+                session(AgentKind::Codex, 1, 0, 0),
+                session(AgentKind::Cursor, 0, 1, 0),
+            ],
+            ..ScanResult::default()
+        };
+
+        let structural = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SkillRootScan),
+            &scan,
+        );
+        assert_eq!(structural["basis"], "skill_root_scan");
+        assert_eq!(structural["denominator_reliable"], true);
+        assert_eq!(structural["missing_root_count"], 1);
+        assert_eq!(structural["limited_agents"], json!([]));
+
+        let usage = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SessionUsage),
+            &scan,
+        );
+        assert_eq!(usage["basis"], "session_usage");
+        assert_eq!(usage["denominator_reliable"], false);
+        assert_eq!(usage["limited_agents"], json!(["codex"]));
+        assert!(
+            usage["missing_agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("cursor"))
+        );
+
+        scan.roots.extend([
+            session_root(
+                AgentKind::ClaudeCode,
+                scan::RootStatus::Inaccessible,
+                "claude-sessions",
+            ),
+            session_root(AgentKind::Pi, scan::RootStatus::Excluded, "pi-sessions"),
+        ]);
+        let mixed_sessions = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SessionUsage),
+            &scan,
+        );
+        assert_eq!(
+            mixed_sessions["inaccessible_agents"],
+            json!(["claude-code"])
+        );
+        assert_eq!(mixed_sessions["excluded_agents"], json!(["pi"]));
+        let classified_agents = [
+            "reliable_agents",
+            "limited_agents",
+            "missing_agents",
+            "excluded_agents",
+            "inaccessible_agents",
+        ]
+        .into_iter()
+        .flat_map(|key| mixed_sessions[key].as_array().unwrap())
+        .collect::<Vec<_>>();
+        assert_eq!(classified_agents.len(), AgentKind::ALL.len());
+        assert_eq!(
+            classified_agents
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            AgentKind::ALL.len()
+        );
+
+        scan.roots.push(root(
+            Some(AgentKind::ClaudeCode),
+            scan::RootStatus::Inaccessible,
+            "claude",
+        ));
+        let inaccessible = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SkillRootScan),
+            &scan,
+        );
+        assert_eq!(inaccessible["denominator_reliable"], false);
+        assert_eq!(inaccessible["inaccessible_root_count"], 1);
+        assert_eq!(inaccessible["limited_agents"], json!(["claude-code"]));
+    }
+
+    #[test]
+    fn stored_coverage_basis_prefers_typed_details_and_only_infers_legacy_records() {
+        let finding = FindingRecord {
+            id: FindingId::parse("finding_coverage-basis").unwrap(),
+            report_id: ReportId::parse("report_coverage-basis").unwrap(),
+            category: FindingCategory::Usage,
+            severity: Severity::Warning,
+            title: "Five-stage usage evidence".into(),
+            summary: String::new(),
+            details: Value::Null,
+            evidence_ids: Vec::new(),
+        };
+
+        let typed = json!({"coverage": {"basis": "skill_root_scan"}});
+        assert_eq!(
+            stored_finding_coverage_basis(&finding, typed.as_object().unwrap()).unwrap(),
+            crate::query::FindingCoverageBasis::SkillRootScan
+        );
+
+        let legacy = json!({});
+        assert_eq!(
+            stored_finding_coverage_basis(&finding, legacy.as_object().unwrap()).unwrap(),
+            crate::query::FindingCoverageBasis::SessionUsage
+        );
+
+        for (invalid, reason) in [
+            (
+                json!({"coverage": {"basis": "future_basis"}}),
+                "unsupported_coverage_basis",
+            ),
+            (
+                json!({"coverage": {"basis": 7}}),
+                "unsupported_coverage_basis",
+            ),
+            (json!({"coverage": []}), "malformed_coverage"),
+        ] {
+            let error =
+                stored_finding_coverage_basis(&finding, invalid.as_object().unwrap()).unwrap_err();
+            let output: Value =
+                serde_json::from_str(&error_json("report", error.as_ref())).unwrap();
+            assert_eq!(output["error"]["code"], "stored_finding_coverage_invalid");
+            assert_eq!(
+                output["error"]["details"]["finding_id"],
+                finding.id.to_string()
+            );
+            assert_eq!(output["error"]["details"]["reason"], reason);
+            assert_eq!(output["error"]["details"]["files_changed"], false);
+            assert_eq!(output["error"]["details"]["next_action"], "scan");
+        }
+    }
 
     #[test]
     fn summary_actions_keep_direct_drilldowns_when_every_finding_fits() {

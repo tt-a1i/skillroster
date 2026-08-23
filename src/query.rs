@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub const SAME_NAME_DIVERGENT_FINDING_KIND: &str = "same_name_divergent_content";
 pub const SAME_NAME_DIVERGENT_FINDING_TITLE: &str = "Same-name Skills have different content";
 pub const SEMANTIC_OVERLAP_FINDING_TITLE: &str = "Semantic overlap candidate";
+pub const STALE_ARCHIVE_FINDING_TITLE: &str = "Stale archive candidates require review";
+pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
@@ -85,6 +87,14 @@ pub enum FindingCategory {
     Lifecycle,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingCoverageBasis {
+    #[default]
+    SkillRootScan,
+    SessionUsage,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
@@ -94,7 +104,7 @@ pub enum Severity {
     High,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Finding {
     pub id: String,
     pub category: FindingCategory,
@@ -106,6 +116,7 @@ pub struct Finding {
     /// Stable path/digest/root references that let callers drill into the fact.
     pub evidence: Vec<String>,
     pub evidence_quality: EvidenceQuality,
+    pub coverage_basis: FindingCoverageBasis,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -178,7 +189,7 @@ pub struct PrimaryMetrics {
     pub agents_with_inaccessible_session_roots: usize,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Report {
     pub metrics: PrimaryMetrics,
     pub findings: Vec<Finding>,
@@ -441,6 +452,7 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let unavailable = scan
         .roots
         .iter()
+        .filter(|root| root.kind == crate::scan::RootKind::Skills)
         .filter(|root| matches!(root.status, crate::scan::RootStatus::Inaccessible))
         .collect::<Vec<_>>();
     if !unavailable.is_empty() {
@@ -932,7 +944,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         )
         .collect();
     let coverage = &overview.coverage;
-    push_finding(
+    push_session_finding(
         findings,
         FindingCategory::Usage,
         Severity::Info,
@@ -977,7 +989,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .supported_agent_count
         .saturating_sub(coverage.complete_agent_count);
     if incomplete_count != 0 {
-        push_finding(
+        push_session_finding(
             findings,
             FindingCategory::Usage,
             Severity::Info,
@@ -1390,11 +1402,11 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         })
         .collect::<Vec<_>>();
     if !stale_candidates.is_empty() {
-        push_finding(
+        push_session_finding(
             findings,
             FindingCategory::Lifecycle,
             Severity::Low,
-            "Stale archive candidates require review",
+            STALE_ARCHIVE_FINDING_TITLE,
             format!(
                 "{} Skills are older than 180 days with no observed use in reliable covered Agent windows. This is candidate evidence only.",
                 stale_candidates.len()
@@ -1411,11 +1423,11 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             EvidenceQuality::Inferred,
         );
     } else if reliable_agents.len() < AgentKind::ALL.len() {
-        push_finding(
+        push_session_finding(
             findings,
             FindingCategory::Lifecycle,
             Severity::Info,
-            "Archive candidacy is unknown",
+            UNKNOWN_ARCHIVE_FINDING_TITLE,
             "Coverage is insufficient to treat missing usage as evidence for archive. No archive action was suggested.",
             Vec::new(),
             Vec::new(),
@@ -1457,10 +1469,63 @@ fn push_finding(
     severity: Severity,
     title: impl Into<String>,
     summary: impl Into<String>,
+    affected_skill_ids: Vec<String>,
+    affected_placement_ids: Vec<String>,
+    evidence: Vec<String>,
+    evidence_quality: EvidenceQuality,
+) {
+    push_finding_with_coverage(
+        findings,
+        category,
+        severity,
+        title,
+        summary,
+        affected_skill_ids,
+        affected_placement_ids,
+        evidence,
+        evidence_quality,
+        FindingCoverageBasis::SkillRootScan,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_session_finding(
+    findings: &mut Vec<Finding>,
+    category: FindingCategory,
+    severity: Severity,
+    title: impl Into<String>,
+    summary: impl Into<String>,
+    affected_skill_ids: Vec<String>,
+    affected_placement_ids: Vec<String>,
+    evidence: Vec<String>,
+    evidence_quality: EvidenceQuality,
+) {
+    push_finding_with_coverage(
+        findings,
+        category,
+        severity,
+        title,
+        summary,
+        affected_skill_ids,
+        affected_placement_ids,
+        evidence,
+        evidence_quality,
+        FindingCoverageBasis::SessionUsage,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_finding_with_coverage(
+    findings: &mut Vec<Finding>,
+    category: FindingCategory,
+    severity: Severity,
+    title: impl Into<String>,
+    summary: impl Into<String>,
     mut affected_skill_ids: Vec<String>,
     mut affected_placement_ids: Vec<String>,
     mut evidence: Vec<String>,
     evidence_quality: EvidenceQuality,
+    coverage_basis: FindingCoverageBasis,
 ) {
     affected_skill_ids.sort();
     affected_skill_ids.dedup();
@@ -1486,6 +1551,7 @@ fn push_finding(
         affected_placement_ids,
         evidence,
         evidence_quality,
+        coverage_basis,
     });
 }
 
@@ -2144,6 +2210,41 @@ fn fnv1a64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inventory_coverage_ignores_session_root_availability() {
+        let root = |kind| crate::scan::RootObservation {
+            agent: Some(AgentKind::Codex),
+            kind,
+            path: PathBuf::from("/fixture/unavailable"),
+            status: crate::scan::RootStatus::Inaccessible,
+            explicit: false,
+            detail: None,
+        };
+        let mut scan = ScanResult {
+            roots: vec![root(crate::scan::RootKind::Sessions)],
+            ..ScanResult::default()
+        };
+        let session_only = build_report(&scan);
+        assert!(
+            session_only
+                .findings
+                .iter()
+                .all(|finding| finding.title != "Some configured roots were inaccessible")
+        );
+
+        scan.roots.push(root(crate::scan::RootKind::Skills));
+        let with_skill_root = build_report(&scan);
+        let inventory = with_skill_root
+            .findings
+            .iter()
+            .find(|finding| finding.title == "Some configured roots were inaccessible")
+            .unwrap();
+        assert_eq!(
+            inventory.coverage_basis,
+            FindingCoverageBasis::SkillRootScan
+        );
+    }
     use crate::scan::{ScanOptions, scan};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3099,6 +3200,7 @@ mod tests {
                     .collect(),
                 evidence: Vec::new(),
                 evidence_quality: EvidenceQuality::Observed,
+                coverage_basis: FindingCoverageBasis::SkillRootScan,
             }
         }
 

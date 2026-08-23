@@ -78,6 +78,14 @@ Ambiguous Skills remain separate. SkillRoster never merges based only on a match
 
 Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large active JSONL files contribute bounded complete-line tails, large monolithic JSON files contribute bounded complete nested objects from their tails, and the fixed byte budget is spread across multiple recent sessions. Reports distinguish missing, inaccessible, sampled-but-limited, and complete observable session roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
 
+Finding coverage never mixes filesystem discovery with session observation.
+Inventory, layout, exposure, overlap, routing, and structural lifecycle
+Findings use `skill_root_scan`; known-missing Skill roots are observed absence,
+while inaccessible roots make that structural denominator incomplete. Usage
+and usage-dependent archive Findings use `session_usage` and separately name
+reliable, sampled-limited, missing, excluded, and inaccessible Agents; those
+states are mutually exclusive for every supported Agent.
+
 A semantic-overlap Finding is candidate evidence, never a consolidation
 decision. Its compact and full detail carry the same bounded comparison bundle:
 the two stable Skill identities, names, descriptions, routing triggers,
