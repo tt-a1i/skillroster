@@ -191,6 +191,18 @@ pub fn run(cli: Cli) -> Result<Output> {
                     false,
                     "snapshot_required",
                 )]
+            } else if let Some(plan_id) = result["pending_plans"]
+                .as_array()
+                .and_then(|plans| plans.first())
+                .and_then(|plan| plan["plan_id"].as_str())
+            {
+                vec![action(
+                    "inspect_pending_plan",
+                    &["plan", "--show", plan_id, "--json"],
+                    false,
+                    false,
+                    "pending_plan_requires_review",
+                )]
             } else {
                 Vec::new()
             };

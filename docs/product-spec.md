@@ -294,6 +294,9 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
   Snapshots remain inspectable history but are not presented as pending work.
   The total count remains exact while the returned list is capped and reports
   whether additional pending Plans were truncated.
+- When pending work exists, `status` routes the Agent to inspect the first Plan
+  from that deterministic bounded ordering before considering a new Scan.
+  Recovery inspection remains higher priority, and the action is read-only.
 - `status` suggests Scan only when no completed Snapshot exists. A healthy
   state with a Snapshot exposes its timestamp and leaves refresh judgment to
   the Agent instead of creating an unconditional Status-to-Scan loop.

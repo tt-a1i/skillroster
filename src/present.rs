@@ -160,7 +160,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         String::new(),
     ];
     match command {
-        "status" => status(result, &mut lines),
+        "status" => status(result, &mut lines, options.width),
         "scan" => scan(result, &mut lines),
         "report" => report(result, &mut lines, options.width),
         "find" => find(result, &mut lines, options.width),
@@ -327,7 +327,7 @@ fn fact_items(lines: &mut Vec<String>, label: &str, items: Vec<String>, width: u
     }
 }
 
-fn status(value: &Value, lines: &mut Vec<String>) {
+fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Database", text(value, "database_path"));
     fact(lines, "Schema", text(value, "schema_version"));
     fact(lines, "Latest Snapshot", text(value, "latest_snapshot_id"));
@@ -337,6 +337,22 @@ fn status(value: &Value, lines: &mut Vec<String>) {
         age(value.get("latest_snapshot_at").and_then(Value::as_i64)),
     );
     fact(lines, "Pending Plans", text(value, "pending_plan_count"));
+    let pending_plan = value
+        .get("pending_plans")
+        .and_then(Value::as_array)
+        .and_then(|plans| plans.first());
+    if let Some(plan) = pending_plan {
+        fact_items(lines, "Review Plan", vec![text(plan, "plan_id")], width);
+        fact_items(
+            lines,
+            "Plan state",
+            vec![
+                text(plan, "status"),
+                age(plan.get("created_at").and_then(Value::as_i64)),
+            ],
+            width,
+        );
+    }
     if let Some(receipt) = value.get("last_receipt").filter(|item| !item.is_null()) {
         fact(
             lines,
@@ -352,10 +368,22 @@ fn status(value: &Value, lines: &mut Vec<String>) {
         fact(lines, "Last Receipt", "none");
     }
     fact(lines, "Recovery", text(value, "recovery_state"));
-    lines.extend(summary(
-        "Read-only · no Agent files changed",
-        "Next: skillroster scan",
-    ));
+    let next = if value["recovery_state"] == "required" {
+        "Next: skillroster lifecycle recovery".to_owned()
+    } else if value.get("latest_snapshot_id").is_none_or(Value::is_null) {
+        "Next: skillroster scan".to_owned()
+    } else if pending_plan.is_some() {
+        "Next: inspect the Review Plan above".to_owned()
+    } else {
+        "Next: scan only when fresher inventory is needed".to_owned()
+    };
+    lines.push(String::new());
+    lines.push("Read-only · no Agent files changed".into());
+    if display_width(&next) > width {
+        lines.push(middle_truncate(&next, width));
+    } else {
+        lines.push(next);
+    }
 }
 
 fn scan(value: &Value, lines: &mut Vec<String>) {
@@ -1800,6 +1828,64 @@ mod tests {
         assert!(PROGRESS_END.contains("?25h"));
         assert!(PROGRESS_BEGIN.starts_with('\r'));
         assert!(PROGRESS_END.starts_with('\r'));
+    }
+
+    #[test]
+    fn status_routes_to_the_highest_priority_read_only_decision() {
+        let base = json!({
+            "database_path": "/db",
+            "schema_version": 9,
+            "latest_snapshot_id": "scan_current",
+            "latest_snapshot_at": 1,
+            "pending_plan_count": 1,
+            "pending_plans": [{
+                "plan_id": "plan_01M0QDAC102GEXKCMHVP97GF2V",
+                "snapshot_id": "scan_current",
+                "status": "ready",
+                "created_at": 1
+            }],
+            "last_receipt": null,
+            "recovery_state": "clear"
+        });
+        let options = RenderOptions {
+            width: 80,
+            styled: false,
+        };
+
+        let pending = render("status", &base, options);
+        assert!(pending.contains("Review Plan            plan_01M0QDAC102GEXKCMHVP97GF2V"));
+        assert!(pending.contains("Next: inspect the Review Plan above"));
+        assert!(!pending.contains("Next: skillroster scan"));
+
+        let narrow = render(
+            "status",
+            &base,
+            RenderOptions {
+                width: 40,
+                styled: false,
+            },
+        );
+        assert!(narrow.contains("Review Plan"));
+        assert!(narrow.contains("\n    plan_01M0QDAC102GEXKCMHVP97GF2V"));
+        assert!(!narrow.contains("Review Plan            plan_"));
+        assert!(narrow.contains("Next: inspect the Review Plan above"));
+        assert!(narrow.lines().all(|line| display_width(line) <= 40));
+
+        let mut recovery = base.clone();
+        recovery["recovery_state"] = json!("required");
+        let recovery = render("status", &recovery, options);
+        assert!(recovery.contains("Next: skillroster lifecycle recovery"));
+
+        let mut missing_snapshot = base.clone();
+        missing_snapshot["latest_snapshot_id"] = Value::Null;
+        let missing_snapshot = render("status", &missing_snapshot, options);
+        assert!(missing_snapshot.contains("Next: skillroster scan"));
+
+        let mut healthy = base;
+        healthy["pending_plan_count"] = json!(0);
+        healthy["pending_plans"] = json!([]);
+        let healthy = render("status", &healthy, options);
+        assert!(healthy.contains("Next: scan only when fresher inventory is needed"));
     }
 
     #[test]
