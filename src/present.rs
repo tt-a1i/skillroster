@@ -1207,6 +1207,10 @@ fn core_reason_label(reason: &str) -> &str {
         "inferred_applied" => "inferred applied",
         "inferred_loaded" => "inferred loaded",
         "inferred_matched" => "inferred matched",
+        "unknown_quality_outcome" => "outcome?",
+        "unknown_quality_applied" => "applied?",
+        "unknown_quality_loaded" => "loaded?",
+        "unknown_quality_matched" => "matched?",
         "cross_agent_observed_outcome" => "elsewhere outcome",
         "cross_agent_observed_applied" => "elsewhere applied",
         "cross_agent_observed_loaded" => "elsewhere loaded",
@@ -1215,6 +1219,10 @@ fn core_reason_label(reason: &str) -> &str {
         "cross_agent_inferred_applied" => "elsewhere inferred applied",
         "cross_agent_inferred_loaded" => "elsewhere inferred loaded",
         "cross_agent_inferred_matched" => "elsewhere inferred matched",
+        "cross_agent_unknown_quality_outcome" => "elsewhere outcome?",
+        "cross_agent_unknown_quality_applied" => "elsewhere applied?",
+        "cross_agent_unknown_quality_loaded" => "elsewhere loaded?",
+        "cross_agent_unknown_quality_matched" => "elsewhere matched?",
         "stable_fallback" => "fallback",
         _ => reason,
     }
@@ -2072,7 +2080,7 @@ mod tests {
                     {
                         "agent": "claude-code",
                         "core_preview": [
-                            {"name": "code-review", "reason": "cross_agent_observed_loaded"}
+                            {"name": "code-review", "reason": "cross_agent_unknown_quality_loaded"}
                         ],
                         "core_selection_count": 10,
                         "core_preview_truncated": true
@@ -2104,7 +2112,7 @@ mod tests {
                 "2 signals · 0 forced · 198 fallback",
                 "1 target Agent · 1 cross-Agent",
                 "code-review",
-                "elsewhere loaded",
+                "elsewhere loaded?",
                 "fallback-dominated Core selection",
             ] {
                 assert!(output.contains(expected), "{expected} missing at {width}");
