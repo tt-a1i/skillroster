@@ -1,4 +1,5 @@
 pub mod app;
+mod bootstrap;
 pub mod change;
 pub mod cli;
 pub mod harness;

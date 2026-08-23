@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::bootstrap::PACKAGE_FILES as BOOTSTRAP_PACKAGE_FILES;
 use crate::change::{
     self, ChangeReceipt, Operation, OperationPolicy, PrepareContext, PreparedPlan,
 };
@@ -6092,7 +6093,7 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
     Ok(mutation_result(&outcome, &receipt, Some(id)))
 }
 
-const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
+const LEGACY_SINGLE_FILE_BOOTSTRAPS: &[(&str, &str)] = &[
     (
         "1.0.0",
         "08440a4a3e10489eae2484d0a5bf8f4b0451d22c43edaa90c75fcd0b66fd4a74",
@@ -6229,6 +6230,10 @@ const LEGACY_BOOTSTRAPS: &[(&str, &str)] = &[
         "1.8.19",
         "78aa0dbdf53c3f9f08fb5bf9805e33b2d5b8ffe4c63bac05d88391f608fab16c",
     ),
+    (
+        "1.8.20",
+        "fc1318f0a8587ce193ab1f54462374508026cf8c50a382b613dc18b48f9d09f2",
+    ),
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6238,28 +6243,10 @@ enum BootstrapContentStatus {
     Modified,
 }
 
-impl BootstrapContentStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Current => "current",
-            Self::OfficialOutdated(_) => "official_outdated",
-            Self::Modified => "modified",
-        }
-    }
-
-    fn installed_version(self) -> Option<&'static str> {
-        match self {
-            Self::Current => Some(env!("CARGO_PKG_VERSION")),
-            Self::OfficialOutdated(version) => Some(version),
-            Self::Modified => None,
-        }
-    }
-}
-
 fn bootstrap_content_status(digest: &str, current_digest: &str) -> BootstrapContentStatus {
     if digest == current_digest {
         BootstrapContentStatus::Current
-    } else if let Some((version, _)) = LEGACY_BOOTSTRAPS
+    } else if let Some((version, _)) = LEGACY_SINGLE_FILE_BOOTSTRAPS
         .iter()
         .find(|(_, official_digest)| *official_digest == digest)
     {
@@ -6271,6 +6258,120 @@ fn bootstrap_content_status(digest: &str, current_digest: &str) -> BootstrapCont
 
 fn normalized_bootstrap_content(content: &str) -> String {
     content.replace("\r\n", "\n")
+}
+
+/// Exact manifests for released Bootstrap packages that already contained all
+/// managed files. Add one entry when a package release is superseded; setup
+/// never infers an official package by mixing file digests from different
+/// releases.
+#[derive(Clone, Debug)]
+struct BootstrapPackageManifest<'a> {
+    version: &'a str,
+    file_digests: &'a [(&'a str, &'a str)],
+}
+
+const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapFileStatus {
+    Current,
+    OfficialOutdated(&'static str),
+    Missing,
+    Modified,
+    Unsupported,
+}
+
+impl BootstrapFileStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::OfficialOutdated(_) => "official_outdated",
+            Self::Missing => "missing",
+            Self::Modified => "modified",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+fn current_bootstrap_package() -> Vec<(&'static str, String, String)> {
+    BOOTSTRAP_PACKAGE_FILES
+        .iter()
+        .map(|file| {
+            let content = normalized_bootstrap_content(file.content);
+            (
+                file.relative_path,
+                content_digest(content.as_bytes()),
+                content,
+            )
+        })
+        .collect()
+}
+
+fn legacy_bootstrap_package_version<'a>(
+    observed_digests: &[Option<String>],
+    complete_packages: &'a [BootstrapPackageManifest<'a>],
+) -> Option<&'a str> {
+    if observed_digests.len() != BOOTSTRAP_PACKAGE_FILES.len() {
+        return None;
+    }
+    if let Some(package) = complete_packages.iter().find(|package| {
+        package.file_digests.len() == BOOTSTRAP_PACKAGE_FILES.len()
+            && BOOTSTRAP_PACKAGE_FILES
+                .iter()
+                .zip(observed_digests)
+                .all(|(file, observed)| {
+                    package
+                        .file_digests
+                        .iter()
+                        .find(|(relative_path, _)| *relative_path == file.relative_path)
+                        .is_some_and(|(_, expected)| observed.as_deref() == Some(*expected))
+                })
+    }) {
+        return Some(package.version);
+    }
+    if observed_digests[1..].iter().all(Option::is_none) {
+        let skill_digest = observed_digests[0].as_deref()?;
+        return LEGACY_SINGLE_FILE_BOOTSTRAPS
+            .iter()
+            .find_map(|(version, digest)| (*digest == skill_digest).then_some(*version));
+    }
+    None
+}
+
+fn bootstrap_file_status(
+    relative_path: &str,
+    path: &Path,
+    current_digest: &str,
+) -> (BootstrapFileStatus, Option<String>) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.file_type().is_file() => {
+            (BootstrapFileStatus::Unsupported, None)
+        }
+        Ok(_) => match std::fs::read(path) {
+            Ok(content) => {
+                let digest = bootstrap_content_digest(&content);
+                let status = if digest == current_digest {
+                    BootstrapFileStatus::Current
+                } else if relative_path == "SKILL.md" {
+                    match bootstrap_content_status(&digest, current_digest) {
+                        BootstrapContentStatus::OfficialOutdated(version) => {
+                            BootstrapFileStatus::OfficialOutdated(version)
+                        }
+                        BootstrapContentStatus::Current => BootstrapFileStatus::Current,
+                        BootstrapContentStatus::Modified => BootstrapFileStatus::Modified,
+                    }
+                } else {
+                    BootstrapFileStatus::Modified
+                };
+                (status, Some(digest))
+            }
+            Err(_) => (BootstrapFileStatus::Unsupported, None),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (BootstrapFileStatus::Missing, None)
+        }
+        Err(_) => (BootstrapFileStatus::Unsupported, None),
+    }
 }
 
 fn bootstrap_content_digest(content: &[u8]) -> String {
@@ -6285,6 +6386,22 @@ fn setup_command(
     home: &Path,
     state_dir: &Path,
     modified_choice: Option<ModifiedBootstrapChoice>,
+) -> Result<Value> {
+    setup_command_with_manifests(
+        store,
+        home,
+        state_dir,
+        modified_choice,
+        LEGACY_COMPLETE_BOOTSTRAP_PACKAGES,
+    )
+}
+
+fn setup_command_with_manifests<'a>(
+    store: &StateStore,
+    home: &Path,
+    state_dir: &Path,
+    modified_choice: Option<ModifiedBootstrapChoice>,
+    legacy_complete_packages: &'a [BootstrapPackageManifest<'a>],
 ) -> Result<Value> {
     let Some(snapshot) = store.latest_completed_scan()? else {
         return Ok(json!({
@@ -6306,9 +6423,7 @@ fn setup_command(
             "next": "skillroster scan --json"
         }));
     };
-    let current_content =
-        normalized_bootstrap_content(include_str!("../skill/skillroster/SKILL.md"));
-    let current_digest = content_digest(current_content.as_bytes());
+    let current_package = current_bootstrap_package();
     let mut detected = Vec::new();
     let mut targets = Vec::new();
     let mut operations = Vec::new();
@@ -6320,7 +6435,7 @@ fn setup_command(
     let mut replace_count = 0_usize;
     let mut physical_targets = BTreeSet::new();
     let mut planned_directories = BTreeSet::new();
-    let mut planned_entrypoints = BTreeSet::new();
+    let mut planned_files = BTreeSet::new();
     for roots in harness::known_agent_roots(home) {
         for root in roots.skill_roots.into_iter().filter(|path| path.is_dir()) {
             let directory = root.join("skillroster");
@@ -6330,99 +6445,139 @@ fn setup_command(
             })?;
             let physical_directory = physical_root.join("skillroster");
             let physical_entrypoint = physical_directory.join("SKILL.md");
-            physical_targets.insert(physical_entrypoint.clone());
+            physical_targets.insert(physical_directory.clone());
             detected.push(json!({"agent": roots.agent.id(), "target": entrypoint}));
             let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(_) => true,
             };
-            let (status, installed_version) = match std::fs::symlink_metadata(&entrypoint) {
-                Ok(metadata)
-                    if directory_is_unsupported
-                        || metadata.file_type().is_symlink()
-                        || !metadata.file_type().is_file() =>
-                {
-                    unsupported_count += 1;
-                    ("unsupported", None)
-                }
-                Ok(_) => match std::fs::read(&entrypoint) {
-                    Ok(content) => {
-                        let digest = bootstrap_content_digest(&content);
-                        let content_status = bootstrap_content_status(&digest, &current_digest);
-                        match content_status {
-                            BootstrapContentStatus::Current => current_count += 1,
-                            BootstrapContentStatus::OfficialOutdated(_) => {
-                                outdated_count += 1;
-                                replace_count += 1;
-                                if planned_entrypoints.insert(physical_entrypoint.clone()) {
-                                    operations.push(json!({
-                                        "kind": "replace_file",
-                                        "target": entrypoint,
-                                        "content": &current_content,
-                                        "expected_fingerprint": change::fingerprint(&entrypoint)?
-                                    }));
-                                }
-                            }
-                            BootstrapContentStatus::Modified => {
-                                modified_count += 1;
-                                if matches!(
-                                    modified_choice,
-                                    Some(ModifiedBootstrapChoice::AdoptCurrent)
-                                ) {
-                                    replace_count += 1;
-                                    if planned_entrypoints.insert(physical_entrypoint.clone()) {
-                                        operations.push(json!({
-                                            "kind": "replace_file",
-                                            "target": entrypoint,
-                                            "content": &current_content,
-                                            "expected_fingerprint": change::fingerprint(&entrypoint)?
-                                        }));
-                                    }
-                                }
-                            }
-                        }
-                        (content_status.as_str(), content_status.installed_version())
-                    }
-                    Err(_) => {
-                        unsupported_count += 1;
-                        ("unsupported", None)
-                    }
-                },
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && !directory_is_unsupported =>
-                {
-                    missing_count += 1;
-                    if !directory.exists() && planned_directories.insert(physical_directory.clone())
-                    {
-                        operations.push(json!({
-                            "kind": "create_directory",
-                            "target": directory,
-                            "expected_fingerprint": "missing"
-                        }));
-                    }
-                    if planned_entrypoints.insert(physical_entrypoint.clone()) {
-                        operations.push(json!({
-                            "kind": "write_file",
-                            "target": entrypoint,
-                            "content": &current_content,
-                            "expected_fingerprint": "missing"
-                        }));
-                    }
-                    ("missing", None)
-                }
-                Err(_) => {
-                    unsupported_count += 1;
-                    ("unsupported", None)
-                }
+            let references = directory.join("references");
+            let references_are_unsupported = match std::fs::symlink_metadata(&references) {
+                Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => true,
             };
+            let package_missing = !directory.exists() && !directory_is_unsupported;
+            let observed_files = current_package
+                .iter()
+                .map(|(relative_path, current_digest, _)| {
+                    let (status, digest) = bootstrap_file_status(
+                        relative_path,
+                        &directory.join(relative_path),
+                        current_digest,
+                    );
+                    (*relative_path, status, digest)
+                })
+                .collect::<Vec<_>>();
+            let observed_digests = observed_files
+                .iter()
+                .map(|(_, _, digest)| digest.clone())
+                .collect::<Vec<_>>();
+            let legacy_version =
+                legacy_bootstrap_package_version(&observed_digests, legacy_complete_packages);
+            let all_managed_files_missing = observed_files
+                .iter()
+                .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Missing));
+            let package_status = if directory_is_unsupported
+                || references_are_unsupported
+                || observed_files
+                    .iter()
+                    .any(|(_, status, _)| matches!(status, BootstrapFileStatus::Unsupported))
+            {
+                "unsupported"
+            } else if package_missing || all_managed_files_missing {
+                "missing"
+            } else if observed_files
+                .iter()
+                .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Current))
+            {
+                "current"
+            } else if legacy_version.is_some() {
+                "official_outdated"
+            } else {
+                "modified"
+            };
+            match package_status {
+                "unsupported" => unsupported_count += 1,
+                "missing" => missing_count += 1,
+                "current" => current_count += 1,
+                "official_outdated" => {
+                    outdated_count += 1;
+                    replace_count += 1;
+                }
+                "modified" => {
+                    modified_count += 1;
+                    if matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)) {
+                        replace_count += 1;
+                    }
+                }
+                _ => unreachable!("package status is exhaustive"),
+            }
+            let should_install = package_status == "missing"
+                || package_status == "official_outdated"
+                || (package_status == "modified"
+                    && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
+            if should_install {
+                if package_missing && planned_directories.insert(physical_directory.clone()) {
+                    operations.push(json!({
+                        "kind": "create_directory",
+                        "target": directory,
+                        "expected_fingerprint": "missing"
+                    }));
+                }
+                let physical_references = physical_directory.join("references");
+                if !references.exists() && planned_directories.insert(physical_references) {
+                    operations.push(json!({
+                        "kind": "create_directory",
+                        "target": references,
+                        "expected_fingerprint": "missing"
+                    }));
+                }
+                for ((relative_path, _, content), (_, status, _)) in
+                    current_package.iter().zip(&observed_files)
+                {
+                    if matches!(status, BootstrapFileStatus::Current) {
+                        continue;
+                    }
+                    let target = directory.join(relative_path);
+                    let physical_target = physical_directory.join(relative_path);
+                    if !planned_files.insert(physical_target) {
+                        continue;
+                    }
+                    let kind = match status {
+                        BootstrapFileStatus::Missing => "write_file",
+                        BootstrapFileStatus::Modified
+                        | BootstrapFileStatus::OfficialOutdated(_) => "replace_file",
+                        BootstrapFileStatus::Current | BootstrapFileStatus::Unsupported => {
+                            unreachable!("install only receives supported non-current files")
+                        }
+                    };
+                    operations.push(json!({
+                        "kind": kind,
+                        "target": target,
+                        "content": content,
+                        "expected_fingerprint": change::fingerprint(&target)?
+                    }));
+                }
+            }
             targets.push(json!({
                 "agent": roots.agent.id(),
                 "target": entrypoint,
                 "physical_target": physical_entrypoint,
-                "status": status,
-                "installed_version": installed_version
+                "status": package_status,
+                "installed_version": if package_status == "current" {
+                    Some(env!("CARGO_PKG_VERSION"))
+                } else if package_status == "official_outdated" {
+                    legacy_version
+                } else {
+                    None
+                },
+                "managed_file_count": current_package.len(),
+                "managed_files": observed_files.iter().map(|(relative_path, status, _)| json!({
+                    "relative_path": relative_path,
+                    "status": status.as_str()
+                })).collect::<Vec<_>>()
             }));
         }
     }
@@ -8316,11 +8471,11 @@ mod recovery_tests {
             BootstrapContentStatus::Current
         );
         assert!(
-            !LEGACY_BOOTSTRAPS
+            !LEGACY_SINGLE_FILE_BOOTSTRAPS
                 .iter()
                 .any(|(_, digest)| *digest == current)
         );
-        for (version, digest) in LEGACY_BOOTSTRAPS {
+        for (version, digest) in LEGACY_SINGLE_FILE_BOOTSTRAPS {
             assert_eq!(
                 bootstrap_content_status(digest, &current),
                 BootstrapContentStatus::OfficialOutdated(version)
@@ -8339,6 +8494,95 @@ mod recovery_tests {
             ),
             BootstrapContentStatus::OfficialOutdated("1.4.0")
         );
+    }
+
+    #[test]
+    fn exact_complete_bootstrap_manifest_upgrades_and_undoes_without_accepting_a_mix() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let root = home.join(".codex/skills");
+        let package = root.join("skillroster");
+        std::fs::create_dir_all(package.join("references")).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let current = current_bootstrap_package();
+        let previous = current
+            .iter()
+            .map(|(_, _, content)| format!("{content}\n<!-- previous official package -->\n"))
+            .collect::<Vec<_>>();
+        let previous_digests = previous
+            .iter()
+            .map(|content| content_digest(content.as_bytes()))
+            .collect::<Vec<_>>();
+        let previous_files = current
+            .iter()
+            .zip(&previous_digests)
+            .map(|((relative_path, _, _), digest)| (*relative_path, digest.as_str()))
+            .collect::<Vec<_>>();
+        let manifests = [BootstrapPackageManifest {
+            version: "previous-complete-fixture",
+            file_digests: &previous_files,
+        }];
+        for ((relative_path, _, _), content) in current.iter().zip(&previous) {
+            std::fs::write(package.join(relative_path), content).unwrap();
+        }
+        let store = StateStore::open(state.join("skillroster.db")).unwrap();
+        scan_command(&store, &home, &state, Vec::new(), Vec::new()).unwrap();
+
+        std::fs::write(package.join(current[1].0), &current[1].2).unwrap();
+        let mixed = setup_command_with_manifests(&store, &home, &state, None, &manifests).unwrap();
+        assert_eq!(mixed["state"], "modified_choice_required");
+        assert_eq!(mixed["outdated_count"], 0);
+        std::fs::write(package.join(current[1].0), &previous[1]).unwrap();
+
+        let incomplete_manifests = [BootstrapPackageManifest {
+            version: "incomplete-fixture",
+            file_digests: &previous_files[..3],
+        }];
+        let incomplete =
+            setup_command_with_manifests(&store, &home, &state, None, &incomplete_manifests)
+                .unwrap();
+        assert_eq!(incomplete["state"], "modified_choice_required");
+
+        let duplicate_path_files = [
+            previous_files[0],
+            previous_files[1],
+            previous_files[2],
+            previous_files[2],
+        ];
+        let duplicate_path_manifests = [BootstrapPackageManifest {
+            version: "duplicate-path-fixture",
+            file_digests: &duplicate_path_files,
+        }];
+        let duplicate_path =
+            setup_command_with_manifests(&store, &home, &state, None, &duplicate_path_manifests)
+                .unwrap();
+        assert_eq!(duplicate_path["state"], "modified_choice_required");
+
+        let upgrade =
+            setup_command_with_manifests(&store, &home, &state, None, &manifests).unwrap();
+        assert_eq!(upgrade["state"], "preview_ready");
+        assert_eq!(upgrade["outdated_count"], 1);
+        assert_eq!(upgrade["operation_count"], 4);
+        assert_eq!(
+            upgrade["targets"][0]["installed_version"],
+            "previous-complete-fixture"
+        );
+        let applied = apply_command(&store, upgrade["plan_id"].as_str().unwrap()).unwrap();
+        for (relative_path, _, content) in &current {
+            assert_eq!(
+                std::fs::read_to_string(package.join(relative_path)).unwrap(),
+                *content
+            );
+        }
+        let undone = undo_command(&store, applied["receipt_id"].as_str().unwrap()).unwrap();
+        assert_eq!(undone["verification"], "passed");
+        for ((relative_path, _, _), content) in current.iter().zip(&previous) {
+            assert_eq!(
+                std::fs::read_to_string(package.join(relative_path)).unwrap(),
+                *content
+            );
+        }
     }
 
     #[test]

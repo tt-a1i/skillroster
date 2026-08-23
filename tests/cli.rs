@@ -2174,19 +2174,35 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
         &[&common[..], &["plan", "--show", plan_id]].concat(),
         None,
     ));
-    assert_eq!(detail["result"]["operations"][0]["kind"], "replace_file");
+    assert!(
+        detail["result"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| operation["kind"] == "replace_file")
+    );
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(
         fs::read_to_string(&bootstrap).unwrap(),
         include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
     );
+    for reference in ["routing.md", "governance.md", "mutation.md"] {
+        assert!(
+            bootstrap
+                .parent()
+                .unwrap()
+                .join("references")
+                .join(reference)
+                .is_file()
+        );
+    }
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.20"
+        env!("CARGO_PKG_VERSION")
     );
 
     let undone = json_output(&run(
@@ -2270,7 +2286,268 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
         assert_eq!(undone["result"]["verification"], "passed");
         assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
+        assert!(!bootstrap.parent().unwrap().join("references").exists());
     }
+}
+
+#[test]
+fn setup_manages_the_fixed_bootstrap_package_and_preserves_unmanaged_files() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let package = root.join("skillroster");
+    let routing = package.join("references/routing.md");
+    let unmanaged = package.join("notes.local.md");
+    fs::write(&unmanaged, "keep me\n").unwrap();
+    fs::write(&routing, "local routing instructions\n").unwrap();
+
+    let blocked = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(blocked["result"]["state"], "modified_choice_required");
+    assert_eq!(blocked["result"]["modified_count"], 1);
+    assert!(blocked["result"]["plan_id"].is_null());
+
+    let retained = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_eq!(retained["result"]["state"], "local_modifications_retained");
+    assert_eq!(
+        fs::read_to_string(&routing).unwrap(),
+        "local routing instructions\n"
+    );
+
+    let adopt = json_output(&run(
+        &[
+            &common[..],
+            &["setup", "--modified-choice", "adopt-current"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(adopt["result"]["operation_count"], 1);
+    let adopted = json_output(&run(
+        &[
+            &common[..],
+            &["apply", adopt["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        fs::read_to_string(&routing).unwrap(),
+        include_str!("../skill/skillroster/references/routing.md").replace("\r\n", "\n")
+    );
+    assert_eq!(fs::read_to_string(&unmanaged).unwrap(), "keep me\n");
+    let healthy = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(healthy["result"]["state"], "up_to_date");
+    assert_eq!(healthy["result"]["targets"][0]["managed_file_count"], 4);
+
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", adopted["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(
+        fs::read_to_string(&routing).unwrap(),
+        "local routing instructions\n"
+    );
+    assert_eq!(fs::read_to_string(&unmanaged).unwrap(), "keep me\n");
+}
+
+#[test]
+fn setup_does_not_report_a_package_with_a_missing_reference_as_current() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    fs::remove_file(root.join("skillroster/references/governance.md")).unwrap();
+
+    let result = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(result["result"]["state"], "modified_choice_required");
+    assert_eq!(result["result"]["current_count"], 0);
+    assert_eq!(result["result"]["modified_count"], 1);
+    assert!(result["result"]["plan_id"].is_null());
+    assert!(
+        result["result"]["targets"][0]["managed_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| {
+                file["relative_path"] == "references/governance.md" && file["status"] == "missing"
+            })
+    );
+
+    let adopt = json_output(&run(
+        &[
+            &common[..],
+            &["setup", "--modified-choice", "adopt-current"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(adopt["result"]["operation_count"], 1);
+    let plan_id = adopt["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["result"]["operations"][0]["kind"], "write_file");
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert!(root.join("skillroster/references/governance.md").is_file());
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(!root.join("skillroster/references/governance.md").exists());
+}
+
+#[test]
+fn setup_treats_a_package_with_no_managed_files_as_missing_and_preserves_extra_files() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let package = root.join("skillroster");
+    fs::create_dir_all(&package).unwrap();
+    let extra = package.join("notes.local.md");
+    fs::write(&extra, "keep me\n").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_eq!(setup["result"]["missing_count"], 1);
+    assert_eq!(setup["result"]["modified_count"], 0);
+    assert_eq!(setup["result"]["targets"][0]["status"], "missing");
+    assert_eq!(setup["result"]["operation_count"], 5);
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(fs::read_to_string(&extra).unwrap(), "keep me\n");
+    assert!(package.join("SKILL.md").is_file());
+    assert!(package.join("references/mutation.md").is_file());
+
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(fs::read_to_string(&extra).unwrap(), "keep me\n");
+    assert!(!package.join("SKILL.md").exists());
+    assert!(!package.join("references").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_rejects_a_symlinked_managed_reference() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let routing = root.join("skillroster/references/routing.md");
+    fs::remove_file(&routing).unwrap();
+    symlink(root.join("skillroster/SKILL.md"), &routing).unwrap();
+
+    let result = json_output(&run(
+        &[
+            &common[..],
+            &["setup", "--modified-choice", "adopt-current"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(result["result"]["state"], "unsupported_targets");
+    assert_eq!(result["result"]["unsupported_count"], 1);
+    assert!(result["result"]["plan_id"].is_null());
+    assert!(
+        fs::symlink_metadata(routing)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[cfg(unix)]
@@ -2313,7 +2590,7 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     assert_eq!(setup["result"]["targets"].as_array().unwrap().len(), 5);
     assert_eq!(setup["result"]["missing_count"], 5);
     assert_eq!(setup["result"]["physical_target_count"], 3);
-    assert_eq!(setup["result"]["operation_count"], 6);
+    assert_eq!(setup["result"]["operation_count"], 18);
 
     let plan_id = setup["result"]["plan_id"].as_str().unwrap();
     let detail = json_output(&run(
@@ -2321,16 +2598,19 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
         None,
     ));
     let operations = detail["result"]["operations"].as_array().unwrap();
-    assert_eq!(operations.len(), 6);
+    assert_eq!(operations.len(), 18);
     let unique_targets = operations
         .iter()
         .map(|operation| operation["target"].as_str().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(unique_targets.len(), 6);
+    assert_eq!(unique_targets.len(), 18);
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     for root in [&shared, &opencode, &hermes] {
         assert!(root.join("skillroster/SKILL.md").is_file());
+        assert!(root.join("skillroster/references/routing.md").is_file());
+        assert!(root.join("skillroster/references/governance.md").is_file());
+        assert!(root.join("skillroster/references/mutation.md").is_file());
     }
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
@@ -2521,7 +2801,10 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.20");
+    assert_eq!(
+        output["result"]["bootstrap_version"],
+        env!("CARGO_PKG_VERSION")
+    );
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
