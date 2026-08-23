@@ -2356,27 +2356,43 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
     match request {
         ReportRequest::Summary => {
             let total = result["finding_count"].as_u64().unwrap_or_default();
-            let returned = result["findings"]
-                .as_array()
-                .map_or(0, |findings| findings.len() as u64);
-            if total <= returned {
-                return Vec::new();
+            let findings = result["findings"].as_array();
+            let returned = findings.map_or(0, |findings| findings.len() as u64);
+            let mut actions = Vec::new();
+            if total > returned {
+                actions.push(action(
+                    "list_findings",
+                    &[
+                        "report",
+                        "--findings",
+                        "--limit",
+                        "20",
+                        "--offset",
+                        "0",
+                        "--json",
+                    ],
+                    false,
+                    false,
+                    "more_findings_available",
+                ));
             }
-            vec![action(
-                "list_findings",
-                &[
-                    "report",
-                    "--findings",
-                    "--limit",
-                    "20",
-                    "--offset",
-                    "0",
-                    "--json",
-                ],
-                false,
-                false,
-                "more_findings_available",
-            )]
+            actions.extend(
+                findings
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|finding| finding["id"].as_str())
+                    .take(3)
+                    .map(|id| {
+                        action(
+                            "view_finding",
+                            &["report", "--finding", id, "--json"],
+                            false,
+                            false,
+                            "top_finding_selected",
+                        )
+                    }),
+            );
+            actions
         }
         ReportRequest::Findings {
             category,
@@ -6897,6 +6913,43 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn summary_actions_keep_direct_drilldowns_when_every_finding_fits() {
+        let result = json!({
+            "finding_count": 2,
+            "findings": [{"id": "finding_one"}, {"id": "finding_two"}]
+        });
+        let actions = report_actions(&result, ReportRequest::Summary);
+        assert_eq!(actions.len(), 2);
+        assert!(actions.iter().all(|action| action.action == "view_finding"));
+        assert_eq!(
+            actions[0].argv,
+            [
+                "skillroster",
+                "report",
+                "--finding",
+                "finding_one",
+                "--json"
+            ]
+        );
+        assert_eq!(
+            actions[1].argv,
+            [
+                "skillroster",
+                "report",
+                "--finding",
+                "finding_two",
+                "--json"
+            ]
+        );
+
+        let empty = report_actions(
+            &json!({"finding_count": 0, "findings": []}),
+            ReportRequest::Summary,
+        );
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn action_context_absolutizes_a_relative_state_directory() {
