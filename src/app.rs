@@ -3506,7 +3506,7 @@ fn expand_finding_roster_changes(
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     if !supported.exclusions.is_empty() {
-        if let Some(blocker) = finding_roster_safety_blocker(scan, &supported.exclusions) {
+        if let Some(blocker) = finding_roster_safety_blocker(&supported.exclusions) {
             return Err(blocker.into());
         }
         return Err(crate::roster_plan::source_confirmation_block(
@@ -3536,60 +3536,11 @@ fn expand_finding_roster_changes(
 }
 
 fn finding_roster_safety_blocker(
-    scan: &ScanResult,
     exclusions: &[crate::roster_plan::RosterChangeExclusion],
 ) -> Option<crate::roster_plan::RosterSafetyBlocker> {
-    for exclusion in exclusions {
-        let placements = scan
-            .placements
-            .iter()
-            .filter(|placement| placement.skill_id == exclusion.skill_id)
-            .collect::<Vec<_>>();
-        match exclusion.reason {
-            "provider_managed_placement_is_read_only" => {
-                let protected = placements
-                    .into_iter()
-                    .filter(|placement| !placement.governable)
-                    .collect::<Vec<_>>();
-                return Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
-                    skill_id: exclusion.skill_id.clone(),
-                    placement_ids: protected
-                        .iter()
-                        .map(|placement| placement.id.clone())
-                        .collect(),
-                    paths: protected
-                        .iter()
-                        .map(|placement| placement.directory.clone())
-                        .collect(),
-                    providers: protected
-                        .iter()
-                        .filter_map(|placement| placement.provider.clone())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                });
-            }
-            "non_agent_source_link_depends_on_removal" => {
-                let dependent = placements
-                    .into_iter()
-                    .filter(|placement| placement.agent.is_none())
-                    .collect::<Vec<_>>();
-                return Some(crate::roster_plan::RosterSafetyBlocker::DependentSource {
-                    skill_id: exclusion.skill_id.clone(),
-                    placement_ids: dependent
-                        .iter()
-                        .map(|placement| placement.id.clone())
-                        .collect(),
-                    paths: dependent
-                        .iter()
-                        .map(|placement| placement.directory.clone())
-                        .collect(),
-                });
-            }
-            _ => {}
-        }
-    }
-    None
+    exclusions
+        .iter()
+        .find_map(|exclusion| exclusion.safety_blocker.clone())
 }
 
 fn exact_duplicate_finding_scope(
@@ -6310,16 +6261,19 @@ mod recovery_tests {
         assert_eq!(planning["reason"], "external_observed_placements");
         assert_eq!(planning["protected_placement_count"], 1);
 
-        let blocker = finding_roster_safety_blocker(
-            &scan,
-            &[crate::roster_plan::RosterChangeExclusion {
-                agent: "codex".into(),
+        let blocker = finding_roster_safety_blocker(&[crate::roster_plan::RosterChangeExclusion {
+            agent: "codex".into(),
+            skill_id: "skill_shared".into(),
+            name: "shared".into(),
+            reason: "provider_managed_placement_is_read_only",
+            observed_source_target: None,
+            safety_blocker: Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
                 skill_id: "skill_shared".into(),
-                name: "shared".into(),
-                reason: "provider_managed_placement_is_read_only",
-                observed_source_target: None,
-            }],
-        )
+                placement_ids: vec!["placement_plugin".into()],
+                paths: vec![PathBuf::from("/fixture/placement_plugin")],
+                providers: vec!["plugin@market".into()],
+            }),
+        }])
         .unwrap();
         let blocked: Value = serde_json::from_str(&error_json("plan", &blocker)).unwrap();
         assert_eq!(
@@ -6754,6 +6708,7 @@ mod recovery_tests {
                 observed_source_target: Some(crate::roster_plan::test_absolute_path(&format!(
                     "opt/root-{index:02}/pkg"
                 ))),
+                safety_blocker: None,
             })
             .collect::<Vec<_>>();
         let blocked = crate::roster_plan::source_confirmation_block(

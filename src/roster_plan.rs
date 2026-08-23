@@ -60,7 +60,7 @@ impl std::fmt::Display for RosterOperationConflict {
 
 impl std::error::Error for RosterOperationConflict {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RosterSafetyBlocker {
     ProviderManaged {
         skill_id: String,
@@ -99,6 +99,7 @@ pub struct RosterChangeExclusion {
     pub name: String,
     pub reason: &'static str,
     pub observed_source_target: Option<PathBuf>,
+    pub safety_blocker: Option<RosterSafetyBlocker>,
 }
 
 pub struct SupportedRosterChanges {
@@ -392,10 +393,8 @@ pub fn exclude_unpreservable_demotions(
                     .is_some_and(|agent| demoted_agents.contains(&agent))
             })
             .collect::<Vec<_>>();
-        let provider_managed_removal =
-            provider_placements_on_physical_removal(&placements, &removable)
-                .next()
-                .is_some();
+        let provider_managed_removals =
+            provider_placements_on_physical_removal(&placements, &removable).collect::<Vec<_>>();
         let skill = scan
             .skills
             .iter()
@@ -412,19 +411,52 @@ pub fn exclude_unpreservable_demotions(
             .iter()
             .copied()
             .any(|placement| is_real_exact(placement, exact_digest));
-        let non_agent_source_dependency = placements
+        let non_agent_source_dependencies = placements
             .iter()
             .copied()
             .filter(|placement| placement.agent.is_none())
-            .any(|placement| depends_on_physical_removal(placement, &removable));
-        let reason = if provider_managed_removal {
-            "provider_managed_placement_is_read_only"
-        } else if non_agent_source_dependency {
-            "non_agent_source_link_depends_on_removal"
+            .filter(|placement| depends_on_physical_removal(placement, &removable))
+            .collect::<Vec<_>>();
+        let (reason, safety_blocker) = if !provider_managed_removals.is_empty() {
+            (
+                "provider_managed_placement_is_read_only",
+                Some(RosterSafetyBlocker::ProviderManaged {
+                    skill_id: skill_id.to_owned(),
+                    placement_ids: provider_managed_removals
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: provider_managed_removals
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                    providers: provider_managed_removals
+                        .iter()
+                        .filter_map(|placement| placement.provider.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                }),
+            )
+        } else if !non_agent_source_dependencies.is_empty() {
+            (
+                "non_agent_source_link_depends_on_removal",
+                Some(RosterSafetyBlocker::DependentSource {
+                    skill_id: skill_id.to_owned(),
+                    placement_ids: non_agent_source_dependencies
+                        .iter()
+                        .map(|placement| placement.id.clone())
+                        .collect(),
+                    paths: non_agent_source_dependencies
+                        .iter()
+                        .map(|placement| placement.directory.clone())
+                        .collect(),
+                }),
+            )
         } else if retained_owned || migratable_owned {
             continue;
         } else {
-            "no_owned_exact_content_to_preserve"
+            ("no_owned_exact_content_to_preserve", None)
         };
         for request in requests
             .into_iter()
@@ -437,6 +469,7 @@ pub fn exclude_unpreservable_demotions(
                 name: name.to_owned(),
                 reason,
                 observed_source_target: safe_observed_source_target(&removable),
+                safety_blocker: safety_blocker.clone(),
             });
         }
     }
@@ -1335,7 +1368,24 @@ mod tests {
         provider.agent = None;
         provider.governable = false;
         provider.provider = Some("fixture-provider".into());
-        snapshot.placements.push(provider);
+        let provider_directory = provider.directory.clone();
+        snapshot.placements.push(provider.clone());
+        let unrelated_directory = temp.path().join("provider-cache/unrelated");
+        fs::create_dir_all(&unrelated_directory).unwrap();
+        fs::write(
+            unrelated_directory.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut unrelated_provider = provider;
+        unrelated_provider.id = "placement_unrelated_provider_fixture".into();
+        unrelated_provider.root = unrelated_directory.parent().unwrap().to_path_buf();
+        unrelated_provider.directory = unrelated_directory.clone();
+        unrelated_provider.entrypoint = unrelated_directory.join("SKILL.md");
+        unrelated_provider.physical_directory =
+            Some(fs::canonicalize(&unrelated_directory).unwrap());
+        unrelated_provider.provider = Some("unrelated-provider".into());
+        snapshot.placements.push(unrelated_provider);
         let skill_id = snapshot.skills[0].id.clone();
         let changes = ["codex", "claude-code", "pi"]
             .into_iter()
@@ -1345,6 +1395,21 @@ mod tests {
                 state: "on_demand".into(),
             })
             .collect::<Vec<_>>();
+        let supported = exclude_unpreservable_demotions(&snapshot, changes.clone()).unwrap();
+        let blocker = supported.exclusions[0].safety_blocker.as_ref().unwrap();
+        match blocker {
+            RosterSafetyBlocker::ProviderManaged {
+                placement_ids,
+                paths,
+                providers,
+                ..
+            } => {
+                assert_eq!(placement_ids, &["placement_provider_fixture"]);
+                assert_eq!(paths, &[provider_directory]);
+                assert_eq!(providers, &["fixture-provider"]);
+            }
+            other => panic!("expected provider-managed blocker, got {other:?}"),
+        }
         let state = temp.path().join("state");
         fs::create_dir(&state).unwrap();
 
@@ -1526,7 +1591,7 @@ mod tests {
         let mut options = ScanOptions::for_home(&home);
         options.include_session_evidence = false;
         options.explicit_source_roots.push(source_root);
-        let snapshot = scan(&options).unwrap();
+        let mut snapshot = scan(&options).unwrap();
         let skill_id = snapshot
             .placements
             .iter()
@@ -1534,6 +1599,29 @@ mod tests {
             .unwrap()
             .skill_id
             .clone();
+        let dependent = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.agent.is_none())
+            .unwrap()
+            .clone();
+        let dependent_id = dependent.id.clone();
+        let dependent_directory = dependent.directory.clone();
+        let unrelated_directory = temp.path().join("unrelated/shared");
+        fs::create_dir_all(&unrelated_directory).unwrap();
+        fs::write(
+            unrelated_directory.join("SKILL.md"),
+            "---\nname: shared\n---\nfixture\n",
+        )
+        .unwrap();
+        let mut unrelated_source = dependent;
+        unrelated_source.id = "placement_unrelated_source_fixture".into();
+        unrelated_source.root = unrelated_directory.parent().unwrap().to_path_buf();
+        unrelated_source.directory = unrelated_directory.clone();
+        unrelated_source.entrypoint = unrelated_directory.join("SKILL.md");
+        unrelated_source.physical_directory = Some(fs::canonicalize(&unrelated_directory).unwrap());
+        unrelated_source.link_target = Some(unrelated_directory.clone());
+        snapshot.placements.push(unrelated_source);
 
         let supported = exclude_unpreservable_demotions(
             &snapshot,
@@ -1553,6 +1641,17 @@ mod tests {
             "non_agent_source_link_depends_on_removal"
         );
         assert!(supported.exclusions[0].observed_source_target.is_none());
+        match supported.exclusions[0].safety_blocker.as_ref().unwrap() {
+            RosterSafetyBlocker::DependentSource {
+                placement_ids,
+                paths,
+                ..
+            } => {
+                assert_eq!(placement_ids, &[dependent_id]);
+                assert_eq!(paths, &[dependent_directory]);
+            }
+            other => panic!("expected dependent-source blocker, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1745,6 +1844,7 @@ mod tests {
                 name: "alpha".into(),
                 reason: "no_owned_exact_content_to_preserve",
                 observed_source_target: Some(test_absolute_path("opt/reviewed/alpha")),
+                safety_blocker: None,
             },
             RosterChangeExclusion {
                 agent: "codex".into(),
@@ -1752,6 +1852,7 @@ mod tests {
                 name: "beta".into(),
                 reason: "no_owned_exact_content_to_preserve",
                 observed_source_target: Some(test_absolute_path("opt/reviewed/beta")),
+                safety_blocker: None,
             },
         ];
         let blocked =
@@ -1796,6 +1897,7 @@ mod tests {
                 observed_source_target: Some(test_absolute_path(&format!(
                     "opt/root-{index:02}/pkg"
                 ))),
+                safety_blocker: None,
             })
             .collect::<Vec<_>>();
         let blocked =
@@ -1891,6 +1993,7 @@ mod tests {
                 observed_source_target: Some(test_absolute_path(&format!(
                     "opt/root-{index:02}/pkg"
                 ))),
+                safety_blocker: None,
             })
             .collect::<Vec<_>>();
 
@@ -1932,6 +2035,7 @@ mod tests {
             name: "rootish".into(),
             reason: "no_owned_exact_content_to_preserve",
             observed_source_target: Some(PathBuf::from("/")),
+            safety_blocker: None,
         }];
         let state = TempDir::new().unwrap();
         let blocked =
