@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -271,8 +270,6 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub retryable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
     #[serde(default)]
     pub relevant_ids: Vec<String>,
     #[serde(default)]
