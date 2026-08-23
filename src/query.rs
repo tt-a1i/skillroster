@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 pub const SAME_NAME_DIVERGENT_FINDING_KIND: &str = "same_name_divergent_content";
 pub const SAME_NAME_DIVERGENT_FINDING_TITLE: &str = "Same-name Skills have different content";
 
+fn normalize_skill_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCategory {
@@ -449,7 +453,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let mut by_name = BTreeMap::<String, Vec<&ScannedSkill>>::new();
     for skill in &scan.skills {
         by_name
-            .entry(skill.name.to_lowercase())
+            .entry(normalize_skill_name(&skill.name))
             .or_default()
             .push(skill);
     }
@@ -996,10 +1000,18 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .iter()
         .map(|skill| tokens(&skill_search_text(skill)))
         .collect::<Vec<_>>();
+    let normalized_names = scan
+        .skills
+        .iter()
+        .map(|skill| normalize_skill_name(&skill.name))
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for (index, left) in scan.skills.iter().enumerate() {
         let left_tokens = &vocabularies[index];
         for (right_index, right) in scan.skills.iter().enumerate().skip(index + 1) {
+            if normalized_names[index] == normalized_names[right_index] {
+                continue;
+            }
             if left.content_digest == right.content_digest {
                 continue;
             }
@@ -1464,7 +1476,7 @@ pub(crate) fn find_matching(
         .filter(|skill| variant_eligible_ids.is_none_or(|ids| ids.contains(&skill.id)))
     {
         variants_by_name
-            .entry(skill.name.trim().to_lowercase())
+            .entry(normalize_skill_name(&skill.name))
             .or_default()
             .push(skill.id.clone());
     }
@@ -1572,7 +1584,7 @@ pub(crate) fn find_matching(
             if score <= 0.0 {
                 return None;
             }
-            let all_variant_skill_ids = variants_by_name.get(&name.trim().to_lowercase());
+            let all_variant_skill_ids = variants_by_name.get(&normalize_skill_name(&name));
             let variant_count = all_variant_skill_ids.map_or(1, Vec::len);
             let variants_truncated = variant_count > 10;
             let variant_skill_ids = if variant_count > 1 {
@@ -2291,27 +2303,55 @@ mod tests {
     #[test]
     fn semantic_overlap_is_candidate_evidence_and_never_a_confirmed_duplicate() {
         let (root, mut scan) = fixture();
-        let mut candidate = scan.skills[0].clone();
+        let original = scan.skills[0].clone();
+        let original_id = original.id.clone();
+        let mut candidate = original.clone();
         candidate.id = "skill_semantic_candidate".into();
+        let candidate_id = candidate.id.clone();
         candidate.name = "source-check".into();
         candidate.content_digest = "different_digest".into();
-        candidate.metadata.description =
-            Some("Search and verify primary sources using official evidence".into());
-        candidate.metadata.triggers = vec!["research".into(), "verify".into()];
-        candidate.summary = "Investigate facts with primary sources.".into();
-        candidate.normalized_text =
-            "Search and verify primary sources using official evidence Investigate facts".into();
-        scan.skills.push(candidate);
+        scan.skills = vec![original, candidate];
+        scan.placements.clear();
+        scan.usage.clear();
 
         let report = build_report(&scan);
         let finding = report
             .findings
             .iter()
-            .find(|finding| finding.title == "Semantic overlap candidate")
+            .find(|finding| {
+                finding.title == "Semantic overlap candidate"
+                    && finding.affected_skill_ids.contains(&original_id)
+                    && finding.affected_skill_ids.contains(&candidate_id)
+            })
             .unwrap();
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("review-only candidate evidence"));
         assert!(finding.summary.contains("not a confirmed duplicate"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn semantic_overlap_excludes_same_name_variants() {
+        let (root, mut scan) = fixture();
+        let original = scan.skills[0].clone();
+        let mut same_name_variant = original.clone();
+        same_name_variant.id = "skill_same_name_variant".into();
+        same_name_variant.name = format!("  {}  ", original.name.to_uppercase());
+        same_name_variant.content_digest = "different_digest".into();
+        scan.skills.push(same_name_variant.clone());
+
+        let report = build_report(&scan);
+
+        assert!(report.findings.iter().any(|finding| {
+            finding.title == SAME_NAME_DIVERGENT_FINDING_TITLE
+                && finding.affected_skill_ids.contains(&original.id)
+                && finding.affected_skill_ids.contains(&same_name_variant.id)
+        }));
+        assert!(!report.findings.iter().any(|finding| {
+            finding.title == "Semantic overlap candidate"
+                && finding.affected_skill_ids.contains(&original.id)
+                && finding.affected_skill_ids.contains(&same_name_variant.id)
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2864,7 +2904,19 @@ mod tests {
                 path: root.clone(),
             });
         options.include_session_evidence = false;
-        let scan = scan(&options).unwrap();
+        let mut scan = scan(&options).unwrap();
+        let diagram_skill_id = scan
+            .skills
+            .iter()
+            .find(|skill| skill.normalized_text.contains("diagrams"))
+            .unwrap()
+            .id
+            .clone();
+        for skill in &mut scan.skills {
+            if skill.id != diagram_skill_id {
+                skill.name = "  TECH-ESSAY-WRITER  ".into();
+            }
+        }
 
         let matches = find(&scan, "diagrams", 10);
 
