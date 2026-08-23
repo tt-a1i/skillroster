@@ -129,6 +129,7 @@ pub fn source_confirmation_block(
     core_budget: usize,
     exclusions: &[RosterChangeExclusion],
     state_dir: &Path,
+    action_argv_prefix: &[String],
 ) -> Result<RosterPlanBlocked> {
     let mut exclusions = exclusions.to_vec();
     exclusions.sort_by(|left, right| {
@@ -172,6 +173,10 @@ pub fn source_confirmation_block(
             .take(SOURCE_CONFIRMATION_JSON_LIMIT)
             .cloned(),
     );
+    let argv_template = scan_with_source_roots_argv(
+        action_argv_prefix,
+        &["<confirmed-canonical-source-directory>".to_owned()],
+    );
     let mut details = json!({
         "reason": "trusted_canonical_sources_required",
         "decision": "confirm_trusted_source_roots",
@@ -186,13 +191,7 @@ pub fn source_confirmation_block(
         "after_confirmation": {
             "repeatable_option": "--source-root",
             "source_roots": bounded_roots.clone(),
-            "argv_template": [
-                "skillroster",
-                "--source-root",
-                "<confirmed-canonical-source-directory>",
-                "scan",
-                "--json"
-            ],
+            "argv_template": argv_template,
             "next": "rescan with only the reported reviewed source roots and retry the same Plan request"
         },
         "files_changed": false,
@@ -218,7 +217,7 @@ pub fn source_confirmation_block(
                     "after_confirmation": {
                         "repeatable_option": "--source-root",
                         "source_roots": source_root_paths,
-                        "argv": scan_with_source_roots_argv(&source_root_paths)
+                        "argv": scan_with_source_roots_argv(action_argv_prefix, &source_root_paths)
                     }
                 }),
             )?
@@ -248,8 +247,12 @@ fn blocked_change_json(exclusion: &RosterChangeExclusion) -> Value {
     item
 }
 
-fn scan_with_source_roots_argv(source_roots: &[String]) -> Vec<String> {
+fn scan_with_source_roots_argv(
+    action_argv_prefix: &[String],
+    source_roots: &[String],
+) -> Vec<String> {
     let mut argv = vec!["skillroster".into()];
+    argv.extend_from_slice(action_argv_prefix);
     for root in source_roots {
         argv.push("--source-root".into());
         argv.push(root.clone());
@@ -1856,7 +1859,8 @@ mod tests {
             },
         ];
         let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
+                .unwrap();
         let reviewed = [
             test_absolute_path("opt/reviewed/alpha"),
             test_absolute_path("opt/reviewed/beta"),
@@ -1901,7 +1905,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
+                .unwrap();
         let changes = blocked.details["blocked_changes"].as_array().unwrap();
         assert_eq!(changes.len(), 10);
         assert_eq!(blocked.details["blocked_change_count"], 11);
@@ -1998,7 +2003,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).is_err()
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
+                .is_err()
         );
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
@@ -2039,7 +2045,8 @@ mod tests {
         }];
         let state = TempDir::new().unwrap();
         let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path()).unwrap();
+            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
+                .unwrap();
         assert!(blocked.paths.is_empty());
         assert_eq!(blocked.details["source_roots"], json!([]));
         assert_eq!(blocked.details["blocked_changes"][0]["name"], "rootish");

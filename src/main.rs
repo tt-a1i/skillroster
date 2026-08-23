@@ -35,7 +35,17 @@ fn main() {
     };
     let json = cli.json;
     let command = cli.command_name();
-    let action_context = app::ActionContext::from_cli(&cli);
+    let action_context = match app::ActionContext::from_cli(&cli) {
+        Ok(context) => context,
+        Err(error) => {
+            if json {
+                write_stdout_or_exit(&app::error_json(command, error.as_ref()));
+            } else {
+                eprintln!("{}", skillroster::present::error_human(&error));
+            }
+            std::process::exit(1);
+        }
+    };
     // Apply and Undo start progress inside `app::run`, after human confirmation.
     let progress = (!matches!(command, "apply" | "undo"))
         .then(|| skillroster::present::ProgressGuard::start(command, json));
