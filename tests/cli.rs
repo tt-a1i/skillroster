@@ -4977,6 +4977,280 @@ fn large_roster_core_protection_choice_uses_production_forced_core_constraints()
 }
 
 #[test]
+fn incomplete_fingerprint_plan_paths_are_typed_and_zero_mutation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let content = "---\nname: bounded-copy\n---\nSame entrypoint.\n";
+    for (name, bytes) in [
+        ("copy-a", 16 * 1024 * 1024 + 1),
+        ("copy-b", 16 * 1024 * 1024 + 2),
+    ] {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+        fs::File::create(directory.join("asset.bin"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+    }
+    let explicit_root = format!("codex={}", root.display());
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--root",
+        &explicit_root,
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let skill_id: String = database
+        .query_row(
+            "SELECT skill_id FROM placements WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let placement_ids = {
+        let mut statement = database
+            .prepare("SELECT id FROM placements WHERE scan_id = ?1 ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([snapshot], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let evidence_id: String = database
+        .query_row(
+            "SELECT fe.evidence_id FROM finding_evidence fe JOIN findings f ON f.id = fe.finding_id WHERE f.title = 'Some Skill package fingerprints are incomplete' ORDER BY fe.evidence_id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let raw_request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "library_changes": [{
+            "skill_id": skill_id,
+            "canonical_placement_id": placement_ids[0],
+            "placement_ids": placement_ids,
+            "requested_state": "managed"
+        }]
+    });
+
+    let raw = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&raw_request.to_string()),
+    );
+    assert!(!raw.status.success());
+    let raw: Value = serde_json::from_slice(&raw.stdout).unwrap();
+    assert_eq!(raw["error"]["code"], "incomplete_package_fingerprint");
+    assert_eq!(raw["error"]["details"]["stage"], "plan");
+    assert_eq!(
+        raw["error"]["details"]["next_action"],
+        "resolve_fingerprint_incompleteness_then_scan"
+    );
+    assert_eq!(
+        raw["error"]["details"]["remediation"]["required_before_rescan"],
+        true
+    );
+
+    let report_id: String = database
+        .query_row(
+            "SELECT id FROM reports WHERE scan_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let legacy_finding_id = "finding_legacy_incomplete";
+    let details = json!({
+        "affected_skill_ids": [skill_id],
+        "affected_placement_ids": placement_ids,
+        "coverage": {"basis": "skill_root_scan"}
+    });
+    database
+        .execute(
+            "INSERT INTO findings (id, report_id, category, severity, title, summary, details_json) VALUES (?1, ?2, 'overlap', 'warning', 'Exact duplicate Skill placements', 'legacy fixture', ?3)",
+            rusqlite::params![legacy_finding_id, report_id, details.to_string()],
+        )
+        .unwrap();
+    database
+        .execute(
+            "INSERT INTO finding_evidence (finding_id, evidence_id) VALUES (?1, ?2)",
+            rusqlite::params![legacy_finding_id, evidence_id],
+        )
+        .unwrap();
+    let finding_request = json!({
+        "schema_version": 1,
+        "finding_library_changes": [{
+            "finding_id": legacy_finding_id,
+            "canonical_placement_id": placement_ids[0],
+            "requested_state": "managed"
+        }]
+    });
+    let finding = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&finding_request.to_string()),
+    );
+    assert!(!finding.status.success());
+    let finding: Value = serde_json::from_slice(&finding.stdout).unwrap();
+    assert_eq!(finding["error"]["code"], "incomplete_package_fingerprint");
+    assert_eq!(finding["error"]["details"]["stage"], "finding_plan");
+
+    let plan_count: i64 = database
+        .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(plan_count, 0);
+    assert!(!state.join("library").exists());
+    assert!(!state.join("plan-backups").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("copy-a/SKILL.md")).unwrap(),
+        content
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("copy-b/SKILL.md")).unwrap(),
+        content
+    );
+}
+
+#[test]
+fn apply_rejects_a_legacy_ready_plan_without_mutation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let content = "---\nname: legacy-ready\n---\nComplete fixture.\n";
+    for name in ["copy-a", "copy-b"] {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    let explicit_root = format!("codex={}", root.display());
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--root",
+        &explicit_root,
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let skill_id: String = database
+        .query_row(
+            "SELECT skill_id FROM placements WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let placement_ids = {
+        let mut statement = database
+            .prepare("SELECT id FROM placements WHERE scan_id = ?1 ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([snapshot], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let evidence_id: String = database
+        .query_row(
+            "SELECT fe.evidence_id FROM finding_evidence fe JOIN findings f ON f.id = fe.finding_id WHERE f.title = 'Exact duplicate Skill placements' ORDER BY fe.evidence_id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "library_changes": [{
+            "skill_id": skill_id,
+            "canonical_placement_id": placement_ids[0],
+            "placement_ids": placement_ids,
+            "requested_state": "managed"
+        }]
+    });
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+
+    let encoded: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&encoded).unwrap();
+    for placement in legacy["placements"].as_array_mut().unwrap() {
+        placement
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint_completeness");
+    }
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            rusqlite::params![legacy.to_string(), snapshot],
+        )
+        .unwrap();
+
+    let rejected = run(&[&common[..], &["apply", plan_id]].concat(), None);
+    assert!(!rejected.status.success());
+    let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(rejected["error"]["code"], "incomplete_package_fingerprint");
+    assert_eq!(rejected["error"]["details"]["stage"], "apply");
+    assert_eq!(
+        rejected["error"]["details"]["remediation"]["options"],
+        json!(["scan_with_current_skillroster"])
+    );
+    let status: String = database
+        .query_row("SELECT status FROM plans WHERE id = ?1", [plan_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(status, "ready");
+    let receipt_count: i64 = database
+        .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(receipt_count, 0);
+    assert!(!state.join("plan-backups").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("copy-a/SKILL.md")).unwrap(),
+        content
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("copy-b/SKILL.md")).unwrap(),
+        content
+    );
+    assert!(
+        !fs::symlink_metadata(root.join("copy-a"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        !fs::symlink_metadata(root.join("copy-b"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
 fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

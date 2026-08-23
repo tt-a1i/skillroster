@@ -76,6 +76,10 @@ pub struct RootObservation {
     pub status: RootStatus,
     pub explicit: bool,
     pub detail: Option<String>,
+    /// Whether discovery inspected the complete configured Skill-root depth.
+    /// Session roots do not use this dimension and remain complete by default.
+    #[serde(default)]
+    pub discovery_complete: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -97,6 +101,27 @@ pub enum LinkStatus {
     EscapesRoot,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FingerprintCompleteness {
+    Complete,
+    Bounded,
+    Unreadable,
+    #[default]
+    Unknown,
+}
+
+impl FingerprintCompleteness {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Bounded => "bounded",
+            Self::Unreadable => "unreadable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillPlacement {
     pub id: String,
@@ -110,6 +135,13 @@ pub struct SkillPlacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_directory: Option<PathBuf>,
     pub content_digest: String,
+    /// Whether `content_digest` covers the complete Skill package. Bounded or
+    /// unreadable fingerprints are inventory facts only and cannot authorize
+    /// exact-duplicate governance.
+    #[serde(default)]
+    pub fingerprint_completeness: FingerprintCompleteness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint_detail: Option<String>,
     pub link_target: Option<PathBuf>,
     pub link_status: LinkStatus,
     pub default_exposed: bool,
@@ -824,6 +856,7 @@ fn observe_excluded_session_roots(
             status: RootStatus::Excluded,
             explicit: false,
             detail: Some(detail.into()),
+            discovery_complete: true,
         });
     }
 }
@@ -848,12 +881,13 @@ fn observe_skill_root(
         status,
         explicit: policy.explicit,
         detail: policy.detail.clone(),
+        discovery_complete: true,
     });
     if status != RootStatus::Included {
         return;
     }
 
-    if let Err(error) = discover_entrypoints(
+    match discover_entrypoints(
         &policy,
         root,
         approved_roots,
@@ -862,13 +896,31 @@ fn observe_skill_root(
         max_depth,
         candidates,
     ) {
-        result.warnings.push(format!(
-            "could not completely inspect skill root {}: {error}",
-            root.display()
-        ));
-        if let Some(observation) = result.roots.last_mut() {
-            observation.status = RootStatus::Inaccessible;
-            observation.detail = Some(error.to_string());
+        Ok(true) => {}
+        Ok(false) => {
+            let detail = format!("Skill discovery was bounded at depth {max_depth}");
+            result.warnings.push(format!(
+                "could not completely inspect skill root {}: {detail}",
+                root.display()
+            ));
+            if let Some(observation) = result.roots.last_mut() {
+                observation.discovery_complete = false;
+                observation.detail = Some(match observation.detail.take() {
+                    Some(existing) => format!("{existing}; {detail}"),
+                    None => detail,
+                });
+            }
+        }
+        Err(error) => {
+            result.warnings.push(format!(
+                "could not completely inspect skill root {}: {error}",
+                root.display()
+            ));
+            if let Some(observation) = result.roots.last_mut() {
+                observation.status = RootStatus::Inaccessible;
+                observation.discovery_complete = false;
+                observation.detail = Some(error.to_string());
+            }
         }
     }
 }
@@ -881,10 +933,11 @@ fn discover_entrypoints(
     depth: usize,
     max_depth: usize,
     output: &mut Vec<EntryCandidate>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if depth > max_depth {
-        return Ok(());
+        return Ok(false);
     }
+    let mut complete = true;
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -903,7 +956,7 @@ fn discover_entrypoints(
                 link_status,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            discover_entrypoints(
+            complete &= discover_entrypoints(
                 policy,
                 placement_root,
                 approved_roots,
@@ -930,7 +983,7 @@ fn discover_entrypoints(
             }
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 fn inspect_link(
@@ -1032,19 +1085,36 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             (String::new(), None)
         };
         let metadata = parse_skill_markdown(&content);
-        let digest = if safe_to_read {
+        let (digest, fingerprint_completeness, fingerprint_detail) = if safe_to_read {
             match digest_skill_directory(&directory) {
-                Ok(digest) => digest,
+                Ok(fingerprint) => (
+                    fingerprint.digest,
+                    fingerprint.completeness,
+                    fingerprint.detail,
+                ),
                 Err(error) => {
+                    let completeness = if error.kind() == io::ErrorKind::InvalidData {
+                        FingerprintCompleteness::Bounded
+                    } else {
+                        FingerprintCompleteness::Unreadable
+                    };
                     result.warnings.push(format!(
                         "could not completely fingerprint Skill package {}: {error}",
                         directory.display()
                     ));
-                    stable_digest(content.as_bytes())
+                    (
+                        stable_digest(content.as_bytes()),
+                        completeness,
+                        Some(error.to_string()),
+                    )
                 }
             }
         } else {
-            stable_digest(candidate.entrypoint.to_string_lossy().as_bytes())
+            (
+                stable_digest(candidate.entrypoint.to_string_lossy().as_bytes()),
+                FingerprintCompleteness::Unreadable,
+                Some("Skill package was not read because its link is unsafe".into()),
+            )
         };
         let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
             (Some(source), Some(version), _) => format!("source:{source}@{version}"),
@@ -1107,6 +1177,8 @@ fn materialize_candidates(candidates: Vec<EntryCandidate>, result: &mut ScanResu
             entrypoint: candidate.entrypoint,
             physical_directory,
             content_digest: digest,
+            fingerprint_completeness,
+            fingerprint_detail,
             link_target: candidate.link_target,
             link_status: candidate.link_status,
             default_exposed: candidate.agent.is_some(),
@@ -1326,9 +1398,16 @@ fn stable_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn digest_skill_directory(directory: &Path) -> io::Result<String> {
+#[derive(Debug)]
+struct PackageFingerprint {
+    digest: String,
+    completeness: FingerprintCompleteness,
+    detail: Option<String>,
+}
+
+fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
     let mut files = Vec::new();
-    collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut digest = Sha256::new();
@@ -1356,7 +1435,15 @@ fn digest_skill_directory(directory: &Path) -> io::Result<String> {
         }
         digest.update([0xff]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(PackageFingerprint {
+        digest: format!("{:x}", digest.finalize()),
+        completeness: if complete {
+            FingerprintCompleteness::Complete
+        } else {
+            FingerprintCompleteness::Bounded
+        },
+        detail: (!complete).then(|| "Skill package fingerprint was bounded at depth 8".into()),
+    })
 }
 
 fn collect_skill_files(
@@ -1365,10 +1452,11 @@ fn collect_skill_files(
     depth: usize,
     max_depth: usize,
     output: &mut Vec<(PathBuf, PathBuf, fs::FileType)>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if depth > max_depth {
-        return Ok(());
+        return Ok(false);
     }
+    let mut complete = true;
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
@@ -1383,7 +1471,7 @@ fn collect_skill_files(
         let metadata = fs::symlink_metadata(&path)?;
         let file_type = metadata.file_type();
         if file_type.is_dir() && !file_type.is_symlink() {
-            collect_skill_files(root, &path, depth + 1, max_depth, output)?;
+            complete &= collect_skill_files(root, &path, depth + 1, max_depth, output)?;
         } else if file_type.is_file() || file_type.is_symlink() {
             let relative = path
                 .strip_prefix(root)
@@ -1392,7 +1480,7 @@ fn collect_skill_files(
             output.push((relative, path, file_type));
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 struct DigestWriter<'a>(&'a mut Sha256);
@@ -1508,6 +1596,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             status,
             explicit: false,
             detail: None,
+            discovery_complete: true,
         });
         if status != RootStatus::Included {
             continue;
@@ -2053,7 +2142,16 @@ pub(crate) fn inspect_skill_identity(entrypoint: &Path) -> io::Result<(String, S
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Skill has no directory"))?;
     let (content, _) = read_bounded(entrypoint, MAX_SKILL_FILE_BYTES)?;
     let metadata = parse_skill_markdown(&content);
-    let digest = digest_skill_directory(directory)?;
+    let fingerprint = digest_skill_directory(directory)?;
+    if fingerprint.completeness != FingerprintCompleteness::Complete {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            fingerprint
+                .detail
+                .unwrap_or_else(|| "Skill package fingerprint is incomplete".into()),
+        ));
+    }
+    let digest = fingerprint.digest;
     let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
         (Some(source), Some(version), _) => format!("source:{source}@{version}"),
         (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
@@ -2489,6 +2587,138 @@ enabled = true
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.placements.len(), 2);
         assert!(result.roots.iter().any(|seen| seen.explicit));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_marks_oversized_package_fingerprint_as_bounded() {
+        let root = temp_directory("bounded-package-size");
+        let skill = root.join("oversized");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: oversized\n---\n").unwrap();
+        let asset = File::create(skill.join("asset.bin")).unwrap();
+        asset.set_len(MAX_SKILL_PACKAGE_BYTES + 1).unwrap();
+
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Bounded
+        );
+        assert!(
+            result.placements[0]
+                .fingerprint_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("fingerprint safety limit"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_marks_deep_package_fingerprint_as_bounded() {
+        let root = temp_directory("bounded-package-depth");
+        let skill = root.join("deep-package");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: deep-package\n---\n").unwrap();
+        let mut deep = skill.clone();
+        for index in 0..9 {
+            deep.push(format!("level-{index}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("behavior.sh"), "echo distinct\n").unwrap();
+
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Bounded
+        );
+        assert!(
+            result.placements[0]
+                .fingerprint_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("bounded at depth 8"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_reports_bounded_skill_root_discovery() {
+        let root = temp_directory("bounded-root-depth");
+        let skill = root.join("one/two/three");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: too-deep\n---\n").unwrap();
+
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        options.max_depth = 1;
+        let result = scan(&options).unwrap();
+
+        assert!(result.skills.is_empty());
+        let observed = result
+            .roots
+            .iter()
+            .find(|observed| observed.path == root)
+            .unwrap();
+        assert_eq!(observed.status, RootStatus::Included);
+        assert!(!observed.discovery_complete);
+        assert!(
+            observed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("bounded at depth 1"))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_scan_payloads_default_to_untrusted_coverage() {
+        let root = temp_directory("legacy-scan-payload");
+        let skill = root.join("legacy");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: legacy\n---\n").unwrap();
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let current = scan(&options).unwrap();
+        let mut legacy = serde_json::to_value(current).unwrap();
+        legacy["roots"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("discovery_complete");
+        legacy["placements"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("fingerprint_completeness");
+
+        let restored: ScanResult = serde_json::from_value(legacy).unwrap();
+
+        assert!(!restored.roots[0].discovery_complete);
+        assert_eq!(
+            restored.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Unknown
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -759,6 +759,8 @@ mod tests {
                 )),
                 physical_directory: None,
                 content_digest: skill.content_digest.clone(),
+                fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
+                fingerprint_detail: None,
                 link_target: None,
                 link_status: LinkStatus::NotLink,
                 default_exposed: true,

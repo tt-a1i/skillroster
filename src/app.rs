@@ -578,7 +578,96 @@ impl std::fmt::Display for LibraryRootConflict {
 
 impl std::error::Error for LibraryRootConflict {}
 
+#[derive(Debug)]
+struct IncompleteFingerprintBlocker {
+    skill_id: String,
+    placement_id: String,
+    path: PathBuf,
+    completeness: scan::FingerprintCompleteness,
+    stage: &'static str,
+}
+
+impl std::fmt::Display for IncompleteFingerprintBlocker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Skill {} placement {} has a {} package fingerprint; resolve fingerprint incompleteness before governance",
+            self.skill_id,
+            self.placement_id,
+            self.completeness.id()
+        )
+    }
+}
+
+impl std::error::Error for IncompleteFingerprintBlocker {}
+
+fn incomplete_fingerprint_blocker<'a>(
+    placements: impl IntoIterator<Item = &'a scan::SkillPlacement>,
+    stage: &'static str,
+) -> Option<IncompleteFingerprintBlocker> {
+    placements
+        .into_iter()
+        .find(|placement| {
+            placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
+        })
+        .map(|placement| IncompleteFingerprintBlocker {
+            skill_id: placement.skill_id.clone(),
+            placement_id: placement.id.clone(),
+            path: placement.entrypoint.clone(),
+            completeness: placement.fingerprint_completeness,
+            stage,
+        })
+}
+
+fn fingerprint_remediation(completeness: scan::FingerprintCompleteness) -> Value {
+    let (reason, required_before_rescan, options) = match completeness {
+        scan::FingerprintCompleteness::Complete => ("none", false, Vec::<&str>::new()),
+        scan::FingerprintCompleteness::Bounded => (
+            "package_exceeds_fingerprint_bounds",
+            true,
+            vec![
+                "reduce_package_below_fingerprint_byte_limit",
+                "move_relevant_content_within_supported_depth",
+            ],
+        ),
+        scan::FingerprintCompleteness::Unreadable => (
+            "package_could_not_be_read_completely",
+            true,
+            vec!["repair_local_read_access", "confirm_safe_source_boundary"],
+        ),
+        scan::FingerprintCompleteness::Unknown => (
+            "legacy_snapshot_has_no_completeness_fact",
+            false,
+            vec!["scan_with_current_skillroster"],
+        ),
+    };
+    json!({
+        "automatic_change_supported": false,
+        "reason": reason,
+        "required_before_rescan": required_before_rescan,
+        "options": options,
+        "then": "scan"
+    })
+}
+
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(blocker) = error.downcast_ref::<IncompleteFingerprintBlocker>() {
+        return ClassifiedError {
+            code: "incomplete_package_fingerprint",
+            retryable: false,
+            details: Some(json!({
+                "reason": "exact_content_evidence_incomplete",
+                "skill_id": blocker.skill_id,
+                "placement_id": blocker.placement_id,
+                "path": blocker.path,
+                "completeness": blocker.completeness,
+                "stage": blocker.stage,
+                "remediation": fingerprint_remediation(blocker.completeness),
+                "files_changed": false,
+                "next_action": "resolve_fingerprint_incompleteness_then_scan"
+            })),
+        };
+    }
     if let Some(conflict) = error.downcast_ref::<LibraryRootConflict>() {
         let agent_root_count = conflict.agent_roots.len();
         return ClassifiedError {
@@ -631,6 +720,20 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "agents": conflict.agents,
                 "files_changed": false,
                 "next_action": "request_consistent_exposure_or_separate_shared_roots"
+            })),
+        };
+    }
+    if let Some(blocker) = error.downcast_ref::<crate::roster_plan::RosterDiscoveryIncomplete>() {
+        return ClassifiedError {
+            code: "roster_skill_root_discovery_incomplete",
+            retryable: false,
+            details: Some(json!({
+                "reason": "skill_root_discovery_bounded",
+                "agent": blocker.agent,
+                "path": blocker.path,
+                "detail": blocker.detail,
+                "files_changed": false,
+                "next_action": "scan"
             })),
         };
     }
@@ -1892,7 +1995,9 @@ fn report_command(
                         "default_exposed": placement.default_exposed,
                         "governable": placement.governable,
                         "provider": placement.provider,
-                        "content_digest": placement.content_digest
+                        "content_digest": placement.content_digest,
+                        "fingerprint_completeness": placement.fingerprint_completeness,
+                        "fingerprint_detail": placement.fingerprint_detail
                     })
                 })
                 .collect::<Vec<_>>();
@@ -2341,7 +2446,9 @@ fn add_semantic_overlap_comparison(
                         "provider_truncated": provider_truncated,
                         "governable": placement.governable,
                         "default_exposed": placement.default_exposed,
-                        "link_status": placement.link_status
+                        "link_status": placement.link_status,
+                        "fingerprint_completeness": placement.fingerprint_completeness,
+                        "fingerprint_detail": placement.fingerprint_detail
                     })
                 })
                 .collect::<Vec<_>>();
@@ -3443,7 +3550,15 @@ fn structural_finding_coverage(
     let included_agents = agents_for_status(scan::RootStatus::Included);
     let missing_agents = agents_for_status(scan::RootStatus::Missing);
     let inaccessible_agents = agents_for_status(scan::RootStatus::Inaccessible);
-    let limited_agents = inaccessible_agents.clone();
+    let bounded_agents = roots
+        .iter()
+        .filter(|root| root.status == scan::RootStatus::Included && !root.discovery_complete)
+        .filter_map(|root| root.agent.map(AgentKind::id))
+        .collect::<BTreeSet<_>>();
+    let limited_agents = inaccessible_agents
+        .union(&bounded_agents)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let reliable_agents = AgentKind::ALL
         .iter()
         .copied()
@@ -3452,6 +3567,10 @@ fn structural_finding_coverage(
         .collect::<Vec<_>>();
     let root_count = |status| roots.iter().filter(|root| root.status == status).count();
     let inaccessible_root_count = root_count(scan::RootStatus::Inaccessible);
+    let bounded_root_count = roots
+        .iter()
+        .filter(|root| root.status == scan::RootStatus::Included && !root.discovery_complete)
+        .count();
     json!({
         "basis": basis,
         "evidence_quality": evidence_quality,
@@ -3461,11 +3580,13 @@ fn structural_finding_coverage(
         "included_agents": included_agents,
         "missing_agents": missing_agents,
         "inaccessible_agents": inaccessible_agents,
+        "bounded_agents": bounded_agents,
         "supported_agent_count": AgentKind::ALL.len(),
         "included_root_count": root_count(scan::RootStatus::Included),
         "missing_root_count": root_count(scan::RootStatus::Missing),
         "inaccessible_root_count": inaccessible_root_count,
-        "denominator_reliable": inaccessible_root_count == 0
+        "bounded_root_count": bounded_root_count,
+        "denominator_reliable": inaccessible_root_count == 0 && bounded_root_count == 0
     })
 }
 
@@ -4818,6 +4939,11 @@ fn exact_duplicate_finding_scope(
         .iter()
         .filter(|placement| placement.skill_id == *skill_id)
         .collect::<Vec<_>>();
+    if let Some(blocker) =
+        incomplete_fingerprint_blocker(all_placements.iter().copied(), "finding_plan")
+    {
+        return Err(blocker.into());
+    }
     let all_ids = all_placements
         .iter()
         .map(|placement| placement.id.as_str())
@@ -5278,6 +5404,11 @@ fn normalize_library_plan(
             .iter()
             .filter(|placement| placement.skill_id == request.skill_id)
             .collect::<Vec<_>>();
+        if let Some(blocker) =
+            incomplete_fingerprint_blocker(all_placements.iter().copied(), "plan")
+        {
+            return Err(blocker.into());
+        }
         if all_placements.iter().any(|placement| !placement.governable) {
             bail!(
                 "Library change for {} includes provider-managed read-only placements",
@@ -5800,6 +5931,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
         }
         .into());
     }
+    validate_governance_fingerprint_completeness(&prepared, &scan)?;
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
@@ -6418,6 +6550,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "explicit": root.explicit,
                 "agent": root.agent.map(AgentKind::id),
                 "detail": root.detail,
+                "discovery_complete": root.discovery_complete,
             }),
             observed_at,
         )?;
@@ -6550,6 +6683,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "default_exposed": placement.default_exposed,
                 "governable": placement.governable,
                 "provider": placement.provider,
+                "fingerprint_completeness": placement.fingerprint_completeness,
+                "fingerprint_detail": placement.fingerprint_detail,
             }),
             observed_at,
         )?;
@@ -6567,6 +6702,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "algorithm": "sha256-v1",
                 "skill_id": skill_id,
                 "placement_id": placement_id,
+                "completeness": placement.fingerprint_completeness,
+                "detail": placement.fingerprint_detail,
             }),
             observed_at,
         )?;
@@ -6724,6 +6861,37 @@ fn validate_roster_changes(
             );
         }
         roster_state(&change.state)?;
+    }
+    Ok(())
+}
+
+fn validate_governance_fingerprint_completeness(
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+) -> Result<()> {
+    if plan.operations.is_empty() {
+        return Ok(());
+    }
+    let governed_skill_ids = plan
+        .roster_changes
+        .iter()
+        .map(|change| change.skill_id.as_str())
+        .chain(
+            plan.library_changes
+                .iter()
+                .map(|change| change.skill_id.as_str()),
+        )
+        .collect::<BTreeSet<_>>();
+    if governed_skill_ids.is_empty() {
+        return Ok(());
+    }
+    if let Some(blocker) = incomplete_fingerprint_blocker(
+        scan.placements
+            .iter()
+            .filter(|placement| governed_skill_ids.contains(placement.skill_id.as_str())),
+        "apply",
+    ) {
+        return Err(blocker.into());
     }
     Ok(())
 }
@@ -7317,6 +7485,7 @@ mod recovery_tests {
             status,
             explicit: false,
             detail: None,
+            discovery_complete: true,
         };
         let session_root = |agent, status, suffix: &str| scan::RootObservation {
             agent: Some(agent),
@@ -7325,6 +7494,7 @@ mod recovery_tests {
             status,
             explicit: false,
             detail: None,
+            discovery_complete: true,
         };
         let session =
             |agent, roots_present, roots_missing, roots_inaccessible| scan::SessionCoverage {
@@ -7374,6 +7544,27 @@ mod recovery_tests {
         assert_eq!(structural["denominator_reliable"], true);
         assert_eq!(structural["missing_root_count"], 1);
         assert_eq!(structural["limited_agents"], json!([]));
+
+        scan.roots[0].discovery_complete = false;
+        let bounded_structural = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SkillRootScan),
+            &scan,
+        );
+        assert_eq!(bounded_structural["denominator_reliable"], false);
+        assert_eq!(bounded_structural["bounded_root_count"], 1);
+        assert_eq!(bounded_structural["limited_agents"], json!(["codex"]));
+        let blocker = crate::roster_plan::RosterDiscoveryIncomplete {
+            agent: "codex".into(),
+            path: PathBuf::from("/fixture/codex"),
+            detail: Some("Skill discovery was bounded at depth 5".into()),
+        };
+        let blocked: Value = serde_json::from_str(&error_json("plan", &blocker)).unwrap();
+        assert_eq!(
+            blocked["error"]["code"],
+            "roster_skill_root_discovery_incomplete"
+        );
+        assert_eq!(blocked["error"]["details"]["files_changed"], false);
+        scan.roots[0].discovery_complete = true;
 
         let usage = finding_coverage(
             &coverage_finding(crate::query::FindingCoverageBasis::SessionUsage),
@@ -7915,6 +8106,8 @@ mod recovery_tests {
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
             physical_directory: None,
             content_digest: "digest_shared".into(),
+            fingerprint_completeness: scan::FingerprintCompleteness::Complete,
+            fingerprint_detail: None,
             link_target: None,
             link_status: scan::LinkStatus::NotLink,
             default_exposed: governable,
@@ -7981,6 +8174,137 @@ mod recovery_tests {
         assert_eq!(
             blocked["error"]["details"]["providers"],
             json!(["plugin@market"])
+        );
+    }
+
+    #[test]
+    fn raw_library_plan_rejects_incomplete_package_fingerprints() {
+        let placement = |id: &str, completeness| scan::SkillPlacement {
+            id: id.into(),
+            skill_id: "skill_bounded".into(),
+            agent: Some(AgentKind::Codex),
+            root: PathBuf::from("/fixture/root"),
+            directory: PathBuf::from(format!("/fixture/{id}")),
+            entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
+            physical_directory: None,
+            content_digest: "same-fallback-digest".into(),
+            fingerprint_completeness: completeness,
+            fingerprint_detail: Some("package exceeded fingerprint limit".into()),
+            link_target: None,
+            link_status: scan::LinkStatus::NotLink,
+            default_exposed: true,
+            governable: true,
+            provider: None,
+            executable_files: Vec::new(),
+            declared_name_matches_directory: Some(true),
+        };
+        let scan = ScanResult {
+            skills: vec![scan::ScannedSkill {
+                id: "skill_bounded".into(),
+                name: "bounded".into(),
+                metadata: scan::SkillMetadata::default(),
+                content_digest: "same-fallback-digest".into(),
+                digest_algorithm: "sha256-v1".into(),
+                summary: String::new(),
+                normalized_text: String::new(),
+                modified_at_unix: None,
+            }],
+            placements: vec![
+                placement("placement_a", scan::FingerprintCompleteness::Bounded),
+                placement("placement_b", scan::FingerprintCompleteness::Complete),
+            ],
+            ..ScanResult::default()
+        };
+        let request = LibraryChangeRequest {
+            skill_id: "skill_bounded".into(),
+            canonical_placement_id: "placement_b".into(),
+            placement_ids: vec!["placement_a".into(), "placement_b".into()],
+            requested_state: RequestedGovernanceState::Managed,
+        };
+
+        let error = match normalize_library_plan(
+            json!({}),
+            &scan,
+            Path::new("/fixture/state"),
+            vec![request],
+        ) {
+            Ok(_) => panic!("incomplete package fingerprints must block Library planning"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("resolve fingerprint incompleteness before governance")
+        );
+        let blocked: Value = serde_json::from_str(&error_json("plan", error.as_ref())).unwrap();
+        assert_eq!(blocked["error"]["code"], "incomplete_package_fingerprint");
+        assert_eq!(blocked["error"]["details"]["stage"], "plan");
+        assert_eq!(
+            blocked["error"]["details"]["next_action"],
+            "resolve_fingerprint_incompleteness_then_scan"
+        );
+        assert_eq!(
+            blocked["error"]["details"]["remediation"]["required_before_rescan"],
+            true
+        );
+        assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn apply_validation_rejects_legacy_unknown_governance_fingerprints() {
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::CreateDirectory {
+                target: PathBuf::from("/fixture/new"),
+                expected_fingerprint: "missing".into(),
+            }],
+            roster_changes: vec![change::RosterChange {
+                agent: "codex".into(),
+                skill_id: "skill_legacy".into(),
+                state: "on_demand".into(),
+            }],
+            source_updates: vec![],
+            library_changes: vec![],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        let scan = ScanResult {
+            placements: vec![scan::SkillPlacement {
+                id: "placement_legacy".into(),
+                skill_id: "skill_legacy".into(),
+                agent: Some(AgentKind::Codex),
+                root: PathBuf::from("/fixture/root"),
+                directory: PathBuf::from("/fixture/root/legacy"),
+                entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
+                physical_directory: None,
+                content_digest: "legacy-digest".into(),
+                fingerprint_completeness: scan::FingerprintCompleteness::Unknown,
+                fingerprint_detail: None,
+                link_target: None,
+                link_status: scan::LinkStatus::NotLink,
+                default_exposed: true,
+                governable: true,
+                provider: None,
+                executable_files: vec![],
+                declared_name_matches_directory: Some(true),
+            }],
+            ..ScanResult::default()
+        };
+
+        let error = validate_governance_fingerprint_completeness(&prepared, &scan).unwrap_err();
+
+        let blocked: Value = serde_json::from_str(&error_json("apply", error.as_ref())).unwrap();
+        assert_eq!(
+            blocked["error"]["details"]["remediation"]["options"],
+            json!(["scan_with_current_skillroster"])
+        );
+        assert_eq!(
+            blocked["error"]["details"]["remediation"]["required_before_rescan"],
+            false
         );
     }
 
