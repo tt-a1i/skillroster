@@ -2830,7 +2830,18 @@ fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
     assert!(library.join("SKILL.md").is_file());
 
     let rebuilt = json_output(&run(&[&common[..], &["scan"]].concat(), None));
-    assert_eq!(rebuilt["result"]["skill_count"], 1);
+    assert_eq!(rebuilt["result"]["skill_count"], 2);
+    assert!(
+        rebuilt["result"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |root| root["path"] == state.join("library").to_str().unwrap()
+                    || fs::canonicalize(root["path"].as_str().unwrap()).ok()
+                        == fs::canonicalize(state.join("library")).ok()
+            )
+    );
     assert!(state.join("skillroster.db").is_file());
 }
 
@@ -3358,6 +3369,26 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         Some(&request("managed").to_string()),
     ));
     assert_eq!(managed_plan["result"]["risk"], "library_governance");
+    let managed_impact = &managed_plan["result"]["impact"]["items"][0];
+    assert_eq!(managed_impact["before"]["physical_source_count"], 2);
+    assert_eq!(managed_impact["after"]["physical_source_count"], 1);
+    assert_eq!(managed_impact["delta"]["physical_source_count"], -1);
+    assert_eq!(managed_impact["before"]["placement_count"], 2);
+    assert_eq!(managed_impact["after"]["placement_count"], 2);
+    assert_eq!(managed_impact["delta"]["placement_count"], 0);
+    assert_eq!(
+        managed_impact["before"]["default_exposed_placement_count"],
+        2
+    );
+    assert_eq!(
+        managed_impact["after"]["default_exposed_placement_count"],
+        2
+    );
+    assert_eq!(
+        managed_impact["delta"]["default_exposed_placement_count"],
+        0
+    );
+    assert_eq!(managed_impact["after"]["relinked_placement_count"], 1);
     let managed = json_output(&run(
         &[
             &common[..],
@@ -3416,6 +3447,20 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request("hosted").to_string()),
     ));
+    let hosted_impact = &hosted_plan["result"]["impact"]["items"][0];
+    assert_eq!(hosted_impact["before"]["physical_source_count"], 2);
+    assert_eq!(hosted_impact["after"]["physical_source_count"], 1);
+    assert_eq!(hosted_impact["delta"]["physical_source_count"], -1);
+    assert_eq!(hosted_impact["before"]["placement_count"], 2);
+    assert_eq!(hosted_impact["after"]["placement_count"], 3);
+    assert_eq!(hosted_impact["delta"]["placement_count"], 1);
+    assert_eq!(
+        hosted_impact["before"]["default_exposed_placement_count"],
+        2
+    );
+    assert_eq!(hosted_impact["after"]["default_exposed_placement_count"], 2);
+    assert_eq!(hosted_impact["delta"]["default_exposed_placement_count"], 0);
+    assert_eq!(hosted_impact["after"]["relinked_placement_count"], 2);
     let hosted = json_output(&run(
         &[
             &common[..],
@@ -3457,6 +3502,36 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .any(|path| fs::canonicalize(path.as_str().unwrap())
                 .is_ok_and(|actual| actual == expected_library_entry))
     );
+    let hosted_rescan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let hosted_snapshot = hosted_rescan["result"]["snapshot_id"].as_str().unwrap();
+    let hosted_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [hosted_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let hosted_payload: Value = serde_json::from_str(&hosted_payload).unwrap();
+    let hosted_placements = hosted_payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|placement| placement["skill_id"] == skill_id)
+        .collect::<Vec<_>>();
+    assert_eq!(hosted_placements.len(), 3);
+    assert!(hosted_placements.iter().any(|placement| {
+        placement["directory"]
+            .as_str()
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|path| path == fs::canonicalize(&library_skill).unwrap())
+    }));
+    assert!(
+        hosted_payload["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|warning| !warning.as_str().unwrap().contains("escapes approved roots"))
+    );
     json_output(&run(
         &[
             &common[..],
@@ -3479,9 +3554,21 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .all(|path| !path.as_str().unwrap().contains("/library/"))
     );
 
+    let restored_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let restored_snapshot = restored_scan["result"]["snapshot_id"].as_str().unwrap();
+    let restored_evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [restored_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut drift_request = request("managed");
+    drift_request["scan_id"] = json!(restored_snapshot);
+    drift_request["evidence_ids"] = json!([restored_evidence_id]);
     let drift_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
-        Some(&request("managed").to_string()),
+        Some(&drift_request.to_string()),
     ));
     fs::write(claude_skill.join("SKILL.md"), "user drift\n").unwrap();
     let drifted = run(
@@ -3499,6 +3586,226 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .file_type()
             .is_symlink()
     );
+}
+
+#[test]
+fn hosted_plan_refuses_a_library_nested_under_an_agent_skill_root() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let codex_root = home.join(".codex/skills");
+    let state = codex_root.join(".skillroster-state");
+    let codex_skill = codex_root.join("shared");
+    let claude_skill = home.join(".claude/skills/shared");
+    let content = "---\nname: shared\ndescription: shared fixture\n---\nbody\n";
+    for directory in [&codex_skill, &claude_skill] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    let mut common_owned = vec![
+        "--home".to_owned(),
+        home.display().to_string(),
+        "--state-dir".to_owned(),
+        state.display().to_string(),
+        "--json".to_owned(),
+    ];
+    for index in 0..12 {
+        common_owned.push("--root".to_owned());
+        common_owned.push(format!(
+            "cursor={}",
+            state
+                .join("library")
+                .join(format!("root-{index:02}"))
+                .display()
+        ));
+    }
+    let common = common_owned.iter().map(String::as_str).collect::<Vec<_>>();
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let placements = payload["placements"].as_array().unwrap();
+    let canonical = placements
+        .iter()
+        .find(|placement| placement["agent"] == "codex")
+        .unwrap();
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "library_changes": [{
+            "skill_id": payload["skills"][0]["id"],
+            "canonical_placement_id": canonical["id"],
+            "placement_ids": placements
+                .iter()
+                .map(|placement| placement["id"].clone())
+                .collect::<Vec<_>>(),
+            "requested_state": "hosted"
+        }]
+    });
+
+    let rejected = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!rejected.status.success());
+    let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(
+        rejected["error"]["code"],
+        "library_root_conflicts_with_agent_root"
+    );
+    assert_eq!(
+        rejected["error"]["details"]["reason"],
+        "library_root_overlaps_agent_skill_root"
+    );
+    assert_eq!(rejected["error"]["details"]["files_changed"], false);
+    assert_eq!(rejected["error"]["details"]["agent_root_count"], 13);
+    assert_eq!(
+        rejected["error"]["details"]["agent_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    assert_eq!(rejected["error"]["details"]["agent_roots_truncated"], true);
+    assert_eq!(
+        rejected["error"]["details"]["next_action"],
+        "choose_state_dir_outside_agent_skill_roots"
+    );
+    assert!(
+        rejected["error"]["details"]["agent_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| fs::canonicalize(root.as_str().unwrap()).ok()
+                == fs::canonicalize(&codex_root).ok())
+    );
+    let plan_count: i64 = database
+        .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(plan_count, 0);
+    assert!(!state.join("library").exists());
+}
+
+#[test]
+fn multi_skill_library_plan_preserves_totals_beyond_the_item_preview() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    for index in 0..12 {
+        let name = format!("shared-{index:02}");
+        let content =
+            format!("---\nname: {name}\ndescription: shared fixture {index}\n---\nbody {index}\n");
+        for root in [home.join(".codex/skills"), home.join(".claude/skills")] {
+            let directory = root.join(&name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("SKILL.md"), &content).unwrap();
+        }
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let mut placements_by_skill = std::collections::BTreeMap::<String, Vec<&Value>>::new();
+    for placement in payload["placements"].as_array().unwrap() {
+        placements_by_skill
+            .entry(placement["skill_id"].as_str().unwrap().to_owned())
+            .or_default()
+            .push(placement);
+    }
+    assert_eq!(placements_by_skill.len(), 12);
+    assert!(
+        placements_by_skill
+            .values()
+            .all(|placements| placements.len() == 2)
+    );
+    let library_changes = placements_by_skill
+        .into_iter()
+        .map(|(skill_id, placements)| {
+            let canonical = placements
+                .iter()
+                .find(|placement| placement["agent"] == "codex")
+                .unwrap();
+            json!({
+                "skill_id": skill_id,
+                "canonical_placement_id": canonical["id"],
+                "placement_ids": placements
+                    .iter()
+                    .map(|placement| placement["id"].clone())
+                    .collect::<Vec<_>>(),
+                "requested_state": "managed"
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot,
+        "evidence_ids": [evidence_id],
+        "library_changes": library_changes
+    });
+
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    let impact = &plan["result"]["impact"];
+    assert_eq!(impact["item_count"], 12);
+    assert_eq!(impact["items"].as_array().unwrap().len(), 10);
+    assert_eq!(impact["items_truncated"], true);
+    assert_eq!(impact["totals"]["before"]["physical_source_count"], 24);
+    assert_eq!(impact["totals"]["after"]["physical_source_count"], 12);
+    assert_eq!(impact["totals"]["delta"]["physical_source_count"], -12);
+    assert_eq!(impact["totals"]["before"]["placement_count"], 24);
+    assert_eq!(impact["totals"]["after"]["placement_count"], 24);
+    assert_eq!(impact["totals"]["delta"]["placement_count"], 0);
+    assert_eq!(
+        impact["totals"]["delta"]["default_exposed_placement_count"],
+        0
+    );
+    assert_eq!(impact["totals"]["relinked_placement_count"], 12);
+
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let full = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(full["result"]["impact"], plan["result"]["impact"]);
+    assert_eq!(full["result"]["operations"].as_array().unwrap().len(), 25);
+    assert_eq!(plan["result"]["files_changed"], false);
 }
 
 #[test]
@@ -3558,7 +3865,10 @@ fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_source
     assert_eq!(planning["canonical_candidates_truncated"], false);
     assert_eq!(
         planning["canonical_candidates"][0]["path"],
-        shared_skill.join("SKILL.md").to_str().unwrap()
+        fs::canonicalize(shared_skill.join("SKILL.md"))
+            .unwrap()
+            .to_str()
+            .unwrap()
     );
     let canonical_placement_id = planning["canonical_candidates"][0]["placement_id"]
         .as_str()
@@ -3595,11 +3905,23 @@ fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_source
     ));
     assert_eq!(plan["result"]["change_summary"]["operation_count"], 5);
     assert_eq!(plan["result"]["affected"]["placement_count"], 6);
+    let impact = &plan["result"]["impact"]["items"][0];
+    assert_eq!(impact["before"]["physical_source_count"], 3);
+    assert_eq!(impact["after"]["physical_source_count"], 1);
+    assert_eq!(impact["delta"]["physical_source_count"], -2);
+    assert_eq!(impact["before"]["placement_count"], 6);
+    assert_eq!(impact["after"]["placement_count"], 6);
+    assert_eq!(impact["delta"]["placement_count"], 0);
+    assert_eq!(impact["before"]["default_exposed_placement_count"], 5);
+    assert_eq!(impact["after"]["default_exposed_placement_count"], 5);
+    assert_eq!(impact["delta"]["default_exposed_placement_count"], 0);
+    assert_eq!(impact["after"]["relinked_placement_count"], 2);
     let plan_id = plan["result"]["plan_id"].as_str().unwrap();
     let full = json_output(&run(
         &[&common[..], &["plan", "--show", plan_id]].concat(),
         None,
     ));
+    assert_eq!(full["result"]["impact"], plan["result"]["impact"]);
     let targets = full["result"]["operations"]
         .as_array()
         .unwrap()

@@ -200,6 +200,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             let (result, warnings) = scan_command(
                 &store,
                 &home,
+                &state_dir,
                 parse_explicit_roots(&cli.roots)?,
                 parse_source_roots(&cli.source_roots)?,
             )?;
@@ -547,7 +548,41 @@ impl std::fmt::Display for StoredFindingCoverageInvalid {
 
 impl std::error::Error for StoredFindingCoverageInvalid {}
 
+#[derive(Debug)]
+struct LibraryRootConflict {
+    library_root: PathBuf,
+    agent_roots: Vec<PathBuf>,
+}
+
+impl std::fmt::Display for LibraryRootConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Hosted Library root {} overlaps an Agent Skill root",
+            self.library_root.display()
+        )
+    }
+}
+
+impl std::error::Error for LibraryRootConflict {}
+
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(conflict) = error.downcast_ref::<LibraryRootConflict>() {
+        let agent_root_count = conflict.agent_roots.len();
+        return ClassifiedError {
+            code: "library_root_conflicts_with_agent_root",
+            retryable: false,
+            details: Some(json!({
+                "reason": "library_root_overlaps_agent_skill_root",
+                "library_root": conflict.library_root,
+                "agent_root_count": agent_root_count,
+                "agent_roots": conflict.agent_roots.iter().take(10).collect::<Vec<_>>(),
+                "agent_roots_truncated": agent_root_count > 10,
+                "files_changed": false,
+                "next_action": "choose_state_dir_outside_agent_skill_roots"
+            })),
+        };
+    }
     if let Some(invalid) = error.downcast_ref::<StoredFindingCoverageInvalid>() {
         return ClassifiedError {
             code: "stored_finding_coverage_invalid",
@@ -1549,6 +1584,7 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
 fn scan_command(
     store: &StateStore,
     home: &Path,
+    state_dir: &Path,
     explicit: Vec<ExplicitSkillRoot>,
     source_roots: Vec<PathBuf>,
 ) -> Result<(Value, Vec<String>)> {
@@ -1564,6 +1600,7 @@ fn scan_command(
     let mut options = ScanOptions::for_home(home);
     options.explicit_skill_roots = explicit;
     options.explicit_source_roots = source_roots;
+    options.managed_source_roots = vec![state_dir.join("library")];
     options.excluded_session_agents = store
         .evidence_exclusions()?
         .iter()
@@ -4182,14 +4219,71 @@ fn bound_transition(value: &mut Value, after_state_key: &str) {
     );
 }
 
+fn library_impact_totals(items: &[Value]) -> Option<Value> {
+    if items.is_empty() {
+        return None;
+    }
+    let sum = |pointer: &str| {
+        items.iter().try_fold(0_u64, |total, item| {
+            total.checked_add(item.pointer(pointer)?.as_u64()?)
+        })
+    };
+    let states = |pointer: &str| {
+        items.iter().try_fold(
+            std::collections::BTreeMap::<String, usize>::new(),
+            |mut counts, item| {
+                let state = item.pointer(pointer)?.as_str()?;
+                *counts.entry(state.to_owned()).or_default() += 1;
+                Some(counts)
+            },
+        )
+    };
+    let before_sources = sum("/before/physical_source_count")?;
+    let after_sources = sum("/after/physical_source_count")?;
+    let before_placements = sum("/before/placement_count")?;
+    let after_placements = sum("/after/placement_count")?;
+    let before_exposed = sum("/before/default_exposed_placement_count")?;
+    let after_exposed = sum("/after/default_exposed_placement_count")?;
+    let relinked = sum("/after/relinked_placement_count")?;
+    let delta = |after: u64, before: u64| {
+        i64::try_from(after)
+            .ok()?
+            .checked_sub(i64::try_from(before).ok()?)
+    };
+    Some(json!({
+        "before": {
+            "physical_source_count": before_sources,
+            "placement_count": before_placements,
+            "default_exposed_placement_count": before_exposed,
+            "governance_state_counts": states("/before/governance_state")?
+        },
+        "after": {
+            "physical_source_count": after_sources,
+            "placement_count": after_placements,
+            "default_exposed_placement_count": after_exposed,
+            "governance_state_counts": states("/after/governance_state")?
+        },
+        "delta": {
+            "physical_source_count": delta(after_sources, before_sources)?,
+            "placement_count": delta(after_placements, before_placements)?,
+            "default_exposed_placement_count": delta(after_exposed, before_exposed)?
+        },
+        "relinked_placement_count": relinked
+    }))
+}
+
 fn bounded_plan_impact(mut impact: Value) -> Value {
     let Some(object) = impact.as_object_mut() else {
         let items = impact.as_array().cloned().unwrap_or_default();
-        return json!({
+        let mut bounded = json!({
             "item_count": items.len(),
             "items": items.iter().take(10).collect::<Vec<_>>(),
             "items_truncated": items.len() > 10
         });
+        if let Some(totals) = library_impact_totals(&items) {
+            bounded["totals"] = totals;
+        }
+        return bounded;
     };
     if let Some(percent) = object
         .get("exposure_reduction_percent")
@@ -5091,6 +5185,40 @@ fn normalized_digest(value: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
+fn resolve_path_with_missing_tail(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut missing = Vec::<std::ffi::OsString>::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_owned());
+        let Some(parent) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        ancestor = parent;
+    }
+    let mut resolved = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    resolved
+}
+
+fn overlapping_agent_skill_roots(scan: &ScanResult, library_root: &Path) -> Vec<PathBuf> {
+    let library_root = resolve_path_with_missing_tail(library_root);
+    let mut roots = scan
+        .roots
+        .iter()
+        .filter(|root| root.kind == RootKind::Skills && root.agent.is_some())
+        .map(|root| resolve_path_with_missing_tail(&root.path))
+        .filter(|root| library_root.starts_with(root) || root.starts_with(&library_root))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 fn normalize_library_plan(
     mut input: Value,
     scan: &ScanResult,
@@ -5106,6 +5234,20 @@ fn normalize_library_plan(
     let mut touched_skills = std::collections::HashSet::new();
     let mut needs_library_root = false;
     let mut needs_backup_root = false;
+
+    if requests
+        .iter()
+        .any(|request| matches!(request.requested_state, RequestedGovernanceState::Hosted))
+    {
+        let agent_roots = overlapping_agent_skill_roots(scan, &library_root);
+        if !agent_roots.is_empty() {
+            return Err(LibraryRootConflict {
+                library_root,
+                agent_roots,
+            }
+            .into());
+        }
+    }
 
     for request in requests {
         if !touched_skills.insert(request.skill_id.clone()) {
@@ -5169,6 +5311,12 @@ fn normalize_library_plan(
                 .or_default()
                 .push(*placement);
         }
+        let before_physical_source_count = physical_groups.len();
+        let before_placement_count = all_placements.len();
+        let default_exposed_placement_count = all_placements
+            .iter()
+            .filter(|placement| placement.default_exposed)
+            .count();
         let canonical_physical = canonical.validated_physical_directory()?;
         if !placement_owns_physical_source(canonical) {
             bail!("canonical placement must be the owned physical source directory");
@@ -5179,6 +5327,11 @@ fn normalize_library_plan(
         };
         let safe_name = safe_skill_directory_name(&skill.name)?;
         let library_path = library_root.join(safe_name);
+        let adds_hosted_library_placement =
+            matches!(request.requested_state, RequestedGovernanceState::Hosted)
+                && canonical.directory != library_path;
+        let after_placement_count =
+            before_placement_count + usize::from(adds_hosted_library_placement);
         let canonical_fingerprint = change::fingerprint(&canonical.directory)?;
         let link_source = match request.requested_state {
             RequestedGovernanceState::Managed => canonical.directory.clone(),
@@ -5206,7 +5359,7 @@ fn normalize_library_plan(
             }
         };
 
-        let mut relinked = 0_usize;
+        let mut relinked = usize::from(adds_hosted_library_placement);
         for (physical_source, mut placements) in physical_groups {
             if physical_source == canonical_physical {
                 continue;
@@ -5260,14 +5413,24 @@ fn normalize_library_plan(
         impacts.push(json!({
             "skill_id": request.skill_id,
             "before": {
-                "placement_count": all_placements.len(),
+                "placement_count": before_placement_count,
+                "physical_source_count": before_physical_source_count,
+                "default_exposed_placement_count": default_exposed_placement_count,
                 "canonical_path": canonical.directory,
                 "governance_state": "observed"
             },
             "after": {
+                "placement_count": after_placement_count,
+                "physical_source_count": 1,
+                "default_exposed_placement_count": default_exposed_placement_count,
                 "governance_state": state_name,
                 "canonical_path": link_source,
                 "relinked_placement_count": relinked
+            },
+            "delta": {
+                "placement_count": after_placement_count as i64 - before_placement_count as i64,
+                "physical_source_count": 1_i64 - before_physical_source_count as i64,
+                "default_exposed_placement_count": 0
             }
         }));
     }
@@ -8205,6 +8368,47 @@ mod recovery_tests {
 
         assert_eq!(impact, stored);
         assert_eq!(impact["exposure_reduction_percent"], 55.84);
+    }
+
+    #[test]
+    fn bounded_library_impact_keeps_complete_totals_when_items_are_truncated() {
+        let items = (0..12)
+            .map(|index| {
+                json!({
+                    "skill_id": format!("skill_{index}"),
+                    "before": {
+                        "governance_state": "observed",
+                        "physical_source_count": 3,
+                        "placement_count": 6,
+                        "default_exposed_placement_count": 5
+                    },
+                    "after": {
+                        "governance_state": "managed",
+                        "physical_source_count": 1,
+                        "placement_count": 6,
+                        "default_exposed_placement_count": 5,
+                        "relinked_placement_count": 2
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let impact = bounded_plan_impact(json!(items));
+
+        assert_eq!(impact["item_count"], 12);
+        assert_eq!(impact["items"].as_array().unwrap().len(), 10);
+        assert_eq!(impact["items_truncated"], true);
+        assert_eq!(impact["totals"]["before"]["physical_source_count"], 36);
+        assert_eq!(impact["totals"]["after"]["physical_source_count"], 12);
+        assert_eq!(impact["totals"]["delta"]["physical_source_count"], -24);
+        assert_eq!(impact["totals"]["before"]["placement_count"], 72);
+        assert_eq!(impact["totals"]["after"]["placement_count"], 72);
+        assert_eq!(impact["totals"]["delta"]["placement_count"], 0);
+        assert_eq!(
+            impact["totals"]["delta"]["default_exposed_placement_count"],
+            0
+        );
+        assert_eq!(impact["totals"]["relinked_placement_count"], 24);
     }
 
     #[test]

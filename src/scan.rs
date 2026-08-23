@@ -25,6 +25,8 @@ pub struct ScanOptions {
     pub home: PathBuf,
     pub explicit_skill_roots: Vec<ExplicitSkillRoot>,
     pub explicit_source_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub managed_source_roots: Vec<PathBuf>,
     pub excluded_session_agents: BTreeSet<AgentKind>,
     pub include_session_evidence: bool,
     pub max_depth: usize,
@@ -42,6 +44,7 @@ impl ScanOptions {
             home: home.into(),
             explicit_skill_roots: Vec::new(),
             explicit_source_roots: Vec::new(),
+            managed_source_roots: Vec::new(),
             excluded_session_agents: BTreeSet::new(),
             include_session_evidence: true,
             max_depth: 5,
@@ -661,10 +664,12 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     // Inventory and link-containment decisions use the resolved physical
     // sources so an alias and its canonical path have identical semantics.
     let confirmed_source_roots = normalized_confirmed_source_roots(&options.explicit_source_roots);
-    let shared_roots = [
+    let mut shared_roots = vec![
         options.home.join(".agents_skills"),
         options.home.join(".skillroster/library"),
     ];
+    shared_roots.extend(options.managed_source_roots.iter().cloned());
+    let shared_roots = normalized_confirmed_source_roots(&shared_roots);
     let approved_roots = known
         .iter()
         .flat_map(|roots| roots.skill_roots.iter().cloned())

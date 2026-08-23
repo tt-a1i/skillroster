@@ -1114,25 +1114,97 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let relinked = items
-            .iter()
-            .filter_map(|item| item.pointer("/after/relinked_placement_count"))
-            .filter_map(Value::as_u64)
-            .sum::<u64>();
-        let before = items
-            .first()
-            .and_then(|item| item.pointer("/before/governance_state"))
-            .and_then(Value::as_str)
-            .unwrap_or("current");
-        let after = items
-            .first()
-            .and_then(|item| item.pointer("/after/governance_state"))
-            .and_then(Value::as_str)
-            .unwrap_or("planned");
-        (
-            "Library before → after",
-            format!("{before} → {after} · {relinked} placements relinked"),
+        let item_total = |pointer: &str| {
+            items
+                .iter()
+                .map(|item| item.pointer(pointer).and_then(Value::as_u64))
+                .collect::<Option<Vec<_>>>()
+                .map(|values| values.into_iter().sum::<u64>())
+        };
+        let total = |totals_pointer: &str, item_pointer: &str| {
+            value
+                .pointer(totals_pointer)
+                .and_then(Value::as_u64)
+                .or_else(|| item_total(item_pointer))
+        };
+        let relinked = total(
+            "/impact/totals/relinked_placement_count",
+            "/after/relinked_placement_count",
         )
+        .unwrap_or_default();
+        let aggregate_state = |totals_pointer: &str, item_pointer: &str, fallback: &str| {
+            if let Some(counts) = value.pointer(totals_pointer).and_then(Value::as_object) {
+                return if counts.len() == 1 {
+                    counts
+                        .keys()
+                        .next()
+                        .map_or_else(|| fallback.to_owned(), std::string::ToString::to_string)
+                } else {
+                    "mixed".to_owned()
+                };
+            }
+            let states = items
+                .iter()
+                .filter_map(|item| item.pointer(item_pointer).and_then(Value::as_str))
+                .collect::<BTreeSet<_>>();
+            match states.len() {
+                0 => fallback.to_owned(),
+                1 => states
+                    .iter()
+                    .next()
+                    .map_or_else(|| fallback.to_owned(), |state| (*state).to_owned()),
+                _ => "mixed".to_owned(),
+            }
+        };
+        let before = aggregate_state(
+            "/impact/totals/before/governance_state_counts",
+            "/before/governance_state",
+            "current",
+        );
+        let after = aggregate_state(
+            "/impact/totals/after/governance_state_counts",
+            "/after/governance_state",
+            "planned",
+        );
+        let comparable = match (
+            total(
+                "/impact/totals/before/physical_source_count",
+                "/before/physical_source_count",
+            ),
+            total(
+                "/impact/totals/after/physical_source_count",
+                "/after/physical_source_count",
+            ),
+            total(
+                "/impact/totals/before/placement_count",
+                "/before/placement_count",
+            ),
+            total(
+                "/impact/totals/after/placement_count",
+                "/after/placement_count",
+            ),
+            total(
+                "/impact/totals/before/default_exposed_placement_count",
+                "/before/default_exposed_placement_count",
+            ),
+            total(
+                "/impact/totals/after/default_exposed_placement_count",
+                "/after/default_exposed_placement_count",
+            ),
+        ) {
+            (
+                Some(before_sources),
+                Some(after_sources),
+                Some(before_placements),
+                Some(after_placements),
+                Some(before_exposed),
+                Some(after_exposed),
+            ) => format!(
+                "{before} → {after} · sources {before_sources}→{after_sources} · placements {before_placements}→{after_placements} · default-exposed {before_exposed}→{after_exposed} · relinked {relinked}"
+            ),
+            _ => format!("{before} → {after} · {relinked} placements relinked"),
+        };
+        ("Library before → after", comparable)
     } else if risk == "source_update" {
         (
             "Source updates",
@@ -1173,7 +1245,12 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
         };
         ("Roster before → after", transition)
     };
-    fact(lines, transition_label, transition);
+    fact_items(
+        lines,
+        transition_label,
+        transition.split(" · ").map(str::to_owned).collect(),
+        width,
+    );
     fact(
         lines,
         "Affected",
@@ -2515,9 +2592,17 @@ mod tests {
                 },
                 "affected": {"agent_count": 1, "skill_count": 1},
                 "impact": {"items": [{
-                    "before": {"governance_state": "observed"},
+                    "before": {
+                        "governance_state": "observed",
+                        "physical_source_count": 3,
+                        "placement_count": 51,
+                        "default_exposed_placement_count": 50
+                    },
                     "after": {
                         "governance_state": "managed",
+                        "physical_source_count": 1,
+                        "placement_count": 51,
+                        "default_exposed_placement_count": 50,
                         "relinked_placement_count": 50
                     }
                 }]},
@@ -2532,8 +2617,58 @@ mod tests {
             },
         );
         assert!(library.contains("Library before → after"));
-        assert!(library.contains("observed → managed · 50 placements relinked"));
+        assert!(library.contains("observed → managed"));
+        assert!(library.contains("sources 3→1"));
+        assert!(library.contains("placements 51→51"));
+        assert!(library.contains("default-exposed 50→50"));
+        assert!(library.contains("relinked 50"));
+        assert!(library.lines().all(|line| display_width(line) <= 80));
         assert!(!library.contains("no Roster changes"));
+
+        let mixed_library = render(
+            "plan",
+            &json!({
+                "plan_id": "plan_mixed",
+                "change_summary": {"operation_count": 5},
+                "affected": {"agent_count": 2, "skill_count": 2},
+                "impact": {
+                    "item_count": 12,
+                    "items_truncated": true,
+                    "items": [{
+                        "before": {"governance_state": "observed"},
+                        "after": {"governance_state": "managed"}
+                    }],
+                    "totals": {
+                        "before": {
+                            "governance_state_counts": {"observed": 12},
+                            "physical_source_count": 24,
+                            "placement_count": 24,
+                            "default_exposed_placement_count": 24
+                        },
+                        "after": {
+                            "governance_state_counts": {"managed": 6, "hosted": 6},
+                            "physical_source_count": 12,
+                            "placement_count": 30,
+                            "default_exposed_placement_count": 24
+                        },
+                        "relinked_placement_count": 18
+                    }
+                },
+                "risk": "library_governance",
+                "reversible": true,
+                "state": "ready"
+            }),
+            RenderOptions {
+                width: 60,
+                styled: false,
+            },
+        );
+        assert!(mixed_library.contains("observed → mixed"));
+        assert!(mixed_library.contains("sources 24→12"));
+        assert!(mixed_library.contains("placements 24→30"));
+        assert!(mixed_library.contains("default-exposed 24→24"));
+        assert!(mixed_library.contains("relinked 18"));
+        assert!(mixed_library.lines().all(|line| display_width(line) <= 60));
     }
 
     fn strip_ansi(value: &str) -> String {
