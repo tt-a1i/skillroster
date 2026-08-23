@@ -1740,6 +1740,15 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
 
     let pending_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(pending_status["result"]["pending_plan_count"], 1);
+    assert_eq!(
+        pending_status["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["plan", "--show", plan_id, "--json"])
+    );
+    assert_eq!(
+        pending_status["suggested_actions"][0]["reason_code"],
+        "pending_plan_requires_review"
+    );
+    assert_eq!(pending_status["suggested_actions"][0]["mutates"], false);
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(applied["result"]["verification"], "passed");
@@ -2400,6 +2409,19 @@ fn setup_reuse_and_status_actionability_follow_snapshot_lifecycle() {
     );
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(status["result"]["pending_plan_count"], 2);
+    assert_eq!(
+        status["suggested_actions"][0]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "plan",
+                "--show",
+                explicit_choice["result"]["plan_id"].as_str().unwrap(),
+                "--json"
+            ]
+        )
+    );
 
     let default_after_explicit = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(
