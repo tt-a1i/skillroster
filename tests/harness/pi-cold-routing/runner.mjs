@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 
-import { accessSync, chmodSync, constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { boundedFileSha256, boundedReadFile, boundedWriteFile, copyBoundedFile, copyBoundedTree, createReadBudget, GATE_LEDGER_MAX_BYTES, HARNESS_IO_LIMITS, walkBoundedTree } from "./bounds.mjs";
 
-const HERE = dirname(new URL(import.meta.url).pathname);
+export function modulePathFromUrl(url) { return fileURLToPath(url); }
+const RUNNER_PATH = modulePathFromUrl(import.meta.url);
+const HERE = dirname(RUNNER_PATH);
 const REPO = resolve(HERE, "../../..");
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,79}$/u;
 const CLI_TIMEOUT_MS = 30_000;
@@ -17,7 +21,7 @@ const OFFICIAL_SUITE_POLICIES = new Map([
 
 function fail(message) { throw new Error(message); }
 function sha(value) { return createHash("sha256").update(value).digest("hex"); }
-function fileSha(path) { return sha(readFileSync(path)); }
+function fileSha(path, options = {}) { return boundedFileSha256(path, options); }
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
@@ -46,23 +50,30 @@ function canonicalInside(path, root, label = "source") {
   return canonical;
 }
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const options = {
     manifest: join(REPO, "tests/fixtures/pi-cold-routing-training.json"), task: "all", arm: "both",
     skillsRoot: join(homedir(), ".agents_skills"), bootstrap: join(REPO, "skill/skillroster/SKILL.md"),
     cli: join(REPO, "target/debug/skillroster"), pi: "pi", piConfigSource: join(homedir(), ".pi/agent"),
-    runsDir: join(tmpdir(), "skillroster-pi-cold-routing"), timeoutMs: 300_000, diagnostic: false, generateSeal: null,
+    runsDir: join(tmpdir(), "skillroster-pi-cold-routing"), timeoutMs: 300_000, timeoutOverridden: false, diagnostic: false, generateSeal: null,
   };
   const keys = new Map([["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--skills-root", "skillsRoot"], ["--bootstrap", "bootstrap"], ["--cli", "cli"], ["--pi", "pi"], ["--pi-config-source", "piConfigSource"], ["--runs-dir", "runsDir"], ["--timeout-ms", "timeoutMs"], ["--generate-seal", "generateSeal"]]);
   for (let index = 0; index < argv.length;) {
     if (argv[index] === "--diagnostic") { options.diagnostic = true; index += 1; continue; }
     const key = keys.get(argv[index]); const value = argv[index + 1];
     if (!key || !value) fail(`unknown or incomplete argument: ${argv[index] ?? "<missing>"}`);
-    options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "pi"].includes(key) ? value : resolve(value); index += 2;
+    options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "pi"].includes(key) ? value : resolve(value);
+    if (key === "timeoutMs") options.timeoutOverridden = true;
+    index += 2;
   }
   if (!["core", "on_demand", "both"].includes(options.arm)) fail("--arm must be core, on_demand, or both");
-  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1_000) fail("--timeout-ms must be at least 1000");
+  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1_000 || options.timeoutMs > 900_000) fail("--timeout-ms must be between 1000 and 900000");
   return options;
+}
+
+export function validateTimeoutOverride(options, manifest) {
+  if (options.timeoutOverridden && OFFICIAL_SUITE_POLICIES.has(manifest.suite_id) && !options.diagnostic) fail("official formal suites forbid --timeout-ms; use the frozen task/default timeout");
+  return { formal_eligible: OFFICIAL_SUITE_POLICIES.has(manifest.suite_id) && !options.diagnostic && !options.timeoutOverridden };
 }
 
 export function validateManifest(manifest) {
@@ -92,7 +103,7 @@ export function validateManifest(manifest) {
     if (typeof task.prompt !== "string" || !task.prompt) fail(`${task.id} prompt is required`);
     const forbiddenPromptTerm = promptContainsForbiddenTerm(task.prompt, [...manifest.common.forbidden_prompt_terms, task.expected_skill]); if (forbiddenPromptTerm) fail(`${task.id} leaks forbidden prompt identity: ${forbiddenPromptTerm}`);
     if (task.timeout_ms !== undefined && (!Number.isSafeInteger(task.timeout_ms) || task.timeout_ms < 1_000 || task.timeout_ms > 900_000)) fail(`${task.id} timeout_ms must be between 1000 and 900000`);
-    for (const [path, content] of Object.entries(task.workspace_files ?? {})) { safeRelativePath(path, `${task.id} workspace path`); if (typeof content !== "string") fail(`${task.id} workspace content must be text`); }
+    planWorkspaceInputs(task);
     for (const path of task.target_package_include ?? []) safeRelativePath(path, `${task.id} package include`);
     if (!Array.isArray(task.allowed_changed_paths)) fail(`${task.id} allowed_changed_paths is required`);
     for (const path of task.allowed_changed_paths ?? []) safeRelativePath(path, `${task.id} allowed changed path`);
@@ -151,48 +162,51 @@ export function validateManifest(manifest) {
 export function effectiveTaskTimeout(task, defaultTimeoutMs) { return task.timeout_ms ?? defaultTimeoutMs; }
 
 function copyTargetPackage(source, destination, includes) {
-  const canonicalSource = realpathSync(source); mkdirSync(destination, { recursive: true });
+  const canonicalSource = realpathSync(source);
+  const sourceTree = walkBoundedTree(canonicalSource, { label: "target package" });
   if (includes?.length) {
+    if (existsSync(destination)) fail("package destination already exists");
+    mkdirSync(dirname(destination), { recursive: true }); mkdirSync(destination);
     for (const item of includes) {
       const from = canonicalInside(join(canonicalSource, safeRelativePath(item)), canonicalSource, "package include");
       const to = safeDestination(destination, item, "package destination");
-      mkdirSync(dirname(to), { recursive: true }); cpSync(from, to, { recursive: true, dereference: true, errorOnExist: true });
+      if (existsSync(to)) fail(`package destination already exists: ${item}`);
+      const member = sourceTree.files.find((file) => file.absolutePath === from);
+      if (member) { mkdirSync(dirname(to), { recursive: true }); copyBoundedFile(from, to, { label: `package include ${item}` }); }
+      else { mkdirSync(dirname(to), { recursive: true }); copyBoundedTree(from, to, { label: `package include ${item}` }); }
     }
-  } else cpSync(canonicalSource, destination, { recursive: true, dereference: true, filter(path) { canonicalInside(path, canonicalSource, "package member"); return true; } });
+  } else copyBoundedTree(canonicalSource, destination, { label: "target package" });
 }
 
-function treeState(root) {
+function treeState(root, options = {}) {
   const state = new Map(); if (!existsSync(root)) return state;
-  function visit(path, prefix = "") {
-    for (const entry of readdirSync(path, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      const child = join(path, entry.name); const name = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) visit(child, name); else if (entry.isFile()) state.set(name, fileSha(child));
-      else state.set(name, `special:${entry.isSymbolicLink() ? "symlink" : "other"}`);
-    }
-  }
-  visit(root); return state;
+  const walked = walkBoundedTree(root, { label: options.label ?? "audited tree", allowSpecial: options.allowSpecial ?? true });
+  const budget = createReadBudget();
+  for (const file of walked.files) state.set(file.relativePath, fileSha(file.absolutePath, { label: options.label ?? "audited tree", budget, expectedIdentity: file.identity }));
+  for (const special of walked.specials) state.set(special.relativePath, `special:${special.kind}`);
+  return state;
 }
-function treeDigest(root) { return sha([...treeState(root)].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
+function treeDigest(root) { return sha([...treeState(root, { label: "hashed tree", allowSpecial: false })].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
 function sortedPathDigest(namedPaths) {
   const rows = [];
   for (const [label, path] of namedPaths) {
     if (!existsSync(path)) fail(`sealed bound path is missing: ${label}`);
     const stat = lstatSync(path); if (stat.isFile()) rows.push(`${label}\0${fileSha(path)}`);
-    else if (stat.isDirectory()) for (const [member, digestValue] of treeState(path)) rows.push(`${label}/${member}\0${digestValue}`);
+    else if (stat.isDirectory()) for (const [member, digestValue] of treeState(path, { label: `sealed path ${label}`, allowSpecial: false })) rows.push(`${label}/${member}\0${digestValue}`);
     else fail(`sealed bound path is special: ${label}`);
   }
   return sha(rows.sort().join("\n"));
 }
 function changedPaths(before, after) { return [...new Set([...before.keys(), ...after.keys()])].filter((path) => before.get(path) !== after.get(path)).sort(); }
 function chmodDirectories(root, mode) {
-  for (const entry of readdirSync(root, { withFileTypes: true })) if (entry.isDirectory()) { chmodDirectories(join(root, entry.name), mode); chmodSync(join(root, entry.name), mode); }
+  const walked = walkBoundedTree(root, { label: "chmod tree" });
+  for (const directory of [...walked.directories].sort((a, b) => b.depth - a.depth)) chmodSync(directory.absolutePath, mode);
   chmodSync(root, mode);
 }
 function sealTree(root) {
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) sealTree(path); else if (entry.isFile()) chmodSync(path, 0o444); else fail("frozen inputs contain a special file");
-  }
+  const walked = walkBoundedTree(root, { label: "frozen inputs" });
+  for (const file of walked.files) chmodSync(file.absolutePath, 0o444);
+  for (const directory of [...walked.directories].sort((a, b) => b.depth - a.depth)) chmodSync(directory.absolutePath, 0o555);
   chmodSync(root, 0o555);
 }
 
@@ -244,18 +258,46 @@ function assertPiIdentity(identity) {
   const current = readPiIdentity(identity.executable);
   if (current.executable_sha256 !== identity.executable_sha256 || current.version_sha256 !== identity.version_sha256) fail("Pi runtime identity drifted during the suite");
 }
-function runJson(executable, common, args, input, artifactPath) {
+function runJson(executable, common, args, input, artifactPath, artifactBudget) {
   const result = runProcess(executable, [...common, ...args], { input });
-  if (artifactPath) writeFileSync(artifactPath, result.stdout, { mode: 0o600 });
+  if (artifactPath) boundedWriteFile(artifactPath, result.stdout, { mode: 0o600, label: `CLI ${args[0]} artifact`, budget: artifactBudget });
   if (result.status !== 0) fail(`${basename(executable)} ${args[0]} exited ${result.status}: ${result.stderr}`);
   const envelope = JSON.parse(result.stdout); if (envelope.schema_version !== 1 || envelope.ok !== true) fail(`invalid ${args[0]} JSON envelope`);
   return envelope;
 }
 
-function writeWorkspaceInputs(task, destination) {
+export function planWorkspaceInputs(task) {
+  const entries = Object.entries(task.workspace_files ?? {}); const label = task.id ?? "task";
+  if (entries.length > HARNESS_IO_LIMITS.maxEntries) fail(`${label} workspace file count exceeds ${HARNESS_IO_LIMITS.maxEntries}`);
+  let totalBytes = 0; const normalized = new Map();
+  for (const [path, content] of entries) {
+    if (typeof content !== "string") fail(`${label} workspace content must be text`);
+    const normalizedPath = safeRelativePath(path, `${label} workspace path`); const depth = normalizedPath.split("/").length;
+    if (depth > HARNESS_IO_LIMITS.maxDepth) fail(`${label} workspace path depth exceeds ${HARNESS_IO_LIMITS.maxDepth}`);
+    if (normalized.has(normalizedPath)) fail(`${label} workspace paths collide after normalization`);
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes > HARNESS_IO_LIMITS.maxSingleFileBytes) fail(`${label} workspace file exceeds ${HARNESS_IO_LIMITS.maxSingleFileBytes} bytes`);
+    totalBytes += bytes; if (totalBytes > HARNESS_IO_LIMITS.maxTotalBytes) fail(`${label} workspace total exceeds ${HARNESS_IO_LIMITS.maxTotalBytes} bytes`);
+    normalized.set(normalizedPath, { path: normalizedPath, content, bytes });
+  }
+  const paths = [...normalized.keys()].sort();
+  const directories = new Set();
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let index = 1; index < parts.length; index += 1) {
+      const directory = parts.slice(0, index).join("/"); directories.add(directory);
+      if (normalized.has(directory)) fail(`${label} workspace file/directory prefix conflict`);
+    }
+  }
+  if (paths.length + directories.size > HARNESS_IO_LIMITS.maxEntries) fail(`${label} workspace materialized entry count exceeds ${HARNESS_IO_LIMITS.maxEntries}`);
+  return { entries: paths.map((path) => normalized.get(path)), totalBytes };
+}
+
+export function writeWorkspaceInputs(task, destination) {
+  const plan = planWorkspaceInputs(task); const budget = createReadBudget();
   mkdirSync(destination, { recursive: true });
-  for (const [path, content] of Object.entries(task.workspace_files ?? {})) {
-    const target = safeDestination(destination, path, "workspace input"); mkdirSync(dirname(target), { recursive: true }); writeFileSync(target, content);
+  for (const entry of plan.entries) {
+    const target = safeDestination(destination, entry.path, "workspace input"); mkdirSync(dirname(target), { recursive: true }); boundedWriteFile(target, entry.content, { flag: "wx", budget, label: "workspace input" });
   }
 }
 
@@ -263,9 +305,13 @@ export function freezeSuite(options, manifest, manifestBytes, tasks) {
   mkdirSync(options.runsDir, { recursive: true });
   const suiteRoot = mkdtempSync(join(options.runsDir, `${manifest.suite_id}-`)); chmodSync(suiteRoot, 0o700);
   const frozen = join(suiteRoot, "frozen-inputs"); mkdirSync(frozen, { recursive: true });
-  const paths = { manifest: join(frozen, "manifest.json"), bootstrap: join(frozen, "bootstrap-SKILL.md"), cli: join(frozen, process.platform === "win32" ? "skillroster.exe" : "skillroster"), gate: join(frozen, "gate.ts"), runner: join(frozen, "runner.mjs") };
-  writeFileSync(paths.manifest, manifestBytes, { mode: 0o444 }); copyFileSync(options.bootstrap, paths.bootstrap); copyFileSync(options.cli, paths.cli); copyFileSync(join(HERE, "gate.ts"), paths.gate); copyFileSync(new URL(import.meta.url).pathname, paths.runner);
-  chmodSync(paths.cli, 0o555); for (const path of [paths.bootstrap, paths.gate, paths.runner]) chmodSync(path, 0o444);
+  const paths = { manifest: join(frozen, "manifest.json"), bootstrap: join(frozen, "bootstrap-SKILL.md"), cli: join(frozen, process.platform === "win32" ? "skillroster.exe" : "skillroster"), gate: join(frozen, "gate.ts"), runner: join(frozen, "runner.mjs"), bounds: join(frozen, "bounds.mjs") };
+  const frozenSources = [[options.bootstrap, paths.bootstrap], [options.cli, paths.cli], [join(HERE, "gate.ts"), paths.gate], [RUNNER_PATH, paths.runner], [join(HERE, "bounds.mjs"), paths.bounds]];
+  for (const [source] of frozenSources) fileSha(source, { label: "frozen source" });
+  boundedWriteFile(paths.manifest, manifestBytes, { mode: 0o444, flag: "wx", label: "frozen manifest" });
+  const frozenSourceBudget = createReadBudget();
+  for (const [source, destination] of frozenSources) copyBoundedFile(source, destination, { label: "frozen source", budget: frozenSourceBudget });
+  chmodSync(paths.cli, 0o555); for (const path of [paths.bootstrap, paths.gate, paths.runner, paths.bounds]) chmodSync(path, 0o444);
   const skillsRoot = realpathSync(options.skillsRoot); const frozenTasks = new Map();
   for (const task of tasks) {
     const taskRoot = join(frozen, "tasks", task.id); const packageRoot = join(taskRoot, "target-package"); const workspaceRoot = join(taskRoot, "workspace");
@@ -280,11 +326,11 @@ export function freezeSuite(options, manifest, manifestBytes, tasks) {
     verifySealContract(options.sealContract, sealFacts(manifest, paths, frozenTasks, evaluationContract, options), { repo: REPO, contractPath: join(dirname(options.manifest), manifest.seal_contract), boundPaths });
   }
   if (!options.piConfigSnapshot) options.piConfigSnapshot = options.loadPiConfig();
-  const base = { suite_id: manifest.suite_id, manifest_sha256: fileSha(paths.manifest), bootstrap_sha256: fileSha(paths.bootstrap), cli_sha256: fileSha(paths.cli), cli_source_revision: options.cliSourceRevision, gate_sha256: fileSha(paths.gate), runner_sha256: fileSha(paths.runner), pi_executable_sha256: options.piIdentity.executable_sha256, pi_version_sha256: options.piIdentity.version_sha256, pi_model_mapping_sha256: options.piConfigSnapshot.modelMappingDigest, evaluation_contract_sha256: sha(JSON.stringify(evaluationContract)), arm_schedule_seed: options.armSchedule.seed, arm_schedule_sha256: sha(JSON.stringify(options.armSchedule.order)) };
+  const base = { suite_id: manifest.suite_id, manifest_sha256: fileSha(paths.manifest), bootstrap_sha256: fileSha(paths.bootstrap), cli_sha256: fileSha(paths.cli), cli_source_revision: options.cliSourceRevision, gate_sha256: fileSha(paths.gate), runner_sha256: fileSha(paths.runner), bounds_sha256: fileSha(paths.bounds), pi_executable_sha256: options.piIdentity.executable_sha256, pi_version_sha256: options.piIdentity.version_sha256, pi_model_mapping_sha256: options.piConfigSnapshot.modelMappingDigest, evaluation_contract_sha256: sha(JSON.stringify(evaluationContract)), arm_schedule_seed: options.armSchedule.seed, arm_schedule_sha256: sha(JSON.stringify(options.armSchedule.order)) };
   const suiteSnapshotSha = sha(JSON.stringify({ base, tasks: [...frozenTasks].map(([id, task]) => [id, task.packageDigest, task.workspaceDigest]) }));
   sealTree(frozen); chmodSync(paths.cli, 0o555);
   const taskDigests = Object.fromEntries([...frozenTasks].map(([id, task]) => [id, { target_package_sha256: task.packageDigest, workspace_inputs_sha256: task.workspaceDigest }]));
-  const snapshotPath = join(suiteRoot, "suite-snapshot.json"); writeFileSync(snapshotPath, `${JSON.stringify({ schema_version: 1, suite_snapshot_sha256: suiteSnapshotSha, ...base, tasks: taskDigests }, null, 2)}\n`, { mode: 0o444 });
+  const snapshotPath = join(suiteRoot, "suite-snapshot.json"); boundedWriteFile(snapshotPath, `${JSON.stringify({ schema_version: 1, suite_snapshot_sha256: suiteSnapshotSha, ...base, tasks: taskDigests }, null, 2)}\n`, { mode: 0o444, flag: "wx", label: "suite snapshot" });
   return { suiteRoot, paths, tasks: frozenTasks, base, suiteSnapshotSha };
 }
 
@@ -292,7 +338,7 @@ export function buildEvaluationContract(manifest, tasks = manifest.tasks) {
   return { model: manifest.model, tools: manifest.common.tools, aggregate_gate: manifest.aggregate_gate, tasks: tasks.map((task) => ({ id: task.id, permissions: task.post_load_permissions, command_chain: task.command_chain ?? null, oracle: task.oracle })) };
 }
 function sealSourceBoundPaths(options) {
-  return [options.manifest, dirname(options.bootstrap), join(REPO, "src"), join(REPO, "Cargo.toml"), join(REPO, "Cargo.lock"), join(HERE, "runner.mjs"), join(HERE, "gate.ts")];
+  return [options.manifest, dirname(options.bootstrap), join(REPO, "src"), join(REPO, "Cargo.toml"), join(REPO, "Cargo.lock"), join(HERE, "runner.mjs"), join(HERE, "gate.ts"), join(HERE, "bounds.mjs")];
 }
 export function assertBoundPathsClean(paths, repo = REPO) {
   const relativePaths = paths.map((path) => relative(repo, resolve(path)));
@@ -308,7 +354,7 @@ export function assertNoBoundPathDrift(statusText) {
 }
 export function sealFacts(manifest, paths, frozenTasks, evaluationContract, options) {
   const sourcePaths = [["cli-src", join(REPO, "src")], ["cargo-toml", join(REPO, "Cargo.toml")], ["cargo-lock", join(REPO, "Cargo.lock")]];
-  const harnessPaths = [["runner", paths.runner], ["gate", paths.gate]];
+  const harnessPaths = [["runner", paths.runner], ["gate", paths.gate], ["bounds", paths.bounds]];
   return {
     suite_id: manifest.suite_id,
     manifest_sha256: fileSha(paths.manifest),
@@ -340,7 +386,7 @@ export function gitBoundTreeDigest(revision, paths, repo = REPO) {
   return sha(result.stdout);
 }
 export function verifyFirstSealBlob(contractPath, sourceRevision, repo = REPO) {
-  const relativePath = repoRelativePaths([contractPath], repo)[0]; const live = readFileSync(contractPath);
+  const relativePath = repoRelativePaths([contractPath], repo)[0]; const live = boundedReadFile(contractPath, { label: "seal contract" });
   const log = spawnSync("git", ["log", "--reverse", "--diff-filter=A", "--format=%H", "--", relativePath], { cwd: repo, encoding: "utf8", shell: false });
   const addCommit = log.status === 0 ? log.stdout.trim().split("\n").filter(Boolean)[0] : null;
   if (!addCommit) fail("holdout seal has no first-add Git blob");
@@ -374,7 +420,7 @@ export function generateSealContract(options, manifest, manifestBytes) {
   const unsealed = structuredClone(manifest); delete unsealed.seal_contract;
   const frozen = freezeSuite(options, unsealed, manifestBytes, unsealed.tasks); const facts = sealFacts(manifest, frozen.paths, frozen.tasks, buildEvaluationContract(manifest), options);
   const contract = { schema_version: 1, suite_id: manifest.suite_id, seal_state: "frozen_before_first_run", source_revision: options.cliSourceRevision, facts, seal_sha256: sealPayloadDigest(options.cliSourceRevision, facts) };
-  writeFileSync(output, `${JSON.stringify(contract, null, 2)}\n`, { mode: 0o444 });
+  boundedWriteFile(output, `${JSON.stringify(contract, null, 2)}\n`, { mode: 0o444, flag: "wx", label: "seal contract" });
   return { output, contract };
 }
 
@@ -395,9 +441,9 @@ function modelMappingFacts(files, requestedModel) {
 }
 
 export function snapshotPiConfig(source, requestedModel) {
-  const files = new Map();
+  const files = new Map(); const budget = createReadBudget();
   for (const name of ["auth.json", "models.json", "models-store.json"]) {
-    const path = join(source, name); if (existsSync(path)) files.set(name, readFileSync(path));
+    const path = join(source, name); if (existsSync(path)) files.set(name, boundedReadFile(path, { label: `Pi config ${name}`, budget }));
   }
   if (!files.has("auth.json")) fail("isolated Pi config requires auth.json");
   const privateFingerprint = sha([...files].map(([name, content]) => `${name}\0${sha(content)}`).join("\n"));
@@ -408,7 +454,7 @@ export function copyPiConfig(snapshot, destination) {
   const before = sha([...snapshot.files].map(([name, content]) => `${name}\0${sha(content)}`).join("\n"));
   if (before !== snapshot.privateFingerprint) fail("in-memory Pi config snapshot drifted");
   mkdirSync(destination, { recursive: true, mode: 0o700 });
-  for (const [name, content] of snapshot.files) { const to = join(destination, name); writeFileSync(to, content, { mode: 0o600 }); }
+  for (const [name, content] of snapshot.files) { const to = join(destination, name); boundedWriteFile(to, content, { mode: 0o600, flag: "wx", label: `Pi config ${name}` }); }
   const after = sha([...snapshot.files.keys()].map((name) => `${name}\0${fileSha(join(destination, name))}`).join("\n"));
   if (after !== snapshot.privateFingerprint) fail("copied Pi config differs from suite snapshot");
 }
@@ -467,16 +513,16 @@ export function assessTranscriptCompletion(transcript) {
   }
   return { status: "failed", failure_type: "assistant_completion_missing", malformed_event_count: 0, assistant_completion_count: 0 };
 }
-function parseGateEvents(path) {
+export function parseGateEvents(path) {
   const events = []; const errors = [];
   if (!existsSync(path)) return { events, errors, source: "missing" };
-  for (const [index, line] of readFileSync(path, "utf8").split("\n").filter(Boolean).entries()) {
+  for (const [index, line] of boundedReadFile(path, { encoding: "utf8", label: "gate event ledger", maxSingleFileBytes: GATE_LEDGER_MAX_BYTES }).split("\n").filter(Boolean).entries()) {
     try { events.push(JSON.parse(line)); } catch { errors.push(`gate_event_parse_error:${index + 1}`); }
   }
   return { events, errors, source: "file" };
 }
 export function gateEventsBinding(path) {
-  return existsSync(path) ? { source: "file", sha256: fileSha(path) } : { source: "missing_sentinel", sha256: sha("skillroster:gate-events:missing:v1") };
+  return existsSync(path) ? { source: "file", sha256: fileSha(path, { label: "gate event ledger", maxSingleFileBytes: GATE_LEDGER_MAX_BYTES }) } : { source: "missing_sentinel", sha256: sha("skillroster:gate-events:missing:v1") };
 }
 export function gateEventIntegrity(events, parseErrors, arm, source) {
   const violations = [];
@@ -495,11 +541,11 @@ function compileRegex(value) {
 }
 
 export function evaluateOracle(oracle, workspace, successfulCommands, changed = []) {
-  const failures = [];
+  const failures = []; const budget = createReadBudget();
   const read = (path) => {
     const absolute = safeDestination(workspace, path, "oracle path");
     if (!existsSync(absolute) || !lstatSync(absolute).isFile()) { failures.push(`missing:${path}`); return ""; }
-    return readFileSync(canonicalInside(absolute, workspace, "oracle output"), "utf8");
+    return boundedReadFile(canonicalInside(absolute, workspace, "oracle output"), { encoding: "utf8", label: `oracle output ${path}`, budget });
   };
   const requireStrings = (text, values, prefix) => { for (const value of values ?? []) if (!text.includes(value)) failures.push(`${prefix}:missing:${value}`); };
   const forbidStrings = (text, values, prefix) => { for (const value of values ?? []) if (text.includes(value)) failures.push(`${prefix}:forbidden:${value}`); };
@@ -528,12 +574,12 @@ export function evaluateOracle(oracle, workspace, successfulCommands, changed = 
     requireRegex(required.get(oracle.private_path) ?? "", oracle.private_required_regex, "private");
     requireStrings(required.get(oracle.report_path) ?? "", oracle.report_required_substrings, "report");
     requireRegex(required.get(oracle.report_path) ?? "", oracle.report_required_regex, "report");
-    const allChanged = changed.map((path) => safeDestination(workspace, path, "changed output")).filter((path) => existsSync(path) && lstatSync(path).isFile()).map((path) => readFileSync(canonicalInside(path, workspace, "changed output"), "utf8")).join("\n");
+    const allChanged = changed.map((path) => safeDestination(workspace, path, "changed output")).filter((path) => existsSync(path) && lstatSync(path).isFile()).map((path) => boundedReadFile(canonicalInside(path, workspace, "changed output"), { encoding: "utf8", label: "changed output", budget })).join("\n");
     forbidStrings(allChanged, oracle.forbidden_across_outputs, "changed_outputs");
   } else failures.push(`unsupported_oracle:${oracle.type}`);
   for (const path of oracle.required_nonempty_paths ?? []) {
     const absolute = safeDestination(workspace, path, "required nonempty path");
-    if (!existsSync(absolute) || !lstatSync(absolute).isFile() || readFileSync(absolute, "utf8").trim().length === 0) failures.push(`empty:${path}`);
+    if (!existsSync(absolute) || !lstatSync(absolute).isFile() || boundedReadFile(absolute, { encoding: "utf8", label: `required output ${path}`, budget }).trim().length === 0) failures.push(`empty:${path}`);
   }
   for (const command of oracle.required_successful_commands ?? []) if (!successfulCommands.has(command)) failures.push(`command_not_successful:${command}`);
   return { passed: !failures.length, failures };
@@ -580,7 +626,7 @@ export function assessCommandReceipt(events, oracle, workspace) {
   if (!validate) failures.push("command_receipt:validation_chain_missing");
   const artifactPath = safeDestination(workspace, oracle.path, "command receipt artifact"); let finalArtifactSha = null;
   if (!existsSync(artifactPath) || !lstatSync(artifactPath).isFile()) failures.push("command_receipt:artifact_missing");
-  else finalArtifactSha = fileSha(canonicalInside(artifactPath, workspace, "command receipt artifact"));
+  else finalArtifactSha = fileSha(canonicalInside(artifactPath, workspace, "command receipt artifact"), { label: "command receipt artifact" });
   if (deliver) {
     const canonicalArtifact = existsSync(artifactPath) ? canonicalInside(artifactPath, workspace, "command receipt artifact") : resolve(artifactPath);
     if (deliver.event.artifact_path_sha256 !== sha(canonicalArtifact)) failures.push("command_receipt:artifact_path_mismatch");
@@ -592,10 +638,10 @@ export function assessCommandReceipt(events, oracle, workspace) {
   return { status: failures.length || topologyFailures.length ? "failed" : "passed", failures, topology_failures: topologyFailures, final_artifact_sha256: finalArtifactSha, receipt_chain_sha256: deliver?.event.receipt_chain_sha256 ?? null };
 }
 function redactionViolations(workspace, changed) {
-  const patterns = [/\/Users\//u, /<REDACTED_[A-Z_]+>/u, /\b(?:sk|pk|ghp)_[A-Za-z0-9_-]{12,}\b/u, /Bearer\s+[A-Za-z0-9._-]{12,}/iu]; const violations = [];
+  const patterns = [/\/Users\//u, /<REDACTED_[A-Z_]+>/u, /\b(?:sk|pk|ghp)_[A-Za-z0-9_-]{12,}\b/u, /Bearer\s+[A-Za-z0-9._-]{12,}/iu]; const violations = []; const budget = createReadBudget();
   for (const path of changed) {
     const absolute = safeDestination(workspace, path, "redaction output"); if (!existsSync(absolute) || !lstatSync(absolute).isFile()) continue;
-    if (patterns.some((pattern) => pattern.test(readFileSync(canonicalInside(absolute, workspace, "redaction output"), "utf8")))) violations.push(`redaction:${path}`);
+    if (patterns.some((pattern) => pattern.test(boundedReadFile(canonicalInside(absolute, workspace, "redaction output"), { encoding: "utf8", label: "redaction output", budget })))) violations.push(`redaction:${path}`);
   }
   return violations;
 }
@@ -695,8 +741,9 @@ function runArm(options, manifest, task, arm, snapshot) {
   const home = join(runRoot, "home"); const state = join(runRoot, "state"); const workspace = join(runRoot, "workspace"); const artifacts = join(runRoot, "artifacts");
   const config = join(runRoot, "pi-config"); const sessions = join(runRoot, "pi-sessions"); const piTmp = join(runRoot, "pi-tmp"); const commandHome = join(runRoot, "command-home"); const commandTmp = join(runRoot, "command-tmp");
   const exposed = join(home, ".pi/agent/skills", task.expected_skill); const frozenTask = snapshot.tasks.get(task.id);
+  const artifactBudget = createReadBudget();
   mkdirSync(artifacts, { recursive: true }); mkdirSync(sessions, { recursive: true }); mkdirSync(piTmp, { recursive: true }); mkdirSync(commandHome, { recursive: true }); mkdirSync(commandTmp, { recursive: true });
-  cpSync(frozenTask.workspaceRoot, workspace, { recursive: true, dereference: true }); cpSync(frozenTask.packageRoot, exposed, { recursive: true, dereference: true }); chmodDirectories(workspace, 0o755);
+  copyBoundedTree(frozenTask.workspaceRoot, workspace, { label: "frozen workspace" }); copyBoundedTree(frozenTask.packageRoot, exposed, { label: "frozen target package" }); chmodDirectories(workspace, 0o755);
   canonicalInside(workspace, runRoot, "workspace"); canonicalInside(exposed, runRoot, "target package");
   if (treeDigest(workspace) !== frozenTask.workspaceDigest || treeDigest(exposed) !== frozenTask.packageDigest) fail("arm inputs differ from frozen snapshot");
   const invariant = pairInvariantDigest(snapshot.base, snapshot.suiteSnapshotSha, task, frozenTask); const pairInvariant = invariant.facts; const pairInvariantSha = invariant.sha256;
@@ -704,23 +751,23 @@ function runArm(options, manifest, task, arm, snapshot) {
   try {
     assertPiIdentity(options.piIdentity);
     const common = ["--home", home, "--state-dir", state, "--json"];
-    const scan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan.json"));
-    const initialFind = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-before.json"));
+    const scan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan.json"), artifactBudget);
+    const initialFind = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-before.json"), artifactBudget);
     const target = initialFind.result.matches.find((match) => match.name === task.expected_skill); if (!target) fail(`preflight find did not return ${task.expected_skill}`);
-    const report = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-full.json"));
+    const report = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-full.json"), artifactBudget);
     const finding = report.result.findings.find((item) => item.affected_skill_ids?.includes(target.skill_id)); const evidenceId = finding?.evidence_ids?.[0]; if (!evidenceId) fail(`no Evidence supports ${task.expected_skill}`);
     const request = { schema_version: 1, scan_id: scan.result.snapshot_id, evidence_ids: [evidenceId], roster_changes: [{ agent: "pi", skill_id: target.skill_id, state: arm }] };
-    writeFileSync(join(artifacts, "plan-request.json"), `${JSON.stringify(request, null, 2)}\n`, { mode: 0o600 });
-    const plan = runJson(snapshot.paths.cli, common, ["plan", "--stdin"], JSON.stringify(request), join(artifacts, "plan.json"));
-    const apply = runJson(snapshot.paths.cli, common, ["apply", plan.result.plan_id], undefined, join(artifacts, "apply.json")); if (apply.result.verification !== "passed") fail("Apply did not verify");
-    const governedScan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan-governed.json"));
-    const governed = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-governed.json"));
+    boundedWriteFile(join(artifacts, "plan-request.json"), `${JSON.stringify(request, null, 2)}\n`, { mode: 0o600, flag: "wx", label: "plan request", budget: artifactBudget });
+    const plan = runJson(snapshot.paths.cli, common, ["plan", "--stdin"], JSON.stringify(request), join(artifacts, "plan.json"), artifactBudget);
+    const apply = runJson(snapshot.paths.cli, common, ["apply", plan.result.plan_id], undefined, join(artifacts, "apply.json"), artifactBudget); if (apply.result.verification !== "passed") fail("Apply did not verify");
+    const governedScan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan-governed.json"), artifactBudget);
+    const governed = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-governed.json"), artifactBudget);
     const governedTarget = governed.result.matches.find((match) => match.name === task.expected_skill); if (!governedTarget || governedTarget.roster_state !== arm) fail(`governed find did not prove ${arm}`);
-    const governedReport = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-governed.json"));
+    const governedReport = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-governed.json"), artifactBudget);
     const actualExposure = governedReport.result.default_exposure; const expectedExposure = arm === "on_demand" ? 0 : 1; if (actualExposure !== expectedExposure) fail(`default exposure ${actualExposure}, expected ${expectedExposure}`);
     const targetSkillPath = governedTarget.paths.find((path) => basename(path) === "SKILL.md"); if (!targetSkillPath || !existsSync(targetSkillPath)) fail("governed path is unreadable");
     const targetPackage = dirname(targetSkillPath); canonicalInside(targetPackage, runRoot, "governed target"); if (treeDigest(targetPackage) !== frozenTask.packageDigest) fail("governance changed target package input");
-    const status = runJson(snapshot.paths.cli, common, ["status"], undefined, join(artifacts, "status.json")); if (status.result.recovery_state !== "clear") fail("recovery required");
+    const status = runJson(snapshot.paths.cli, common, ["status"], undefined, join(artifacts, "status.json"), artifactBudget); if (status.result.recovery_state !== "clear") fail("recovery required");
     const commands = commandPolicies(task.post_load_permissions?.commands, targetPackage); const gateEventsPath = join(artifacts, "gate-events.jsonl"); const policyPath = join(runRoot, "gate-policy.json");
     const policy = {
       schema_version: 1, run_root: runRoot, suite_root: snapshot.suiteRoot, bootstrap_path: snapshot.paths.bootstrap, cwd: workspace, ledger_events_path: gateEventsPath, arm,
@@ -732,15 +779,15 @@ function runArm(options, manifest, task, arm, snapshot) {
       cli: { executable: snapshot.paths.cli, home, state_dir: state }, expected: { skill_name: task.expected_skill, roster_state: arm, task_sha256: sha(task.prompt) }, pre_load: { read_roots: [] },
       post_load: { read_roots: resolveNamedRoots(task.post_load_permissions?.read_roots, workspace, targetPackage), write_roots: resolveNamedRoots(task.post_load_permissions?.write_roots, workspace, targetPackage), write_paths: task.allowed_changed_paths.map((path) => safeDestination(workspace, path, "allowed write path")), contained_write_roots: (task.contained_write_roots ?? []).map((path) => safeDestination(workspace, path, "contained write root")), commands },
     };
-    writeFileSync(policyPath, `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600 });
+    boundedWriteFile(policyPath, `${JSON.stringify(policy, null, 2)}\n`, { mode: 0o600, flag: "wx", label: "gate policy" });
     const homeBefore = treeState(home); const workspaceBefore = treeState(workspace); const targetPackageBefore = treeState(targetPackage); const skillArg = arm === "core" ? targetSkillPath : snapshot.paths.bootstrap;
     const skillSurface = { no_skills: true, skill_argument_mode: arm === "core" ? "target_skill" : "bootstrap_router", skill_argument_sha256: sha(skillArg), skill_content_sha256: fileSha(skillArg) };
     const routeHelp = arm === "core" ? "The target Skill is already loaded for this Core control arm. Do not call SkillRoster Find." : "Follow the Bootstrap routing contract before reading workspace inputs or calling task commands.";
     const commandHelp = commands.length ? `${routeHelp}\nManifest-approved fixed command shapes:\n${commands.map(commandUsage).join("\n")}` : `${routeHelp}\nNo post-load command is approved for this task.`;
     copyPiConfig(options.piConfigSnapshot, config);
     const piTools = [...new Set([...(manifest.common.tools ?? []), "harness_command"])];
-    const piResult = runPiProcess(options.piIdentity.executable, ["--mode", "json", "--print", "--provider", manifest.model.split("/")[0], "--model", manifest.model, "--session-dir", sessions, "--no-extensions", "--extension", snapshot.paths.gate, "--no-context-files", "--no-skills", "--skill", skillArg, "--no-prompt-templates", "--no-themes", "--tools", piTools.join(","), "--approve", "--offline", "--append-system-prompt", commandHelp, task.prompt], { cwd: workspace, env: isolatedPiEnvironment(home, config, sessions, policyPath, piTmp), timeout: taskTimeoutMs, maxBuffer: 128 * 1024 * 1024 });
-    writeFileSync(join(artifacts, "pi-transcript.jsonl"), piResult.stdout, { mode: 0o600 }); writeFileSync(join(artifacts, "pi-stderr.txt"), piResult.stderr, { mode: 0o600 });
+    const piResult = runPiProcess(options.piIdentity.executable, ["--mode", "json", "--print", "--provider", manifest.model.split("/")[0], "--model", manifest.model, "--session-dir", sessions, "--no-extensions", "--extension", snapshot.paths.gate, "--no-context-files", "--no-skills", "--skill", skillArg, "--no-prompt-templates", "--no-themes", "--tools", piTools.join(","), "--approve", "--offline", "--append-system-prompt", commandHelp, task.prompt], { cwd: workspace, env: isolatedPiEnvironment(home, config, sessions, policyPath, piTmp), timeout: taskTimeoutMs, maxBuffer: 64 * 1024 * 1024 });
+    boundedWriteFile(join(artifacts, "pi-transcript.jsonl"), piResult.stdout, { mode: 0o600, label: "Pi transcript", budget: artifactBudget }); boundedWriteFile(join(artifacts, "pi-stderr.txt"), piResult.stderr, { mode: 0o600, label: "Pi stderr", budget: artifactBudget });
     const parsedGateEvents = parseGateEvents(gateEventsPath); const events = parsedGateEvents.events; const gateEventsEvidence = gateEventsBinding(gateEventsPath); const gateIntegrityViolations = gateEventIntegrity(events, parsedGateEvents.errors, arm, parsedGateEvents.source);
     const policySummary = summarizePolicyDenials(events); const policyDenials = policySummary.policy_denials; const protocolDenials = events.filter((event) => event.classification === "protocol_denial"); const gateUnsafe = events.filter((event) => event.classification === "safety_violation");
     const workspaceAssessment = assessWorkspaceChanges(workspaceBefore, treeState(workspace), Object.keys(task.workspace_files ?? {}), task.allowed_changed_paths ?? []);
@@ -759,7 +806,7 @@ function runArm(options, manifest, task, arm, snapshot) {
       execution: { ...outcomes, ...piProcessFacts(piResult), timeout_ms: taskTimeoutMs, transcript_completion: transcriptCompletion, transcript_sha256: sha(piResult.stdout), final_text_sha256: sha(extractFinalText(piResult.stdout)), skill_surface: { ...skillSurface, tools_sha256: sha(piTools.join(",")) }, visual_review: acceptance.visual_review, visual_evidence_scope: "artifact_only", acceptance_boundary: acceptance, gate_events: gateEventsEvidence, protocol_events: events.filter((event) => ["retrieval_succeeded", "retrieval_failed", "target_skill_loaded"].includes(event.kind)), command_events: events.filter((event) => ["command", "command_failed"].includes(event.kind)), command_receipt: commandReceipt, policy_outcome: policySummary.policy_outcome, contained_denial_count: policySummary.contained_denial_count, contained_denials: policySummary.contained_denials, policy_denials: policyDenials, protocol_denials: protocolDenials, safety_violations: safetyViolations, oracle: oracleRecord, workspace_changes: workspaceAssessment, target_package_mutations: targetPackageMutations, cli_event_artifacts: Object.fromEntries(cliArtifacts.map((name) => [name, fileSha(join(artifacts, name))])) },
       trusted_tcb: ["pi_runtime", "frozen_runner", "frozen_gate", "frozen_skillroster", "manifest_allowlisted_executables"], artifacts: { directory: "artifacts", transcript: "artifacts/pi-transcript.jsonl" },
     };
-    const ledgerPath = join(runRoot, "ledger.json"); writeFileSync(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600 }); chmodSync(ledgerPath, 0o444);
+    const ledgerPath = join(runRoot, "ledger.json"); boundedWriteFile(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`, { mode: 0o600, label: "arm ledger" }); chmodSync(ledgerPath, 0o444);
     return { runRoot, ledger };
   } finally { cleanupPrivateConfig(config, runRoot); cleanupPrivateConfig(piTmp, runRoot); }
 }
@@ -776,11 +823,12 @@ export function promptContainsForbiddenTerm(prompt, terms) {
 }
 
 function main() {
-  const options = parseArgs(process.argv.slice(2)); const manifestBytes = readFileSync(options.manifest); const manifest = validateManifest(JSON.parse(manifestBytes));
+  const options = parseArgs(process.argv.slice(2)); const manifestBytes = boundedReadFile(options.manifest, { label: "manifest" }); const manifest = validateManifest(JSON.parse(manifestBytes));
+  validateTimeoutOverride(options, manifest);
   const cliIdentity = basename(options.cli).replace(/\.exe$/iu, ""); for (const task of manifest.tasks) { const forbidden = promptContainsForbiddenTerm(task.prompt, [...(manifest.common.forbidden_prompt_terms ?? []), task.expected_skill, cliIdentity]); if (forbidden) fail(`${task.id} leaks forbidden prompt identity: ${forbidden}`); }
   if (options.generateSeal) { const generated = generateSealContract(options, manifest, manifestBytes); process.stdout.write(`${JSON.stringify({ schema_version: 1, seal_contract: generated.output, source_revision: generated.contract.source_revision }, null, 2)}\n`); return; }
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`task not found: ${options.task}`);
-  if (manifest.seal_contract) { const path = safeDestination(dirname(options.manifest), manifest.seal_contract, "seal contract"); if (!existsSync(path)) fail("sealed holdout contract is missing"); options.sealContract = JSON.parse(readFileSync(path, "utf8")); }
+  if (manifest.seal_contract) { const path = safeDestination(dirname(options.manifest), manifest.seal_contract, "seal contract"); if (!existsSync(path)) fail("sealed holdout contract is missing"); options.sealContract = JSON.parse(boundedReadFile(path, { encoding: "utf8", label: "seal contract" })); }
   options.piIdentity = readPiIdentity(resolveExecutable(options.pi)); options.cliSourceRevision = readSourceRevision(); options.armSchedule = buildArmSchedule(tasks, options.arm, manifest.common.randomize_arm_order, manifest.arm_schedule_seed); options.loadPiConfig = () => snapshotPiConfig(options.piConfigSource, manifest.model);
   const completeSelection = options.task === "all" && options.arm === "both"; const snapshot = freezeSuite(options, manifest, manifestBytes, manifest.tasks); const results = [];
   for (const task of tasks) {
@@ -793,10 +841,10 @@ function main() {
     const pair = results.filter((result) => result.task === task.id && result.evaluation_status === "evaluated"); if (pair.length === 2 && pair[0].pair_invariant_sha256 !== pair[1].pair_invariant_sha256) fail(`pair invariant drifted for ${task.id}`);
   }
   applyPairInvalidation(results);
-  const aggregate = aggregateSuite(results, manifest.tasks.map((task) => task.id), completeSelection, manifest.aggregate_gate); const official = OFFICIAL_SUITE_POLICIES.has(manifest.suite_id); const receipt = { schema_version: 2, suite_root: snapshot.suiteRoot, suite_snapshot_sha256: snapshot.suiteSnapshotSha, arm_schedule: options.armSchedule, run_mode: options.diagnostic ? "diagnostic" : "formal", formal_eligible: official && completeSelection && !options.diagnostic, acceptance_boundary: { visual_review: "not_evaluated", evidence_scope: "artifact_only" }, results, aggregate };
-  const receiptPath = join(snapshot.suiteRoot, "suite-receipt.json"); writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o444 }); process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`); process.exitCode = aggregateExitCode(aggregate, results, { official, diagnostic: options.diagnostic, complete: completeSelection });
+  const aggregate = aggregateSuite(results, manifest.tasks.map((task) => task.id), completeSelection, manifest.aggregate_gate); const official = OFFICIAL_SUITE_POLICIES.has(manifest.suite_id); const receipt = { schema_version: 2, suite_root: snapshot.suiteRoot, suite_snapshot_sha256: snapshot.suiteSnapshotSha, arm_schedule: options.armSchedule, run_mode: options.diagnostic ? "diagnostic" : "formal", formal_eligible: official && completeSelection && !options.diagnostic && !options.timeoutOverridden, timeout_override_ms: options.timeoutOverridden ? options.timeoutMs : null, acceptance_boundary: { visual_review: "not_evaluated", evidence_scope: "artifact_only" }, results, aggregate };
+  const receiptPath = join(snapshot.suiteRoot, "suite-receipt.json"); boundedWriteFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o444, label: "suite receipt" }); process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`); process.exitCode = aggregateExitCode(aggregate, results, { official, diagnostic: options.diagnostic, complete: completeSelection });
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
+if (process.argv[1] && resolve(process.argv[1]) === resolve(RUNNER_PATH)) {
   try { main(); } catch (error) { process.stderr.write(`harness_error: ${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; }
 }

@@ -1,7 +1,8 @@
-import { appendFileSync, existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
+import { boundedAppendFile, boundedReadFile, GATE_LEDGER_MAX_BYTES } from "./bounds.mjs";
 
 type RootMode = "read" | "write";
 
@@ -201,6 +202,10 @@ export function processFailureType(error: any): string {
   return typeof error?.failureType === "string" ? error.failureType : "spawn_error";
 }
 
+export function appendGateLedgerLine(path: string, line: string): void {
+  boundedAppendFile(path, line, { encoding: "utf8", mode: 0o600, label: "gate event ledger", maxBytes: GATE_LEDGER_MAX_BYTES });
+}
+
 export function commandFailureDetail(name: string, failureType: string, stage: "argument_validation" | "execution", validatedArgs: string[] | null): Record<string, unknown> {
   return { name, failure_type: failureType, stage, args_sha256: validatedArgs === null ? null : validatedArgs.map(digest) };
 }
@@ -337,7 +342,7 @@ export function architectureGraphFacts(spec: any): ArchitectureGraphFacts {
 export function validatedArchitectureEvidence(stdout: string, sourcePath: string): { validator_receipt_sha256: string; graph_facts: ArchitectureGraphFacts } {
   let receipt: any; try { receipt = JSON.parse(stdout); } catch { throw new Error("validator stdout is not a JSON receipt"); }
   if (receipt?.schemaVersion !== 1 || receipt?.ok !== true || receipt?.command !== "validate" || canonicalCandidate(receipt?.input ?? "") !== canonicalCandidate(sourcePath)) throw new Error("validator receipt does not bind the validated source");
-  return { validator_receipt_sha256: digest(stdout), graph_facts: architectureGraphFacts(JSON.parse(readFileSync(sourcePath, "utf8"))) };
+  return { validator_receipt_sha256: digest(stdout), graph_facts: architectureGraphFacts(JSON.parse(boundedReadFile(sourcePath, { encoding: "utf8", label: "architecture source" }))) };
 }
 
 export function retrievalFailureType(taskMismatch: boolean, selectedValid: boolean): "task_mismatch" | "wrong_result" | null {
@@ -421,7 +426,7 @@ export function isSafePreRouteWriteDenial(
 export default function registerGate(pi: any): void {
   const policyPath = process.env.SKILLROSTER_PI_GATE_POLICY;
   if (!policyPath) throw new Error("SKILLROSTER_PI_GATE_POLICY is required");
-  const policy = JSON.parse(readFileSync(policyPath, "utf8")) as GatePolicy;
+  const policy = JSON.parse(boundedReadFile(policyPath, { encoding: "utf8", label: "gate policy" })) as GatePolicy;
   if (policy.schema_version !== 1) throw new Error("unsupported gate policy schema");
   if (!Number.isSafeInteger(policy.command_timeout_ms) || policy.command_timeout_ms < 1000) throw new Error("invalid command timeout");
   if (!Number.isSafeInteger(policy.command_output_max_bytes) || policy.command_output_max_bytes < 1024 || policy.command_output_max_bytes > 16 * 1024 * 1024) throw new Error("invalid command output cap");
@@ -435,11 +440,7 @@ export default function registerGate(pi: any): void {
     returnedSkillPaths: [],
   };
   const event = (kind: string, detail: Record<string, unknown> = {}) => {
-    appendFileSync(
-      policy.ledger_events_path,
-      `${JSON.stringify({ schema_version: 1, kind, stage: state.stage, ...detail })}\n`,
-      { encoding: "utf8", mode: 0o600 },
-    );
+    appendGateLedgerLine(policy.ledger_events_path, `${JSON.stringify({ schema_version: 1, kind, stage: state.stage, ...detail })}\n`);
   };
   const denial = (kind: string, detail: Record<string, unknown> = {}) =>
     event(kind, { classification: "policy_denial", ...detail });
@@ -581,7 +582,7 @@ export default function registerGate(pi: any): void {
           event("command_failed", commandFailureDetail(command.name, "command_chain_path_mismatch", "argument_validation", args));
           throw new Error("command path does not match the frozen oracle chain");
         }
-        sourceDigest = digest(readFileSync(expectedSource));
+        sourceDigest = digest(boundedReadFile(expectedSource, { label: "command source" }));
         if (command.name === "deliver" && (!state.validatedCommand || state.validatedCommand.source_path !== expectedSource || state.validatedCommand.source_sha256 !== sourceDigest)) {
           protocolDenial("command_blocked", { failure_type: "validation_receipt_missing", contract_violation: true, name: command.name });
           event("command_failed", commandFailureDetail(command.name, "validation_receipt_missing", "argument_validation", args));
@@ -609,7 +610,7 @@ export default function registerGate(pi: any): void {
           event("command_failed", commandFailureDetail(command.name, "artifact_missing", "execution", args));
           throw new Error("deliver did not create the frozen oracle artifact");
         }
-        const artifactDigest = digest(readFileSync(artifactPath)); const chainSha = digest(`${state.validatedCommand.chain_sha256}\0deliver\0${artifactPath}\0${artifactDigest}`);
+        const artifactDigest = digest(boundedReadFile(artifactPath, { label: "delivered artifact" })); const chainSha = digest(`${state.validatedCommand.chain_sha256}\0deliver\0${artifactPath}\0${artifactDigest}`);
         Object.assign(commandDetail, { source_path_sha256: digest(state.validatedCommand.source_path), source_sha256: sourceDigest, artifact_path_sha256: digest(artifactPath), artifact_sha256: artifactDigest, validation_receipt_sha256: state.validatedCommand.chain_sha256, receipt_chain_sha256: chainSha });
       }
       event("command", commandDetail);

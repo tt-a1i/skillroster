@@ -81,6 +81,19 @@ jobs:
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
+      - name: Set up Node.js 24 for harness checks
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Check Pi cold-routing harness
+        shell: bash
+        run: |
+          node --check tests/harness/pi-cold-routing/bounds.mjs
+          node --check tests/harness/pi-cold-routing/runner.mjs
+          node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
+          node --test tests/harness/pi-cold-routing/*.test.mjs
+
   portability:
     name: ${{ matrix.name }}
     needs: changes
@@ -111,6 +124,21 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
+
+      - name: Set up Node.js 24 for harness checks
+        if: runner.os == 'Windows'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Check Pi cold-routing harness
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          node --check tests/harness/pi-cold-routing/bounds.mjs
+          node --check tests/harness/pi-cold-routing/runner.mjs
+          node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
+          node --test tests/harness/pi-cold-routing/*.test.mjs
 
   gate:
     name: CI gate

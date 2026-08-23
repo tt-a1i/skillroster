@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { acceptanceBoundary, aggregateExitCode, aggregateSuite, applyPairInvalidation, assertNoBoundPathDrift, assessCommandReceipt, assessTranscriptCompletion, assessWorkspaceChanges, buildArmSchedule, classifyExecutionFailure, classifyPiTermination, cleanupPrivateConfig, commandUsage, copyPiConfig, deriveOutcomes, effectiveTaskTimeout, evaluateOracle, evaluateTopologyContract, freezeSuite, gateEventIntegrity, gateEventsBinding, gitBoundTreeDigest, invalidateOnCoreFailure, oracleEvidenceRecord, pairInvariantDigest, piProcessFacts, promptContainsForbiddenTerm, sealPayloadDigest, snapshotPiConfig, summarizePolicyDenials, validateManifest, verifyFirstSealBlob, verifySealContract } from "./runner.mjs";
+import { acceptanceBoundary, aggregateExitCode, aggregateSuite, applyPairInvalidation, assertNoBoundPathDrift, assessCommandReceipt, assessTranscriptCompletion, assessWorkspaceChanges, buildArmSchedule, classifyExecutionFailure, classifyPiTermination, cleanupPrivateConfig, commandUsage, copyPiConfig, deriveOutcomes, effectiveTaskTimeout, evaluateOracle, evaluateTopologyContract, freezeSuite, gateEventIntegrity, gateEventsBinding, gitBoundTreeDigest, invalidateOnCoreFailure, modulePathFromUrl, oracleEvidenceRecord, pairInvariantDigest, parseArgs, parseGateEvents, piProcessFacts, planWorkspaceInputs, promptContainsForbiddenTerm, sealPayloadDigest, snapshotPiConfig, summarizePolicyDenials, validateManifest, validateTimeoutOverride, verifyFirstSealBlob, verifySealContract, writeWorkspaceInputs } from "./runner.mjs";
 
 const taskIds = ["a", "b", "c", "d"];
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -328,6 +329,52 @@ test("task timeout is frozen per task with a 300000 default", () => {
   task.timeout_ms = 900001; assert.throws(() => validateManifest(manifest), /timeout_ms/u);
 });
 
+test("workspace inputs are fully planned before destination mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "skillroster-workspace-plan-")); const absent = join(root, "absent");
+  const task = (workspaceFiles) => ({ id: "workspace-task", workspace_files: workspaceFiles });
+  assert.throws(() => writeWorkspaceInputs(task({ "a": "file", "a/b.txt": "child" }), absent), /prefix conflict/u);
+  assert.equal(existsSync(absent), false);
+
+  const empty = join(root, "empty"); mkdirSync(empty);
+  assert.throws(() => writeWorkspaceInputs(task({ "same/path.txt": "one", "same\\path.txt": "two" }), empty), /collide/u);
+  assert.deepEqual(readdirSync(empty), []);
+  assert.throws(() => planWorkspaceInputs(task({ [`${"d/".repeat(32)}file.txt`]: "deep" })), /depth/u);
+
+  const tooMany = Object.fromEntries(Array.from({ length: 10_001 }, (_, index) => [`files/${index}.txt`, "x"]));
+  assert.throws(() => planWorkspaceInputs(task(tooMany)), /file count/u);
+  const tooManyMaterializedEntries = Object.fromEntries(Array.from({ length: 5_001 }, (_, index) => [`directory-${index}/file.txt`, "x"]));
+  assert.throws(() => planWorkspaceInputs(task(tooManyMaterializedEntries)), /materialized entry count/u);
+  const oversized = "x".repeat(64 * 1024 * 1024 + 1);
+  assert.throws(() => planWorkspaceInputs(task({ "large.txt": oversized })), /workspace file exceeds/u);
+  const fortyMiB = "x".repeat(40 * 1024 * 1024);
+  assert.throws(() => planWorkspaceInputs(task(Object.fromEntries(Array.from({ length: 7 }, (_, index) => [`${index}.txt`, fortyMiB])))), /workspace total exceeds/u);
+});
+
+test("official formal suites reject timeout overrides while bounded diagnostics are ineligible", () => {
+  const formal = parseArgs(["--timeout-ms", "600000"]);
+  assert.equal(formal.timeoutOverridden, true);
+  assert.throws(() => validateTimeoutOverride(formal, { suite_id: "cold-routing-training-v10" }), /formal suites forbid/u);
+  const diagnostic = parseArgs(["--diagnostic", "--timeout-ms", "900000"]);
+  assert.deepEqual(validateTimeoutOverride(diagnostic, { suite_id: "cold-routing-holdout-v2" }), { formal_eligible: false });
+  assert.throws(() => parseArgs(["--diagnostic", "--timeout-ms", "900001"]), /between 1000 and 900000/u);
+  const frozen = parseArgs([]);
+  assert.equal(frozen.timeoutOverridden, false);
+  assert.deepEqual(validateTimeoutOverride(frozen, { suite_id: "cold-routing-holdout-v2" }), { formal_eligible: true });
+});
+
+test("module file URLs decode spaces and reserved path characters portably", () => {
+  const path = join(tmpdir(), "skillroster harness # percent %.mjs");
+  assert.equal(modulePathFromUrl(pathToFileURL(path)), path);
+});
+
+test("oracle and gate-ledger full reads fail closed at the shared single-file cap", () => {
+  const root = mkdtempSync(join(tmpdir(), "skillroster-full-read-cap-"));
+  const output = join(root, "output.html"); writeFileSync(output, ""); truncateSync(output, 65 * 1024 * 1024);
+  assert.throws(() => evaluateOracle({ type: "html", path: "output.html" }, root, new Set(), ["output.html"]), /bounded I\/O policy/u);
+  const events = join(root, "events.jsonl"); writeFileSync(events, ""); truncateSync(events, 65 * 1024 * 1024);
+  assert.throws(() => gateEventsBinding(events), /bounded I\/O policy/u);
+});
+
 test("redaction oracle checks only public seeds for public facts and all changed files for leaks", () => {
   const root = mkdtempSync(join(tmpdir(), "skillroster-oracle-")); mkdirSync(join(root, "outputs"));
   writeFileSync(join(root, "outputs/public.md"), "Windows CRLF");
@@ -480,6 +527,9 @@ test("gate event evidence binds full bytes or an explicit missing sentinel", () 
   const missing = gateEventsBinding(path); assert.equal(missing.source, "missing_sentinel"); assert.equal(missing.sha256.length, 64);
   writeFileSync(path, '{"kind":"command"}\n{"kind":"command_failed"}\n');
   const present = gateEventsBinding(path); assert.equal(present.source, "file"); assert.equal(present.sha256.length, 64); assert.notEqual(present.sha256, missing.sha256);
+  truncateSync(path, 8 * 1024 * 1024 + 1);
+  assert.throws(() => gateEventsBinding(path), /single file/u);
+  assert.throws(() => parseGateEvents(path), /single file/u);
 });
 
 test("gate event integrity fails closed for missing, empty, duplicate, schema, arm, and malformed evidence", () => {

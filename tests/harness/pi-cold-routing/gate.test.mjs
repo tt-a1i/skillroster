@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import registerGate, { architectureGraphFacts, boundedCommandDiagnostics, canonicalPathInRoots, canonicalPolicyPathInRun, classifyContainedWriteDenial, commandArgumentFailureClassification, commandFailureDetail, containsUnquotedShellSyntax, deniedFileAttemptClassification, findParseFailureClassification, isExactInjectedBootstrapPath, isRouteOrderViolation, isSafePreRouteWriteDenial, parseFindCommand, processFailureType, retrievalFailureType, retrievalStageAfter, runAllowlistedProcess, validateCommandArguments, validatedArchitectureEvidence, violatesHintContract } from "./gate.ts";
+import registerGate, { appendGateLedgerLine, architectureGraphFacts, boundedCommandDiagnostics, canonicalPathInRoots, canonicalPolicyPathInRun, classifyContainedWriteDenial, commandArgumentFailureClassification, commandFailureDetail, containsUnquotedShellSyntax, deniedFileAttemptClassification, findParseFailureClassification, isExactInjectedBootstrapPath, isRouteOrderViolation, isSafePreRouteWriteDenial, parseFindCommand, processFailureType, retrievalFailureType, retrievalStageAfter, runAllowlistedProcess, validateCommandArguments, validatedArchitectureEvidence, violatesHintContract } from "./gate.ts";
 
 test("read gate rejects traversal and symlink escapes", () => {
   const root = mkdtempSync(join(tmpdir(), "skillroster-gate-"));
@@ -85,6 +85,12 @@ test("live file hook records a typed contained denial while exact output remains
   assert(events.some((event) => event.kind === "file_tool" && event.tool === "write"));
   assert(events.some((event) => event.kind === "file_tool_blocked" && event.classification === "policy_denial" && event.failure_type === "output_path_denied" && event.contained === true));
   assert(!events.some((event) => event.classification === "safety_violation"));
+});
+
+test("gate ledger append path enforces its dedicated eight MiB cap", () => {
+  const root = mkdtempSync(join(tmpdir(), "skillroster-gate-ledger-cap-")); const ledger = join(root, "events.jsonl");
+  appendGateLedgerLine(ledger, "x".repeat(8 * 1024 * 1024));
+  assert.throws(() => appendGateLedgerLine(ledger, "x"), /total bytes/u);
 });
 
 test("policy paths allow a symlink-aliased run root but reject real escapes", () => {
