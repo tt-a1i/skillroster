@@ -1,6 +1,7 @@
 # Pi cold-routing canary ledger
 
-Date: 2026-08-24 (Asia/Shanghai)  
+Date: 2026-08-24 (Asia/Shanghai)
+
 Scope: diagnostic canary for Issues #129 and #130; not the full paired pilot.
 
 ## Frozen inputs
