@@ -2124,7 +2124,7 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
     fs::write(skill.join("SKILL.md"), "---\nname: example\n---\nbody\n").unwrap();
     fs::write(
         &session,
-        "{\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}\n",
+        "{\"timestamp\":\"1970-01-01T00:00:10Z\",\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}\n",
     )
     .unwrap();
     fs::File::options()
@@ -2158,7 +2158,14 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
     ));
     let first: Value = serde_json::from_slice(&fs::read(&first_export).unwrap()).unwrap();
     assert_eq!(first["data"]["usage_events"].as_array().unwrap().len(), 1);
+    assert_eq!(first["data"]["usage_events"][0]["occurred_at"], 10);
 
+    fs::File::options()
+        .write(true)
+        .open(&session)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(15)))
+        .unwrap();
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let second_export = temp.path().join("second-export.json");
     json_output(&run(
@@ -2180,7 +2187,7 @@ fn unchanged_rescans_do_not_multiply_exported_usage_observations() {
     let mut session_file = OpenOptions::new().append(true).open(&session).unwrap();
     writeln!(
         session_file,
-        "{{\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}}"
+        "{{\"timestamp\":\"1970-01-01T00:00:20Z\",\"type\":\"invoke_skill\",\"invoked_skill\":\"example\"}}"
     )
     .unwrap();
     session_file

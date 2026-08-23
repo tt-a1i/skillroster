@@ -1,5 +1,6 @@
 use crate::harness::{AgentKind, SessionSignal, known_agent_roots, session_record_observations};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1541,6 +1542,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     break;
                 }
                 lines_observed += physical_lines;
+                let record_timestamp = session_record_timestamp(&line);
                 let observations = session_record_observations(agent, &line);
                 if !observations.is_empty() {
                     let mut seen_event_skill_stages = BTreeSet::new();
@@ -1583,11 +1585,16 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                                 stage,
                                 quality,
                                 event_count: 0,
-                                first_seen_unix: timestamp,
-                                last_seen_unix: timestamp,
+                                first_seen_unix: None,
+                                last_seen_unix: None,
                                 source_path_digest: source_path_digest.clone(),
                             });
                             event.event_count += 1;
+                            update_window(
+                                &mut event.first_seen_unix,
+                                &mut event.last_seen_unix,
+                                record_timestamp,
+                            );
                         }
                     }
                     continue;
@@ -1605,11 +1612,16 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                         stage,
                         quality,
                         event_count: 0,
-                        first_seen_unix: timestamp,
-                        last_seen_unix: timestamp,
+                        first_seen_unix: None,
+                        last_seen_unix: None,
                         source_path_digest: source_path_digest.clone(),
                     });
                     event.event_count += 1;
+                    update_window(
+                        &mut event.first_seen_unix,
+                        &mut event.last_seen_unix,
+                        record_timestamp,
+                    );
                 }
             }
             if file_partially_observed {
@@ -1821,6 +1833,36 @@ fn update_window(first: &mut Option<u64>, last: &mut Option<u64>, timestamp: Opt
     let Some(timestamp) = timestamp else { return };
     *first = Some(first.map_or(timestamp, |current| current.min(timestamp)));
     *last = Some(last.map_or(timestamp, |current| current.max(timestamp)));
+}
+
+fn session_record_timestamp(record: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(record).ok()?;
+    let object = value.as_object()?;
+    ["timestamp", "created_at", "createdAt", "time"]
+        .into_iter()
+        .find_map(|field| object.get(field).and_then(timestamp_value_unix))
+}
+
+fn timestamp_value_unix(value: &serde_json::Value) -> Option<u64> {
+    if let Some(value) = value.as_u64() {
+        return Some(normalize_unix_timestamp(value));
+    }
+    let value = value.as_str()?;
+    if let Ok(timestamp) = value.parse::<u64>() {
+        return Some(normalize_unix_timestamp(timestamp));
+    }
+    DateTime::parse_from_rfc3339(value)
+        .ok()?
+        .timestamp()
+        .try_into()
+        .ok()
+}
+
+fn normalize_unix_timestamp(mut timestamp: u64) -> u64 {
+    while timestamp >= 100_000_000_000 {
+        timestamp /= 1_000;
+    }
+    timestamp
 }
 
 pub fn skill_search_text(skill: &ScannedSkill) -> String {

@@ -238,6 +238,10 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 - Usage Observations have a stable identity across Scans. An unchanged rescan
   does not create another raw observation. A changed bounded source window is
   recorded as a new observation, not inferred as an additive event delta.
+- Usage event windows use timestamps carried by the session record. Session
+  file modification times describe coverage only and must not refresh old
+  Skill events; when a record has no trustworthy timestamp, event time remains
+  unknown.
 - Older usage is reduced to the maximum observed count per source and month.
   These maxima are conservative source-window facts, not cumulative totals.
 - Pre-v9 monthly rows cannot be safely reconstructed by source. They are
