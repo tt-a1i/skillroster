@@ -84,14 +84,16 @@ pub fn run(cli: Cli) -> Result<Output> {
                     false,
                     "recovery_required",
                 )]
-            } else {
+            } else if result["latest_snapshot_id"].is_null() {
                 vec![action(
                     "scan",
                     &["scan", "--json"],
                     false,
                     false,
-                    "refresh_facts",
+                    "snapshot_required",
                 )]
+            } else {
+                Vec::new()
             };
             ("status", result, vec![], actions)
         }
