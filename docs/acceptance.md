@@ -396,6 +396,29 @@ The new binary also read a v1.8.16 stored Plan without complete-selection data
 and preserved its aggregate evidence. Every inspection and Plan reported
 `files_changed=false`; no Apply was run and no Agent file changed.
 
+The v1.8.18 same-Snapshot A/B reused the immutable official v1.8.17 Snapshot
+`scan_000000000000407f18ce4a370d209368` and large-Roster Finding
+`finding_000000000000414818ce4a39aa046681`; it did not rescan. The stored old
+budget-10 Plan selected four positive-signal Core entries and 36 stable
+fallbacks. The new algorithm selected the same 40-entry budget as four
+target-Agent entries, 36 explicitly attributed cross-Agent entries, and zero
+fallbacks. Exact-ID comparison replaced 6, 10, 10, and 10 fallbacks for Codex,
+Claude, Pi, and Hermes respectively. Both Plans bind the same Snapshot and
+Finding and report `files_changed=false`; no Apply was run. The new Plan stays
+typed `cross_agent_dominated_core_selection` with `review_required: true`.
+
+A separate current-home sensitivity run used four explicitly reviewed
+canonical source roots: 231 independent Skills, 871 placements including those
+read-only sources, 548 default exposures, and five sampled Agent session roots.
+Its budget-10 Plan selected two target-Agent, 14 cross-Agent, and 24 fallback
+Core entries, so fallback still dominated all four affected Rosters. Every
+cross-Agent selection persisted its source Agent IDs and
+`evidence_scope: cross_agent`; no name-based transfer occurred. The Plan reduced
+proposed exposure from 548 to 82, reported zero canonical deletions, and kept
+`files_changed=false`. No Apply was run. The ordinary 60-, 80-, and 120-column
+views preserved `target Agent`, `cross-Agent`, and `elsewhere loaded` while
+shortening long Skill names first.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
