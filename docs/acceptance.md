@@ -419,6 +419,26 @@ proposed exposure from 548 to 82, reported zero canonical deletions, and kept
 views preserved `target Agent`, `cross-Agent`, and `elsewhere loaded` while
 shortening long Skill names first.
 
+The v1.8.19 Agent decision-loop dogfood used an isolated state directory and
+four explicitly reviewed source roots against the current real home. Its
+read-only Snapshot contained 236 independent Skills, 763 placements, 564
+default exposures, and 173 Findings. The Usage Finding first page now placed
+all eight coverage records and 35 observed non-Exposure rows before inferred
+Exposure, omitted the invalid Plan action, and replayed its full-detail next
+page with the same home and state context. The suggested unfiltered Findings
+page improved from three titles across three categories to all eleven rollup
+titles across five categories; nine pages still enumerated exactly 173 unique
+Finding IDs.
+
+The same Snapshot exposed eight large-Roster source-dependency pairs. The
+decision view grouped them into the two actual Skills, `repo-learning` and
+`ego-browser`, named all four affected Agents, and returned the two dependent
+non-Agent source paths. It exposed confirmation-gated Core protection only
+after the production per-Agent Recommendation constraints accepted the
+complete identity set; a 100-dependent-Skill plus bootstrap regression proves
+an over-budget set is typed unavailable and has no Plan template. No choice was
+made, no Apply ran, and no real Agent file changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do
