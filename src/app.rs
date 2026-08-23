@@ -1705,9 +1705,14 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 finding_library_planning(&stored, &report.scan_id, &latest_scan_id, &scan)
             {
                 object.insert("planning".into(), planning);
-            } else if let Some(planning) =
-                finding_roster_planning(store, &stored, &report.scan_id, &latest_scan_id, &scan)?
-            {
+            } else if let Some(planning) = finding_roster_planning(
+                store,
+                &stored,
+                &report.scan_id,
+                &latest_scan_id,
+                &scan,
+                full,
+            )? {
                 object.insert("planning".into(), planning);
             }
             add_same_name_resolution(object, &scan);
@@ -2383,12 +2388,97 @@ fn finding_library_planning(
     }))
 }
 
+#[derive(Default)]
+struct BlockedSkillFacts {
+    name: String,
+    agents: BTreeSet<String>,
+    reasons: BTreeSet<&'static str>,
+    observed_source_targets: BTreeSet<String>,
+    dependent_source_paths: BTreeSet<String>,
+    dependent_placement_ids: BTreeSet<String>,
+}
+
+struct BlockedSkillPlanning {
+    count: usize,
+    items: Vec<Value>,
+    truncated: bool,
+    displayed_skill_ids: Vec<String>,
+    displayed_dependent_source_paths: Vec<String>,
+}
+
+fn blocked_skill_planning(
+    exclusions: &[crate::roster_plan::RosterChangeExclusion],
+    full: bool,
+) -> BlockedSkillPlanning {
+    let mut by_skill = BTreeMap::<String, BlockedSkillFacts>::new();
+    for exclusion in exclusions {
+        let facts = by_skill.entry(exclusion.skill_id.clone()).or_default();
+        facts.name = exclusion.name.clone();
+        facts.agents.insert(exclusion.agent.clone());
+        facts.reasons.insert(exclusion.reason);
+        if let Some(target) = &exclusion.observed_source_target {
+            facts
+                .observed_source_targets
+                .insert(target.display().to_string());
+        }
+        if let Some(crate::roster_plan::RosterSafetyBlocker::DependentSource {
+            placement_ids,
+            paths,
+            ..
+        }) = &exclusion.safety_blocker
+        {
+            facts
+                .dependent_placement_ids
+                .extend(placement_ids.iter().cloned());
+            facts
+                .dependent_source_paths
+                .extend(paths.iter().map(|path| path.display().to_string()));
+        }
+    }
+
+    let count = by_skill.len();
+    let limit = if full { usize::MAX } else { 5 };
+    let selected = by_skill.into_iter().take(limit).collect::<Vec<_>>();
+    let displayed_skill_ids = selected
+        .iter()
+        .map(|(skill_id, _)| skill_id.clone())
+        .collect::<Vec<_>>();
+    let displayed_dependent_source_paths = selected
+        .iter()
+        .flat_map(|(_, facts)| facts.dependent_source_paths.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let items = selected
+        .into_iter()
+        .map(|(skill_id, facts)| {
+            json!({
+                "skill_id": skill_id,
+                "name": facts.name,
+                "agents": facts.agents,
+                "reasons": facts.reasons,
+                "observed_source_targets": facts.observed_source_targets,
+                "dependent_source_paths": facts.dependent_source_paths,
+                "dependent_placement_ids": facts.dependent_placement_ids
+            })
+        })
+        .collect();
+    BlockedSkillPlanning {
+        count,
+        items,
+        truncated: count > limit,
+        displayed_skill_ids,
+        displayed_dependent_source_paths,
+    }
+}
+
 fn finding_roster_planning(
     store: &StateStore,
     finding: &FindingRecord,
     scan_id: &ScanId,
     latest_scan_id: &ScanId,
     scan: &ScanResult,
+    full: bool,
 ) -> Result<Option<Value>> {
     if !crate::roster_recommendation::is_large_roster_finding(finding) {
         return Ok(None);
@@ -2471,12 +2561,15 @@ fn finding_roster_planning(
             json!({
                 "agent": exclusion.agent,
                 "skill_id": exclusion.skill_id,
+                "name": exclusion.name,
                 "reason": exclusion.reason,
-                "state": "unchanged"
+                "state": "unchanged",
+                "observed_source_target": exclusion.observed_source_target
             })
         })
         .collect::<Vec<_>>();
     if blocked_change_count > 0 {
+        let blocked_skills = blocked_skill_planning(&supported.exclusions, full);
         let source_dependency = supported
             .exclusions
             .iter()
@@ -2494,6 +2587,39 @@ fn finding_roster_planning(
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         if source_dependency {
+            let mut protect_choice = json!({
+                "choice": "protect_blocked_skills_as_core",
+                "requires_confirmation": true,
+                "protected_skill_ids": blocked_skills.displayed_skill_ids,
+                "protected_skill_ids_complete": !blocked_skills.truncated,
+                "plan_request_template_available": !blocked_skills.truncated,
+                "next": if blocked_skills.truncated {
+                    "open the full Finding before constructing a complete protected-Skill Plan request"
+                } else {
+                    "after user confirmation, retry Plan with these protected Skill identities; another independent blocker may still fail closed"
+                }
+            });
+            if !blocked_skills.truncated {
+                protect_choice["plan_request_template"] = json!({
+                    "schema_version": 1,
+                    "finding_roster_changes": [{
+                        "finding_id": finding.id,
+                        "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                        "protected_skill_ids": blocked_skills.displayed_skill_ids
+                    }]
+                });
+            }
+            let source_choice = json!({
+                "choice": "preserve_or_retarget_dependent_sources",
+                "requires_confirmation": true,
+                "dependent_source_paths": blocked_skills.displayed_dependent_source_paths,
+                "dependent_source_paths_complete": !blocked_skills.truncated,
+                "next": if blocked_skills.truncated {
+                    "open the full Finding before changing any dependent source link"
+                } else {
+                    "after user-approved manual preservation or retargeting, rescan and reopen the new large-Roster Finding"
+                }
+            });
             return Ok(Some(json!({
                 "supported": false,
                 "reason": "source_dependency_blocks_roster_change",
@@ -2509,9 +2635,13 @@ fn finding_roster_planning(
                 "blocked_change_count": blocked_change_count,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
+                "blocked_skill_count": blocked_skills.count,
+                "blocked_skills": blocked_skills.items,
+                "blocked_skills_truncated": blocked_skills.truncated,
                 "dependent_link_targets": observed_link_targets,
+                "resolution_choices": [protect_choice, source_choice],
                 "after_resolution": {
-                    "next": "move or retarget the dependent source link, then rescan and reopen the new large-Roster Finding"
+                    "next": "choose either explicit Core protection or user-approved source-link preservation, then retry from fresh evidence"
                 }
             })));
         }
@@ -2530,6 +2660,9 @@ fn finding_roster_planning(
             "blocked_change_count": blocked_change_count,
             "blocked_changes": blocked_changes,
             "blocked_changes_truncated": blocked_change_count > 5,
+            "blocked_skill_count": blocked_skills.count,
+            "blocked_skills": blocked_skills.items,
+            "blocked_skills_truncated": blocked_skills.truncated,
             "observed_link_targets": observed_link_targets,
             "after_confirmation": {
                 "repeatable_option": "--source-root",
@@ -6623,6 +6756,49 @@ mod recovery_tests {
         );
         assert_eq!(ids(&filtered), ["a1", "b1", "a2", "b2", "a3"]);
         assert_eq!(filtered["page"]["total"], 5);
+    }
+
+    #[test]
+    fn blocked_skill_planning_groups_pairs_and_expands_full_detail() {
+        let exclusions = (0..6)
+            .flat_map(|index| {
+                ["codex", "claude-code"].map(move |agent| {
+                    crate::roster_plan::RosterChangeExclusion {
+                        agent: agent.into(),
+                        skill_id: format!("skill_{index}"),
+                        name: format!("skill-name-{index}"),
+                        reason: "non_agent_source_link_depends_on_removal",
+                        observed_source_target: Some(PathBuf::from(format!(
+                            "/agent/skill-{index}"
+                        ))),
+                        safety_blocker: Some(
+                            crate::roster_plan::RosterSafetyBlocker::DependentSource {
+                                skill_id: format!("skill_{index}"),
+                                placement_ids: vec![format!("placement_{index}")],
+                                paths: vec![PathBuf::from(format!("/source/skill-{index}"))],
+                            },
+                        ),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let compact = blocked_skill_planning(&exclusions, false);
+        assert_eq!(compact.count, 6);
+        assert_eq!(compact.items.len(), 5);
+        assert!(compact.truncated);
+        assert_eq!(compact.items[0]["name"], "skill-name-0");
+        assert_eq!(compact.items[0]["agents"], json!(["claude-code", "codex"]));
+        assert_eq!(
+            compact.items[0]["dependent_source_paths"],
+            json!(["/source/skill-0"])
+        );
+
+        let full = blocked_skill_planning(&exclusions, true);
+        assert_eq!(full.count, 6);
+        assert_eq!(full.items.len(), 6);
+        assert!(!full.truncated);
+        assert_eq!(full.displayed_skill_ids.len(), 6);
     }
 
     #[test]
