@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 pub const SAME_NAME_DIVERGENT_FINDING_KIND: &str = "same_name_divergent_content";
 pub const SAME_NAME_DIVERGENT_FINDING_TITLE: &str = "Same-name Skills have different content";
 
+fn normalize_skill_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCategory {
@@ -449,7 +453,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let mut by_name = BTreeMap::<String, Vec<&ScannedSkill>>::new();
     for skill in &scan.skills {
         by_name
-            .entry(skill.name.trim().to_lowercase())
+            .entry(normalize_skill_name(&skill.name))
             .or_default()
             .push(skill);
     }
@@ -999,7 +1003,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let normalized_names = scan
         .skills
         .iter()
-        .map(|skill| skill.name.trim().to_lowercase())
+        .map(|skill| normalize_skill_name(&skill.name))
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for (index, left) in scan.skills.iter().enumerate() {
@@ -1472,7 +1476,7 @@ pub(crate) fn find_matching(
         .filter(|skill| variant_eligible_ids.is_none_or(|ids| ids.contains(&skill.id)))
     {
         variants_by_name
-            .entry(skill.name.trim().to_lowercase())
+            .entry(normalize_skill_name(&skill.name))
             .or_default()
             .push(skill.id.clone());
     }
@@ -2300,7 +2304,9 @@ mod tests {
     fn semantic_overlap_is_candidate_evidence_and_never_a_confirmed_duplicate() {
         let (root, mut scan) = fixture();
         let mut candidate = scan.skills[0].clone();
+        let original_id = candidate.id.clone();
         candidate.id = "skill_semantic_candidate".into();
+        let candidate_id = candidate.id.clone();
         candidate.name = "source-check".into();
         candidate.content_digest = "different_digest".into();
         candidate.metadata.description =
@@ -2315,7 +2321,11 @@ mod tests {
         let finding = report
             .findings
             .iter()
-            .find(|finding| finding.title == "Semantic overlap candidate")
+            .find(|finding| {
+                finding.title == "Semantic overlap candidate"
+                    && finding.affected_skill_ids.contains(&original_id)
+                    && finding.affected_skill_ids.contains(&candidate_id)
+            })
             .unwrap();
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("review-only candidate evidence"));
