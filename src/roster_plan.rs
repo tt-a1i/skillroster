@@ -506,9 +506,6 @@ pub fn derive(
             }
             .into());
         }
-        for placement in &placements {
-            placement.validated_physical_directory()?;
-        }
         let desired = requests
             .iter()
             .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
@@ -524,6 +521,9 @@ pub fn derive(
                     .is_some_and(|state| state != &RosterState::Core)
             })
             .collect::<Vec<_>>();
+        for placement in &removal {
+            placement.validated_physical_directory()?;
+        }
         let provider_placement_ids = provider_placements_on_physical_removal(&placements, &removal)
             .map(|placement| placement.id.clone())
             .collect::<Vec<_>>();
@@ -1383,6 +1383,42 @@ mod tests {
             supported.exclusions[0].observed_source_target.as_deref(),
             Some(outside.as_path())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_escaping_link_without_mutation_does_not_require_physical_validation() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".codex/skills");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: external\n---\nfixture\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("external")).unwrap();
+        let snapshot = scan(&ScanOptions::for_home(&home)).unwrap();
+        assert!(snapshot.placements[0].physical_directory.is_none());
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let plan = derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "codex".into(),
+                skill_id: snapshot.skills[0].id.clone(),
+                state: "core".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(plan.operations.is_empty());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+        assert!(outside.join("SKILL.md").is_file());
     }
 
     #[cfg(unix)]
