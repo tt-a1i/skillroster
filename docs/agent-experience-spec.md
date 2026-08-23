@@ -168,6 +168,11 @@ Machine results should expose facts, not preformatted prose:
 - risk, reversibility, drift, confirmation, and recovery state;
 - typed `suggested_actions` containing argv, mutation status, confirmation requirement, and reason code.
 
+Suggested actions must represent a required or evidence-backed transition.
+Healthy `status` output with a completed Snapshot does not prescribe another
+Scan; it exposes `latest_snapshot_at` so the Agent can judge freshness from the
+user's task and current context.
+
 The Agent decides wording and information order from these fields. The CLI must not send ANSI, Markdown, localized prose, TUI frames, or an opaque “health score” through JSON. The first complete release does not include a human TUI.
 
 ## 10. Acceptance scenarios

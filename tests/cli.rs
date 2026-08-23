@@ -55,6 +55,37 @@ fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
 }
 
 #[test]
+fn healthy_status_does_not_suggest_an_unconditional_rescan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/skills")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let missing_snapshot = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(
+        missing_snapshot["suggested_actions"][0]["argv"],
+        json!(["skillroster", "scan", "--json"])
+    );
+    assert_eq!(
+        missing_snapshot["suggested_actions"][0]["reason_code"],
+        "snapshot_required"
+    );
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let healthy = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert!(healthy["result"]["latest_snapshot_id"].is_string());
+    assert_eq!(healthy["result"]["recovery_state"], "clear");
+    assert_eq!(healthy["suggested_actions"], json!([]));
+}
+
+#[test]
 fn public_cli_exits_quietly_when_the_output_consumer_closes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
