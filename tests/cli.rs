@@ -4221,6 +4221,92 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
 }
 
 #[test]
+#[cfg(unix)]
+fn large_roster_core_protection_choice_uses_production_forced_core_constraints() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source_root = temp.path().join("sources");
+    fs::create_dir_all(&source_root).unwrap();
+    let bootstrap = root.join("skillroster");
+    fs::create_dir_all(&bootstrap).unwrap();
+    fs::write(
+        bootstrap.join("SKILL.md"),
+        "---\nname: skillroster\n---\nfixture\n",
+    )
+    .unwrap();
+    for index in 0..100 {
+        let name = format!("dependent-{index:03}");
+        let canonical = root.join(&name);
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(
+            canonical.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&canonical, source_root.join(&name)).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source_root.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    let planning = &full["result"]["planning"];
+    let protect = &planning["resolution_choices"][0];
+
+    assert_eq!(planning["blocked_skill_count"], 51);
+    assert_eq!(planning["blocked_skills"].as_array().unwrap().len(), 51);
+    assert_eq!(planning["blocked_skills_truncated"], false);
+    assert_eq!(protect["protected_skill_ids_complete"], true);
+    assert_eq!(protect["available"], false);
+    assert_eq!(protect["plan_request_template_available"], false);
+    assert_eq!(
+        protect["unavailable_reason"],
+        "protected_core_selection_unavailable"
+    );
+    assert!(
+        protect["unavailable_detail"]
+            .as_str()
+            .unwrap()
+            .contains("protected, declared-Core, or bootstrap Skills")
+    );
+    assert!(protect.get("plan_request_template").is_none());
+    assert!(
+        planning["after_resolution"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("use user-approved source-link preservation")
+    );
+    assert!(
+        full["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
+}
+
+#[test]
 fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
