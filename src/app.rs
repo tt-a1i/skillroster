@@ -680,7 +680,8 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
         },
         "usage_history": {
             "stable_identity_fields": [
-                "skill_id", "agent_id", "stage", "quality", "source_path_digest"
+                "skill_id", "agent_id", "stage", "quality", "source_path_digest",
+                "observed_event_count", "occurred_at"
             ],
             "raw_value_field": "observed_event_count",
             "monthly_value_field": "max_observed_event_count",
@@ -5206,13 +5207,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             continue;
         };
         let agent_id = agent_ids[&usage.agent].clone();
-        let reference = format!(
-            "usage:{}:{}:{:?}:{}",
-            usage.agent.id(),
-            usage.skill_id,
-            usage.stage,
-            usage.source_path_digest
-        );
+        let reference = usage.evidence_reference();
         let evidence_id = save_reference_evidence(
             store,
             scan_id,
@@ -5232,6 +5227,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "event_count": usage.event_count,
                 "first_seen_unix": usage.first_seen_unix,
                 "last_seen_unix": usage.last_seen_unix,
+                "month_start_unix": usage.month_start_unix,
                 "source_path_digest": usage.source_path_digest,
             }),
             observed_at,
@@ -5244,7 +5240,9 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             quality: evidence_quality(usage.quality),
             source_path_digest: usage.source_path_digest.clone(),
             observed_event_count: usage.event_count,
-            occurred_at: usage.last_seen_unix.unwrap_or_default() as i64,
+            occurred_at: usage
+                .last_seen_unix
+                .and_then(|value| i64::try_from(value).ok()),
             outcome: None,
         })?;
     }

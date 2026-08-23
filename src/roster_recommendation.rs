@@ -502,6 +502,7 @@ mod tests {
             event_count: 3,
             first_seen_unix: Some(10),
             last_seen_unix: Some(20),
+            month_start_unix: None,
             source_path_digest: "sha256:usage".into(),
         });
         let recommendation = recommend(
@@ -788,6 +789,7 @@ mod tests {
             event_count: 1,
             first_seen_unix: Some(10),
             last_seen_unix: Some(20),
+            month_start_unix: None,
             source_path_digest: "sha256:usage".into(),
         }
     }
