@@ -4022,16 +4022,26 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     let home = temp.path().join("home");
     let state = temp.path().join("state");
     let root = home.join(".codex/skills");
-    let canonical = root.join("zzz-canonical");
     let source_root = temp.path().join("sources");
-    fs::create_dir_all(&canonical).unwrap();
     fs::create_dir_all(&source_root).unwrap();
-    fs::write(
-        canonical.join("SKILL.md"),
-        "---\nname: zzz-canonical\n---\nfixture\n",
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(&canonical, source_root.join("dependent-source")).unwrap();
+    let canonicals = (0..6)
+        .map(|index| {
+            let name = format!("zzz-canonical-{index}");
+            let canonical = root.join(&name);
+            fs::create_dir_all(&canonical).unwrap();
+            fs::write(
+                canonical.join("SKILL.md"),
+                format!("---\nname: {name}\n---\nfixture\n"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(
+                &canonical,
+                source_root.join(format!("dependent-source-{index}")),
+            )
+            .unwrap();
+            canonical
+        })
+        .collect::<Vec<_>>();
     for index in 0..51 {
         let directory = root.join(format!("skill-{index:03}"));
         fs::create_dir(&directory).unwrap();
@@ -4068,12 +4078,110 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     assert_eq!(planning["supported"], false);
     assert_eq!(planning["reason"], "source_dependency_blocks_roster_change");
     assert_eq!(planning["decision"], "resolve_source_dependency");
-    assert_eq!(planning["blocked_change_count"], 1);
+    assert_eq!(planning["blocked_change_count"], 6);
     assert_eq!(
         planning["blocked_changes"][0]["reason"],
         "non_agent_source_link_depends_on_removal"
     );
-    assert_eq!(planning["dependent_link_targets"], json!([canonical]));
+    assert_eq!(planning["dependent_link_targets"], json!(canonicals));
+    assert_eq!(planning["blocked_skill_count"], 6);
+    assert_eq!(planning["blocked_skills_truncated"], true);
+    assert_eq!(planning["blocked_skills"].as_array().unwrap().len(), 5);
+    let blocked_skill = &planning["blocked_skills"][0];
+    assert!(
+        blocked_skill["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("zzz-canonical-")
+    );
+    assert_eq!(blocked_skill["agents"], json!(["codex"]));
+    assert_eq!(
+        blocked_skill["reasons"],
+        json!(["non_agent_source_link_depends_on_removal"])
+    );
+    assert_eq!(
+        blocked_skill["dependent_source_paths"],
+        json!([fs::canonicalize(&source_root).unwrap().join(format!(
+            "dependent-source-{}",
+            blocked_skill["name"]
+                .as_str()
+                .unwrap()
+                .strip_prefix("zzz-canonical-")
+                .unwrap()
+        ))])
+    );
+    assert_eq!(
+        planning["resolution_choices"][0]["choice"],
+        "protect_blocked_skills_as_core"
+    );
+    assert_eq!(
+        planning["resolution_choices"][0]["requires_confirmation"],
+        true
+    );
+    assert_eq!(
+        planning["resolution_choices"][0]["plan_request_template_available"],
+        false
+    );
+    assert_eq!(planning["resolution_choices"][0]["available"], false);
+    assert_eq!(
+        planning["resolution_choices"][0]["unavailable_reason"],
+        "blocked_skill_set_incomplete"
+    );
+    assert!(
+        planning["resolution_choices"][0]
+            .get("plan_request_template")
+            .is_none()
+    );
+    assert_eq!(
+        planning["resolution_choices"][1]["choice"],
+        "preserve_or_retarget_dependent_sources"
+    );
+    assert_eq!(
+        planning["resolution_choices"][1]["dependent_source_paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    let full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    assert_eq!(full["result"]["planning"]["blocked_skill_count"], 6);
+    assert_eq!(
+        full["result"]["planning"]["blocked_skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert_eq!(
+        full["result"]["planning"]["blocked_skills_truncated"],
+        false
+    );
+    assert_eq!(
+        full["result"]["planning"]["resolution_choices"][0]["plan_request_template_available"],
+        true
+    );
+    assert_eq!(
+        full["result"]["planning"]["resolution_choices"][0]["available"],
+        true
+    );
+    assert_eq!(
+        full["result"]["planning"]["resolution_choices"][0]["plan_request_template"]
+            ["finding_roster_changes"][0]["protected_skill_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        6
+    );
+    assert!(
+        full["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
     assert!(
         detail["suggested_actions"]
             .as_array()
@@ -4101,13 +4209,101 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
         blocked["error"]["details"]["reason"],
         "dependent_source_would_break"
     );
-    assert_eq!(
-        blocked["error"]["details"]["paths"],
-        json!([fs::canonicalize(&source_root)
+    let blocked_paths = blocked["error"]["details"]["paths"].as_array().unwrap();
+    assert_eq!(blocked_paths.len(), 1);
+    assert!(
+        blocked_paths[0]
+            .as_str()
             .unwrap()
-            .join("dependent-source")])
+            .starts_with(fs::canonicalize(&source_root).unwrap().to_str().unwrap())
     );
     assert_eq!(blocked["error"]["details"]["files_changed"], false);
+}
+
+#[test]
+#[cfg(unix)]
+fn large_roster_core_protection_choice_uses_production_forced_core_constraints() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source_root = temp.path().join("sources");
+    fs::create_dir_all(&source_root).unwrap();
+    let bootstrap = root.join("skillroster");
+    fs::create_dir_all(&bootstrap).unwrap();
+    fs::write(
+        bootstrap.join("SKILL.md"),
+        "---\nname: skillroster\n---\nfixture\n",
+    )
+    .unwrap();
+    for index in 0..100 {
+        let name = format!("dependent-{index:03}");
+        let canonical = root.join(&name);
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(
+            canonical.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&canonical, source_root.join(&name)).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source_root.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    let planning = &full["result"]["planning"];
+    let protect = &planning["resolution_choices"][0];
+
+    assert_eq!(planning["blocked_skill_count"], 51);
+    assert_eq!(planning["blocked_skills"].as_array().unwrap().len(), 51);
+    assert_eq!(planning["blocked_skills_truncated"], false);
+    assert_eq!(protect["protected_skill_ids_complete"], true);
+    assert_eq!(protect["available"], false);
+    assert_eq!(protect["plan_request_template_available"], false);
+    assert_eq!(
+        protect["unavailable_reason"],
+        "protected_core_selection_unavailable"
+    );
+    assert!(
+        protect["unavailable_detail"]
+            .as_str()
+            .unwrap()
+            .contains("protected, declared-Core, or bootstrap Skills")
+    );
+    assert!(protect.get("plan_request_template").is_none());
+    assert!(
+        planning["after_resolution"]["next"]
+            .as_str()
+            .unwrap()
+            .contains("use user-approved source-link preservation")
+    );
+    assert!(
+        full["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
 }
 
 #[test]
