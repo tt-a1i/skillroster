@@ -27,6 +27,8 @@ use crate::model::{
 use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
 
+const STATUS_PENDING_PLAN_LIMIT: usize = 20;
+
 pub struct Output {
     pub json: String,
     pub human: String,
@@ -400,7 +402,40 @@ struct ClassifiedError {
     details: Option<Value>,
 }
 
+#[derive(Debug)]
+struct PlanSnapshotDrift {
+    plan_id: PlanId,
+    expected_snapshot_id: ScanId,
+    current_snapshot_id: ScanId,
+}
+
+impl std::fmt::Display for PlanSnapshotDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Plan {} is stale; a newer Snapshot exists",
+            self.plan_id
+        )
+    }
+}
+
+impl std::error::Error for PlanSnapshotDrift {}
+
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(drift) = error.downcast_ref::<PlanSnapshotDrift>() {
+        return ClassifiedError {
+            code: "state_drift",
+            retryable: false,
+            details: Some(json!({
+                "reason": "plan_snapshot_stale",
+                "plan_id": drift.plan_id,
+                "expected_snapshot_id": drift.expected_snapshot_id,
+                "current_snapshot_id": drift.current_snapshot_id,
+                "files_changed": false,
+                "next_action": "create_plan_for_current_snapshot"
+            })),
+        };
+    }
     if let Some(conflict) = error.downcast_ref::<crate::roster_plan::RosterPhysicalConflict>() {
         return ClassifiedError {
             code: "roster_physical_state_conflict",
@@ -727,10 +762,10 @@ fn home_result(store: &StateStore, state_dir: &Path) -> Result<Value> {
 fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> Result<Value> {
     let latest = store.latest_completed_scan()?;
     let latest_scan_id = latest.as_ref().map(|scan| &scan.id);
-    let pending_plans = store
-        .pending_plans()?
+    let (pending_plan_count, pending_plans) =
+        store.pending_plans(latest_scan_id, STATUS_PENDING_PLAN_LIMIT)?;
+    let pending_plans = pending_plans
         .into_iter()
-        .filter(|plan| plan.status != PlanStatus::Ready || latest_scan_id == Some(&plan.scan_id))
         .map(|plan| {
             json!({
                 "plan_id": plan.id,
@@ -754,7 +789,9 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
         "schema_version": store.schema_version()?,
         "latest_snapshot_id": latest.as_ref().map(|scan| scan.id.to_string()),
         "latest_snapshot_at": latest.and_then(|scan| scan.completed_at),
-        "pending_plan_count": pending_plans.len(),
+        "pending_plan_count": pending_plan_count,
+        "pending_plans_returned": pending_plans.len(),
+        "pending_plans_truncated": pending_plan_count > pending_plans.len(),
         "pending_plans": pending_plans,
         "last_receipt": last_receipt,
         "recovery_state": recovery_text(store, state_dir)?,
@@ -4701,7 +4738,12 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
     require_clear_journals(store, &prepared.state_dir)?;
     let (latest_scan_id, scan) = latest_scan(store)?;
     if latest_scan_id != record.scan_id {
-        bail!("Plan {id} is stale; a newer Snapshot exists");
+        return Err(PlanSnapshotDrift {
+            plan_id: id,
+            expected_snapshot_id: record.scan_id,
+            current_snapshot_id: latest_scan_id,
+        }
+        .into());
     }
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;

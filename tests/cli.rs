@@ -1872,7 +1872,7 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
 }
 
 #[test]
-fn repeated_setup_reuses_the_same_ready_plan() {
+fn setup_reuse_and_status_actionability_follow_snapshot_lifecycle() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -1979,6 +1979,21 @@ fn repeated_setup_reuses_the_same_ready_plan() {
     let stale_apply = run(&[&common[..], &["apply", old_plan_id]].concat(), None);
     assert!(!stale_apply.status.success());
     let stale_apply: Value = serde_json::from_slice(&stale_apply.stdout).unwrap();
+    assert_eq!(stale_apply["error"]["code"], "state_drift");
+    assert_eq!(
+        stale_apply["error"]["details"]["reason"],
+        "plan_snapshot_stale"
+    );
+    assert_eq!(stale_apply["error"]["details"]["plan_id"], old_plan_id);
+    assert_eq!(
+        stale_apply["error"]["details"]["current_snapshot_id"],
+        newer_scan["result"]["snapshot_id"]
+    );
+    assert_ne!(
+        stale_apply["error"]["details"]["expected_snapshot_id"],
+        stale_apply["error"]["details"]["current_snapshot_id"]
+    );
+    assert_eq!(stale_apply["error"]["details"]["files_changed"], false);
     assert!(
         stale_apply["error"]["message"]
             .as_str()
