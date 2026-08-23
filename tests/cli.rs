@@ -1688,14 +1688,14 @@ fn explicit_roots_preserve_all_eight_agent_identities() {
     let home = temp.path().join("empty-home");
     let state = temp.path().join("state");
     let agents = [
-        ("codex", "codex"),
-        ("claude-code", "claude_code"),
-        ("pi", "pi"),
-        ("opencode", "open_code"),
-        ("hermes", "hermes"),
-        ("cursor", "cursor"),
-        ("gemini-cli", "gemini_cli"),
-        ("github-copilot", "git_hub_copilot"),
+        "codex",
+        "claude-code",
+        "pi",
+        "opencode",
+        "hermes",
+        "cursor",
+        "gemini-cli",
+        "github-copilot",
     ];
     let shared_root = temp.path().join("shared-skills");
     let shared_skill = shared_root.join("shared-fixture");
@@ -1712,7 +1712,7 @@ fn explicit_roots_preserve_all_eight_agent_identities() {
         state.display().to_string(),
         "--json".to_owned(),
     ];
-    for (agent, _) in agents {
+    for agent in agents {
         args.push("--root".to_owned());
         args.push(format!("{agent}={}", shared_root.display()));
     }
@@ -1726,10 +1726,17 @@ fn explicit_roots_preserve_all_eight_agent_identities() {
         .filter(|root| root["explicit"] == true)
         .collect::<Vec<_>>();
     assert_eq!(explicit.len(), 8);
-    for (_, json_agent) in agents {
-        assert!(explicit.iter().any(|root| root["agent"] == json_agent));
+    for agent in agents {
+        assert!(explicit.iter().any(|root| root["agent"] == agent));
     }
     assert!(explicit.iter().all(|root| root["status"] == "included"));
+    let coverage_agents = scan["result"]["coverage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|coverage| coverage["agent"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(coverage_agents, agents);
     assert_eq!(scan["result"]["placement_count"], 8);
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     let assigned_agents: i64 = database
