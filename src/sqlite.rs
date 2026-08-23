@@ -981,29 +981,27 @@ impl StateStore {
             .transpose()
     }
 
-    pub fn ready_plan_with_fingerprint(
+    pub fn ready_plans_with_fingerprint(
         &self,
         scan_id: &ScanId,
         fingerprint: &str,
-    ) -> StorageResult<Option<PlanRecord>> {
-        let stored = self
-            .connection
-            .query_row(
-                "SELECT immutable_json, status FROM plans
-                 WHERE scan_id = ?1 AND fingerprint = ?2 AND status = 'ready'
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![scan_id.as_str(), fingerprint],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        stored
-            .map(|(encoded, status)| {
-                let mut plan: PlanRecord = from_json(&encoded)?;
-                plan.status = enum_from_text(&status)?;
-                Ok(plan)
-            })
-            .transpose()
+    ) -> StorageResult<Vec<PlanRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT immutable_json, status FROM plans
+             WHERE scan_id = ?1 AND fingerprint = ?2 AND status = 'ready'
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = statement.query_map(params![scan_id.as_str(), fingerprint], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut plans = Vec::new();
+        for row in rows {
+            let (encoded, status) = row?;
+            let mut plan: PlanRecord = from_json(&encoded)?;
+            plan.status = enum_from_text(&status)?;
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     pub fn update_plan_status(&self, id: &PlanId, next: PlanStatus) -> StorageResult<()> {

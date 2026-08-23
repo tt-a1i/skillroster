@@ -2725,6 +2725,7 @@ fn plan_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
         state_dir,
         serde_json::from_str(&input)?,
         PlanOrigin::Agent,
+        None,
     )
 }
 
@@ -4164,6 +4165,7 @@ fn prepare_plan(
     state_dir: &Path,
     input: Value,
     origin: PlanOrigin,
+    reuse_identity: Option<Value>,
 ) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
@@ -4236,12 +4238,14 @@ fn prepare_plan(
     validate_plan_evidence(store, &prepared, &scan_id)?;
     if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
         let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
-        if let Some(existing) =
-            store.ready_plan_with_fingerprint(&prepared_scan_id, &prepared.digest)?
-            && existing.input.get("raw") == Some(&input)
-            && let Some(summary) = existing.input.get("summary")
-        {
-            return Ok(summary.clone());
+        for existing in store.ready_plans_with_fingerprint(&prepared_scan_id, &prepared.digest)? {
+            if existing.input.get("raw") == Some(&input)
+                && existing.input.get("reuse_identity") == reuse_identity.as_ref()
+            {
+                if let Some(summary) = existing.input.get("summary") {
+                    return Ok(summary.clone());
+                }
+            }
         }
     }
     let roster_before = capture_roster_state(store, &prepared)?;
@@ -4376,6 +4380,7 @@ fn prepare_plan(
         finding_ids.clone(),
         summary.clone(),
         selection_evidence_full,
+        reuse_identity,
     )?)?;
     Ok(summary)
 }
@@ -4931,6 +4936,13 @@ fn setup_command(
         state_dir,
         json!({"schema_version": 1, "scan_id": snapshot.id, "operations": operations}),
         PlanOrigin::BootstrapSetup,
+        Some(json!({
+            "modified_choice": match modified_choice {
+                None => Value::Null,
+                Some(ModifiedBootstrapChoice::RetainLocal) => json!("retain-local"),
+                Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
+            }
+        })),
     )?;
     let operation_count = plan["change_summary"]["operation_count"]
         .as_u64()
@@ -5540,6 +5552,7 @@ fn plan_record(
     finding_ids: Vec<FindingId>,
     summary: Value,
     selection_evidence_full: Option<Value>,
+    reuse_identity: Option<Value>,
 ) -> Result<PlanRecord> {
     let operations = prepared
         .operations
@@ -5589,7 +5602,8 @@ fn plan_record(
             "roster_before": roster_before,
             "library_before": library_before,
             "summary": summary,
-            "selection_evidence_full": selection_evidence_full
+            "selection_evidence_full": selection_evidence_full,
+            "reuse_identity": reuse_identity
         }),
         fingerprint: prepared.digest.clone(),
         operations,

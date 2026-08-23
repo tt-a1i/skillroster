@@ -1690,6 +1690,25 @@ fn repeated_setup_reuses_the_same_ready_plan() {
         status["result"]["pending_plans"][0]["plan_id"],
         after_terminal_state["result"]["plan_id"]
     );
+
+    let explicit_choice = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_ne!(
+        explicit_choice["result"]["plan_id"],
+        after_terminal_state["result"]["plan_id"]
+    );
+    let explicit_retry = json_output(&run(
+        &[&common[..], &["setup", "--modified-choice", "retain-local"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        explicit_retry["result"]["plan_id"],
+        explicit_choice["result"]["plan_id"]
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 2);
 }
 
 #[test]
