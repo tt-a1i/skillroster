@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`src/main.rs` contains the Rust CLI entry point. As behavior grows, move reusable logic into focused modules under `src/` and keep `main.rs` limited to argument parsing and orchestration. Place integration tests in `tests/`; keep small unit tests beside their modules with `#[cfg(test)]`. Canonical vocabulary lives in `CONTEXT.md`; normative requirements live in `docs/product-spec.md`. Cargo build artifacts under `target/` are generated and must remain untracked.
+`src/main.rs` contains the Rust CLI entry point. Move reusable logic into focused modules under `src/` and keep `main.rs` to parsing and orchestration. Place integration tests in `tests/`; keep small unit tests beside modules with `#[cfg(test)]`. Canonical vocabulary lives in `CONTEXT.md`; normative requirements live in `docs/product-spec.md`. Keep generated `target/` artifacts untracked.
 
 ## Build, Test, and Development Commands
 
@@ -28,4 +28,4 @@ Write short commit messages in the form `type: summary`, matching the existing `
 
 ## Architecture & Safety
 
-SkillRoster is local-first and agent-first. The first release is a Rust CLI plus one thin bootstrap Skill, not an MCP server. Preserve user-owned Skill contents, preview mutations as immutable plans, refuse ambiguous targets, and produce receipts for every applied change. Read `CONTEXT.md` and `docs/product-spec.md` before changing domain terms or safety boundaries.
+SkillRoster is a local-first engine for Agents. Keep semantic comparison, intent interpretation, prioritization, and explanation in the caller. The Rust CLI returns bounded deterministic facts, validates structured decisions, and executes reversible Plans; people need not compose command workflows. Preserve user-owned contents, refuse ambiguity, and produce a Receipt for every mutation. Read `CONTEXT.md` and `docs/product-spec.md` before changing this boundary, domain terms, or safety rules.
