@@ -74,6 +74,17 @@ stage, quality, event count, and observation window together; the opaque Skill
 ID remains the stable identity, not the user-facing label. Incomplete coverage
 still forbids usage percentages and “unused” conclusions.
 
+Suggested actions are factual continuations, not generic guesses. Offer Plan
+only when the Finding explicitly reports `planning.supported: true`; otherwise
+follow the typed decision or open full detail. A paged Finding action preserves
+the same compact/full mode and advances `page.next_offset`. Findings lists
+interleave category/severity/title families before repeating instances so the
+first page represents the available problem types without hiding any Finding.
+For a blocked large Roster, present the named blocked Skill identities,
+affected Agents, dependent source paths, and every typed resolution choice.
+Never execute a confirmation-gated Core-protection template or source-link
+change on the user's behalf.
+
 ## 5. Ready Plan response
 
 ```text
