@@ -1635,6 +1635,22 @@ fn compact_scan_warnings(warnings: Vec<String>) -> Vec<String> {
     remaining
 }
 
+fn usage_finding_evidence_priority(evidence: &EvidenceRecord) -> u8 {
+    if evidence.kind == EvidenceKind::Coverage {
+        return 0;
+    }
+    if evidence.kind != EvidenceKind::Usage {
+        return 5;
+    }
+    let exposed = evidence.details["stage"].as_str() == Some("exposed");
+    match (&evidence.quality, exposed) {
+        (EvidenceQuality::Observed, false) => 1,
+        (EvidenceQuality::Observed, true) => 2,
+        (_, false) => 3,
+        (_, true) => 4,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ReportRequest<'a> {
     Summary,
@@ -1705,6 +1721,40 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let ordered_evidence = if stored.title == "Five-stage usage evidence" {
+                let mut evidence = store.finding_evidence(&id)?;
+                evidence.sort_by(|left, right| {
+                    usage_finding_evidence_priority(left)
+                        .cmp(&usage_finding_evidence_priority(right))
+                        .then_with(|| {
+                            left.details["agent"]
+                                .as_str()
+                                .cmp(&right.details["agent"].as_str())
+                        })
+                        .then_with(|| {
+                            left.details["skill_id"]
+                                .as_str()
+                                .cmp(&right.details["skill_id"].as_str())
+                        })
+                        .then_with(|| {
+                            left.details["stage"]
+                                .as_str()
+                                .cmp(&right.details["stage"].as_str())
+                        })
+                        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+                });
+                evidence
+            } else {
+                Vec::new()
+            };
+            let ordered_evidence_ids = if ordered_evidence.is_empty() {
+                stored.evidence_ids.clone()
+            } else {
+                ordered_evidence
+                    .iter()
+                    .map(|evidence| evidence.id.clone())
+                    .collect()
+            };
             let end = offset.saturating_add(limit);
             let paged_skill_ids = affected_skill_ids
                 .iter()
@@ -1718,8 +1768,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 .take(limit)
                 .cloned()
                 .collect::<Vec<_>>();
-            let paged_evidence_ids = stored
-                .evidence_ids
+            let paged_evidence_ids = ordered_evidence_ids
                 .iter()
                 .skip(offset)
                 .take(limit)
@@ -1750,24 +1799,32 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                 })
                 .collect::<Vec<_>>();
             placements.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-            let evidence = paged_evidence_ids
-                .iter()
-                .map(|id| store.get_evidence(id))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let evidence = if ordered_evidence.is_empty() {
+                paged_evidence_ids
+                    .iter()
+                    .map(|id| store.get_evidence(id))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            } else {
+                ordered_evidence
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit)
+                    .collect()
+            };
             let total = affected_skill_ids
                 .len()
                 .max(affected_placement_ids.len())
-                .max(stored.evidence_ids.len());
+                .max(ordered_evidence_ids.len());
             let next_offset = (end < total).then_some(end);
             object.insert("affected_skill_ids".into(), json!(paged_skill_ids));
             object.insert("affected_placement_ids".into(), json!(paged_placement_ids));
             object.insert("evidence_ids".into(), json!(paged_evidence_ids));
             object.insert(
                 "primary_evidence_id".into(),
-                json!(stored.evidence_ids.first()),
+                json!(ordered_evidence_ids.first()),
             );
             object.insert("placements".into(), json!(placements));
             object.insert("evidence".into(), json!(evidence));
@@ -1781,7 +1838,7 @@ fn report_command(store: &StateStore, request: ReportRequest<'_>) -> Result<Valu
                     "totals": {
                         "affected_skills": affected_skill_ids.len(),
                         "affected_placements": affected_placement_ids.len(),
-                        "evidence": stored.evidence_ids.len()
+                        "evidence": ordered_evidence_ids.len()
                     },
                     "returned": {
                         "affected_skills": object["affected_skill_ids"].as_array().map_or(0, Vec::len),
@@ -2140,9 +2197,30 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
             let requires_variant_decision =
                 result["resolution"]["decision"].as_str() == Some("choose_same_name_variant");
-            let planning_blocked = result["planning"]["supported"].as_bool() == Some(false);
+            let planning_supported = result["planning"]["supported"].as_bool() == Some(true);
             let mut actions = Vec::new();
-            if !requires_trust_decision && !requires_variant_decision && !planning_blocked {
+            if let Some(next_offset) = result["page"]["next_offset"].as_u64() {
+                let mut argv = vec!["report".to_owned(), "--finding".to_owned(), id.to_owned()];
+                if full {
+                    argv.push("--full".to_owned());
+                }
+                argv.extend([
+                    "--limit".to_owned(),
+                    limit.to_string(),
+                    "--offset".to_owned(),
+                    next_offset.to_string(),
+                    "--json".to_owned(),
+                ]);
+                let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+                actions.push(action(
+                    "list_more_finding_detail",
+                    &argv,
+                    false,
+                    false,
+                    "more_finding_detail_available",
+                ));
+            }
+            if !requires_trust_decision && !requires_variant_decision && planning_supported {
                 actions.push(action(
                     "plan",
                     &["plan", "--stdin", "--json"],

@@ -363,6 +363,13 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         .expect("compact Claude Code Loaded evidence");
     assert_eq!(compact_claude["facts"]["skill_name"], "claude-code-fixture");
     let overview = &compact["result"]["usage_overview"];
+    assert!(
+        compact["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
     assert_eq!(overview["stages"].as_array().unwrap().len(), 5);
     assert_eq!(overview["coverage"]["supported_agent_count"], 8);
     assert_eq!(overview["coverage"]["roots_present_agent_count"], 8);
@@ -408,6 +415,31 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         })
         .expect("full Claude Code Loaded evidence");
     assert_eq!(full_claude["details"]["skill_name"], "claude-code-fixture");
+    let full_evidence = full["result"]["evidence"].as_array().unwrap();
+    let first_observed_activity = full_evidence
+        .iter()
+        .position(|evidence| {
+            evidence["kind"] == "usage"
+                && evidence["quality"] == "observed"
+                && evidence["details"]["stage"] != "exposed"
+        })
+        .expect("observed non-exposure usage evidence");
+    let first_inferred_exposure = full_evidence
+        .iter()
+        .position(|evidence| {
+            evidence["kind"] == "usage"
+                && evidence["quality"] != "observed"
+                && evidence["details"]["stage"] == "exposed"
+        })
+        .expect("inferred exposure evidence");
+    assert!(first_observed_activity < first_inferred_exposure);
+    assert!(
+        full["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "plan")
+    );
     assert_eq!(
         compact["result"]["usage_overview"],
         full["result"]["usage_overview"]
