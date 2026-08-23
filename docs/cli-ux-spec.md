@@ -89,14 +89,15 @@ Show Agent coverage as it progresses, then independent Skill count, placement co
 
 Lead with four counts: independent Skills, placements, default exposure, and observed-use coverage. Show the three highest-priority Findings, then category totals. Evidence detail remains behind `report --finding`.
 
-Agent callers use `report --summary --json` by default. The compact payload
+Agent callers use selector-free `report --json` by default; `--summary` is an
+explicit alias. The compact payload
 contains those four metrics, total Finding count, category totals, and at most
 three complete Finding summaries. When the Agent needs another category or an
 exhaustive selection surface, it uses `report --findings --json`, optionally
 filtered by one `--category` and one `--severity`. That mode returns compact
 Finding summaries plus `page.next_offset`; it never suggests planning before a
-Finding is selected. Full `report --json` remains an explicit diagnostic export,
-not the bootstrap workflow default.
+Finding is selected. `report --full --json` is the explicit exhaustive
+diagnostic export and never the bootstrap workflow default.
 
 `report --finding ID --json` returns at most 20 compact Evidence items. Each
 item combines its stable Evidence ID, subject, path, quality, and decision facts

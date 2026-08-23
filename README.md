@@ -26,11 +26,12 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 ```bash
 skillroster scan --json
 skillroster --source-root /absolute/trusted/source scan --json
-skillroster report --summary --json
+skillroster report --json
 skillroster report --findings --limit 20 --json
 skillroster report --findings --category usage --json
 skillroster report --finding <finding-id> --limit 20 --json
 skillroster report --finding <finding-id> --full --json
+skillroster report --full --json
 skillroster find "database migration" --json
 skillroster find "把中文改自然一点" --json
 skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
@@ -115,8 +116,10 @@ The three-Finding summary also includes compact Finding-group rollups with
 deduplicated affected Skill and placement counts. It leads to
 `report --findings`, a compact paged list that can be filtered by category or
 severity. This gives Agents both the complete problem scale and a bounded path
-to every Finding without loading the exhaustive report. Only a selected
-Finding leads to Evidence inspection or planning.
+to every Finding without loading the exhaustive report. Selector-free `report`
+returns this bounded summary; `--summary` is an explicit alias and `--full`
+requests the exhaustive diagnostic export. Only a selected Finding leads to
+Evidence inspection or planning.
 
 ## Status
 
