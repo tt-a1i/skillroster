@@ -2303,19 +2303,16 @@ mod tests {
     #[test]
     fn semantic_overlap_is_candidate_evidence_and_never_a_confirmed_duplicate() {
         let (root, mut scan) = fixture();
-        let mut candidate = scan.skills[0].clone();
-        let original_id = candidate.id.clone();
+        let original = scan.skills[0].clone();
+        let original_id = original.id.clone();
+        let mut candidate = original.clone();
         candidate.id = "skill_semantic_candidate".into();
         let candidate_id = candidate.id.clone();
         candidate.name = "source-check".into();
         candidate.content_digest = "different_digest".into();
-        candidate.metadata.description =
-            Some("Search and verify primary sources using official evidence".into());
-        candidate.metadata.triggers = vec!["research".into(), "verify".into()];
-        candidate.summary = "Investigate facts with primary sources.".into();
-        candidate.normalized_text =
-            "Search and verify primary sources using official evidence Investigate facts".into();
-        scan.skills.push(candidate);
+        scan.skills = vec![original, candidate];
+        scan.placements.clear();
+        scan.usage.clear();
 
         let report = build_report(&scan);
         let finding = report
