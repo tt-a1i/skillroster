@@ -134,7 +134,7 @@ output. Find never implies activation.
 
 ### `plan`
 
-Show before/after Roster counts, affected Agents and Skills, operation categories, risk, reversibility, exclusions, and blocked preconditions. Finding-derived Roster Plans also show forced, positive-signal, and stable-fallback Core counts; a fallback-dominated selection is explicitly review-required on the Plan and Apply confirmation surfaces. A ready Plan ends with its immutable ID and digest; it performs no mutation. Agent JSON defaults to the bounded summary even when the stored Plan contains hundreds of operations. `plan --show PLAN_ID --json` explicitly returns the complete stored operations, changes, and before-state collections for audits or exact-path questions.
+Show before/after Roster counts, affected Agents and Skills, operation categories, risk, reversibility, exclusions, and blocked preconditions. Finding-derived Roster Plans also show forced, positive-signal, and stable-fallback Core counts plus a compact named Core preview for each Agent; at 60, 80, and 120 columns the preview keeps one name, its reason, and the remaining count visible. A fallback-dominated selection is explicitly review-required on the Plan and Apply confirmation surfaces. A ready Plan ends with its immutable ID and digest; it performs no mutation. Agent JSON defaults to the bounded summary even when the stored Plan contains hundreds of operations. `plan --show PLAN_ID --json` explicitly returns the exact immutable Core selections and the complete stored operations, changes, and before-state collections for audits or exact-path questions.
 
 ### `apply` and `undo`
 

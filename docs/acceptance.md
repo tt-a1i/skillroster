@@ -382,6 +382,20 @@ default exposure, 169 Findings, no escaping-link Finding, and
 forms together. Direct escapes, indirect escapes, and unresolved links remain
 unread; no Apply was run and no Agent file changed.
 
+The v1.8.17 Core-selection dogfood reused that real-home Snapshot and prepared
+isolated immutable Plans with Core budgets of 10, 25, and 50. All four
+oversized Agents were fallback-dominated: the budget-10 Plan selected 40 Core
+Skills with one observed-loaded signal and 39 stable fallbacks. The previous
+summary exposed only aggregate counts and the 361 KiB full Plan exposed opaque
+Roster IDs, so an Agent could not review which Skills remained Core without an
+unrelated lookup. The new bounded summary is 9.4 KiB and exposes five named
+selections with reasons per Agent; `plan --show` persists all 40 exact named
+selections and reasons. The ordinary 60-, 80-, and 120-column views keep one
+name, reason, and remaining count visible for Codex, Claude, Pi, and Hermes.
+The new binary also read a v1.8.16 stored Plan without complete-selection data
+and preserved its aggregate evidence. Every inspection and Plan reported
+`files_changed=false`; no Apply was run and no Agent file changed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

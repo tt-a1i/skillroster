@@ -1183,7 +1183,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(current["result"]["plan_id"].is_null());
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.16"
+        "1.8.17"
     );
 
     let undone = json_output(&run(
@@ -1353,7 +1353,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.16");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.17");
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
@@ -2955,6 +2955,28 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
         true
     );
     assert_eq!(
+        plan["result"]["selection_evidence"]["detail_level"],
+        "summary"
+    );
+    let core_preview = plan["result"]["selection_evidence"]["agents"][0]["core_preview"]
+        .as_array()
+        .unwrap();
+    assert_eq!(core_preview.len(), 5);
+    assert!(core_preview.iter().all(|selection| {
+        selection["skill_id"].is_string()
+            && selection["name"].is_string()
+            && selection["reason"].is_string()
+    }));
+    assert_eq!(
+        plan["result"]["selection_evidence"]["agents"][0]["core_preview_truncated"],
+        true
+    );
+    assert!(
+        plan["result"]["selection_evidence"]["agents"][0]
+            .get("core_selections")
+            .is_none()
+    );
+    assert_eq!(
         plan["result"]["uncertainty"]["code"],
         "fallback_dominated_core_selection"
     );
@@ -2966,13 +2988,39 @@ fn large_roster_finding_prepares_and_reverses_a_semantic_layering_plan() {
         None,
     ));
     assert_eq!(
-        detail["result"]["selection_evidence"],
-        plan["result"]["selection_evidence"]
+        detail["result"]["selection_evidence"]["detail_level"],
+        "full"
     );
+    let core_selections = detail["result"]["selection_evidence"]["agents"][0]["core_selections"]
+        .as_array()
+        .unwrap();
+    assert_eq!(core_selections.len(), 10);
+    assert_eq!(&core_selections[..5], core_preview);
+    assert!(core_selections.iter().all(|selection| {
+        selection["skill_id"].is_string()
+            && selection["name"].is_string()
+            && selection["reason"].is_string()
+    }));
+    for field in [
+        "core_selection_count",
+        "forced_core_count",
+        "positive_signal_core_count",
+        "stable_fallback_core_count",
+        "fallback_dominated",
+        "fallback_dominated_agent_count",
+        "reason_counts",
+    ] {
+        assert_eq!(
+            detail["result"]["selection_evidence"][field],
+            plan["result"]["selection_evidence"][field]
+        );
+    }
     assert_eq!(
         detail["result"]["uncertainty"],
         plan["result"]["uncertainty"]
     );
+    assert_eq!(plan["result"]["files_changed"], false);
+    assert_eq!(detail["result"]["files_changed"], false);
     let human = run(
         &[
             "--home",
