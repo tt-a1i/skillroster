@@ -2986,7 +2986,23 @@ fn roster_selection_evidence(
             "absence_of_usage_evidence": "not_negative_evidence"
         })
     };
-    let uncertainty = if fallback_dominated {
+    let uncertainty = if fallback_dominated && cross_agent_dominated {
+        Some(json!({
+            "code": "mixed_evidence_dominated_core_selection",
+            "dominance_codes": [
+                "fallback_dominated_core_selection",
+                "cross_agent_dominated_core_selection"
+            ],
+            "review_required": true,
+            "core_selection_count": core_selection_count,
+            "direct_signal_core_count": direct_signal_core_count,
+            "cross_agent_signal_core_count": cross_agent_signal_core_count,
+            "stable_fallback_core_count": stable_fallback_core_count,
+            "fallback_dominated_agent_count": fallback_dominated_agent_count,
+            "cross_agent_dominated_agent_count": cross_agent_dominated_agent_count,
+            "absence_of_usage_evidence": "not_negative_evidence"
+        }))
+    } else if fallback_dominated {
         Some(json!({
             "code": "fallback_dominated_core_selection",
             "review_required": true,
@@ -5657,6 +5673,86 @@ mod recovery_tests {
             evidence.full["agents"][0]["core_selections"][0]["evidence_agents"],
             json!(["codex"])
         );
+    }
+
+    #[test]
+    fn roster_selection_uncertainty_preserves_mixed_agent_dominance() {
+        let selection = |scope: &'static str, reason: &'static str, id: &str| {
+            crate::roster_recommendation::CoreSelection {
+                skill_id: id.into(),
+                name: id.into(),
+                reason,
+                evidence_scope: scope,
+                evidence_agents: if scope == "cross_agent" {
+                    vec!["cursor".into()]
+                } else {
+                    Vec::new()
+                },
+            }
+        };
+        let agent =
+            |agent: AgentKind, selections: Vec<crate::roster_recommendation::CoreSelection>| {
+                let cross_agent_signal_count = selections
+                    .iter()
+                    .filter(|selection| selection.evidence_scope == "cross_agent")
+                    .count();
+                let fallback_core_count = selections
+                    .iter()
+                    .filter(|selection| selection.evidence_scope == "fallback")
+                    .count();
+                crate::roster_recommendation::AgentRecommendation {
+                    agent,
+                    before_default_exposure: 51,
+                    unique_skill_count: 51,
+                    core_count: selections.len(),
+                    on_demand_count: 51 - selections.len(),
+                    positive_signal_count: cross_agent_signal_count,
+                    direct_signal_count: 0,
+                    cross_agent_signal_count,
+                    fallback_core_count,
+                    core_selections: selections,
+                }
+            };
+        let recommendation = crate::roster_recommendation::RosterRecommendation {
+            changes: vec![],
+            agents: vec![
+                agent(
+                    AgentKind::Codex,
+                    vec![
+                        selection("fallback", "stable_fallback", "fallback_a"),
+                        selection("fallback", "stable_fallback", "fallback_b"),
+                        selection("target_agent", "observed_loaded", "direct"),
+                    ],
+                ),
+                agent(
+                    AgentKind::ClaudeCode,
+                    vec![
+                        selection("cross_agent", "cross_agent_observed_loaded", "cross_a"),
+                        selection("cross_agent", "cross_agent_observed_loaded", "cross_b"),
+                        selection("fallback", "stable_fallback", "fallback_c"),
+                    ],
+                ),
+            ],
+        };
+
+        let uncertainty = roster_selection_evidence(&recommendation)
+            .uncertainty
+            .unwrap();
+
+        assert_eq!(
+            uncertainty["code"],
+            "mixed_evidence_dominated_core_selection"
+        );
+        assert_eq!(
+            uncertainty["dominance_codes"],
+            json!([
+                "fallback_dominated_core_selection",
+                "cross_agent_dominated_core_selection"
+            ])
+        );
+        assert_eq!(uncertainty["fallback_dominated_agent_count"], 1);
+        assert_eq!(uncertainty["cross_agent_dominated_agent_count"], 1);
+        assert_eq!(uncertainty["review_required"], true);
     }
 
     #[test]

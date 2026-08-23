@@ -1161,6 +1161,7 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
     {
         let review = match value.pointer("/uncertainty/code").and_then(Value::as_str) {
             Some("cross_agent_dominated_core_selection") => "cross-Agent-dominated Core selection",
+            Some("mixed_evidence_dominated_core_selection") => "fallback + cross-Agent dominance",
             _ => "fallback-dominated Core selection",
         };
         fact(lines, "Review required", review);
@@ -2122,6 +2123,18 @@ mod tests {
                 "line exceeded {width} columns:\n{output}"
             );
         }
+        let mut mixed = value;
+        mixed["uncertainty"]["code"] = json!("mixed_evidence_dominated_core_selection");
+        let output = render(
+            "plan",
+            &mixed,
+            RenderOptions {
+                width: 60,
+                styled: false,
+            },
+        );
+        assert!(output.contains("fallback + cross-Agent dominance"));
+        assert!(output.lines().all(|line| display_width(line) <= 60));
     }
 
     #[test]

@@ -110,6 +110,10 @@ impl Candidate {
         self.protected || self.declared_core || self.bootstrap
     }
 
+    fn has_positive_signal(&self) -> bool {
+        self.direct_signal.is_present() || self.cross_agent_signal.is_present()
+    }
+
     fn reason(&self) -> &'static str {
         if self.protected {
             "protected_by_request"
@@ -293,17 +297,19 @@ pub fn recommend(
                 evidence_agents: candidate.evidence_agents(),
             })
             .collect::<Vec<_>>();
-        let positive_signal_count = core_selections
+        let positive_signal_count = candidates
             .iter()
-            .filter(|selection| matches!(selection.evidence_scope, "target_agent" | "cross_agent"))
+            .filter(|candidate| candidate.has_positive_signal())
             .count();
-        let direct_signal_count = core_selections
+        let direct_signal_count = candidates
             .iter()
-            .filter(|selection| selection.evidence_scope == "target_agent")
+            .filter(|candidate| candidate.direct_signal.is_present())
             .count();
-        let cross_agent_signal_count = core_selections
+        let cross_agent_signal_count = candidates
             .iter()
-            .filter(|selection| selection.evidence_scope == "cross_agent")
+            .filter(|candidate| {
+                !candidate.direct_signal.is_present() && candidate.cross_agent_signal.is_present()
+            })
             .count();
         let fallback_core_count = core_selections
             .iter()
@@ -598,6 +604,36 @@ mod tests {
         assert_eq!(selection.reason, "observed_matched");
         assert_eq!(selection.evidence_scope, "target_agent");
         assert_eq!(selection.evidence_agents, ["codex"]);
+    }
+
+    #[test]
+    fn planning_signal_counts_include_candidates_beyond_the_core_budget() {
+        let mut scan = oversized_scan(51);
+        for index in 0..51 {
+            scan.usage.push(usage(
+                AgentKind::Codex,
+                &format!("skill_{index:03}"),
+                UsageStage::Loaded,
+                EvidenceQuality::Observed,
+            ));
+        }
+
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(recommendation.agents[0].core_selections.len(), 1);
+        assert_eq!(recommendation.agents[0].positive_signal_count, 51);
+        assert_eq!(recommendation.agents[0].direct_signal_count, 51);
+        assert_eq!(recommendation.agents[0].cross_agent_signal_count, 0);
+        assert_eq!(recommendation.agents[0].fallback_core_count, 0);
     }
 
     #[test]
