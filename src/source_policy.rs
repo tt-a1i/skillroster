@@ -79,20 +79,25 @@ impl fmt::Display for SourcePermissionId {
 
 /// Stable filesystem identity captured when a permission is granted.
 ///
-/// POSIX uses device + inode; Windows uses the volume serial paired with the
-/// 64-bit file index reported by `GetFileInformationByHandle`. A volume whose
-/// filesystem exposes no stable index reports `Unavailable`, and drift
-/// detection then degrades to exact resolved-path equality.
+/// POSIX uses device + inode plus the inode change-time epoch so immediate
+/// inode reuse cannot make a replacement look like the approved object.
+/// Windows pairs volume + file index with the object's creation time for the
+/// same reason. A platform without these facts reports `Unavailable`, and
+/// drift detection then degrades to exact resolved-path equality.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RootIdentity {
     Posix {
         dev: u64,
         ino: u64,
+        ctime: i64,
+        ctime_nsec: i64,
     },
     Windows {
         volume_serial: u32,
         file_index_high: u32,
         file_index_low: u32,
+        creation_time_high: u32,
+        creation_time_low: u32,
     },
     Unavailable,
 }
@@ -104,6 +109,8 @@ pub(crate) fn capture_identity(path: &Path) -> io::Result<RootIdentity> {
     Ok(RootIdentity::Posix {
         dev: metadata.dev(),
         ino: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
     })
 }
 
@@ -145,6 +152,8 @@ pub(crate) fn capture_identity(path: &Path) -> io::Result<RootIdentity> {
         volume_serial: information.dwVolumeSerialNumber,
         file_index_high: information.nFileIndexHigh,
         file_index_low: information.nFileIndexLow,
+        creation_time_high: information.ftCreationTime.dwHighDateTime,
+        creation_time_low: information.ftCreationTime.dwLowDateTime,
     })
 }
 
@@ -589,16 +598,31 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 pub fn identity_json(identity: &RootIdentity) -> Value {
     match identity {
-        RootIdentity::Posix { dev, ino } => json!({ "kind": "posix", "dev": dev, "ino": ino }),
+        RootIdentity::Posix {
+            dev,
+            ino,
+            ctime,
+            ctime_nsec,
+        } => json!({
+            "kind": "posix",
+            "dev": dev,
+            "ino": ino,
+            "ctime": ctime,
+            "ctime_nsec": ctime_nsec
+        }),
         RootIdentity::Windows {
             volume_serial,
             file_index_high,
             file_index_low,
+            creation_time_high,
+            creation_time_low,
         } => json!({
             "kind": "windows",
             "volume_serial": volume_serial,
             "file_index_high": file_index_high,
-            "file_index_low": file_index_low
+            "file_index_low": file_index_low,
+            "creation_time_high": creation_time_high,
+            "creation_time_low": creation_time_low
         }),
         RootIdentity::Unavailable => json!({ "kind": "unavailable" }),
     }

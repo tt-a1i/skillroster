@@ -165,7 +165,9 @@ when they observe drift, and preserve the drift in the Snapshot. This protects
 against accidental or persistent local replacement and retargeting. It is not
 an adversarial sandbox against a same-user process completing an ABA swap
 entirely between checkpoints; descriptor/handle-bound traversal is tracked as
-separate security hardening.
+separate security hardening. The persisted object epoch is conservative:
+platform metadata changes that could indicate object reuse may require an
+explicit revoke and reconfirm rather than silently retaining read access.
 
 `setup` detects supported Agents and returns a preview for installing or
 upgrading the single bootstrap Skill. Exact official older copies are eligible

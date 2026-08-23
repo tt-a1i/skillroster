@@ -12,7 +12,9 @@ replaced, or retargeted permissions. A permission survives ordinary evidence
 and Plan/Receipt purges; revoke it explicitly with
 `skillroster source-root revoke ID --json`, or remove it with the complete local
 state. These records authorize factual reads only and never endorse content or
-authorize governance.
+authorize governance. Filesystem identity includes a conservative object-epoch
+guard; metadata changes that could be object reuse may require revoke and
+reconfirm instead of silently continuing.
 
 When a bounded planning error omits source-confirmation blockers, SkillRoster
 writes one versioned JSON detail artifact under
