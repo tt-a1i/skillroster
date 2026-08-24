@@ -300,6 +300,81 @@ pub enum EvidenceQuality {
     Unknown,
 }
 
+/// A deterministic reason why a session denominator is not complete.  These
+/// facts are recorded at the scanner boundary rather than inferred later from
+/// aggregate counters, because several limits can produce the same counters.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCoverageLimitationCode {
+    RootMissing,
+    RootInaccessible,
+    DiscoveryFileLimit,
+    DiscoveryDepthLimit,
+    DiscoveryWalkFailure,
+    SampledFileLimit,
+    SampledByteLimit,
+    SampledLineLimit,
+    FileByteLimit,
+    FileMetadataFailure,
+    FileReadFailure,
+    FileZeroRead,
+    JsonExtractionLimit,
+    JsonRecordLimit,
+    LineAlignmentLoss,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCoverageScope {
+    Root,
+    File,
+    Agent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCoverageCountKind {
+    Exact,
+    LowerBound,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCoverageUnit {
+    Roots,
+    Files,
+    Depth,
+    Walks,
+    Bytes,
+    Lines,
+    Records,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCoverageLimitationSource {
+    Roots,
+    SessionDiscovery,
+    SessionSampling,
+    SessionJson,
+    SessionJsonl,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionCoverageLimitation {
+    pub code: SessionCoverageLimitationCode,
+    pub scope: SessionCoverageScope,
+    pub count_kind: SessionCoverageCountKind,
+    pub observed: Option<u64>,
+    pub limit: Option<u64>,
+    pub unit: SessionCoverageUnit,
+    /// Stable scanner boundary that produced this fact. This is deliberately
+    /// not a free-form error message and is safe for Agent callers to branch
+    /// on.
+    pub source: SessionCoverageLimitationSource,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UsageEvidence {
     pub agent: AgentKind,
@@ -353,6 +428,10 @@ pub struct SessionCoverage {
     pub discovery_truncated: bool,
     pub first_seen_unix: Option<u64>,
     pub last_seen_unix: Option<u64>,
+    /// `None` means this is a legacy payload written before typed limitation
+    /// facts existed. New scans always write `Some`, including an empty list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limitations: Option<Vec<SessionCoverageLimitation>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1948,7 +2027,10 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
         discovery_truncated: false,
         first_seen_unix: None,
         last_seen_unix: None,
+        limitations: Some(Vec::new()),
     };
+    let mut limitations =
+        BTreeMap::<SessionCoverageLimitationCode, SessionCoverageLimitation>::new();
     let mut skill_ids_by_name = BTreeMap::<String, BTreeSet<String>>::new();
     for skill in &result.skills {
         skill_ids_by_name
@@ -2020,8 +2102,30 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             Err(_) => RootStatus::Inaccessible,
         };
         match status {
-            RootStatus::Missing => coverage.roots_missing += 1,
-            RootStatus::Inaccessible => coverage.roots_inaccessible += 1,
+            RootStatus::Missing => {
+                coverage.roots_missing += 1;
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::RootMissing,
+                    SessionCoverageScope::Root,
+                    SessionCoverageCountKind::Exact,
+                    Some(coverage.roots_missing as u64),
+                    None,
+                    SessionCoverageLimitationSource::Roots,
+                );
+            }
+            RootStatus::Inaccessible => {
+                coverage.roots_inaccessible += 1;
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::RootInaccessible,
+                    SessionCoverageScope::Root,
+                    SessionCoverageCountKind::Exact,
+                    Some(coverage.roots_inaccessible as u64),
+                    None,
+                    SessionCoverageLimitationSource::Roots,
+                );
+            }
             RootStatus::Included | RootStatus::Excluded => {}
         }
         result.roots.push(RootObservation {
@@ -2044,16 +2148,49 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             MAX_SESSION_DISCOVERY_FILES_PER_AGENT + 1,
             &mut files,
         ) {
-            Ok(true) => {
-                coverage.discovery_truncated = true;
-                coverage.truncated = true;
+            Ok(discovery) => {
+                if discovery.file_limit {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::DiscoveryFileLimit,
+                        SessionCoverageScope::Root,
+                        SessionCoverageCountKind::LowerBound,
+                        Some(files.len() as u64),
+                        Some(MAX_SESSION_DISCOVERY_FILES_PER_AGENT as u64),
+                        SessionCoverageLimitationSource::SessionDiscovery,
+                    );
+                    coverage.discovery_truncated = true;
+                    coverage.truncated = true;
+                }
+                if discovery.depth_limit {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::DiscoveryDepthLimit,
+                        SessionCoverageScope::Root,
+                        SessionCoverageCountKind::Unknown,
+                        None,
+                        Some(6),
+                        SessionCoverageLimitationSource::SessionDiscovery,
+                    );
+                    coverage.discovery_truncated = true;
+                    coverage.truncated = true;
+                }
             }
-            Ok(false) => {}
             Err(_) => {
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::DiscoveryWalkFailure,
+                    SessionCoverageScope::Root,
+                    SessionCoverageCountKind::Unknown,
+                    None,
+                    None,
+                    SessionCoverageLimitationSource::SessionDiscovery,
+                );
                 coverage.files_skipped += 1;
+                coverage.truncated = true;
                 continue;
             }
-        }
+        };
         let discovered_count = files.len();
         coverage.files_discovered = coverage.files_discovered.saturating_add(discovered_count);
         files.sort_by_cached_key(|path| {
@@ -2065,6 +2202,15 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 .files_skipped
                 .saturating_add(discovered_count - MAX_SESSION_FILES_PER_AGENT);
             coverage.truncated = true;
+            record_session_limitation(
+                &mut limitations,
+                SessionCoverageLimitationCode::SampledFileLimit,
+                SessionCoverageScope::Root,
+                SessionCoverageCountKind::Exact,
+                Some(discovered_count as u64),
+                Some(MAX_SESSION_FILES_PER_AGENT as u64),
+                SessionCoverageLimitationSource::SessionSampling,
+            );
         }
         files.truncate(MAX_SESSION_FILES_PER_AGENT);
         for (index, file) in files.iter().enumerate() {
@@ -2074,31 +2220,116 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     .files_skipped
                     .saturating_add(files.len().saturating_sub(index));
                 coverage.truncated = true;
+                if remaining_bytes == 0 {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::SampledByteLimit,
+                        SessionCoverageScope::Agent,
+                        SessionCoverageCountKind::Exact,
+                        Some(bytes_observed),
+                        Some(MAX_SESSION_BYTES_PER_AGENT),
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
+                }
+                if lines_observed >= MAX_SESSION_LINES_PER_AGENT {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::SampledLineLimit,
+                        SessionCoverageScope::Agent,
+                        SessionCoverageCountKind::Exact,
+                        Some(lines_observed as u64),
+                        Some(MAX_SESSION_LINES_PER_AGENT as u64),
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
+                }
                 break;
             }
             let metadata = match fs::metadata(file) {
                 Ok(metadata) => metadata,
                 _ => {
                     coverage.files_skipped += 1;
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::FileMetadataFailure,
+                        SessionCoverageScope::File,
+                        SessionCoverageCountKind::Unknown,
+                        None,
+                        None,
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
                     continue;
                 }
             };
             let is_json = file.extension().and_then(|extension| extension.to_str()) == Some("json");
             let sample_limit = remaining_bytes.min(MAX_SESSION_BYTES_PER_FILE);
-            let (sample, sample_bytes) =
-                match read_session_tail(file, metadata.len(), sample_limit, !is_json) {
+            let file_byte_limit_applies = metadata.len() > MAX_SESSION_BYTES_PER_FILE;
+            let agent_byte_limit_applies =
+                remaining_bytes < MAX_SESSION_BYTES_PER_FILE && remaining_bytes < metadata.len();
+            if agent_byte_limit_applies {
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::SampledByteLimit,
+                    SessionCoverageScope::Agent,
+                    SessionCoverageCountKind::LowerBound,
+                    Some(bytes_observed),
+                    Some(MAX_SESSION_BYTES_PER_AGENT),
+                    SessionCoverageLimitationSource::SessionSampling,
+                );
+            }
+            let (sample, sample_bytes, alignment_lost) =
+                match read_session_tail_with_facts(file, metadata.len(), sample_limit, !is_json) {
                     Ok(sample) => sample,
                     Err(_) => {
                         coverage.files_skipped += 1;
+                        record_session_limitation(
+                            &mut limitations,
+                            SessionCoverageLimitationCode::FileReadFailure,
+                            SessionCoverageScope::File,
+                            SessionCoverageCountKind::Unknown,
+                            None,
+                            None,
+                            SessionCoverageLimitationSource::SessionSampling,
+                        );
                         continue;
                     }
                 };
+            if alignment_lost {
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::LineAlignmentLoss,
+                    SessionCoverageScope::File,
+                    SessionCoverageCountKind::Unknown,
+                    None,
+                    None,
+                    SessionCoverageLimitationSource::SessionJsonl,
+                );
+            }
+            if file_byte_limit_applies {
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::FileByteLimit,
+                    SessionCoverageScope::File,
+                    SessionCoverageCountKind::Exact,
+                    Some(sample_bytes),
+                    Some(MAX_SESSION_BYTES_PER_FILE),
+                    SessionCoverageLimitationSource::SessionSampling,
+                );
+            }
             let mut file_partially_observed = sample_bytes < metadata.len();
             if file_partially_observed {
                 coverage.truncated = true;
             }
             if sample_bytes == 0 && metadata.len() != 0 {
                 coverage.files_skipped += 1;
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::FileZeroRead,
+                    SessionCoverageScope::File,
+                    SessionCoverageCountKind::Exact,
+                    Some(0),
+                    Some(metadata.len()),
+                    SessionCoverageLimitationSource::SessionSampling,
+                );
                 continue;
             }
             bytes_observed = bytes_observed.saturating_add(sample_bytes);
@@ -2118,7 +2349,30 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 let physical_lines = sample.lines().count().max(1);
                 vec![(sample.into_owned(), physical_lines)]
             } else if is_json {
-                extract_complete_json_objects(&sample)
+                let extracted = extract_complete_json_objects_with_facts(&sample);
+                if extracted.extraction_limited {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::JsonRecordLimit,
+                        SessionCoverageScope::File,
+                        SessionCoverageCountKind::LowerBound,
+                        Some(extracted.records.len() as u64),
+                        Some(MAX_SESSION_LINES_PER_AGENT as u64),
+                        SessionCoverageLimitationSource::SessionJson,
+                    );
+                }
+                if extracted.parse_boundary {
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::JsonExtractionLimit,
+                        SessionCoverageScope::File,
+                        SessionCoverageCountKind::Unknown,
+                        None,
+                        Some(8 * MAX_SESSION_BYTES_PER_FILE),
+                        SessionCoverageLimitationSource::SessionJson,
+                    );
+                }
+                extracted.records
             } else {
                 sample
                     .lines()
@@ -2129,6 +2383,15 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 if lines_observed.saturating_add(physical_lines) > MAX_SESSION_LINES_PER_AGENT {
                     file_partially_observed = true;
                     coverage.truncated = true;
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::SampledLineLimit,
+                        SessionCoverageScope::Agent,
+                        SessionCoverageCountKind::Exact,
+                        Some(lines_observed as u64),
+                        Some(MAX_SESSION_LINES_PER_AGENT as u64),
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
                     break;
                 }
                 lines_observed += physical_lines;
@@ -2234,12 +2497,14 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     }
     coverage.bytes_observed = bytes_observed;
     coverage.lines_observed = lines_observed;
+    coverage.limitations = Some(limitations.into_values().collect());
     coverage.denominator_reliable = coverage.roots_present > 0
         && coverage.roots_missing == 0
         && coverage.roots_inaccessible == 0
         && coverage.files_skipped == 0
         && coverage.files_partially_observed == 0
-        && !coverage.discovery_truncated;
+        && !coverage.discovery_truncated
+        && coverage.limitations.as_ref().is_none_or(Vec::is_empty);
     result.usage.extend(events.into_values());
     result.coverage.push(coverage);
 }
@@ -2251,29 +2516,86 @@ fn session_file_modified(path: &Path) -> u64 {
         .unwrap_or_default()
 }
 
-fn read_session_tail(
+fn record_session_limitation(
+    limitations: &mut BTreeMap<SessionCoverageLimitationCode, SessionCoverageLimitation>,
+    code: SessionCoverageLimitationCode,
+    scope: SessionCoverageScope,
+    count_kind: SessionCoverageCountKind,
+    observed: Option<u64>,
+    limit: Option<u64>,
+    source: SessionCoverageLimitationSource,
+) {
+    let fact = limitations
+        .entry(code)
+        .or_insert_with(|| SessionCoverageLimitation {
+            code,
+            scope,
+            count_kind,
+            observed,
+            limit,
+            unit: limitation_unit(code),
+            source,
+        });
+    if let Some(value) = observed {
+        fact.observed = Some(fact.observed.unwrap_or_default().max(value));
+    }
+    if let Some(value) = limit {
+        fact.limit = Some(fact.limit.unwrap_or(value).min(value));
+    }
+}
+
+const fn limitation_unit(code: SessionCoverageLimitationCode) -> SessionCoverageUnit {
+    match code {
+        SessionCoverageLimitationCode::RootMissing
+        | SessionCoverageLimitationCode::RootInaccessible => SessionCoverageUnit::Roots,
+        SessionCoverageLimitationCode::DiscoveryFileLimit
+        | SessionCoverageLimitationCode::SampledFileLimit
+        | SessionCoverageLimitationCode::FileMetadataFailure
+        | SessionCoverageLimitationCode::FileReadFailure
+        | SessionCoverageLimitationCode::FileZeroRead => SessionCoverageUnit::Files,
+        SessionCoverageLimitationCode::DiscoveryDepthLimit => SessionCoverageUnit::Depth,
+        SessionCoverageLimitationCode::DiscoveryWalkFailure => SessionCoverageUnit::Walks,
+        SessionCoverageLimitationCode::SampledByteLimit
+        | SessionCoverageLimitationCode::FileByteLimit => SessionCoverageUnit::Bytes,
+        SessionCoverageLimitationCode::SampledLineLimit
+        | SessionCoverageLimitationCode::LineAlignmentLoss => SessionCoverageUnit::Lines,
+        SessionCoverageLimitationCode::JsonExtractionLimit => SessionCoverageUnit::Bytes,
+        SessionCoverageLimitationCode::JsonRecordLimit => SessionCoverageUnit::Records,
+    }
+}
+
+fn read_session_tail_with_facts(
     path: &Path,
     file_bytes: u64,
     maximum: u64,
     align_to_line: bool,
-) -> io::Result<(Vec<u8>, u64)> {
+) -> io::Result<(Vec<u8>, u64, bool)> {
     let mut file = File::open(path)?;
     let offset = file_bytes.saturating_sub(maximum);
     file.seek(SeekFrom::Start(offset))?;
     let mut sample = Vec::with_capacity(maximum as usize);
     file.take(maximum).read_to_end(&mut sample)?;
     let bytes_read = sample.len() as u64;
+    let mut alignment_lost = false;
     if offset != 0 && align_to_line {
         if let Some(newline) = sample.iter().position(|byte| *byte == b'\n') {
             sample.drain(..=newline);
         } else {
+            alignment_lost = !sample.is_empty();
             sample.clear();
         }
     }
-    Ok((sample, bytes_read))
+    Ok((sample, bytes_read, alignment_lost))
 }
 
-fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
+#[derive(Default)]
+struct JsonExtractionFacts {
+    records: Vec<(String, usize)>,
+    extraction_limited: bool,
+    parse_boundary: bool,
+}
+
+fn extract_complete_json_objects_with_facts(sample: &str) -> JsonExtractionFacts {
     let bytes = sample.as_bytes();
     let mut candidates = Vec::<(usize, usize)>::new();
     // A tail can begin either inside or outside a JSON string. Try both bounded
@@ -2312,12 +2634,14 @@ fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
     let mut selected = Vec::<(usize, usize)>::new();
     let mut covered_until = 0;
     let mut parse_bytes = 0_u64;
+    let mut parse_boundary = false;
     for (start, end) in candidates {
         if end <= covered_until {
             continue;
         }
         let candidate_bytes = (end - start) as u64;
         if parse_bytes.saturating_add(candidate_bytes) > 8 * MAX_SESSION_BYTES_PER_FILE {
+            parse_boundary = true;
             continue;
         }
         parse_bytes += candidate_bytes;
@@ -2327,17 +2651,33 @@ fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
         }
     }
     selected.sort_by_key(|(start, _)| *start);
-    if selected.len() > MAX_SESSION_LINES_PER_AGENT {
+    let extraction_limited = selected.len() > MAX_SESSION_LINES_PER_AGENT;
+    if extraction_limited {
         selected.drain(..selected.len() - MAX_SESSION_LINES_PER_AGENT);
     }
-    selected
-        .into_iter()
-        .map(|(start, end)| {
-            let value = sample[start..end].to_owned();
-            let lines = value.lines().count().max(1);
-            (value, lines)
-        })
-        .collect()
+    JsonExtractionFacts {
+        records: selected
+            .into_iter()
+            .map(|(start, end)| {
+                let value = sample[start..end].to_owned();
+                let lines = value.lines().count().max(1);
+                (value, lines)
+            })
+            .collect(),
+        extraction_limited,
+        parse_boundary,
+    }
+}
+
+#[cfg(test)]
+fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
+    extract_complete_json_objects_with_facts(sample).records
+}
+
+#[derive(Default)]
+struct SessionDiscoveryOutcome {
+    file_limit: bool,
+    depth_limit: bool,
 }
 
 fn collect_session_files(
@@ -2346,13 +2686,32 @@ fn collect_session_files(
     max_depth: usize,
     maximum: usize,
     output: &mut Vec<PathBuf>,
-) -> io::Result<bool> {
-    if depth > max_depth || output.len() >= maximum {
-        return Ok(output.len() >= maximum);
+) -> io::Result<SessionDiscoveryOutcome> {
+    let mut outcome = SessionDiscoveryOutcome::default();
+    collect_session_files_with_outcome(directory, depth, max_depth, maximum, output, &mut outcome)?;
+    Ok(outcome)
+}
+
+fn collect_session_files_with_outcome(
+    directory: &Path,
+    depth: usize,
+    max_depth: usize,
+    maximum: usize,
+    output: &mut Vec<PathBuf>,
+    outcome: &mut SessionDiscoveryOutcome,
+) -> io::Result<()> {
+    if depth > max_depth {
+        outcome.depth_limit = true;
+        return Ok(());
+    }
+    if output.len() >= maximum {
+        outcome.file_limit = true;
+        return Ok(());
     }
     for entry in fs::read_dir(directory)? {
         if output.len() >= maximum {
-            return Ok(true);
+            outcome.file_limit = true;
+            return Ok(());
         }
         let entry = entry?;
         let path = entry.path();
@@ -2361,9 +2720,14 @@ fn collect_session_files(
             continue;
         }
         if metadata.is_dir() {
-            if collect_session_files(&path, depth + 1, max_depth, maximum, output)? {
-                return Ok(true);
-            }
+            collect_session_files_with_outcome(
+                &path,
+                depth + 1,
+                max_depth,
+                maximum,
+                output,
+                outcome,
+            )?;
         } else if matches!(
             path.extension().and_then(|ext| ext.to_str()),
             Some("json" | "jsonl" | "log")
@@ -2371,7 +2735,7 @@ fn collect_session_files(
             output.push(path);
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 const fn usage_stage(signal: SessionSignal) -> UsageStage {
@@ -3743,6 +4107,15 @@ enabled = true
         assert_eq!(result.coverage[0].files_partially_observed, 1);
         assert!(result.coverage[0].truncated);
         assert!(!result.coverage[0].denominator_reliable);
+        let limitations = result.coverage[0].limitations.as_ref().unwrap();
+        assert!(!limitations.iter().any(|limitation| {
+            limitation.code == SessionCoverageLimitationCode::SampledByteLimit
+        }));
+        assert!(limitations.iter().any(|limitation| {
+            limitation.code == SessionCoverageLimitationCode::FileByteLimit
+                && limitation.scope == SessionCoverageScope::File
+                && limitation.limit == Some(MAX_SESSION_BYTES_PER_FILE)
+        }));
 
         fs::remove_dir_all(home).unwrap();
     }
@@ -3766,6 +4139,17 @@ enabled = true
         assert_eq!(coverage.roots_missing, 1);
         assert_eq!(coverage.roots_inaccessible, 0);
         assert!(!coverage.denominator_reliable);
+        assert!(
+            coverage
+                .limitations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|limitation| {
+                    limitation.code == SessionCoverageLimitationCode::RootMissing
+                        && limitation.scope == SessionCoverageScope::Root
+                })
+        );
 
         fs::remove_dir_all(home).unwrap();
     }
@@ -3907,6 +4291,45 @@ enabled = true
                 .iter()
                 .all(|(record, lines)| record == "{}" && *lines == 1)
         );
+    }
+
+    #[test]
+    fn json_record_limit_is_a_typed_denominator_blocker() {
+        let home = temp_directory("json-record-limit");
+        let skill = home.join(".hermes/skills/research");
+        let sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+        fs::write(
+            sessions.join("session.json"),
+            format!(
+                r#"{{"padding":"{}","events":[{}]}}"#,
+                "x".repeat(MAX_SESSION_BYTES_PER_FILE as usize + 1),
+                vec!["{}"; MAX_SESSION_LINES_PER_AGENT + 1].join(",")
+            ),
+        )
+        .unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|coverage| coverage.agent == AgentKind::Hermes)
+            .unwrap();
+        assert!(!coverage.denominator_reliable);
+        assert!(
+            coverage
+                .limitations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|limitation| {
+                    limitation.code == SessionCoverageLimitationCode::JsonRecordLimit
+                        && limitation.unit == SessionCoverageUnit::Records
+                })
+        );
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

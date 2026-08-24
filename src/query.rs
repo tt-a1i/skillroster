@@ -2919,6 +2919,7 @@ mod tests {
             discovery_truncated: false,
             first_seen_unix: Some(10),
             last_seen_unix: Some(20),
+            limitations: Some(Vec::new()),
         });
 
         let report = build_report(&scan);

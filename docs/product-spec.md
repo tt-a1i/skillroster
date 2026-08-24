@@ -84,6 +84,8 @@ Ambiguous Skills remain separate. SkillRoster never merges based only on a match
 
 Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large active JSONL files contribute bounded complete-line tails, large monolithic JSON files contribute bounded complete nested objects from their tails, and the fixed byte budget is spread across multiple recent sessions. Reports distinguish missing, inaccessible, sampled-but-limited, and complete observable session roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
 
+New session Scans record every completeness boundary at its trigger point as typed, multi-value Coverage limitations. Each fact freezes its code, root/file/Agent scope, count quality, observed value, active limit, unit, and scanner source; aggregate coverage fields remain compatibility projections. Public Coverage Evidence classifies which unchanged boundaries will recur, which local read failures may resolve, and which roots require verification before a rescan. Scanner caps are not configurable through the CLI. Legacy Snapshots without typed limitations remain `legacy_unknown` and never inherit the current binary's limits or claim a reliable denominator.
+
 Finding coverage never mixes filesystem discovery with session observation.
 Inventory, layout, exposure, overlap, routing, and structural lifecycle
 Findings use `skill_root_scan`; known-missing Skill roots are observed absence,

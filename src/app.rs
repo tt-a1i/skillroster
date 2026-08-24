@@ -2339,9 +2339,100 @@ fn usage_finding_evidence_priority(evidence: &EvidenceRecord) -> u8 {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CoverageRetryDisposition {
+    SameBoundaryExpected,
+    RetryMayResolve,
+    VerifyBeforeRescan,
+}
+
+const fn coverage_retry_disposition(
+    code: scan::SessionCoverageLimitationCode,
+) -> CoverageRetryDisposition {
+    match code {
+        scan::SessionCoverageLimitationCode::RootMissing
+        | scan::SessionCoverageLimitationCode::RootInaccessible => {
+            CoverageRetryDisposition::VerifyBeforeRescan
+        }
+        scan::SessionCoverageLimitationCode::DiscoveryWalkFailure
+        | scan::SessionCoverageLimitationCode::FileMetadataFailure
+        | scan::SessionCoverageLimitationCode::FileReadFailure
+        | scan::SessionCoverageLimitationCode::FileZeroRead => {
+            CoverageRetryDisposition::RetryMayResolve
+        }
+        scan::SessionCoverageLimitationCode::DiscoveryFileLimit
+        | scan::SessionCoverageLimitationCode::DiscoveryDepthLimit
+        | scan::SessionCoverageLimitationCode::SampledFileLimit
+        | scan::SessionCoverageLimitationCode::SampledByteLimit
+        | scan::SessionCoverageLimitationCode::SampledLineLimit
+        | scan::SessionCoverageLimitationCode::FileByteLimit
+        | scan::SessionCoverageLimitationCode::JsonExtractionLimit
+        | scan::SessionCoverageLimitationCode::JsonRecordLimit
+        | scan::SessionCoverageLimitationCode::LineAlignmentLoss => {
+            CoverageRetryDisposition::SameBoundaryExpected
+        }
+    }
+}
+
 fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     let mut details = serde_json::to_value(coverage)?;
     details["agent"] = json!(coverage.agent.id());
+    let legacy = coverage.limitations.is_none();
+    let limitations = coverage.limitations.as_deref().unwrap_or_default();
+    let mut same_boundary_expected_codes = Vec::new();
+    let mut retry_may_resolve_codes = Vec::new();
+    let mut verify_before_rescan_codes = Vec::new();
+    for limitation in limitations {
+        let code = serde_json::to_value(limitation.code)?;
+        match coverage_retry_disposition(limitation.code) {
+            CoverageRetryDisposition::SameBoundaryExpected => {
+                same_boundary_expected_codes.push(code)
+            }
+            CoverageRetryDisposition::RetryMayResolve => retry_may_resolve_codes.push(code),
+            CoverageRetryDisposition::VerifyBeforeRescan => verify_before_rescan_codes.push(code),
+        }
+    }
+    let denominator_supported = !legacy && coverage.denominator_reliable;
+    let mut next_steps = Vec::new();
+    if !denominator_supported {
+        next_steps.push("retain_bounded_positive_observations");
+    }
+    if legacy {
+        next_steps.push("rescan_to_record_typed_limitations");
+    }
+    if !verify_before_rescan_codes.is_empty() {
+        next_steps.push("verify_session_root_before_rescan");
+    }
+    if !retry_may_resolve_codes.is_empty() {
+        next_steps.push("resolve_read_boundary_before_rescan");
+    }
+    if !same_boundary_expected_codes.is_empty()
+        || (!denominator_supported && limitations.is_empty() && !legacy)
+    {
+        next_steps.push("report_current_cli_cannot_establish_complete_denominator");
+    }
+    details["limitation_state"] = json!(if legacy {
+        "legacy_unknown"
+    } else if coverage.denominator_reliable {
+        "complete"
+    } else if limitations.is_empty() {
+        "incomplete_unknown"
+    } else {
+        "limited"
+    });
+    details["actionability"] = json!({
+        "cap_configurable_by_cli": false,
+        "same_boundary_expected_codes": same_boundary_expected_codes,
+        "retry_may_resolve_codes": retry_may_resolve_codes,
+        "verify_before_rescan_codes": verify_before_rescan_codes,
+        "supported_next_steps": next_steps,
+        "inference_boundary": {
+            "bounded_positive_observations_only": !denominator_supported,
+            "usage_denominator_supported": denominator_supported,
+            "unused_claim_supported": false,
+            "automatic_governance_supported": false,
+        },
+    });
     Ok(details)
 }
 
@@ -9404,6 +9495,7 @@ mod recovery_tests {
                 discovery_truncated: false,
                 first_seen_unix: None,
                 last_seen_unix: None,
+                limitations: Some(Vec::new()),
             };
         let mut scan = ScanResult {
             roots: vec![
@@ -9520,6 +9612,97 @@ mod recovery_tests {
         assert_eq!(inaccessible["denominator_reliable"], false);
         assert_eq!(inaccessible["inaccessible_root_count"], 1);
         assert_eq!(inaccessible["limited_agents"], json!(["claude-code"]));
+    }
+
+    #[test]
+    fn session_coverage_details_keep_typed_limitations_actionable_and_legacy_safe() {
+        let mut coverage = scan::SessionCoverage {
+            agent: AgentKind::Codex,
+            roots_present: 1,
+            roots_missing: 0,
+            roots_inaccessible: 0,
+            files_discovered: 2,
+            files_observed: 1,
+            files_partially_observed: 1,
+            files_skipped: 1,
+            denominator_reliable: false,
+            bytes_observed: 4 * 1024 * 1024,
+            lines_observed: 10,
+            truncated: true,
+            discovery_truncated: false,
+            first_seen_unix: None,
+            last_seen_unix: None,
+            limitations: Some(vec![scan::SessionCoverageLimitation {
+                code: scan::SessionCoverageLimitationCode::SampledByteLimit,
+                scope: scan::SessionCoverageScope::Agent,
+                count_kind: scan::SessionCoverageCountKind::Exact,
+                observed: Some(4 * 1024 * 1024),
+                limit: Some(4 * 1024 * 1024),
+                unit: scan::SessionCoverageUnit::Bytes,
+                source: scan::SessionCoverageLimitationSource::SessionSampling,
+            }]),
+        };
+        let limited = session_coverage_details(&coverage).unwrap();
+        assert_eq!(limited["limitation_state"], "limited");
+        assert_eq!(limited["actionability"]["cap_configurable_by_cli"], false);
+        assert_eq!(
+            limited["actionability"]["same_boundary_expected_codes"],
+            json!(["sampled_byte_limit"])
+        );
+        assert_eq!(
+            limited["actionability"]["inference_boundary"]["unused_claim_supported"],
+            false
+        );
+        assert_eq!(limited["limitations"][0]["unit"], "bytes");
+        assert_eq!(limited["limitations"][0]["source"], "session_sampling");
+
+        coverage.limitations = Some(vec![scan::SessionCoverageLimitation {
+            code: scan::SessionCoverageLimitationCode::FileReadFailure,
+            scope: scan::SessionCoverageScope::File,
+            count_kind: scan::SessionCoverageCountKind::Unknown,
+            observed: None,
+            limit: None,
+            unit: scan::SessionCoverageUnit::Files,
+            source: scan::SessionCoverageLimitationSource::SessionSampling,
+        }]);
+        let transient = session_coverage_details(&coverage).unwrap();
+        assert_eq!(
+            transient["actionability"]["retry_may_resolve_codes"],
+            json!(["file_read_failure"])
+        );
+        assert_eq!(
+            transient["actionability"]["same_boundary_expected_codes"],
+            json!([])
+        );
+
+        coverage.denominator_reliable = true;
+        coverage.limitations = None;
+        let legacy = session_coverage_details(&coverage).unwrap();
+        assert_eq!(legacy["limitation_state"], "legacy_unknown");
+        assert_eq!(
+            legacy["actionability"]["same_boundary_expected_codes"],
+            json!([])
+        );
+        assert_eq!(
+            legacy["actionability"]["inference_boundary"]["usage_denominator_supported"],
+            false
+        );
+        assert!(
+            legacy["actionability"]["supported_next_steps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("rescan_to_record_typed_limitations"))
+        );
+        assert!(!legacy["limitations"].is_array());
+
+        coverage.denominator_reliable = false;
+        coverage.limitations = Some(Vec::new());
+        let unknown = session_coverage_details(&coverage).unwrap();
+        assert_eq!(unknown["limitation_state"], "incomplete_unknown");
+        assert_eq!(
+            unknown["actionability"]["inference_boundary"]["bounded_positive_observations_only"],
+            true
+        );
     }
 
     #[test]
