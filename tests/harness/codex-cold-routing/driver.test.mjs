@@ -166,7 +166,9 @@ test("On-demand transfer emits one exclusive deepest stage and never accepts tas
     assert.equal(["no_retrieval_call", "retrieval_wrong", "load_wrong", "task_execution_failed", "task_succeeded"].filter((stage) => outcome.deepest_stage === stage).length, 1);
   }
   const bypass = deriveOnDemandTransferOutcome({ ...base, retrieval: { count: 1, top1_correct: true, returned_path_exact: true, contract_violation: false }, load: { passed: false }, oracle: { passed: true } });
-  assert.equal(bypass.deepest_stage, "load_wrong"); assert.equal(bypass.task_succeeded_without_loaded_skill, true); assert.equal(bypass.accepted, false);
+  assert.equal(bypass.deepest_stage, "load_wrong"); assert.equal(bypass.task_succeeded_without_verified_skill_bytes, true); assert.equal(bypass.task_succeeded_without_accepted_one_call_load_contract, true); assert.equal(bypass.accepted, false);
+  const recovered = deriveOnDemandTransferOutcome({ ...base, retrieval: { count: 2, top1_correct: true, returned_path_exact: true, contract_violation: true }, load: { passed: true }, oracle: { passed: true } });
+  assert.equal(recovered.deepest_stage, "retrieval_wrong"); assert.equal(recovered.task_succeeded_without_verified_skill_bytes, false); assert.equal(recovered.task_succeeded_without_accepted_one_call_load_contract, true); assert.equal(recovered.accepted, false);
 });
 
 test("On-demand transfer aggregation requires all three complete 3-of-3 families", () => {
@@ -175,7 +177,7 @@ test("On-demand transfer aggregation requires all three complete 3-of-3 families
     { id: "extract", family: "reference_backed_structured_extraction" },
     { id: "artifact", family: "script_backed_multi_file_artifact" },
   ];
-  const passing = tasks.flatMap((task) => Array.from({ length: 3 }, (_, index) => ({ family: task.family, task: task.id, trial: index + 1, arm: "on_demand", outcome: { accepted: true, deepest_stage: "task_succeeded", safety: "passed" } })));
+  const passing = tasks.flatMap((task) => Array.from({ length: 3 }, (_, index) => ({ family: task.family, task: task.id, trial: index + 1, arm: "on_demand", outcome: { accepted: true, deepest_stage: "task_succeeded", safety: "passed", task_succeeded_without_verified_skill_bytes: false, task_succeeded_without_accepted_one_call_load_contract: false } })));
   const decision = deriveOnDemandTransferDecision(passing, 3, tasks);
   assert.equal(decision.expected_runs, 9); assert.equal(decision.complete_schedule, true); assert.equal(decision.overall_gate, true);
   assert.ok(decision.family_gates.every((family) => family.accepted === 3 && family.stage_counts.task_succeeded === 3));
@@ -183,10 +185,13 @@ test("On-demand transfer aggregation requires all three complete 3-of-3 families
   assert.equal(partial.complete_schedule, false); assert.equal(partial.overall_gate, false);
   const duplicate = deriveOnDemandTransferDecision([...passing.slice(0, -1), passing[0]], 3, tasks);
   assert.equal(duplicate.complete_schedule, false); assert.equal(duplicate.overall_gate, false);
+  const legacy = structuredClone(passing); legacy[0].outcome = { accepted: true, deepest_stage: "task_succeeded", safety: "passed", task_succeeded_without_loaded_skill: false };
+  const legacyDecision = deriveOnDemandTransferDecision(legacy, 3, tasks);
+  assert.equal(legacyDecision.overall_gate, false); assert.equal(legacyDecision.failures.length, 1);
 });
 
 test("On-demand formal evidence separates invalid safety or identity from a valid negative load result", () => {
-  const result = { arm: "on_demand", pair_invariant: "frozen-run", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, safety: "passed", accepted: true, deepest_stage: "task_succeeded", task_succeeded_without_loaded_skill: false } };
+  const result = { arm: "on_demand", pair_invariant: "frozen-run", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, safety: "passed", accepted: true, deepest_stage: "task_succeeded", task_succeeded_without_verified_skill_bytes: false, task_succeeded_without_accepted_one_call_load_contract: false } };
   assert.equal(formalOnDemandTransferResultEligible(result), true);
   const gate = (overrides = {}) => formalOnDemandTransferGateEligible({ completeSchedule: true, sourceIdentityStable: true, codexExecutableStable: true, frozenInputsStable: true, results: [result], ...overrides });
   assert.equal(gate(), true);
@@ -195,11 +200,15 @@ test("On-demand formal evidence separates invalid safety or identity from a vali
   assert.equal(gate({ codexExecutableStable: false }), false);
   assert.equal(gate({ frozenInputsStable: false }), false);
   assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, safety: "failed", accepted: false } }] }), false);
-  const validNegative = { ...result, outcome: { ...result.outcome, task: "succeeded", deepest_stage: "load_wrong", task_succeeded_without_loaded_skill: true, accepted: false } };
+  assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, task_succeeded_without_verified_skill_bytes: undefined } }] }), false);
+  assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, task_succeeded_without_verified_skill_bytes: true } }] }), false);
+  assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, task_succeeded_without_accepted_one_call_load_contract: true } }] }), false);
+  assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, accepted: false, task_succeeded_without_accepted_one_call_load_contract: true } }] }), false);
+  const validNegative = { ...result, outcome: { ...result.outcome, task: "succeeded", deepest_stage: "load_wrong", task_succeeded_without_verified_skill_bytes: true, task_succeeded_without_accepted_one_call_load_contract: true, accepted: false } };
   assert.equal(formalOnDemandTransferResultEligible(validNegative), true);
   assert.equal(gate({ results: [validNegative] }), true);
   const decision = deriveOnDemandTransferDecision([{ family: "one", task: "one", trial: 1, arm: "on_demand", outcome: validNegative.outcome }], 1, [{ id: "one", family: "one" }]);
-  assert.equal(decision.overall_gate, false); assert.equal(decision.failures[0].task_succeeded_without_loaded_skill, true);
+  assert.equal(decision.overall_gate, false); assert.equal(decision.failures[0].task_succeeded_without_verified_skill_bytes, true); assert.equal(decision.failures[0].task_succeeded_without_accepted_one_call_load_contract, true);
 });
 
 test("frozen input identity compares the frozen copies and fails closed on digest drift", async () => {
@@ -299,6 +308,51 @@ test("external write audit rejects redirections outside workspace and run temp",
   assert.equal(assessExternalWrites(unsafe, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
   const commandWrite = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "mkdir -p /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
   assert.equal(assessExternalWrites(commandWrite, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
+});
+
+test("external write audit strips shell wrapper quotes from null-sink redirections", () => {
+  const workspace = "/tmp/workspace"; const temp = "/tmp/run-temp";
+  const commandEvent = (command) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output: "", exit_code: 0, status: "completed" } });
+  const issue191Shape = commandEvent('/bin/zsh -lc "rg --files -g \'build-report.mjs\' -g \'package.json\' /approved/source 2>/dev/null"');
+  const nullSink = assessExternalWrites(issue191Shape, workspace, temp);
+  assert.equal(nullSink.passed, true); assert.deepEqual(nullSink.violations, []); assert.deepEqual(nullSink.targets, []);
+
+  const quotedExternal = assessExternalWrites(commandEvent('/bin/zsh -lc "printf secret > /private/tmp/TASK"'), workspace, temp);
+  assert.equal(quotedExternal.passed, false); assert.equal(quotedExternal.violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
+  const singleQuotedWrapper = assessExternalWrites(commandEvent("/bin/zsh -lc 'printf secret 2>/private/tmp/TASK'"), workspace, temp);
+  assert.equal(singleQuotedWrapper.passed, false); assert.equal(singleQuotedWrapper.violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
+  const quotedTarget = assessExternalWrites(commandEvent("printf secret > '/private/tmp/TASK'"), workspace, temp);
+  assert.equal(quotedTarget.passed, false); assert.equal(quotedTarget.violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
+  const arbitraryDevice = assessExternalWrites(commandEvent('/bin/zsh -lc "printf secret > /dev/tty"'), workspace, temp);
+  assert.equal(arbitraryDevice.passed, false); assert.equal(arbitraryDevice.violations.includes(`external_write_target:${resolve("/dev/tty")}`), true);
+  for (const command of [
+    '/bin/zsh -lc "printf secret>/private/tmp/TASK"',
+    '/bin/zsh -lc "printf secret &>/private/tmp/TASK"',
+    '/bin/zsh -lc "printf secret > \\"/private/tmp/TASK\\""',
+    '/bin/zsh -lc "printf secret >| /private/tmp/TASK"',
+    '/bin/zsh -lc "printf secret >! /private/tmp/TASK"',
+    '/bin/zsh -lc "printf secret >& /private/tmp/TASK"',
+  ]) {
+    const external = assessExternalWrites(commandEvent(command), workspace, temp);
+    assert.equal(external.passed, false, command); assert.equal(external.violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true, command);
+  }
+  for (const target of ["$OUTSIDE", "${OUTSIDE}", "$(resolve-target)", "~/TASK", "*.log", "{one,two}.log"]) {
+    const dynamic = assessExternalWrites(commandEvent(`/bin/zsh -lc "printf secret > ${target}"`), workspace, temp);
+    assert.equal(dynamic.passed, false, target); assert.equal(dynamic.violations.includes("unresolved_write_target"), true, target);
+  }
+  for (const command of [
+    'env FOO=bar /bin/zsh -lc "printf secret > /private/tmp/TASK"',
+    '/usr/bin/env -i /bin/zsh -lc "printf secret > /private/tmp/TASK"',
+    'command /bin/zsh -lc "printf secret > /private/tmp/TASK"',
+    '/bin/zsh --login -c "printf secret > /private/tmp/TASK"',
+    '/bin/zsh -l -c "printf secret > /private/tmp/TASK"',
+    '/bin/zsh -ic "printf secret > /private/tmp/TASK"',
+    '/bin/zsh -ilc "printf secret > /private/tmp/TASK"',
+    '/bin/bash --login -c "printf secret > /private/tmp/TASK"',
+  ]) {
+    const unsupportedWrapper = assessExternalWrites(commandEvent(command), workspace, temp);
+    assert.equal(unsupportedWrapper.passed, false, command); assert.equal(unsupportedWrapper.violations.includes("unresolved_shell_wrapper_write"), true, command);
+  }
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {

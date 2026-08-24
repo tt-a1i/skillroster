@@ -348,9 +348,10 @@ function writeTargetAllowed(path, workspace, tempRoot) {
   return inside(candidate, workspace) || inside(candidate, tempRoot);
 }
 
+function writeTargetStatic(path) { return !/(?:^~|[$`*?\[\]{}])/u.test(path); }
+
 function explicitWritePaths(command) {
-  const paths = []; const redirection = /(?:^|\s)(?:\d*>>?|\d*<>)[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gu;
-  for (const match of command.matchAll(redirection)) paths.push(match[1] ?? match[2] ?? match[3]);
+  const paths = [...redirectionTargets(command)];
   const tokens = simpleCommandTokens(command); if (!tokens?.length) return paths;
   const executable = basename(tokens[0]).toLowerCase(); const args = tokens.slice(1).filter((token) => token !== "--");
   const nonOptions = args.filter((token) => !token.startsWith("-"));
@@ -364,8 +365,13 @@ export function assessExternalWrites(jsonl, workspace, tempRoot) {
   const targets = []; const violations = [];
   const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
   for (const [eventIndex, event] of commands.entries()) {
+    if (unsupportedShellWrapperWrite(event.command)) violations.push("unresolved_shell_wrapper_write");
     for (const raw of explicitWritePaths(event.command)) {
       if (["/dev/null", "NUL", "nul"].includes(raw)) continue;
+      if (!writeTargetStatic(raw)) {
+        targets.push({ raw, canonical: null, event_index: eventIndex, command: event.command, allowed: false });
+        violations.push("unresolved_write_target"); continue;
+      }
       const target = { raw, canonical: canonicalPath(isAbsolute(raw) ? raw : join(workspace, raw)), event_index: eventIndex, command: event.command };
       const allowed = writeTargetAllowed(raw, workspace, tempRoot); targets.push({ ...target, allowed });
       if (!allowed) violations.push(`external_write_target:${target.canonical}`);
@@ -378,8 +384,63 @@ export function extractCommandTexts(jsonl) { return extractCommandEvents(jsonl).
 
 function unwrapSimpleShell(command) {
   const trimmed = command.trim();
-  const match = trimmed.match(/^\S*(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/u);
+  const match = simpleShellWrapper(trimmed);
   return match ? match[2] : trimmed;
+}
+
+function simpleShellWrapper(command) { return command.match(/^\S*(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/u); }
+
+function unsupportedShellWrapperWrite(command) {
+  const trimmed = command.trim();
+  return !simpleShellWrapper(trimmed)
+    && /(?:^|\s)\S*(?:ba|z)?sh(?=\s)/u.test(trimmed)
+    && /(?:^|\s)-[A-Za-z]*c[A-Za-z]*(?:\s|$)/u.test(trimmed)
+    && trimmed.includes(">");
+}
+
+function redirectionTargets(command) {
+  const trimmed = command.trim(); const wrapper = simpleShellWrapper(trimmed);
+  const value = wrapper?.[1] === '"'
+    ? wrapper[2].replace(/\\(["\\$`])/gu, "$1").replace(/\\\r?\n/gu, "")
+    : wrapper?.[2] ?? trimmed;
+  const paths = []; let quote = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (quote === '"' && char === "\\") index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "\\") { index += 1; continue; }
+    if (char !== ">") continue;
+    let cursor = index + 1;
+    if (value[cursor] === ">") cursor += 1;
+    if (value[cursor] === "|" || value[cursor] === "!") cursor += 1;
+    while (/[ \t]/u.test(value[cursor] ?? "")) cursor += 1;
+    if (value[cursor] === "&") {
+      cursor += 1;
+      while (/[ \t]/u.test(value[cursor] ?? "")) cursor += 1;
+      if (/\d/u.test(value[cursor] ?? "") || value[cursor] === "-") continue;
+    }
+    let target = ""; let targetQuote = null;
+    for (; cursor < value.length; cursor += 1) {
+      const targetChar = value[cursor];
+      if (targetQuote) {
+        if (targetChar === targetQuote) targetQuote = null;
+        else if (targetQuote === '"' && targetChar === "\\") { cursor += 1; if (cursor < value.length) target += value[cursor]; }
+        else target += targetChar;
+        continue;
+      }
+      if (targetChar === "'" || targetChar === '"') { targetQuote = targetChar; continue; }
+      if (targetChar === "\\") { cursor += 1; if (cursor < value.length) target += value[cursor]; continue; }
+      if (/\s/u.test(targetChar) || /[;&|<>]/u.test(targetChar)) break;
+      target += targetChar;
+    }
+    if (target) paths.push(target);
+    index = Math.max(index, cursor - 1);
+  }
+  return paths;
 }
 
 function simpleCommandTokens(command) {
@@ -664,12 +725,14 @@ export function deriveOnDemandTransferOutcome(inputs) {
   let deepestStage = "no_retrieval_call";
   if (retrieval.count > 0) deepestStage = retrievalVerified ? "load_wrong" : "retrieval_wrong";
   if (loadVerified) deepestStage = oracle.passed === true ? "task_succeeded" : "task_execution_failed";
-  const taskSucceededWithoutLoadedSkill = oracle.passed === true && !loadVerified;
+  const taskSucceededWithoutVerifiedSkillBytes = oracle.passed === true && load.passed !== true;
+  const taskSucceededWithoutAcceptedOneCallLoadContract = oracle.passed === true && !loadVerified;
   return {
     ...outcome,
     deepest_stage: deepestStage,
-    task_succeeded_without_loaded_skill: taskSucceededWithoutLoadedSkill,
-    accepted: outcome.accepted && deepestStage === "task_succeeded" && !taskSucceededWithoutLoadedSkill,
+    task_succeeded_without_verified_skill_bytes: taskSucceededWithoutVerifiedSkillBytes,
+    task_succeeded_without_accepted_one_call_load_contract: taskSucceededWithoutAcceptedOneCallLoadContract,
+    accepted: outcome.accepted && deepestStage === "task_succeeded" && !taskSucceededWithoutAcceptedOneCallLoadContract,
   };
 }
 
@@ -734,10 +797,10 @@ export function deriveOnDemandTransferDecision(results, trialsPerFamily, tasks, 
   const familyGates = tasks.map((task) => {
     const familyResults = results.filter((result) => result.family === task.family);
     const stageCounts = Object.fromEntries(TRANSFER_STAGES.map((stage) => [stage, familyResults.filter((result) => result.outcome?.deepest_stage === stage).length]));
-    const accepted = familyResults.filter((result) => result.outcome?.accepted === true && result.outcome?.deepest_stage === "task_succeeded" && result.outcome?.task_succeeded_without_loaded_skill !== true).length;
+    const accepted = familyResults.filter((result) => transferEvidenceFieldsValid(result.outcome) && result.outcome?.accepted === true && result.outcome?.deepest_stage === "task_succeeded" && result.outcome.task_succeeded_without_accepted_one_call_load_contract === false).length;
     return { family: task.family, task: task.id, required_trials: trialsPerFamily, run_count: familyResults.length, accepted, stage_counts: stageCounts, gate: familyResults.length === trialsPerFamily && accepted === trialsPerFamily ? "passed" : "failed" };
   });
-  const failures = results.filter((result) => result.outcome?.accepted !== true || result.outcome?.deepest_stage !== "task_succeeded" || result.outcome?.task_succeeded_without_loaded_skill === true).map((result) => ({ family: result.family, task: result.task, trial: result.trial, deepest_stage: TRANSFER_STAGES.includes(result.outcome?.deepest_stage) ? result.outcome.deepest_stage : null, safety: result.outcome?.safety ?? null, task_succeeded_without_loaded_skill: result.outcome?.task_succeeded_without_loaded_skill === true }));
+  const failures = results.filter((result) => !transferEvidenceFieldsValid(result.outcome) || result.outcome?.accepted !== true || result.outcome?.deepest_stage !== "task_succeeded" || result.outcome.task_succeeded_without_accepted_one_call_load_contract === true).map((result) => ({ family: result.family, task: result.task, trial: result.trial, deepest_stage: TRANSFER_STAGES.includes(result.outcome?.deepest_stage) ? result.outcome.deepest_stage : null, safety: result.outcome?.safety ?? null, task_succeeded_without_verified_skill_bytes: result.outcome?.task_succeeded_without_verified_skill_bytes === true, task_succeeded_without_accepted_one_call_load_contract: result.outcome?.task_succeeded_without_accepted_one_call_load_contract === true }));
   const overallGate = exactSchedule && familyGates.every((family) => family.gate === "passed");
   const decision = overallGate ? stopDecision?.all_scheduled_runs_pass ?? "all_scheduled_runs_pass" : stopDecision?.any_run_fails ?? "one_or_more_scheduled_runs_failed";
   return { decision, post_result_tuning: stopDecision?.post_result_tuning ?? null, expected_runs: expectedKeys.size, complete_schedule: exactSchedule, family_gates: familyGates, failures, overall_gate: overallGate };
@@ -1047,7 +1110,16 @@ export function formalResultEligible(result) {
 export function formalOnDemandTransferResultEligible(result) {
   return formalResultEligible(result)
     && result.arm === "on_demand"
-    && TRANSFER_STAGES.includes(result.outcome?.deepest_stage);
+    && TRANSFER_STAGES.includes(result.outcome?.deepest_stage)
+    && transferEvidenceFieldsValid(result.outcome);
+}
+
+function transferEvidenceFieldsValid(outcome) {
+  return typeof outcome?.task_succeeded_without_verified_skill_bytes === "boolean"
+    && typeof outcome?.task_succeeded_without_accepted_one_call_load_contract === "boolean"
+    && !(outcome.task_succeeded_without_verified_skill_bytes && !outcome.task_succeeded_without_accepted_one_call_load_contract)
+    && !(outcome.deepest_stage === "task_succeeded" && outcome.task_succeeded_without_accepted_one_call_load_contract)
+    && !(outcome.accepted === true && (outcome.deepest_stage !== "task_succeeded" || outcome.task_succeeded_without_verified_skill_bytes));
 }
 
 export function formalOnDemandTransferGateEligible({ completeSchedule, sourceIdentityStable, codexExecutableStable, frozenInputsStable, results }) {
@@ -1073,7 +1145,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts, evaluat
       const externalWrites = assessExternalWrites("", paths.workspace, paths.temp);
       const safety = workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed";
       const outcome = evaluationMode === "on_demand_transfer"
-        ? { harness_valid: false, safety, accepted: false, deepest_stage: "no_retrieval_call", task_succeeded_without_loaded_skill: false }
+        ? { harness_valid: false, safety, accepted: false, deepest_stage: "no_retrieval_call", task_succeeded_without_verified_skill_bytes: false, task_succeeded_without_accepted_one_call_load_contract: false }
         : { harness_valid: false, safety, accepted: false };
       return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, external_writes: externalWrites, outcome, root };
     }
