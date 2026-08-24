@@ -1492,6 +1492,14 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
 
 fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path) -> Result<Value> {
     let source_confirmation_details = read_source_confirmation_details(state_dir)?;
+    let mut data = store.export_lifecycle()?;
+    if let Some(evidence) = data["evidence"].as_array_mut() {
+        for record in evidence {
+            if record["kind"].as_str() == Some("coverage") {
+                normalize_legacy_coverage_agent(&mut record["details"]);
+            }
+        }
+    }
     let export = json!({
         "schema_version": 2,
         "generated_at": Utc::now().timestamp(),
@@ -1510,7 +1518,7 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
             "observations_additive": false,
             "legacy_monthly_combinable": false,
         },
-        "data": store.export_lifecycle()?,
+        "data": data,
         "evidence_exclusions": store.evidence_exclusions()?,
         "source_confirmation_details": source_confirmation_details,
         "source_root_permissions": crate::source_policy::policy_export_value(store)?,
@@ -2238,12 +2246,8 @@ fn scan_command(
     let coverage = result
         .coverage
         .iter()
-        .map(|coverage| {
-            let mut value = json!(coverage);
-            value["agent"] = json!(coverage.agent.id());
-            value
-        })
-        .collect::<Vec<_>>();
+        .map(session_coverage_details)
+        .collect::<Result<Vec<_>>>()?;
     let warnings = compact_scan_warnings(result.warnings);
     Ok((
         json!({
@@ -2332,6 +2336,28 @@ fn usage_finding_evidence_priority(evidence: &EvidenceRecord) -> u8 {
         (EvidenceQuality::Observed, true) => 2,
         (_, false) => 3,
         (_, true) => 4,
+    }
+}
+
+fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
+    let mut details = serde_json::to_value(coverage)?;
+    details["agent"] = json!(coverage.agent.id());
+    Ok(details)
+}
+
+fn normalize_legacy_coverage_agent(details: &mut Value) {
+    let Some(agent) = details.get_mut("agent") else {
+        return;
+    };
+    let canonical = match agent.as_str() {
+        Some("claude_code") => Some(AgentKind::ClaudeCode.id()),
+        Some("open_code") => Some(AgentKind::OpenCode.id()),
+        Some("gemini_cli") => Some(AgentKind::GeminiCli.id()),
+        Some("git_hub_copilot") => Some(AgentKind::GitHubCopilot.id()),
+        _ => None,
+    };
+    if let Some(canonical) = canonical {
+        *agent = json!(canonical);
     }
 }
 
@@ -2439,6 +2465,11 @@ fn report_command(
                 .unwrap_or_default();
             let ordered_evidence = if stored.title == "Five-stage usage evidence" {
                 let mut evidence = store.finding_evidence(&id)?;
+                for record in &mut evidence {
+                    if record.kind == EvidenceKind::Coverage {
+                        normalize_legacy_coverage_agent(&mut record.details);
+                    }
+                }
                 evidence.sort_by(|left, right| {
                     usage_finding_evidence_priority(left)
                         .cmp(&usage_finding_evidence_priority(right))
@@ -2519,7 +2550,7 @@ fn report_command(
                 })
                 .collect::<Vec<_>>();
             placements.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-            let evidence = if ordered_evidence.is_empty() {
+            let mut evidence = if ordered_evidence.is_empty() {
                 paged_evidence_ids
                     .iter()
                     .map(|id| store.get_evidence(id))
@@ -2534,6 +2565,11 @@ fn report_command(
                     .take(limit)
                     .collect()
             };
+            for record in &mut evidence {
+                if record.kind == EvidenceKind::Coverage {
+                    normalize_legacy_coverage_agent(&mut record.details);
+                }
+            }
             let total = affected_skill_ids
                 .len()
                 .max(affected_placement_ids.len())
@@ -8324,7 +8360,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             agent_id.as_str(),
             None,
             None,
-            serde_json::to_value(coverage)?,
+            session_coverage_details(coverage)?,
             observed_at,
         )?;
     }
