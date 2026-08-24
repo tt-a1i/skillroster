@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "issue": 153,
+  "candidate_version": "1.8.24",
+  "mode": "real_home_isolated_state_read_only",
+  "agents_checked": 8,
+  "before": {
+    "independent_skills": 260,
+    "placements": 887
+  },
+  "after": {
+    "independent_skills": 251,
+    "placements": 887,
+    "files_changed": false
+  },
+  "families": [
+    {
+      "name": "humanizer-zh",
+      "before_variant_count": 2,
+      "after_variant_count": 1
+    },
+    {
+      "name": "agent-session-miner",
+      "before_variant_count": 2,
+      "after_variant_count": 1
+    },
+    {
+      "name": "goal-crafter",
+      "before_variant_count": 2,
+      "after_variant_count": 2,
+      "exact_loads": [
+        {
+          "byte_length": 7980,
+          "sha256": "5f1762d57f9dd3fecdf0168112fe8b6ff42968831155e436b3e15fe2b61f7337",
+          "identity_matches_snapshot": true,
+          "package_fingerprint_matches_snapshot": true,
+          "files_changed": false
+        },
+        {
+          "byte_length": 8484,
+          "sha256": "378f4c526746255c172d0fe300ff8b741a054b042b82e1726b1caa4772a41f17",
+          "identity_matches_snapshot": true,
+          "package_fingerprint_matches_snapshot": true,
+          "files_changed": false
+        }
+      ]
+    }
+  ],
+  "retained_sensitive_data": false
+}

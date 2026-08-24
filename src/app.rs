@@ -603,6 +603,38 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if error
+        .downcast_ref::<ContentIdentityRescanRequired>()
+        .is_some()
+    {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "content_identity_rescan_required".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids: Vec::new(),
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "legacy_snapshot_requires_rescan",
+                    "required_algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![action(
+            "refresh_snapshot_content_identity",
+            &["scan", "--json"],
+            false,
+            false,
+            "content_identity_rescan_required",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -2318,6 +2350,7 @@ fn report_command(
             let scan: ScanResult = store
                 .scan_payload(&report.scan_id)?
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            require_content_identity(&scan)?;
             let coverage_basis = stored_finding_coverage_basis(&stored, object)?;
             let evidence_quality = object
                 .get("evidence_quality")
@@ -2503,6 +2536,7 @@ fn report_command(
         });
     }
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id {
             return Ok(select_report_view(&existing.summary, request));
@@ -4273,6 +4307,7 @@ fn find_command(
         .into());
     }
     let (scan_id, scan) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
         std::iter::once(task).chain(retrieval_hints.iter().map(String::as_str)),
@@ -6721,6 +6756,7 @@ fn prepare_plan(
         bail!("recovery is required before another Plan can be prepared");
     }
     let (scan_id, scan) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
         let (input, roster_provenance) = expand_finding_roster_changes(
             store,
@@ -7761,7 +7797,13 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             .or_else(|| skill.metadata.revision.clone());
         let identity_key = match (&skill.metadata.source, &declared_revision) {
             (Some(source), Some(revision)) => format!("source:{source}@{revision}"),
-            _ => format!("content:{}", skill.content_digest),
+            _ => format!(
+                "content:{}",
+                skill
+                    .content_identity_digest
+                    .as_deref()
+                    .unwrap_or(&skill.content_digest)
+            ),
         };
         let stored_id = store.save_skill(&SkillRecord {
             id,
@@ -8385,6 +8427,28 @@ fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
     store
         .latest_scan_payload()?
         .ok_or_else(|| anyhow!("no completed Snapshot; run skillroster scan first"))
+}
+
+#[derive(Debug)]
+struct ContentIdentityRescanRequired;
+
+impl std::fmt::Display for ContentIdentityRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "latest Snapshot has no {} content identity; run skillroster scan",
+            scan::CONTENT_IDENTITY_ALGORITHM
+        )
+    }
+}
+
+impl std::error::Error for ContentIdentityRescanRequired {}
+
+fn require_content_identity(scan: &ScanResult) -> Result<()> {
+    if scan.content_identity_algorithm.as_deref() != Some(scan::CONTENT_IDENTITY_ALGORITHM) {
+        return Err(ContentIdentityRescanRequired.into());
+    }
+    Ok(())
 }
 
 fn harness_agent(value: &str) -> Result<AgentKind> {
@@ -9541,6 +9605,7 @@ mod recovery_tests {
                 name: "bounded".into(),
                 metadata: scan::SkillMetadata::default(),
                 content_digest: "same-fallback-digest".into(),
+                content_identity_digest: None,
                 digest_algorithm: "sha256-v1".into(),
                 summary: String::new(),
                 normalized_text: String::new(),

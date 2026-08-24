@@ -1190,6 +1190,160 @@ fn finding_list_is_paged_filterable_and_leads_to_evidence() {
 }
 
 #[test]
+fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/legacy-identity");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: legacy-identity\ndescription: Legacy identity fixture\n---\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let encoded: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&encoded).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("content_identity_algorithm");
+    for skill in legacy["skills"].as_array_mut().unwrap() {
+        skill
+            .as_object_mut()
+            .unwrap()
+            .remove("content_identity_digest");
+    }
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            rusqlite::params![legacy.to_string(), snapshot],
+        )
+        .unwrap();
+
+    for tail in [
+        vec!["find", "legacy identity fixture"],
+        vec!["report", "--summary"],
+    ] {
+        let rejected = run(&[&common[..], &tail].concat(), None);
+        assert!(!rejected.status.success());
+        let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(
+            rejected["error"]["code"],
+            "content_identity_rescan_required"
+        );
+        assert_eq!(
+            rejected["error"]["details"]["required_algorithm"],
+            "sha256-content-v1"
+        );
+        assert_eq!(rejected["error"]["details"]["files_changed"], false);
+        assert_eq!(
+            rejected["suggested_actions"][0]["argv"],
+            context_action_argv(&home, &state, &["scan", "--json"])
+        );
+    }
+
+    let rejected_plan = run(&[&common[..], &["plan", "--stdin"]].concat(), Some("{}"));
+    assert!(!rejected_plan.status.success());
+    let rejected_plan: Value = serde_json::from_slice(&rejected_plan.stdout).unwrap();
+    assert_eq!(
+        rejected_plan["error"]["code"],
+        "content_identity_rescan_required"
+    );
+}
+
+#[test]
+fn gitignore_only_copies_share_routing_identity_but_keep_integrity_drift_checks() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex = home.join(".codex/skills/shared-capability");
+    let claude = home.join(".claude/skills/shared-capability");
+    for directory in [&codex, &claude] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            "---\nname: shared-capability\ndescription: Exact route fixture\n---\nshared body\n",
+        )
+        .unwrap();
+    }
+    fs::write(claude.join(".gitignore"), "local-only\n").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let scanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(scanned["result"]["skill_count"], 1);
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert!(
+        report["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| {
+                finding["title"] != "Same-name Skills have different content"
+                    && finding["title"] != "Declared identity has divergent local content"
+            })
+    );
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &["find", "exact route fixture", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["variant_count"], 1);
+    assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
+
+    let loaded_entrypoint = Path::new(
+        found["result"]["loaded_skill"]["content"]["path"]
+            .as_str()
+            .unwrap(),
+    );
+    fs::write(
+        loaded_entrypoint.parent().unwrap().join(".gitignore"),
+        "changed after scan\n",
+    )
+    .unwrap();
+    let drifted = run(
+        &[
+            &common[..],
+            &["find", "exact route fixture", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!drifted.status.success());
+    let drifted: Value = serde_json::from_slice(&drifted.stdout).unwrap();
+    assert_eq!(
+        drifted["error"]["details"]["reason"],
+        "package_identity_drift"
+    );
+    assert_eq!(drifted["error"]["details"]["files_changed"], false);
+}
+
+#[test]
 fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

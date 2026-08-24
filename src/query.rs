@@ -630,11 +630,14 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             .push(skill);
     }
     for (name, skills) in by_name {
-        let digests = skills
+        let content_identity_digests = skills
             .iter()
-            .map(|skill| skill.content_digest.as_str())
+            .filter_map(|skill| skill.content_identity_digest.as_deref())
             .collect::<BTreeSet<_>>();
-        if skills.len() > 1 && digests.len() > 1 {
+        let identity_complete = skills
+            .iter()
+            .all(|skill| skill.content_identity_digest.is_some());
+        if skills.len() > 1 && identity_complete && content_identity_digests.len() > 1 {
             let affected_skill_ids = skills
                 .iter()
                 .map(|skill| skill.id.clone())
@@ -652,7 +655,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 SAME_NAME_DIVERGENT_FINDING_TITLE,
                 format!(
                     "{name} resolves to {} distinct content digests.",
-                    digests.len()
+                    content_identity_digests.len()
                 ),
                 affected_skill_ids,
                 affected_placement_ids,
@@ -666,17 +669,18 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 
     for (skill_id, placements) in placements_by_skill(scan) {
+        let Some(skill) = scan.skills.iter().find(|skill| skill.id == skill_id) else {
+            continue;
+        };
+        if skill.metadata.source.is_none() {
+            continue;
+        }
         let digests = placements
             .iter()
             .map(|placement| placement.content_digest.as_str())
             .collect::<BTreeSet<_>>();
         if digests.len() > 1 {
-            let skill_name = scan
-                .skills
-                .iter()
-                .find(|skill| skill.id == skill_id)
-                .map(|skill| skill.name.as_str())
-                .unwrap_or("unknown Skill");
+            let skill_name = skill.name.as_str();
             push_finding(
                 findings,
                 FindingCategory::Layout,
@@ -2750,6 +2754,7 @@ mod tests {
         same_name_variant.id = "skill_same_name_variant".into();
         same_name_variant.name = format!("  {}  ", original.name.to_uppercase());
         same_name_variant.content_digest = "different_digest".into();
+        same_name_variant.content_identity_digest = Some("different_identity_digest".into());
         scan.skills.push(same_name_variant.clone());
 
         let report = build_report(&scan);

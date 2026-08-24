@@ -16,6 +16,7 @@ use std::time::UNIX_EPOCH;
 
 const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
+pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-v1";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_AGENT: usize = 10_000;
 const MAX_SESSION_FILES_PER_AGENT: usize = 250;
@@ -268,6 +269,11 @@ pub struct ScannedSkill {
     pub name: String,
     pub metadata: SkillMetadata,
     pub content_digest: String,
+    /// Deterministic Agent Skills payload identity. Unlike `content_digest`,
+    /// this excludes documented source-control metadata and must never be used
+    /// for path drift, mutation, Receipt, or Undo verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_identity_digest: Option<String>,
     pub digest_algorithm: String,
     pub summary: String,
     /// Whitespace-normalized complete SKILL.md text used only by the local FTS index.
@@ -357,6 +363,10 @@ pub struct ScanResult {
     pub usage: Vec<UsageEvidence>,
     pub coverage: Vec<SessionCoverage>,
     pub warnings: Vec<String>,
+    /// Versioned presence marker for content-identity facts. Missing means a
+    /// legacy Snapshot must be rescanned before identity grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_identity_algorithm: Option<String>,
     /// Durable source-root read permissions frozen before this Scan. Drifted
     /// permissions remain typed facts but are excluded from approved roots.
     #[serde(default)]
@@ -772,7 +782,10 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 }
 
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
-    let mut result = ScanResult::default();
+    let mut result = ScanResult {
+        content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
+        ..ScanResult::default()
+    };
     let known = known_agent_roots(&options.home);
     let plugin_roots = codex_plugin_skill_roots(&options.home, &mut result.warnings);
     // These paths are already an explicit trust decision from the caller.
@@ -1438,10 +1451,17 @@ fn materialize_candidates_with_hook(
             (String::new(), None)
         };
         let mut metadata = parse_skill_markdown(&content);
-        let (mut digest, mut fingerprint_completeness, mut fingerprint_detail) = if initially_safe {
+        let (
+            mut digest,
+            mut content_identity_digest,
+            mut fingerprint_completeness,
+            mut fingerprint_detail,
+        ) = if initially_safe {
             match digest_skill_directory(&directory) {
                 Ok(fingerprint) => (
                     fingerprint.digest,
+                    (fingerprint.completeness == FingerprintCompleteness::Complete)
+                        .then_some(fingerprint.content_identity_digest),
                     fingerprint.completeness,
                     fingerprint.detail,
                 ),
@@ -1457,6 +1477,7 @@ fn materialize_candidates_with_hook(
                     ));
                     (
                         stable_digest(content.as_bytes()),
+                        None,
                         completeness,
                         Some(error.to_string()),
                     )
@@ -1465,6 +1486,7 @@ fn materialize_candidates_with_hook(
         } else {
             (
                 stable_digest(candidate.entrypoint.to_string_lossy().as_bytes()),
+                None,
                 FingerprintCompleteness::Unreadable,
                 Some("Skill package was not read because its link is unsafe".into()),
             )
@@ -1494,6 +1516,7 @@ fn materialize_candidates_with_hook(
             modified_at = None;
             metadata = SkillMetadata::default();
             digest = stable_digest(candidate.entrypoint.to_string_lossy().as_bytes());
+            content_identity_digest = None;
             fingerprint_completeness = FingerprintCompleteness::Unreadable;
             fingerprint_detail = Some(
                 "Skill package data was discarded because its durable read permission drifted"
@@ -1504,7 +1527,17 @@ fn materialize_candidates_with_hook(
         let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
             (Some(source), Some(version), _) => format!("source:{source}@{version}"),
             (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
-            _ if safe_to_read && !content.is_empty() => format!("content:{digest}"),
+            _ if safe_to_read && !content.is_empty() => {
+                content_identity_digest.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "incomplete-content:{}:{digest}",
+                            candidate.entrypoint.display()
+                        )
+                    },
+                    |identity| format!("content:{identity}"),
+                )
+            }
             _ => format!("unreadable-link:{}", candidate.entrypoint.display()),
         };
         let skill_id = format!("skill_{}", stable_digest(identity_basis.as_bytes()));
@@ -1537,6 +1570,7 @@ fn materialize_candidates_with_hook(
                 name,
                 metadata,
                 content_digest: digest.clone(),
+                content_identity_digest: content_identity_digest.clone(),
                 digest_algorithm: "sha256-v1".into(),
                 summary: summarize_markdown(&content, 320),
                 normalized_text,
@@ -1796,6 +1830,7 @@ fn stable_digest(bytes: &[u8]) -> String {
 #[derive(Debug)]
 struct PackageFingerprint {
     digest: String,
+    content_identity_digest: String,
     completeness: FingerprintCompleteness,
     detail: Option<String>,
 }
@@ -1806,14 +1841,25 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut digest = Sha256::new();
+    let mut content_identity_digest = Sha256::new();
     let mut total_bytes = 0_u64;
     for (relative_path, path, file_type) in files {
-        digest.update(relative_path.to_string_lossy().as_bytes());
+        let is_source_control_metadata = relative_path == Path::new(".gitignore");
+        let relative_path_bytes = relative_path.to_string_lossy();
+        digest.update(relative_path_bytes.as_bytes());
         digest.update([0]);
+        if !is_source_control_metadata {
+            content_identity_digest.update(relative_path_bytes.as_bytes());
+            content_identity_digest.update([0]);
+        }
         if file_type.is_symlink() {
             let target = fs::read_link(path)?;
             digest.update(b"symlink\0");
             digest.update(target.to_string_lossy().as_bytes());
+            if !is_source_control_metadata {
+                content_identity_digest.update(b"symlink\0");
+                content_identity_digest.update(target.to_string_lossy().as_bytes());
+            }
         } else {
             let metadata = fs::metadata(&path)?;
             total_bytes = total_bytes.saturating_add(metadata.len());
@@ -1825,13 +1871,20 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
                     ),
                 ));
             }
-            let mut file = File::open(path)?;
-            io::copy(&mut file, &mut DigestWriter(&mut digest))?;
+            let bytes = fs::read(path)?;
+            digest.update(&bytes);
+            if !is_source_control_metadata {
+                content_identity_digest.update(&bytes);
+            }
         }
         digest.update([0xff]);
+        if !is_source_control_metadata {
+            content_identity_digest.update([0xff]);
+        }
     }
     Ok(PackageFingerprint {
         digest: format!("{:x}", digest.finalize()),
+        content_identity_digest: format!("{:x}", content_identity_digest.finalize()),
         completeness: if complete {
             FingerprintCompleteness::Complete
         } else {
@@ -1876,19 +1929,6 @@ fn collect_skill_files(
         }
     }
     Ok(complete)
-}
-
-struct DigestWriter<'a>(&'a mut Sha256);
-
-impl io::Write for DigestWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
@@ -2550,7 +2590,7 @@ pub(crate) fn inspect_skill_identity(entrypoint: &Path) -> io::Result<(String, S
     let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
         (Some(source), Some(version), _) => format!("source:{source}@{version}"),
         (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
-        _ => format!("content:{digest}"),
+        _ => format!("content:{}", fingerprint.content_identity_digest),
     };
     Ok((
         format!("skill_{}", stable_digest(identity_basis.as_bytes())),
@@ -3405,6 +3445,58 @@ enabled = true
         let result = scan(&options).unwrap();
         assert_eq!(result.skills.len(), 2);
         assert_eq!(result.placements.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn content_identity_ignores_gitignore_but_keeps_supporting_files() {
+        let root = temp_directory("content-identity");
+        let first = root.join("one");
+        let second = root.join("two");
+        for directory in [&first, &second] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                "---\nname: example\ndescription: Example skill\n---\nSame instructions.",
+            )
+            .unwrap();
+            fs::write(directory.join("run.sh"), "same behavior").unwrap();
+        }
+        fs::write(second.join(".gitignore"), "local-only\n").unwrap();
+
+        let (first_id, first_package_digest) =
+            inspect_skill_identity(&first.join("SKILL.md")).unwrap();
+        let (second_id, second_package_digest) =
+            inspect_skill_identity(&second.join("SKILL.md")).unwrap();
+        assert_eq!(first_id, second_id);
+        assert_ne!(first_package_digest, second_package_digest);
+
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        assert_eq!(
+            result.content_identity_algorithm.as_deref(),
+            Some(CONTENT_IDENTITY_ALGORITHM)
+        );
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.placements.len(), 2);
+        let first_content_identity = digest_skill_directory(&first)
+            .unwrap()
+            .content_identity_digest;
+        assert_eq!(
+            result.skills[0].content_identity_digest.as_deref(),
+            Some(first_content_identity.as_str())
+        );
+
+        fs::write(second.join("run.sh"), "different behavior").unwrap();
+        let (changed_id, _) = inspect_skill_identity(&second.join("SKILL.md")).unwrap();
+        assert_ne!(first_id, changed_id);
+        let changed = scan(&options).unwrap();
+        assert_eq!(changed.skills.len(), 2);
         fs::remove_dir_all(root).unwrap();
     }
 
