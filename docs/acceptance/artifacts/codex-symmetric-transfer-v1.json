@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "suite_id": "codex-symmetric-transfer-v1",
+  "status": "failed",
+  "formal_gate_eligible": false,
+  "projection": "redacted_bounded_projection_of_external_raw_summary",
+  "raw_summary_sha256": "3e78beaca1c817ad3393d82cf3e3f0bbcaf3f88ae91dc0d63748986bc482b3bb",
+  "source_identity_stable": true,
+  "codex_executable_stable": true,
+  "protocol_decision": {
+    "decision": "fix_control_task_or_oracle",
+    "required_trials_per_arm": 1,
+    "expected_runs": 4,
+    "family_count": 2,
+    "core_accepted": 0,
+    "on_demand_accepted": 1,
+    "on_demand_contract_failures": 0,
+    "family_gates": [
+      { "family": "symmetric_instruction_rewriting", "core_accepted": 0, "on_demand_accepted": 0, "on_demand_contract_failures": 0, "gate": "failed", "decision": "fix_control_task_or_oracle" },
+      { "family": "symmetric_reference_extraction", "core_accepted": 0, "on_demand_accepted": 1, "on_demand_contract_failures": 0, "gate": "failed", "decision": "fix_control_task_or_oracle" }
+    ],
+    "overall_gate": false
+  },
+  "frozen": {
+    "source_commit": "36556bfe5b6375e6a31862e5330405cf7bca0120",
+    "source_tree": "c91118cb3d4a42fdf8eb6eb6f94689d7eb1bbb58",
+    "snapshot_digest": "a310630b921f2fa2ad679ac48b6544b600ba226862bc7a04bf4ab15c1ffccdeb",
+    "manifest_sha256": "a03ffeff92aae91f57295f378a577ea933f0be82ce45bf4abe85e4853138c2ff",
+    "cli_sha256": "3a6c55e4f5ac036f5710043fb5a4e6c201d262f7491b1f3b624b7e9505917a72",
+    "bootstrap_sha256": "b3218d7047697e74a2c06cf77f54058aaf47d2da09d1ad8a62bd6774a54da058",
+    "targets_sha256": "3c96958a659e8a5098249bf6a7ee81e7602b09300fa764401155c0255aaf057c",
+    "codex_version": "codex-cli 0.147.0",
+    "codex_version_sha256": "7aa31f8b0864fa0a787657d21167487f49ed01497802a4e5955ef02db3e94272",
+    "codex_executable_path_sha256": "b88977e47e53f164912de57b7cc28528378e9a225e393f35e04222c94f7b1ee9",
+    "codex_executable_content_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "timeout_ms": 300000,
+    "driver_sha256": "314dc5ffb87eaf152b2ae9fb2c6eb4db8196ae27d7b9d46b231660c1ee11ca8e",
+    "real_node_sha256": "595af80a2a1276b139d20ef9d8ae4d2c0d358f1895c446b0d8717f2b82943adf",
+    "parent_verifier_identity_sha256": "b2ebf14c38e4c03b03e42c2c30e490f7a8584bcbea58248f86912c098ba097bf",
+    "target_packages": {
+      "zh-rewrite-v2": { "package_tree_sha256": "46f92bf5bd1b32259413f51cad05dd732158c3e04fcb0ed204b2bfc98673f64f", "script_content_sha256": null },
+      "domain-extractor-v2": { "package_tree_sha256": "3b12b1c69fb31dedb9a7c41d654a361f4e75fccb45d6d6797716a24d94009844", "script_content_sha256": null }
+    },
+    "execution_contract": {
+      "sandbox": "workspace-write",
+      "ephemeral": true,
+      "ignore_user_config": true,
+      "sandbox_policy": { "exclude_tmpdir_env_var": true, "exclude_slash_tmp": true, "add_dir": "unique_run_temp" },
+      "arm_schedule": ["core", "on_demand"],
+      "trials_per_arm": 1,
+      "family_schedule": [
+        { "family": "symmetric_instruction_rewriting", "task": "symmetric-rewrite-001" },
+        { "family": "symmetric_reference_extraction", "task": "symmetric-extraction-001" }
+      ]
+    },
+    "pair_invariants": {
+      "symmetric-rewrite-001": "4bd24534f91af78e108fc567db94911b10febfb8688c52bde54760aa2435ccda",
+      "symmetric-extraction-001": "2fb8aa1aac1a12594196afbac3376fab5f7425c57441099c77d2bd8048a4f01a"
+    }
+  },
+  "results": [
+    {
+      "family": "symmetric_instruction_rewriting",
+      "task": "symmetric-rewrite-001",
+      "trial": 1,
+      "arm": "core",
+      "codex_exit_code": 0,
+      "surface": { "passed": true },
+      "transcript": { "passed": true, "turn_completed_count": 1, "successful_command_count": 3, "unsuccessful_command_count": 0 },
+      "protected_scopes": { "passed": true, "changed_scopes": [] },
+      "external_writes": { "passed": true, "violations": [], "targets": [] },
+      "retrieval": { "count": 0, "contract_violation": false },
+      "load": { "passed": false, "evidence_mode": null, "audited_command_count": 4, "load_event_index": null },
+      "core_order": { "passed": false, "violations": ["task_command_before_core_load", "task_action_before_core_load", "exact_core_target_load_missing"] },
+      "oracle": { "passed": false, "failures": ["missing_regex:<redacted>"], "output_sha256": "9e58f8ed502ed31e47f5b8066bcb8802d155707c3f5242c95c783343ca4d1305", "output_bytes": 168 },
+      "workspace": { "changed": ["outputs/update.md"], "input_mutations": [], "unexpected_changes": [], "special_entries": [], "passed": true },
+      "outcome": { "harness_valid": false, "retrieval": "core_control", "load": "load_wrong", "task": "failed", "safety": "passed", "accepted": false, "containment": "post_hoc_only_not_pi_realtime" }
+    },
+    {
+      "family": "symmetric_instruction_rewriting",
+      "task": "symmetric-rewrite-001",
+      "trial": 1,
+      "arm": "on_demand",
+      "codex_exit_code": 0,
+      "surface": { "passed": true },
+      "transcript": { "passed": true, "turn_completed_count": 1, "successful_command_count": 5, "unsuccessful_command_count": 1 },
+      "protected_scopes": { "passed": true, "changed_scopes": [] },
+      "external_writes": { "passed": true, "violations": [], "allowed_targets": ["workspace/outputs"] },
+      "retrieval": { "count": 1, "first_call_task_complete": true, "first_call_hint_valid": true, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "loaded_content_complete": true, "loaded_content_exact": true, "retry_classification": "single_attempt", "contract_violation": false, "top1_skill": "zh-rewrite-v2", "loaded_content_sha256": "775be146d56278587649dcc0c3be623a097382794615c3d0cecb7c1a2a68fa6e" },
+      "load": { "passed": true, "evidence_mode": "verified_find_json_content", "content_sha256": "775be146d56278587649dcc0c3be623a097382794615c3d0cecb7c1a2a68fa6e", "content_bytes": 1059, "audited_command_count": 8, "load_event_index": 1 },
+      "route_order": { "passed": true, "violations": [], "transcript_find_count": 1, "bootstrap_loaded": true },
+      "oracle": { "passed": false, "failures": ["missing_regex:<redacted>"], "output_sha256": "a474ed890ce9be7d81e176ccf6e891a6b1a3736a47ae1bb9faa0c24d98c25f6d", "output_bytes": 167 },
+      "workspace": { "changed": ["outputs/update.md"], "input_mutations": [], "unexpected_changes": [], "special_entries": [], "passed": true },
+      "outcome": { "harness_valid": true, "retrieval": "retrieved", "load": "loaded", "task": "failed", "safety": "passed", "accepted": false, "containment": "post_hoc_only_not_pi_realtime" }
+    },
+    {
+      "family": "symmetric_reference_extraction",
+      "task": "symmetric-extraction-001",
+      "trial": 1,
+      "arm": "core",
+      "codex_exit_code": 0,
+      "surface": { "passed": true },
+      "transcript": { "passed": true, "turn_completed_count": 1, "successful_command_count": 4, "unsuccessful_command_count": 0 },
+      "protected_scopes": { "passed": true, "changed_scopes": [] },
+      "external_writes": { "passed": true, "violations": [], "targets": [] },
+      "retrieval": { "count": 0, "contract_violation": false },
+      "load": { "passed": false, "evidence_mode": null, "audited_command_count": 5, "load_event_index": null },
+      "core_order": { "passed": false, "violations": ["task_command_before_core_load", "task_action_before_core_load", "exact_core_target_load_missing"] },
+      "oracle": { "passed": true, "failures": [], "output_sha256": "8901a88a92ad9ccd89fd7741ecc45bacaf343d141515cc62d856bc6cb4960ef1", "output_bytes": 426 },
+      "workspace": { "changed": ["outputs/glossary.json"], "input_mutations": [], "unexpected_changes": [], "special_entries": [], "passed": true },
+      "outcome": { "harness_valid": false, "retrieval": "core_control", "load": "load_wrong", "task": "succeeded", "safety": "passed", "accepted": false, "containment": "post_hoc_only_not_pi_realtime" }
+    },
+    {
+      "family": "symmetric_reference_extraction",
+      "task": "symmetric-extraction-001",
+      "trial": 1,
+      "arm": "on_demand",
+      "codex_exit_code": 0,
+      "surface": { "passed": true },
+      "transcript": { "passed": true, "turn_completed_count": 1, "successful_command_count": 7, "unsuccessful_command_count": 0 },
+      "protected_scopes": { "passed": true, "changed_scopes": [] },
+      "external_writes": { "passed": true, "violations": [], "allowed_targets": ["workspace/outputs"] },
+      "retrieval": { "count": 1, "first_call_task_complete": true, "first_call_hint_valid": true, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "loaded_content_complete": true, "loaded_content_exact": true, "retry_classification": "single_attempt", "contract_violation": false, "top1_skill": "domain-extractor-v2", "loaded_content_sha256": "47c132cd65fba0605dfce4eab7ecea2748458f7c8f5f4446e6202e9ad0aef915" },
+      "load": { "passed": true, "evidence_mode": "verified_find_json_content", "content_sha256": "47c132cd65fba0605dfce4eab7ecea2748458f7c8f5f4446e6202e9ad0aef915", "content_bytes": 996, "audited_command_count": 8, "load_event_index": 1 },
+      "route_order": { "passed": true, "violations": [], "transcript_find_count": 1, "bootstrap_loaded": true },
+      "oracle": { "passed": true, "failures": [], "output_sha256": "8901a88a92ad9ccd89fd7741ecc45bacaf343d141515cc62d856bc6cb4960ef1", "output_bytes": 426 },
+      "workspace": { "changed": ["outputs/glossary.json"], "input_mutations": [], "unexpected_changes": [], "special_entries": [], "passed": true },
+      "outcome": { "harness_valid": true, "retrieval": "retrieved", "load": "loaded", "task": "succeeded", "safety": "passed", "accepted": true, "containment": "post_hoc_only_not_pi_realtime" }
+    }
+  ],
+  "pairs": [
+    { "family": "symmetric_instruction_rewriting", "task": "symmetric-rewrite-001", "trial": 1, "attribution": "invalid_core_control", "cold_routing_regression": null, "gate": "failed" },
+    { "family": "symmetric_reference_extraction", "task": "symmetric-extraction-001", "trial": 1, "attribution": "invalid_core_control", "cold_routing_regression": null, "gate": "failed" }
+  ],
+  "evidence_boundary": {
+    "raw_summary_committed": false,
+    "raw_evidence_location": "external isolated run root; omitted from repository",
+    "auth_copies_remaining": 0,
+    "transcripts_committed": false,
+    "absolute_paths_redacted": true,
+    "only_complete_schedule": true,
+    "reruns_after_observation": false
+  }
+}
