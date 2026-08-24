@@ -367,14 +367,21 @@ function unwrapSimpleShell(command) {
 
 function simpleCommandTokens(command) {
   const value = unwrapSimpleShell(command);
-  if (/[|;&<>`]|\$\(/u.test(value)) return null;
   const tokens = []; let token = ""; let quote = null;
   for (let index = 0; index < value.length; index += 1) {
     const char = value[index];
-    if (quote) { if (char === quote) quote = null; else token += char; continue; }
+    if (char === "`" || (char === "$" && value[index + 1] === "(")) return null;
+    if (quote) {
+      if (char === quote) quote = null;
+      else if (quote === '"' && char === "\\") { index += 1; if (index >= value.length || /[\r\n]/u.test(value[index])) return null; token += value[index]; }
+      else token += char;
+      continue;
+    }
     if (char === "'" || char === '"') { quote = char; continue; }
+    if (/[|;&<>]/u.test(char)) return null;
+    if (/[\r\n]/u.test(char)) return null;
     if (/\s/u.test(char)) { if (token) { tokens.push(token); token = ""; } continue; }
-    if (char === "\\") { index += 1; if (index >= value.length) return null; token += value[index]; continue; }
+    if (char === "\\") { index += 1; if (index >= value.length || /[\r\n]/u.test(value[index])) return null; token += value[index]; continue; }
     token += char;
   }
   if (quote) return null;
