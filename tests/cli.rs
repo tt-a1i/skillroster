@@ -1386,6 +1386,17 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         )
         .unwrap();
     }
+    for index in 0..2 {
+        let skill = root.join(format!("primary-{index:02}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: primary-clean\ndescription: Primary clean exact route\n---\nprimary {index}\n"
+            ),
+        )
+        .unwrap();
+    }
     let common = [
         "--home",
         home.to_str().unwrap(),
@@ -1400,7 +1411,12 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|finding| finding["kind"] == "same_name_divergent_content")
+        .find(|finding| {
+            finding["kind"] == "same_name_divergent_content"
+                && finding["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("shared-many"))
+        })
         .unwrap();
     let found = json_output(&run(
         &[&common[..], &["find", "many variant route"]].concat(),
@@ -1478,6 +1494,32 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
             .unwrap()
             .iter()
             .all(|action| action["action"] != "load_exact_variant_for_comparison")
+    );
+
+    let clean_top = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "primary clean exact route many variant",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(clean_top["result"]["matches"][0]["name"], "primary-clean");
+    assert_eq!(clean_top["result"]["matches"][0]["variant_count"], 2);
+    assert_eq!(clean_top["result"]["rescan_required"], true);
+    assert_eq!(
+        clean_top["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .count(),
+        2
     );
 }
 

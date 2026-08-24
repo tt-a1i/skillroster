@@ -13,6 +13,12 @@ paths. The structured evidence is in
 - State: isolated under a temporary dogfood directory
 - Mutation boundary: every Find and exact load returned `files_changed: false`
 
+This receipt is intentionally bound to `71dea6b`, the executable used for the
+dogfood run. Later review commits only scoped ranking evidence, suppressed
+exact actions for a drifted Top-1 group, and added this receipt; those deltas
+are covered by focused regression tests and are not retroactively claimed as
+part of the dogfood execution.
+
 ## Observations
 
 `goal-crafter` was a genuine same-name, divergent-entrypoint Top-1. Ordinary

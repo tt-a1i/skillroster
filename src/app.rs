@@ -4467,8 +4467,17 @@ fn find_command(
             ),
         });
     }
-    if !load && !variant_rescan_required {
-        if let Some(found) = matches.first().filter(|found| found.variant_count > 1) {
+    if !load {
+        if let Some(found) = matches.first().filter(|found| {
+            found.variant_count > 1
+                && !matches!(
+                    found
+                        .variant_finding
+                        .as_ref()
+                        .map(|reference| reference.state),
+                    Some(crate::query::VariantFindingState::RescanRequired)
+                )
+        }) {
             actions.extend(explicit_variant_load_actions(task, &retrieval_hints, found));
         }
     }

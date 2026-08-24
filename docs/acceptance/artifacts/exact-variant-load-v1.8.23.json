@@ -3,6 +3,7 @@
   "issue": 151,
   "baseline_commit": "60964802c2d3881a73286321e87310b400adcb0a",
   "candidate_commit": "71dea6b72ee4e8ba4d7276f28e70012c3ea92d9f",
+  "receipt_scope": "Dogfood execution is bound to candidate_commit; later review fixes are verified by focused tests, not retroactively attributed to this run.",
   "snapshot": {
     "id": "scan_00000000000015f918ceb3305f81ba08",
     "independent_skills": 260,
