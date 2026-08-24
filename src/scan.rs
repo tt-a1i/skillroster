@@ -1,4 +1,7 @@
-use crate::harness::{AgentKind, SessionSignal, known_agent_roots, session_record_observations};
+use crate::harness::{
+    AgentKind, SessionSignal, SkillDiscoverySemantics, known_agent_roots,
+    session_record_observations,
+};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -372,6 +375,7 @@ struct EntryCandidate {
     expected_physical_directory: Option<PathBuf>,
     link_target: Option<PathBuf>,
     link_status: LinkStatus,
+    default_exposed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -381,6 +385,24 @@ struct SkillRootPolicy {
     governable: bool,
     detail: Option<String>,
     provider: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiscoveryState {
+    hidden_ancestor: bool,
+    inside_skill_package: bool,
+    harness_excluded: bool,
+}
+
+impl DiscoveryState {
+    fn descend(self, agent: Option<AgentKind>, child_name: &str, containing_skill: bool) -> Self {
+        Self {
+            hidden_ancestor: self.hidden_ancestor || child_name.starts_with('.'),
+            inside_skill_package: self.inside_skill_package || containing_skill,
+            harness_excluded: self.harness_excluded
+                || hermes_excludes_directory(agent, child_name, containing_skill),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -983,8 +1005,8 @@ fn observe_skill_root(
         root,
         approved_roots,
         root,
-        0,
         max_depth,
+        DiscoveryState::default(),
         candidates,
     ) {
         Ok(true) => {}
@@ -1104,22 +1126,29 @@ fn discover_entrypoints(
     placement_root: &Path,
     approved_roots: &[PathBuf],
     directory: &Path,
-    depth: usize,
     max_depth: usize,
+    state: DiscoveryState,
     output: &mut Vec<EntryCandidate>,
 ) -> io::Result<bool> {
+    let depth = directory
+        .strip_prefix(placement_root)
+        .map(|path| path.components().count())
+        .unwrap_or(max_depth.saturating_add(1));
     if depth > max_depth {
         return Ok(false);
     }
     let mut complete = true;
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
+    let directory_has_skill = directory.join("SKILL.md").is_file();
     for entry in entries {
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         let file_name = entry.file_name();
         if file_name == "SKILL.md" {
             let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
+            let default_exposed =
+                default_exposure_for_candidate(policy, placement_root, &path, depth, state);
             output.push(EntryCandidate {
                 agent: policy.agent,
                 root: placement_root.to_path_buf(),
@@ -1129,15 +1158,18 @@ fn discover_entrypoints(
                 entrypoint: path,
                 link_target: target,
                 link_status,
+                default_exposed,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            let child_name = file_name.to_string_lossy();
+            let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
             complete &= discover_entrypoints(
                 policy,
                 placement_root,
                 approved_roots,
                 &path,
-                depth + 1,
                 max_depth,
+                child_state,
                 output,
             )?;
         } else if metadata.file_type().is_symlink() {
@@ -1146,6 +1178,15 @@ fn discover_entrypoints(
             let linked_entrypoint = path.join("SKILL.md");
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
+                let child_name = file_name.to_string_lossy();
+                let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
+                let default_exposed = default_exposure_for_candidate(
+                    policy,
+                    placement_root,
+                    &linked_entrypoint,
+                    depth + 1,
+                    child_state,
+                );
                 output.push(EntryCandidate {
                     agent: policy.agent,
                     root: placement_root.to_path_buf(),
@@ -1155,11 +1196,90 @@ fn discover_entrypoints(
                     entrypoint: linked_entrypoint,
                     link_target: target,
                     link_status: status,
+                    default_exposed,
                 });
             }
         }
     }
     Ok(complete)
+}
+
+const HERMES_EXCLUDED_SKILL_DIRS: &[&str] = &[
+    ".git",
+    ".github",
+    ".hub",
+    ".archive",
+    ".venv",
+    "venv",
+    "node_modules",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
+
+const HERMES_SKILL_SUPPORT_DIRS: &[&str] = &["references", "templates", "assets", "scripts"];
+
+fn hermes_excludes_directory(agent: Option<AgentKind>, name: &str, containing_skill: bool) -> bool {
+    agent == Some(AgentKind::Hermes)
+        && (HERMES_EXCLUDED_SKILL_DIRS.contains(&name)
+            || (containing_skill && HERMES_SKILL_SUPPORT_DIRS.contains(&name)))
+}
+
+fn default_exposure_for_candidate(
+    policy: &SkillRootPolicy,
+    placement_root: &Path,
+    entrypoint: &Path,
+    depth: usize,
+    state: DiscoveryState,
+) -> bool {
+    let Some(agent) = policy.agent else {
+        return false;
+    };
+    match agent.skill_discovery_semantics() {
+        SkillDiscoverySemantics::Codex => {
+            let relative = entrypoint.strip_prefix(placement_root).ok();
+            let scanning_system_root = placement_root
+                .file_name()
+                .is_some_and(|name| name == ".system");
+            let visible_below_system_root = relative
+                .and_then(Path::parent)
+                .and_then(|path| {
+                    let mut components = path.components();
+                    (components.next()?.as_os_str() == ".system").then(|| {
+                        components.all(|component| {
+                            !component.as_os_str().to_string_lossy().starts_with('.')
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            !state.harness_excluded
+                && if scanning_system_root {
+                    !state.hidden_ancestor
+                } else if visible_below_system_root {
+                    true
+                } else {
+                    !state.hidden_ancestor
+                }
+        }
+        SkillDiscoverySemantics::ClaudeCode => {
+            depth == 1
+                && !state.hidden_ancestor
+                && !state.harness_excluded
+                && entrypoint
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+        }
+        SkillDiscoverySemantics::Pi => {
+            !state.hidden_ancestor && !state.inside_skill_package && !state.harness_excluded
+        }
+        SkillDiscoverySemantics::Hermes => !state.harness_excluded,
+        SkillDiscoverySemantics::Conservative => true,
+    }
 }
 
 fn inspect_link(
@@ -1449,7 +1569,7 @@ fn materialize_candidates_with_hook(
             fingerprint_detail,
             link_target: candidate.link_target,
             link_status: candidate.link_status,
-            default_exposed: candidate.agent.is_some(),
+            default_exposed: candidate.agent.is_some() && candidate.default_exposed,
             owned_by_agent: Some(candidate.agent.is_some()),
             mutation_scope: Some(mutation_scope),
             governable: mutation_scope == MutationScope::Mutable,
@@ -3103,6 +3223,7 @@ enabled = true
             entrypoint: linked.join("SKILL.md"),
             link_target: Some(source.clone()),
             link_status: LinkStatus::Valid,
+            default_exposed: true,
         };
         let mut result = ScanResult::default();
         let mut replaced = false;
@@ -3180,6 +3301,7 @@ enabled = true
             expected_physical_directory: Some(source.clone()),
             link_target: Some(source),
             link_status: LinkStatus::Valid,
+            default_exposed: true,
         };
         let mut result = ScanResult::default();
         materialize_candidates_with_hook(vec![candidate], &[anchor], &[], &mut result, |_| {

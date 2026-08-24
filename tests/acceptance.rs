@@ -115,6 +115,173 @@ fn public_skill_ids(home: &Path, state: &Path, names: &[String]) -> BTreeMap<Str
         .collect()
 }
 
+#[test]
+fn public_scan_and_report_use_verified_agent_exposure_rules() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let skill = |relative: &str| {
+        let entrypoint = home.join(relative).join("SKILL.md");
+        fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        fs::write(
+            entrypoint,
+            format!(
+                "---\nname: {}\ndescription: fixture\n---\n",
+                relative.replace('/', "-")
+            ),
+        )
+        .unwrap();
+    };
+
+    skill(".codex/skills/visible");
+    skill(".codex/skills/.bak-test/hidden");
+    skill(".codex/skills/.system/system");
+    skill(".codex/skills/.system/.bak-test/hidden");
+    skill(".claude/skills/direct");
+    skill(".claude/skills/.hidden");
+    skill(".claude/skills/category/nested");
+    skill(".claude/skills/.personal/hidden");
+    skill(".pi/agent/skills/visible");
+    skill(".pi/agent/skills/.bak-test/hidden");
+    skill(".pi/agent/skills/package");
+    skill(".pi/agent/skills/package/nested");
+    skill(".hermes/skills/visible");
+    skill(".hermes/skills/.bak-test/hidden");
+    skill(".hermes/skills/.archive/hidden");
+
+    let duplicate_contents =
+        "---\nname: codex-duplicate\ndescription: identical active and backup copies\n---\n";
+    fs::write(
+        home.join(".codex/skills/visible/SKILL.md"),
+        duplicate_contents,
+    )
+    .unwrap();
+    fs::write(
+        home.join(".codex/skills/.bak-test/hidden/SKILL.md"),
+        duplicate_contents,
+    )
+    .unwrap();
+
+    let mut options = ScanOptions::for_home(home);
+    options.include_session_evidence = false;
+    let scanned = scan(&options).unwrap();
+    let report = build_report(&scanned);
+    let scan_json = serde_json::to_value(&scanned).unwrap();
+    let report_json = serde_json::to_value(&report).unwrap();
+
+    let exposed = |agent: &str, suffix: &str| {
+        scan_json["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|placement| {
+                placement["agent"] == agent
+                    && placement["entrypoint"]
+                        .as_str()
+                        .map(|path| path.replace('\\', "/"))
+                        .is_some_and(|path| path.ends_with(suffix))
+            })
+            .unwrap_or_else(|| panic!("missing {agent} placement ending in {suffix}"))
+            ["default_exposed"]
+            .as_bool()
+            .unwrap()
+    };
+
+    assert!(exposed("codex", ".codex/skills/visible/SKILL.md"));
+    assert!(!exposed("codex", ".codex/skills/.bak-test/hidden/SKILL.md"));
+    assert!(exposed("codex", ".codex/skills/.system/system/SKILL.md"));
+    assert!(!exposed(
+        "codex",
+        ".codex/skills/.system/.bak-test/hidden/SKILL.md"
+    ));
+    assert_eq!(
+        scan_json["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|placement| {
+                placement["agent"] == "codex"
+                    && placement["entrypoint"]
+                        .as_str()
+                        .map(|path| path.replace('\\', "/"))
+                        .is_some_and(|path| path.ends_with(".system/system/SKILL.md"))
+            })
+            .count(),
+        1
+    );
+    assert!(exposed("claude_code", ".claude/skills/direct/SKILL.md"));
+    assert!(!exposed("claude_code", ".claude/skills/.hidden/SKILL.md"));
+    assert!(!exposed(
+        "claude_code",
+        ".claude/skills/category/nested/SKILL.md"
+    ));
+    assert!(!exposed(
+        "claude_code",
+        ".claude/skills/.personal/hidden/SKILL.md"
+    ));
+    assert!(exposed("pi", ".pi/agent/skills/visible/SKILL.md"));
+    assert!(!exposed("pi", ".pi/agent/skills/.bak-test/hidden/SKILL.md"));
+    assert!(exposed("pi", ".pi/agent/skills/package/SKILL.md"));
+    assert!(!exposed("pi", ".pi/agent/skills/package/nested/SKILL.md"));
+    assert!(exposed("hermes", ".hermes/skills/visible/SKILL.md"));
+    assert!(exposed(
+        "hermes",
+        ".hermes/skills/.bak-test/hidden/SKILL.md"
+    ));
+    assert!(!exposed(
+        "hermes",
+        ".hermes/skills/.archive/hidden/SKILL.md"
+    ));
+    assert!(
+        scan_json["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|placement| placement["agent"].is_string())
+            .filter(|placement| placement["default_exposed"] == false)
+            .all(|placement| {
+                placement["owned_by_agent"] == true
+                    && placement["governable"] == true
+                    && placement["mutation_scope"] == "mutable"
+            })
+    );
+
+    assert_eq!(report_json["metrics"]["default_exposure"], 7);
+
+    let state = home.join("state");
+    let cli_scan = cli_json(home, &state, &["scan"], None);
+    assert_eq!(
+        cli_scan["result"]["placement_count"],
+        scanned.placements.len()
+    );
+    let cli_report = cli_json(home, &state, &["report", "--full"], None);
+    assert_eq!(cli_report["result"]["default_exposure"], 7);
+    let duplicate_finding_id = cli_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Exact duplicate Skill placements")
+        .and_then(|finding| finding["id"].as_str())
+        .expect("active and hidden backup copies remain duplicate inventory");
+    let duplicate_detail = cli_json(
+        home,
+        &state,
+        &["report", "--finding", duplicate_finding_id, "--full"],
+        None,
+    );
+    let duplicate_placements = duplicate_detail["result"]["placements"].as_array().unwrap();
+    assert_eq!(duplicate_placements.len(), 2);
+    assert!(
+        duplicate_placements
+            .iter()
+            .any(|placement| placement["default_exposed"] == true)
+    );
+    assert!(
+        duplicate_placements
+            .iter()
+            .any(|placement| placement["default_exposed"] == false)
+    );
+}
+
 fn evaluate_capabilities(home: &Path, state: &Path, routes: &[RouteCase]) -> (usize, usize) {
     let mut routed = 0;
     let mut succeeded = 0;
