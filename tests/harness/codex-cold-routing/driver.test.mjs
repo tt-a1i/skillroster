@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -16,6 +16,9 @@ const digest = async (value) => {
 
 test("default is a non-executing plan and execution requires explicit auth", () => {
   assert.equal(parseArgs([]).execute, false);
+  assert.equal(parseArgs([]).reasoningEffort, "medium");
+  assert.equal(parseArgs(["--reasoning-effort", "high"]).reasoningEffort, "high");
+  assert.throws(() => parseArgs(["--reasoning-effort", "ultra"]), /reasoning-effort/u);
   assert.throws(() => parseArgs(["--execute"]), /explicit --auth-source/u);
   assert.equal(parseArgs(["--execute", "--auth-source", "/tmp/auth.json"]).execute, true);
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
@@ -65,14 +68,29 @@ test("offline reevaluation writes only outside the immutable source run tree", (
   const before = snapshotWorkspace(source); const output = join(parent, "post-hoc.json"); assert.equal(main(["--reevaluate-root", source, "--reevaluate-output", output]), 0); assert.deepEqual(snapshotWorkspace(source), before); const summary = JSON.parse(readFileSync(output)); assert.equal(summary.raw_runs_modified, false); assert.equal(summary.formal_gate_eligible, false); assert.equal(summary.source_tree_sha256_before, summary.source_tree_sha256_after); assert.ok(summary.results.every((result) => result.formal_evidence_accepted === null && result.post_hoc_only === true));
 });
 
-test("manifest is restricted to the two-family Codex transfer contract", () => {
+test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   const manifest = { schema_version: 1, harness: "codex-transfer", tasks: [
     { id: "a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
     { id: "b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
   ] };
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
-  assert.throws(() => validateManifest({ ...manifest, tasks: [manifest.tasks[0]] }), /unsupported/u);
+  assert.equal(validateManifest({ ...manifest, tasks: [manifest.tasks[0]], trials_per_arm: 3 }).tasks.length, 1);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [], trials_per_arm: 3 }), /unsupported/u);
+  assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 0 }), /trials_per_arm/u);
+  assert.throws(() => validateManifest({ ...manifest, formal_protocol_gate: "yes" }), /formal_protocol_gate/u);
+  for (const prompt of ["use SkillRoster", "run capability search", "please Find it", "做能力检索", "load one"]) {
+    assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], prompt }] }), /must not disclose/u);
+  }
+});
+
+test("formal eligibility requires a complete successful harness record, not a task pass", () => {
+  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, accepted: false } };
+  assert.equal(formalResultEligible(eligible), true);
+  for (const mutation of [
+    { codex_exit_code: 124 }, { transcript: { passed: false } }, { surface: { passed: false } },
+    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } },
+  ]) assert.equal(formalResultEligible({ ...eligible, ...mutation }), false);
 });
 
 test("pair invariant is frozen from the suite snapshot and complete task input", () => {
@@ -81,6 +99,16 @@ test("pair invariant is frozen from the suite snapshot and complete task input",
   assert.equal(pairInvariant("suite-snapshot", task), frozen);
   assert.notEqual(pairInvariant("other-snapshot", task), frozen);
   assert.notEqual(pairInvariant("suite-snapshot", { ...task, prompt: "changed" }), frozen);
+  assert.notEqual(pairInvariant("suite-snapshot", task, 2), frozen);
+});
+
+test("protocol decision applies the frozen stop conditions", () => {
+  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, load: "loaded", contract_violation: false, ...overrides } });
+  assert.equal(deriveProtocolDecision([result("core", true), result("core", false), result("core", true)], 3).decision, "fix_control_task_or_oracle");
+  const core = Array.from({ length: 3 }, () => result("core", true));
+  const contractFailures = [result("on_demand", false, { load: "load_wrong" }), result("on_demand", false, { contract_violation: true }), result("on_demand", true)];
+  assert.equal(deriveProtocolDecision([...core, ...contractFailures], 3).decision, "fix_bootstrap_or_cli_contract");
+  assert.equal(deriveProtocolDecision([...core, ...Array.from({ length: 3 }, () => result("on_demand", true))], 3).decision, "retain_current_design");
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
@@ -210,7 +238,23 @@ test("cumulative sed reads prove full load only after all lines are covered", ()
   assert.equal(full.passed, true); assert.equal(full.load_event_index, 1);
 });
 
-test("on-demand route order permits only Bootstrap before completed, ledger-bound Find and target load", async () => {
+test("exact target load classifies every compound suffix and rejects writes", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-leading-load-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\n"); const canonical = realpathSync(target);
+  const command = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && printf '\\nDONE\\n'"`;
+  const event = (type, output = null, value = command) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command: value, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
+  const transcript = `${event("started")}\n${event("completed", "one\ntwo\n\nDONE\n")}`;
+  assert.equal(assessExactLoad(transcript, target).passed, true);
+  assert.equal(assessCoreOrder(transcript, target).passed, true);
+  const tailOnly = `${event("started")}\n${event("completed", "DONE\n")}`; assert.equal(assessExactLoad(tailOnly, target).passed, false);
+  const mutatingCommand = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && touch /tmp/unaudited"`;
+  const mutating = `${event("started", null, mutatingCommand)}\n${event("completed", "one\ntwo\n", mutatingCommand)}`; assert.equal(assessExactLoad(mutating, target).passed, false);
+  const outsideRead = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && cat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideRead), target).passed, false);
+  const outsideReadSequence = `/bin/zsh -lc "cat '${canonical}'\ncat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideReadSequence), target).passed, false);
+  const unsafeListing = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && rg --files /tmp"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", unsafeListing), target).passed, false);
+  const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
+});
+
+test("on-demand route order permits metadata-authorized Find followed by exact target load", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-route-order-")); const bootstrap = join(root, "bootstrap.md"); const target = join(root, "target.md"); const workspace = join(root, "input.md");
   writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "target"); writeFileSync(workspace, "input");
   const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) }; const findAudit = { count: 1, calls: [call] };
@@ -233,8 +277,16 @@ test("on-demand route order permits only Bootstrap before completed, ledger-boun
   assert.match(assessRouteOrder(startedEarly, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /task_command_before_find/u);
   const todoBeforeFind = [JSON.stringify({ type: "item.completed", item: { type: "todo_list", items: [] } }), event(`cat '${realpathSync(bootstrap)}'`, "bootstrap"), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
   assert.match(assessRouteOrder(todoBeforeFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /todo_list/u);
-  const partialBootstrap = [event(`sed -n '2,2p' '${realpathSync(bootstrap)}'`, ""), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
-  assert.match(assessRouteOrder(partialBootstrap, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_before_bootstrap_full_load/u);
+  const directFind = [event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  const directAssessment = assessRouteOrder(directFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" });
+  assert.equal(directAssessment.passed, true); assert.equal(directAssessment.bootstrap_loaded, false);
+  const unsafePrefix = [event(`printf task > /tmp/TASK && skillroster find '完整任务' --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(unsafePrefix, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
+  const assignment = [event(`TASK='完整任务'; skillroster find "$TASK" --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.equal(assessRouteOrder(assignment, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
+  const codexAssignmentCommand = `/bin/zsh -lc \\"TASK='完整任务'\nskillroster find \\\\\\"\\"'$TASK\\" --hint \\"agent hint\\" --json'`;
+  const codexAssignment = [event(codexAssignmentCommand), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.equal(assessRouteOrder(codexAssignment, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
 });
 
 test("target read cannot start until the matching Find completion is ledger-authorized", async () => {
@@ -288,6 +340,17 @@ test("oracle and safety remain independent outcome dimensions", () => {
   assert.equal(unsafe.task, "succeeded"); assert.equal(unsafe.safety, "failed"); assert.equal(unsafe.accepted, false);
   const coreWithoutLoad = deriveArmOutcome({ arm: "core", surface, retrieval: { count: 0, contract_violation: false }, load: { passed: false }, oracle, workspace: { passed: true } });
   assert.equal(coreWithoutLoad.load, "load_wrong"); assert.equal(coreWithoutLoad.accepted, false);
+});
+
+test("JSON oracle compares structure without depending on object key order", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-json-oracle-")); mkdirSync(join(root, "outputs"));
+  writeFileSync(join(root, "outputs/events.json"), JSON.stringify({ records: [{ state: "open", id: "evt-01" }], schema_version: 1 }));
+  const oracle = { path: "outputs/events.json", json_equals: { schema_version: 1, records: [{ id: "evt-01", state: "open" }] } };
+  assert.equal(evaluateOracle(root, oracle).passed, true);
+  writeFileSync(join(root, "outputs/events.json"), JSON.stringify({ schema_version: 1, records: [{ id: "evt-01", state: "closed" }] }));
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:mismatch"]);
+  writeFileSync(join(root, "outputs/events.json"), "not json");
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:invalid_json"]);
 });
 
 test("Archify transcript attempts require exact shape and lifecycle order", () => {

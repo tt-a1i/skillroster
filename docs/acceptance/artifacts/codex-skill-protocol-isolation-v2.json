@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "suite_id": "codex-skill-protocol-isolation-v2",
+  "status": "failed",
+  "driver_reported_formal_gate_eligible": true,
+  "formal_gate_eligible": false,
+  "protocol_decision": {
+    "decision": "fix_bootstrap_or_cli_contract",
+    "required_trials_per_arm": 3,
+    "core_accepted": 3,
+    "on_demand_accepted": 1,
+    "on_demand_contract_failures": 2
+  },
+  "frozen": {
+    "snapshot_digest": "8a3d6c817e071738965459bc92c084b48c7d01e2b8f8ec15bd801a5edd6b366c",
+    "manifest_sha256": "d369db4fe868eb0f445ed6f5fc3c6b792086958ded4f9c9eb21476d8ec713748",
+    "cli_sha256": "1b48bd605359b49538648d3cff8d549b3956e418cdbefc819efe69cda9fa4f28",
+    "bootstrap_sha256": "3e28f02ed580180b8543be8ea23507c8c1b9f22a01adec696ee7d455c0676c57",
+    "targets_sha256": "3403e1d7eef046a608c7189429c4c092b505b27c8780076671b40600b6f83173",
+    "codex_version_sha256": "7aa31f8b0864fa0a787657d21167487f49ed01497802a4e5955ef02db3e94272",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "driver_sha256": "cb687834d3116e28f5dea126b9ba13e9dacdb526bc248d4e0fa78e679f041cc3",
+    "pair_invariants": {
+      "event-manifest-001#1": "6bcc514aa418696c179caca53c24fe555ece28da585e88b2752171057f114f6b",
+      "event-manifest-001#2": "4869f01ac5aaa25b72979733df35d2ea47cc1b3ef8c5af9cc65fd4dbe766ae87",
+      "event-manifest-001#3": "bf969543e1ac71a083ea749d062095fb3da81734a315bbbe97eb566a3e5ae71d"
+    }
+  },
+  "results": [
+    { "trial": 1, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 1, "arm": "on_demand", "find_count": 1, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "load": false, "route_order": false, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": false },
+    { "trial": 2, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 2, "arm": "on_demand", "find_count": 3, "first_call_argv_exact": false, "first_call_hint_valid": false, "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": false, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": false },
+    { "trial": 3, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 3, "arm": "on_demand", "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true }
+  ],
+  "manual_review": {
+    "trial_1_on_demand": "Find shared a compound shell command with a preceding write to /tmp/TASK; the frozen v2 ledger did not classify that side effect explicitly.",
+    "formal_eligibility": "Independent review invalidated the driver field because timeout_ms and repository source identity were not frozen.",
+    "retroactive_upgrade": false
+  },
+  "raw_evidence_committed": false,
+  "auth_copies_remaining": 0
+}
