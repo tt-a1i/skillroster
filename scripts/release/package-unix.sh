@@ -37,6 +37,7 @@ mkdir -p "$stage"
 install -m 0755 "target/${target}/release/skillroster" "$stage/skillroster"
 cp README.md "$stage/README.md"
 cp LICENSE "$stage/LICENSE"
+scripts/release/smoke.sh "$stage/skillroster"
 tar -C "$dist_root" -czf "$archive" "$name"
 rm -rf "$stage"
 
