@@ -5,6 +5,7 @@
   "tasks": [
     {
       "id": "transfer-humanize-001",
+      "family": "chinese_style_editing",
       "expected_skill": "humanizer-zh",
       "prompt": "请把 draft.md 改成一段自然、克制的团队内部更新，保存到 outputs/update.md。只保留原文明确写出的发布日期、离线草稿、批量导出、内测总人数和反馈人数，不要补充问候、收尾建议、使用安排，也不要根据人数推导新信息；所有数字和事实都要保留，正文控制在 80 到 180 个字符（含标点），不要标题、列表或修改说明。",
       "hint": "Chinese natural internal update remove AI writing patterns preserve stated facts",
@@ -23,6 +24,7 @@
     },
     {
       "id": "transfer-architecture-001",
+      "family": "interactive_architecture_diagram",
       "expected_skill": "archify",
       "prompt": "请根据 system-overview.txt 生成一份可独立打开的交互式系统架构 HTML，保存为 outputs/order-architecture.html。唯一允许的中间规格文件是 scratch/order-architecture.spec.json，不要创建其他中间文件。页面支持明暗主题，并提供基础的组件搜索和链路追踪交互。架构保持真实而有界：使用 6–8 个组件、2–3 个信任边界、一条主要请求链和一个异步分支，不要强制加入循环、泳道或卡片布局。完成后只告诉我文件路径和校验是否通过。",
       "hint": "interactive standalone system architecture diagram trust boundaries request trace HTML",

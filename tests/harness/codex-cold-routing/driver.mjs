@@ -72,9 +72,12 @@ export function validateManifest(manifest) {
   if (!Number.isSafeInteger(trialsPerArm) || trialsPerArm < 1 || trialsPerArm > 10) fail("trials_per_arm must be between 1 and 10");
   if (manifest.formal_protocol_gate !== undefined && typeof manifest.formal_protocol_gate !== "boolean") fail("formal_protocol_gate must be boolean");
   const ids = new Set();
+  const families = new Set();
   for (const task of manifest.tasks) {
     if (!/^[a-z0-9][a-z0-9-]*$/u.test(task.id ?? "") || ids.has(task.id)) fail("task id must be unique and path-safe");
     ids.add(task.id);
+    if (!/^[a-z0-9][a-z0-9_-]*$/u.test(task.family ?? "") || families.has(task.family)) fail("family must be unique and path-safe");
+    families.add(task.family);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(task.expected_skill ?? "")) fail(`${task.id} expected_skill is unsafe`);
     if (typeof task.prompt !== "string" || !task.prompt || typeof task.hint !== "string" || !task.hint.trim()) fail(`${task.id} requires prompt and hint`);
     const escapedSkill = task.expected_skill.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
@@ -87,6 +90,12 @@ export function validateManifest(manifest) {
     if (task.allowed_changed_paths.some((path) => Object.hasOwn(task.workspace_files ?? {}, path))) fail(`${task.id} cannot mutate an input`);
     safeRelative(task.oracle?.path, `${task.id} oracle path`);
     if (!task.allowed_changed_paths.includes(task.oracle.path)) fail(`${task.id} oracle path must be allowlisted`);
+    for (const requiredFile of task.oracle.required_files ?? []) {
+      safeRelative(requiredFile?.path, `${task.id} required file path`);
+      if (!task.allowed_changed_paths.includes(requiredFile.path)) fail(`${task.id} required file path must be allowlisted`);
+      for (const value of requiredFile.required_substrings ?? []) if (typeof value !== "string" || !value) fail(`${task.id} required file substring must be non-empty`);
+      for (const value of requiredFile.required_regex ?? []) new RegExp(value, "u");
+    }
     for (const pattern of [...(task.oracle.required_regex ?? []), ...(task.oracle.forbidden_regex ?? [])]) new RegExp(pattern, "u");
     if (task.oracle?.json_equals !== undefined && (task.oracle.json_equals === null || typeof task.oracle.json_equals !== "object")) fail(`${task.id} json_equals must be an object or array`);
     const receipt = task.oracle.archify_receipt_contract;
@@ -187,6 +196,13 @@ export function evaluateOracle(workspace, oracle, evidence = {}) {
   for (const value of oracle.forbidden_substrings ?? []) if (text.includes(value)) failures.push(`forbidden_substring:${value}`);
   for (const value of oracle.required_regex ?? []) if (!new RegExp(value, "u").test(text)) failures.push(`missing_regex:${value}`);
   for (const value of oracle.forbidden_regex ?? []) if (new RegExp(value, "u").test(text)) failures.push(`forbidden_regex:${value}`);
+  for (const requiredFile of oracle.required_files ?? []) {
+    const requiredPath = noFollowWorkspaceFile(workspace, requiredFile.path);
+    if (!requiredPath) { failures.push(`required_file:unsafe_or_missing:${requiredFile.path}`); continue; }
+    const requiredText = readFileSync(requiredPath, "utf8");
+    for (const value of requiredFile.required_substrings ?? []) if (!requiredText.includes(value)) failures.push(`required_file:missing_substring:${requiredFile.path}:${value}`);
+    for (const value of requiredFile.required_regex ?? []) if (!new RegExp(value, "u").test(requiredText)) failures.push(`required_file:missing_regex:${requiredFile.path}:${value}`);
+  }
   if (oracle.json_equals !== undefined) {
     let actual; try { actual = JSON.parse(text); } catch { failures.push("json_equals:invalid_json"); }
     if (actual !== undefined && JSON.stringify(canonicalJson(actual)) !== JSON.stringify(canonicalJson(oracle.json_equals))) failures.push("json_equals:mismatch");
@@ -308,6 +324,37 @@ export function assessTranscriptIntegrity(jsonl) {
   if (incompleteCommands) violations.push(`incomplete_command_events:${incompleteCommands}`);
   if (!successfulCommands) violations.push("successful_command_event_missing");
   return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands, unsuccessful_command_count: unsuccessfulCommands };
+}
+
+function writeTargetAllowed(path, workspace, tempRoot) {
+  const candidate = isAbsolute(path) ? resolve(path) : resolve(workspace, path);
+  return inside(candidate, workspace) || inside(candidate, tempRoot);
+}
+
+function explicitWritePaths(command) {
+  const paths = []; const redirection = /(?:^|\s)(?:\d*>>?|\d*<>)[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gu;
+  for (const match of command.matchAll(redirection)) paths.push(match[1] ?? match[2] ?? match[3]);
+  const tokens = simpleCommandTokens(command); if (!tokens?.length) return paths;
+  const executable = basename(tokens[0]).toLowerCase(); const args = tokens.slice(1).filter((token) => token !== "--");
+  const nonOptions = args.filter((token) => !token.startsWith("-"));
+  if (["touch", "mkdir", "tee"].includes(executable)) paths.push(...nonOptions);
+  else if (["cp", "mv", "install"].includes(executable) && nonOptions.length >= 2) paths.push(nonOptions.at(-1));
+  else if (executable === "sed" && args.includes("-i") && nonOptions.length) paths.push(nonOptions.at(-1));
+  return paths;
+}
+
+export function assessExternalWrites(jsonl, workspace, tempRoot) {
+  const targets = []; const violations = [];
+  const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
+  for (const [eventIndex, event] of commands.entries()) {
+    for (const raw of explicitWritePaths(event.command)) {
+      if (["/dev/null", "NUL", "nul"].includes(raw)) continue;
+      const target = { raw, canonical: canonicalPath(isAbsolute(raw) ? raw : join(workspace, raw)), event_index: eventIndex, command: event.command };
+      const allowed = writeTargetAllowed(raw, workspace, tempRoot); targets.push({ ...target, allowed });
+      if (!allowed) violations.push(`external_write_target:${target.canonical}`);
+    }
+  }
+  return { passed: violations.length === 0, violations: [...new Set(violations)], targets, audit_scope: "command-visible explicit redirection targets; OS sandbox is the actual write boundary" };
 }
 
 export function extractCommandTexts(jsonl) { return extractCommandEvents(jsonl).filter((event) => event.kind === "command").map((event) => event.command); }
@@ -568,8 +615,8 @@ export function assessCoreOrder(transcript, targetPath) {
   return { passed: violations.length === 0, violations, audit_scope: "Core first-action full-load gate over Codex command event state machine" };
 }
 
-export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder = { passed: true }, coreOrder = { passed: true }, transcript = { passed: true }, protectedScopes = { passed: true } }) {
-  const safety = workspace.passed && protectedScopes.passed ? "passed" : "failed";
+export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder = { passed: true }, coreOrder = { passed: true }, transcript = { passed: true }, protectedScopes = { passed: true }, externalWrites = { passed: true } }) {
+  const safety = workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed";
   const harnessValid = surface.passed && transcript.passed && (arm !== "core" || coreOrder.passed);
   const retrievalStage = arm === "core" ? "core_control" : retrieval.count === 0 ? "no_retrieval" : retrieval.top1_correct ? "retrieved" : "retrieval_wrong";
   const loadStage = arm === "core" ? load.passed ? "loaded" : "load_wrong" : load.passed && retrieval.returned_path_exact ? "loaded" : "load_wrong";
@@ -586,20 +633,54 @@ export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, worksp
 
 export function classifyPair(core, onDemand) {
   if (!core.harness_valid || core.task !== "succeeded" || core.load !== "loaded" || core.safety !== "passed") return { attribution: "invalid_core_control", cold_routing_regression: null };
+  if (!onDemand.harness_valid) return { attribution: "invalid_on_demand_harness", cold_routing_regression: null };
+  if (onDemand.safety !== "passed") return { attribution: "on_demand_safety_failure", cold_routing_regression: null };
   const regression = onDemand.task !== "succeeded" || onDemand.retrieval !== "retrieved" || onDemand.load !== "loaded" || onDemand.safety !== "passed" || onDemand.contract_violation;
   return { attribution: regression ? "on_demand_specific_failure" : "no_observed_regression", cold_routing_regression: regression };
 }
 
-export function deriveProtocolDecision(results, trialsPerArm) {
+function resultFamily(result) { return result.family ?? "default"; }
+
+export function groupPairedResults(tasks, results, trialsPerArm) {
+  return tasks.flatMap((task) => Array.from({ length: trialsPerArm }, (_, index) => {
+    const trial = index + 1; const coreResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "core"); const onDemandResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "on_demand");
+    if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { family: task.family, task: task.id, trial, attribution: "pair_invariant_mismatch", gate: "failed", cold_routing_regression: null };
+    if (!coreResult || !onDemandResult) return { family: task.family, task: task.id, trial, attribution: "pair_incomplete", gate: "failed", cold_routing_regression: null };
+    const pair = classifyPair(coreResult.outcome, onDemandResult.outcome);
+    return { family: task.family, task: task.id, trial, ...pair, gate: pair.attribution === "no_observed_regression" ? "passed" : "failed" };
+  }));
+}
+
+export function deriveProtocolDecision(results, trialsPerArm, tasks = null, pairs = null) {
   const core = results.filter((result) => result.arm === "core"); const onDemand = results.filter((result) => result.arm === "on_demand");
   const coreAccepted = core.filter((result) => result.outcome?.accepted === true).length;
   const onDemandAccepted = onDemand.filter((result) => result.outcome?.accepted === true).length;
   const onDemandContractFailures = onDemand.filter((result) => result.outcome?.contract_violation === true || result.outcome?.load !== "loaded").length;
+  const familyIds = [...new Set((tasks ?? results).map((item) => item.family ?? "default"))];
+  const groupedPairs = pairs ?? [];
+  const family_gates = familyIds.map((family) => {
+    const familyResults = results.filter((result) => resultFamily(result) === family);
+    const familyCore = familyResults.filter((result) => result.arm === "core");
+    const familyOnDemand = familyResults.filter((result) => result.arm === "on_demand");
+    const familyPairs = groupedPairs.filter((pair) => pair.family === family);
+    const familyCoreAccepted = familyCore.filter((result) => result.outcome?.accepted === true).length;
+    const familyOnDemandAccepted = familyOnDemand.filter((result) => result.outcome?.accepted === true).length;
+    const familyContractFailures = familyOnDemand.filter((result) => result.outcome?.contract_violation === true || result.outcome?.load !== "loaded").length;
+    const familySafetyInvalid = familyResults.some((result) => result.outcome?.safety !== "passed");
+    let familyDecision = "investigate_repeatable_on_demand_gap";
+    if (familySafetyInvalid) familyDecision = "stop_invalid_safety_evidence";
+    else if (familyCoreAccepted < trialsPerArm) familyDecision = "fix_control_task_or_oracle";
+    else if (familyContractFailures >= 2) familyDecision = "fix_bootstrap_or_cli_contract";
+    else if (familyOnDemandAccepted === trialsPerArm
+      && (pairs ? familyPairs.length === trialsPerArm && familyPairs.every((pair) => pair.gate === "passed") : familyCore.length === trialsPerArm && familyOnDemand.length === trialsPerArm)) familyDecision = "retain_current_design";
+    return { family, required_trials_per_arm: trialsPerArm, pair_count: familyPairs.length, core_accepted: familyCoreAccepted, on_demand_accepted: familyOnDemandAccepted, on_demand_contract_failures: familyContractFailures, gate: familyDecision === "retain_current_design" ? "passed" : "failed", decision: familyDecision };
+  });
   let decision = "investigate_repeatable_on_demand_gap";
-  if (coreAccepted < trialsPerArm) decision = "fix_control_task_or_oracle";
-  else if (onDemandContractFailures >= 2) decision = "fix_bootstrap_or_cli_contract";
-  else if (onDemandAccepted === trialsPerArm) decision = "retain_current_design";
-  return { decision, required_trials_per_arm: trialsPerArm, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures };
+  if (results.some((result) => result.outcome?.safety !== "passed")) decision = "stop_invalid_safety_evidence";
+  else if (coreAccepted < familyIds.length * trialsPerArm) decision = "fix_control_task_or_oracle";
+  else if (family_gates.some((gate) => gate.on_demand_contract_failures >= 2)) decision = "fix_bootstrap_or_cli_contract";
+  else if (family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed")) decision = "retain_current_design";
+  return { decision, required_trials_per_arm: trialsPerArm, expected_runs: familyIds.length * trialsPerArm * 2, family_count: familyIds.length, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures, family_gates, overall_gate: family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed") };
 }
 
 function writeInputs(workspace, files) {
@@ -805,7 +886,9 @@ function freezeSuite(manifest, options) {
       isolated_non_repository_workspace: true,
       execution_only_flags_unsupported_by_debug: ["ignore_user_config", "sandbox", "ephemeral"],
     },
+    sandbox_policy: { workspace_write: { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dir: "unique_run_temp" } },
     arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm,
+    family_schedule: manifest.tasks.map((task) => ({ family: task.family, task: task.id })),
   };
   const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${JSON.stringify(codexExecutable)}\0${driverSha256}\0${parentVerifierIdentity}`);
   const pairInvariants = {};
@@ -817,6 +900,15 @@ function freezeSuite(manifest, options) {
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
+}
+
+export function codexSandboxPolicy(tempRoot) {
+  return { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: [canonicalPath(tempRoot)] };
+}
+
+export function codexExecutionArgs(options, paths, prompt) {
+  const policy = codexSandboxPolicy(paths.temp);
+  return ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--add-dir", policy.add_dirs[0], "--skip-git-repo-check", "--json", "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true", "-c", "sandbox_workspace_write.exclude_slash_tmp=true", ...codexModelConfig(options), "-C", paths.workspace, prompt];
 }
 
 function codexModelConfig(options) { return ["-c", `model=${JSON.stringify(options.model)}`, "-c", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`]; }
@@ -870,7 +962,8 @@ export function formalResultEligible(result) {
     && result.transcript?.passed === true
     && result.workspace?.passed === true
     && result.protected_scopes?.passed === true
-    && result.outcome?.harness_valid === true);
+    && result.outcome?.harness_valid === true
+    && result.outcome?.safety === "passed");
 }
 
 function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
@@ -885,14 +978,15 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const surface = preflightSurface(paths, task, arm, options, env);
     if (!surface.passed) {
       const workspace = assessWorkspaceChanges(initialWorkspace, walk(paths.workspace), Object.keys(task.workspace_files), task.allowed_changed_paths); const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
-      return { task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed ? "passed" : "failed", accepted: false }, root };
+      const externalWrites = assessExternalWrites("", paths.workspace, paths.temp);
+      return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, external_writes: externalWrites, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed", accepted: false }, root };
     }
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
     const runEnv = { ...env };
     if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.runtimeAudit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
-    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", ...codexModelConfig(options), "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const result = run(options.codex, codexExecutionArgs(options, paths, task.prompt), { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     if (existsSync(paths.runtimeAudit)) copyFileSync(paths.runtimeAudit, paths.audit);
@@ -904,8 +998,9 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
-    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
-    return { task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    const externalWrites = assessExternalWrites(result.stdout, paths.workspace, paths.temp);
+    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes, externalWrites });
+    return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, external_writes: externalWrites, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
     cleanupRuntime(paths.temp);
@@ -925,9 +1020,9 @@ export function reevaluateExistingRuns(suiteRoot, manifest) {
   for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of ["core", "on_demand"]) {
     const prefix = trialsPerArm === 1 ? `${task.id}-${arm}-` : `${task.id}-trial-${trial}-${arm}-`;
     const matches = readdirSync(suiteRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix));
-    if (matches.length !== 1) { results.push({ task: task.id, trial, arm, root: null, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: [`run_root_count:${matches.length}`] }); continue; }
+    if (matches.length !== 1) { results.push({ family: task.family, task: task.id, trial, arm, root: null, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: [`run_root_count:${matches.length}`] }); continue; }
     const root = join(suiteRoot, matches[0].name); const workspacePath = join(root, "workspace"); const transcriptPath = join(root, "codex-events.jsonl");
-    if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ task: task.id, trial, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
+    if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ family: task.family, task: task.id, trial, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
     const transcriptText = readFileSync(transcriptPath, "utf8"); const targetPath = arm === "core" ? join(root, "home", ".codex", "skills", task.expected_skill, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
     const initial = new Map(Object.entries(task.workspace_files).map(([path, content]) => [path, sha(content)])); const workspace = assessWorkspaceChanges(initial, walk(workspacePath), Object.keys(task.workspace_files), task.allowed_changed_paths);
     const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(join(root, "find-audit.jsonl")) ? readFileSync(join(root, "find-audit.jsonl"), "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: targetPath, oneCall: task.one_call_load === true }) : { count: 0, contract_violation: false };
@@ -936,7 +1031,7 @@ export function reevaluateExistingRuns(suiteRoot, manifest) {
     const routeOrder = arm === "on_demand" ? assessRouteOrder(transcriptText, { bootstrapPath: join(root, "home", ".codex", "skills", "skillroster", "SKILL.md"), targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(transcriptText, targetPath) : { passed: true, audit_scope: "not_applicable" };
     const oracle = evaluateOracle(workspacePath, task.oracle, { transcript: transcriptText, targetPackage: dirname(targetPath), parentVerificationAuthority: { mode: "historical_untrusted" } });
-    results.push({ task: task.id, trial, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not a formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });
+    results.push({ family: task.family, task: task.id, trial, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not a formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });
   }
   const sourceDigestAfter = stateDigest(suiteRoot); if (sourceDigestAfter !== sourceDigestBefore) fail("reevaluation changed the source run tree");
   return { status: "reevaluated", source_root: canonicalPath(suiteRoot), source_tree_sha256_before: sourceDigestBefore, source_tree_sha256_after: sourceDigestAfter, raw_runs_modified: false, formal_gate_eligible: false, results };
@@ -964,16 +1059,13 @@ export function main(argv = process.argv.slice(2)) {
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`unknown task: ${options.task}`);
   const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = []; const trialsPerArm = manifest.trials_per_arm ?? 1;
   for (const task of tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of arms) results.push(executeArm(task, arm, trial, trialsPerArm, runOptions, frozen.facts));
-  const pairs = tasks.flatMap((task) => Array.from({ length: trialsPerArm }, (_, index) => {
-    const trial = index + 1; const coreResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "core"); const onDemandResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "on_demand");
-    if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { task: task.id, trial, attribution: "pair_invariant_mismatch", cold_routing_regression: null };
-    return coreResult && onDemandResult ? { task: task.id, trial, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, trial, attribution: "pair_incomplete", cold_routing_regression: null };
-  }));
+  const pairs = groupPairedResults(tasks, results, trialsPerArm);
   const completeSchedule = tasks.length === manifest.tasks.length && arms.length === 2 && results.length === manifest.tasks.length * trialsPerArm * 2;
   const sourceIdentityAfter = repositoryIdentity(); const sourceIdentityStable = JSON.stringify(sourceIdentityAfter) === JSON.stringify(frozen.facts.source_identity);
   const codexExecutableAfter = executableIdentity(options.codex); const codexExecutableStable = JSON.stringify(codexExecutableAfter) === JSON.stringify(frozen.facts.codex_executable);
+  const protocolDecision = manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm, tasks, pairs) : null;
   const formalGateEligible = completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(formalResultEligible) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.gate === "passed") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: protocolDecision, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 

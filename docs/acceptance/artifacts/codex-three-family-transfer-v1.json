@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "suite_id": "codex-three-family-transfer-v1",
+  "status": "failed",
+  "formal_gate_eligible": false,
+  "projection": "redacted_projection_of_external_raw_summary",
+  "raw_summary_sha256": "3b59130eab61a196a5f555e94f179cc4e1913350a15d69689a31247da2bffce6",
+  "run_lineage": {
+    "earlier_interrupted_attempt": "excluded: five roots, artifact Core transcript missing, no summary",
+    "complete_formal_candidate": "run2 only",
+    "post_evidence_hardening": true,
+    "rerun_after_hardening": false
+  },
+  "attribution_phase": "pre_hardening_historical_run; pair attributions below are preserved and not retroactively recomputed",
+  "source_identity_stable": true,
+  "codex_executable_stable": true,
+  "safety_accounting": "scoped_protected_scopes_only; extraction On-demand transcript disclosed an out_of_scope_write_to_private_tmp_TASK, so complete safety proof is unavailable",
+  "protocol_decision": {
+    "decision": "fix_control_task_or_oracle",
+    "required_trials_per_arm": 1,
+    "expected_runs": 6,
+    "family_count": 3,
+    "core_accepted": 2,
+    "on_demand_accepted": 1,
+    "on_demand_contract_failures": 2,
+    "overall_gate": false,
+    "family_gates": [
+      { "family": "instruction_only_rewriting", "core_accepted": 0, "on_demand_accepted": 0, "gate": "failed", "decision": "fix_control_task_or_oracle" },
+      { "family": "reference_backed_extraction", "core_accepted": 1, "on_demand_accepted": 0, "gate": "failed", "decision": "investigate_repeatable_on_demand_gap" },
+      { "family": "script_backed_artifact", "core_accepted": 1, "on_demand_accepted": 1, "gate": "passed", "decision": "retain_current_design" }
+    ]
+  },
+  "frozen": {
+    "source_commit": "3251a36660dbfa37543ba198135331864ae9e6e5",
+    "source_tree": "5a91c1e06ba386b36df78e02601ea12df67f3a2f",
+    "snapshot_digest": "c94cdd5a205e4ba24f0ff03bc314fb3212a3eba16a8ec5db2b9ec619bef8a6d2",
+    "manifest_sha256": "ffc3693e8e0f478d2c62f9200faafdf34cd13cbabcd284934218f543ab59e270",
+    "cli_sha256": "5b4300ffdd7d56ab76b4a9ebd4218ad6de73a54cfe3eb520ce8570629a7f20c6",
+    "bootstrap_sha256": "b3218d7047697e74a2c06cf77f54058aaf47d2da09d1ad8a62bd6774a54da058",
+    "targets_sha256": "6f109d5994c186b1c15a7fd101d44d5ad1ab6b839b8936a8a242556c5331c9b3",
+    "target_packages": {
+      "zh-rewrite": { "package_tree_sha256": "e3bcb922dd97c9103e993afc73e3bae197332ece0cd96a48522343750f7a9d7e", "script_content_sha256": null },
+      "domain-extractor": { "package_tree_sha256": "771258bf08b6efcd039ec6ab19f6c8099c6f3a90dfd6764de42598d24b5a19fb", "script_content_sha256": null },
+      "artifact-builder": { "package_tree_sha256": "ed2107c0d93c5d07d336781f318790ec916259a4b6b20567b7b93df0db90a3c3", "script_content_sha256": null }
+    },
+    "codex_version": "codex-cli 0.147.0",
+    "codex_executable_content_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "timeout_ms": 180000,
+    "driver_sha256": "2df91332990e805d05c3ff0a0530a28b745546f1c703cedcc1674734d397da3e",
+    "pair_invariants": {
+      "transfer-rewrite-001": "68a5b24f1a60bcb313d453a221b97d6395f23145f00765cb4b28708e1ca6ef63",
+      "transfer-extraction-001": "cd2bf0a5d071448a531ae0934a137f41957287e487287d1b1f3230d7fb6ec586",
+      "transfer-artifact-001": "021baeaa7e41a2601b44a7251c2b895650003be8dc4b2dba1323de176df49270"
+    }
+  },
+  "runs": [
+    { "family": "instruction_only_rewriting", "arm": "core", "surface": true, "transcript": true, "harness_valid": false, "load": false, "core_order": false, "oracle": false, "workspace": true, "protected_scopes": true, "accepted": false, "attribution": "invalid_core_control" },
+    { "family": "instruction_only_rewriting", "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "retrieval": true, "exact_load": true, "route_order": false, "oracle": false, "workspace": true, "protected_scopes": true, "accepted": false },
+    { "family": "reference_backed_extraction", "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "family": "reference_backed_extraction", "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "retrieval": true, "exact_load": true, "route_order": false, "oracle": true, "workspace": true, "protected_scopes": true, "out_of_scope_write": "private_tmp_TASK_disclosed_and_cleaned", "accepted": false },
+    { "family": "script_backed_artifact", "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "family": "script_backed_artifact", "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "retrieval": true, "exact_load": true, "route_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true }
+  ],
+  "auth_copies_remaining": 0,
+  "raw_evidence_committed": false
+}

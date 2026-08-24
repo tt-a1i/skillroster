@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -45,6 +45,16 @@ test("default is a non-executing plan and execution requires explicit auth", () 
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
   assert.throws(() => parseArgs(["--execute", "--auth-source", "/tmp/auth.json", "--reevaluate-root", "/tmp/runs"]), /mutually exclusive/u);
   assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
+});
+
+test("Codex execution freezes temp confinement and grants only the unique run temp", () => {
+  const runTemp = resolve("/tmp/run-temp");
+  const policy = codexSandboxPolicy(runTemp);
+  assert.deepEqual(policy, { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: [runTemp] });
+  const args = codexExecutionArgs({ model: "gpt-5.6-luna", reasoningEffort: "medium" }, { temp: runTemp, workspace: resolve("/tmp/workspace") }, "task");
+  assert.ok(args.includes("--add-dir")); assert.ok(args.includes(runTemp));
+  assert.ok(args.includes("sandbox_workspace_write.exclude_tmpdir_env_var=true"));
+  assert.ok(args.includes("sandbox_workspace_write.exclude_slash_tmp=true"));
 });
 
 test("summary output preserves stdout JSON in a private external file", { skip: process.platform === "win32" }, () => {
@@ -91,8 +101,8 @@ test("offline reevaluation writes only outside the immutable source run tree", (
 
 test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   const manifest = { schema_version: 1, harness: "codex-transfer", tasks: [
-    { id: "a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
-    { id: "b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+    { id: "a", family: "family-a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+    { id: "b", family: "family-b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
   ] };
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
@@ -100,17 +110,47 @@ test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   assert.throws(() => validateManifest({ ...manifest, tasks: [], trials_per_arm: 3 }), /unsupported/u);
   assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 0 }), /trials_per_arm/u);
   assert.throws(() => validateManifest({ ...manifest, formal_protocol_gate: "yes" }), /formal_protocol_gate/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], family: "family-b" }, manifest.tasks[1]] }), /family must be unique/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], family: "Family A" }, manifest.tasks[1]] }), /family must be unique/u);
   for (const prompt of ["use SkillRoster", "run capability search", "please Find it", "做能力检索", "load one"]) {
     assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], prompt }] }), /must not disclose/u);
   }
 });
 
+test("multi-family protocol aggregation counts every task pair and emits one gate per family", () => {
+  const tasks = [{ id: "a", family: "rewrite" }, { id: "b", family: "extract" }, { id: "c", family: "artifact" }];
+  const results = tasks.flatMap((task) => [
+    { family: task.family, task: task.id, trial: 1, arm: "core", pair_invariant: `${task.id}-pair`, outcome: { accepted: true, harness_valid: true, task: "succeeded", load: "loaded", safety: "passed" } },
+    { family: task.family, task: task.id, trial: 1, arm: "on_demand", pair_invariant: `${task.id}-pair`, outcome: { accepted: true, harness_valid: true, task: "succeeded", load: "loaded", safety: "passed", retrieval: "retrieved", contract_violation: false } },
+  ]);
+  const pairs = groupPairedResults(tasks, results, 1);
+  assert.deepEqual(pairs.map((pair) => [pair.family, pair.gate]), [["rewrite", "passed"], ["extract", "passed"], ["artifact", "passed"]]);
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.expected_runs, 6);
+  assert.equal(decision.core_accepted, 3);
+  assert.equal(decision.on_demand_accepted, 3);
+  assert.equal(decision.overall_gate, true);
+  assert.deepEqual(decision.family_gates.map((gate) => gate.family), ["rewrite", "extract", "artifact"]);
+  assert.ok(decision.family_gates.every((gate) => gate.gate === "passed"));
+});
+
+test("a failed family gate cannot be hidden by passing families", () => {
+  const tasks = [{ id: "rewrite", family: "rewrite" }, { id: "extract", family: "extract" }];
+  const result = (task, family, arm, accepted) => ({ family, task, trial: 1, arm, pair_invariant: `${task}-pair`, outcome: { accepted, harness_valid: true, task: accepted ? "succeeded" : "failed", load: accepted ? "loaded" : "load_wrong", safety: "passed", retrieval: accepted ? "retrieved" : "retrieval_wrong", contract_violation: !accepted } });
+  const results = [result("rewrite", "rewrite", "core", true), result("rewrite", "rewrite", "on_demand", true), result("extract", "extract", "core", true), result("extract", "extract", "on_demand", false)];
+  const pairs = groupPairedResults(tasks, results, 1);
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.overall_gate, false);
+  assert.equal(decision.family_gates.find((gate) => gate.family === "rewrite").gate, "passed");
+  assert.equal(decision.family_gates.find((gate) => gate.family === "extract").gate, "failed");
+});
+
 test("formal eligibility requires a complete successful harness record, not a task pass", () => {
-  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, accepted: false } };
+  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, safety: "passed", accepted: false } };
   assert.equal(formalResultEligible(eligible), true);
   for (const mutation of [
     { codex_exit_code: 124 }, { transcript: { passed: false } }, { surface: { passed: false } },
-    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } },
+    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } }, { outcome: { harness_valid: true, safety: "failed" } },
   ]) assert.equal(formalResultEligible({ ...eligible, ...mutation }), false);
 });
 
@@ -124,12 +164,40 @@ test("pair invariant is frozen from the suite snapshot and complete task input",
 });
 
 test("protocol decision applies the frozen stop conditions", () => {
-  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, load: "loaded", contract_violation: false, ...overrides } });
+  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, safety: "passed", load: "loaded", contract_violation: false, ...overrides } });
   assert.equal(deriveProtocolDecision([result("core", true), result("core", false), result("core", true)], 3).decision, "fix_control_task_or_oracle");
   const core = Array.from({ length: 3 }, () => result("core", true));
   const contractFailures = [result("on_demand", false, { load: "load_wrong" }), result("on_demand", false, { contract_violation: true }), result("on_demand", true)];
   assert.equal(deriveProtocolDecision([...core, ...contractFailures], 3).decision, "fix_bootstrap_or_cli_contract");
   assert.equal(deriveProtocolDecision([...core, ...Array.from({ length: 3 }, () => result("on_demand", true))], 3).decision, "retain_current_design");
+});
+
+test("repeated contract failures must occur within one family", () => {
+  const result = (family, arm, accepted, contractViolation = false) => ({ family, arm, outcome: { accepted, harness_valid: true, safety: "passed", task: accepted ? "succeeded" : "failed", load: accepted ? "loaded" : "load_wrong", contract_violation: contractViolation } });
+  const tasks = [{ id: "a", family: "a" }, { id: "b", family: "b" }];
+  const pairs = [{ family: "a", gate: "failed" }, { family: "b", gate: "failed" }];
+  const results = [result("a", "core", true), result("a", "on_demand", false, true), result("b", "core", true), result("b", "on_demand", false, true)];
+  assert.equal(deriveProtocolDecision(results, 1, tasks, pairs).decision, "investigate_repeatable_on_demand_gap");
+});
+
+test("safety-invalid evidence takes the family and global stop path", () => {
+  const result = (family, arm, safety) => ({ family, arm, outcome: { accepted: false, harness_valid: true, safety, task: "succeeded", load: "loaded", contract_violation: false } });
+  const tasks = [{ id: "safe", family: "safe" }, { id: "unsafe", family: "unsafe" }];
+  const pairs = [{ family: "safe", gate: "failed" }, { family: "unsafe", gate: "failed" }];
+  const results = [result("safe", "core", "passed"), result("safe", "on_demand", "passed"), result("unsafe", "core", "passed"), result("unsafe", "on_demand", "failed")];
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.decision, "stop_invalid_safety_evidence");
+  assert.equal(decision.family_gates.find((gate) => gate.family === "unsafe").decision, "stop_invalid_safety_evidence");
+});
+
+test("external write audit rejects redirections outside workspace and run temp", () => {
+  const workspace = "/tmp/workspace"; const temp = "/tmp/run-temp";
+  const safe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf ok > outputs/result.txt", aggregated_output: "", exit_code: 0, status: "completed" } });
+  const unsafe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf secret > /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
+  assert.equal(assessExternalWrites(safe, workspace, temp).passed, true);
+  assert.equal(assessExternalWrites(unsafe, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
+  const commandWrite = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "mkdir -p /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
+  assert.equal(assessExternalWrites(commandWrite, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
@@ -394,6 +462,16 @@ test("JSON oracle compares structure without depending on object key order", () 
   assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:invalid_json"]);
 });
 
+test("JSON oracle can require a bounded companion file", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-required-file-oracle-")); mkdirSync(join(root, "outputs"));
+  writeFileSync(join(root, "outputs/report.json"), JSON.stringify({ ok: true }));
+  writeFileSync(join(root, "outputs/README.md"), "# Report\nItems: 2\n");
+  const oracle = { path: "outputs/report.json", json_equals: { ok: true }, required_files: [{ path: "outputs/README.md", required_substrings: ["# Report", "Items: 2"] }] };
+  assert.equal(evaluateOracle(root, oracle).passed, true);
+  writeFileSync(join(root, "outputs/README.md"), "# Report\n");
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["required_file:missing_substring:outputs/README.md:Items: 2"]);
+});
+
 test("Archify transcript attempts require exact shape and lifecycle order", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-archify-receipts-")); const workspace = join(root, "workspace"); const target = join(root, "archify"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const script = join(target, "bin", "archify.mjs");
   mkdirSync(join(workspace, "scratch"), { recursive: true }); mkdirSync(join(workspace, "outputs"), { recursive: true }); mkdirSync(join(target, "bin"), { recursive: true }); writeFileSync(spec, "{\"type\":\"architecture\"}\n"); writeFileSync(artifact, "<html>static token stuffing</html>\n"); writeFileSync(script, "// frozen tool");
@@ -447,6 +525,8 @@ test("a failed Core control prevents cold-routing attribution", () => {
   const good = { harness_valid: true, task: "succeeded", safety: "passed", retrieval: "retrieved", load: "loaded", contract_violation: false };
   assert.deepEqual(classifyPair({ ...good, task: "failed" }, good), { attribution: "invalid_core_control", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, { ...good, contract_violation: true }), { attribution: "on_demand_specific_failure", cold_routing_regression: true });
+  assert.deepEqual(classifyPair(good, { ...good, harness_valid: false }), { attribution: "invalid_on_demand_harness", cold_routing_regression: null });
+  assert.deepEqual(classifyPair(good, { ...good, safety: "failed" }), { attribution: "on_demand_safety_failure", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, good), { attribution: "no_observed_regression", cold_routing_regression: false });
 });
 
@@ -454,4 +534,13 @@ test("fixture remains readable and contains only the two previously passing fami
   const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer.json", import.meta.url)));
   validateManifest(fixture);
   assert.deepEqual(fixture.tasks.map((task) => task.expected_skill).sort(), ["archify", "humanizer-zh"]);
+});
+
+test("sealed transfer fixture keeps three distinct capability families and six scheduled runs", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v2.json", import.meta.url)));
+  validateManifest(fixture);
+  assert.equal(fixture.formal_protocol_gate, true);
+  assert.deepEqual(fixture.tasks.map((task) => task.family), ["instruction_only_rewriting", "reference_backed_extraction", "script_backed_artifact"]);
+  assert.equal(fixture.tasks.length * 2 * fixture.trials_per_arm, 6);
+  assert.equal(new Set(fixture.tasks.map((task) => task.family)).size, 3);
 });
