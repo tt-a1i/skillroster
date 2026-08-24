@@ -59,17 +59,18 @@ defines `O_DIRECTORY` and the security rationale for `O_NOFOLLOW`.
 
 - [POSIX `open`/`openat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html)
 - [POSIX `fstat`](https://pubs.opengroup.org/onlinepubs/009696699/functions/fstat.html)
+- [POSIX `fstatat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fstatat.html)
 - [Linux `stat`/`fstatat`](https://man7.org/linux/man-pages/man2/lstat.2.html)
 - [Linux `openat2`](https://man7.org/linux/man-pages/man2/openat2.2.html)
-- [Apple/XNU `open(2)`](https://keith.github.io/xcode-man-pages/open.2.html)
+- [Apple-maintained XNU `fcntl.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h)
 
 Linux `openat2()` adds `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`,
 `RESOLVE_NO_SYMLINKS`, and `RESOLVE_NO_MAGICLINKS`; these are useful when the
 caller needs one kernel pathname-resolution operation with explicit containment
 rules. It is Linux-specific (introduced in Linux 5.6), so it cannot be the
-portable abstraction. macOS's documented `open(2)` page includes `O_NOFOLLOW`,
-and newer Darwin headers expose stronger no-follow/beneath flags; availability
-must be feature-detected rather than assumed from Linux names.
+portable abstraction. Apple's XNU headers directly define `O_RESOLVE_BENEATH`,
+`O_NOFOLLOW_ANY`, `AT_RESOLVE_BENEATH`, and `AT_SYMLINK_NOFOLLOW_ANY`; their
+availability is gated by Darwin feature levels and must be feature-detected.
 
 The minimum POSIX traversal is therefore:
 
@@ -90,6 +91,17 @@ to report, not package content to follow. Rust can pass Unix-specific flags via
 [`OpenOptionsExt::custom_flags`](https://doc.rust-lang.org/std/os/unix/fs/trait.OpenOptionsExt.html),
 but the descriptor lifetime and traversal policy still need a platform module.
 
+The root open has an additional identity gate. Before opening, the backend
+retains the current approved-root identity from the existing policy (`dev`,
+`ino`, `ctime`, and nanoseconds on POSIX). It opens the canonical root with
+directory/no-follow flags, immediately calls `fstat()` on that **root fd**, and
+compares the result to the approved identity before discovery. For a portable
+POSIX implementation, every canonical component should be opened as the final
+component of its own `openat()` call; a single `openat()` pathname with
+`O_NOFOLLOW` does not protect intermediate components. Linux/Darwin stronger
+no-follow/beneath flags can reduce that component loop where feature detection
+proves them available.
+
 ### Windows
 
 Win32 `CreateFile` returns a handle that remains valid for the object while a
@@ -105,15 +117,18 @@ the final reparse point.
 - [`FILE_ID_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info)
 - [`FILE_ATTRIBUTE_TAG_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_attribute_tag_info)
 - [Reparse-point operations](https://learn.microsoft.com/en-us/windows/win32/fileio/reparse-point-operations)
-- [`OpenFileById`](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-openfilebyid)
+- [`OpenFileById`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid)
 
 This is not the same API shape as POSIX `openat`: ordinary `CreateFileW` takes
-a pathname, not a parent directory handle. `OpenFileById` can reopen an object
-from a volume handle and file ID, but it is not a general portable
-component-by-component traversal primitive and filesystem support varies.
-Directory enumeration can return file IDs (`FileIdExtdDirectoryInfo`), but a
-backend still has to open by ID, reject unsupported filesystems, inspect
-reparse tags, and verify the returned handle before consuming it.
+a pathname, not a parent directory handle. `OpenFileById` accepts `hVolumeHint`,
+which Microsoft defines as a handle to any file on the volume or share where
+the target is stored, plus a `FILE_ID_DESCRIPTOR`; it is not a general
+portable component-by-component traversal primitive and filesystem support
+varies. Directory enumeration can return file IDs through the official
+[`FILE_ID_EXTD_DIR_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_extd_dir_info)
+structure, but a backend still has to open by ID, reject unsupported
+filesystems, inspect reparse tags, and verify the returned handle before
+consuming it.
 
 Windows Native System Services document `NtCreateFile` with a
 `RootDirectory` handle and relative path names, plus `FILE_OPEN_BY_FILE_ID`.
@@ -127,6 +142,9 @@ surface than the ordinary Win32 contract:
 Consequently, a Windows implementation must fail closed when it cannot prove
 that a child handle is anchored. A path reopen followed by an ID comparison is
 still useful ordinary-drift detection, but it is not a handle-bound guarantee.
+The root handle must likewise be queried immediately and compared with the
+existing approved `RootIdentity` (volume serial, file index, and creation time)
+before any directory enumeration.
 
 ## Measured macOS prototype
 
@@ -136,65 +154,137 @@ directory descriptor, renamed that directory away, installed a different
 directory at the old pathname, then read once by pathname and once relative to
 the held descriptor.
 
-Command shape (Python uses the host's `open(2)`/`openat(2)` through
-`os.open(..., dir_fd=...)`):
+The following is the complete, self-cleaning script that was run. It uses the
+host's `open(2)`/`openat(2)` through `os.open(..., dir_fd=...)`; the important
+descriptor is `pkg_fd`, not `root_fd`.
 
 ```text
-PROTO_DIR=$(mktemp -d /tmp/skillroster-135.XXXXXX)
-PROTO_DIR="$PROTO_DIR" python3 - <<'PY'
-# create pkg/SKILL.md and replacement/SKILL.md
-# root_fd = os.open(root, O_RDONLY|O_DIRECTORY|O_NOFOLLOW)
-# pkg_fd = os.open("pkg", O_RDONLY|O_DIRECTORY|O_NOFOLLOW, dir_fd=root_fd)
-# rename pkg -> pkg-old; rename replacement -> pkg
-# pathname = read(root / "pkg" / "SKILL.md")
-# bound = read(os.open("SKILL.md", O_RDONLY|O_NOFOLLOW, dir_fd=pkg_fd))
+python3 - <<'PY'
+import json
+import os
+import platform
+import shutil
+import tempfile
+from pathlib import Path
+
+root = Path(tempfile.mkdtemp(prefix="skillroster-135-"))
+fds = []
+try:
+    (root / "pkg").mkdir()
+    (root / "pkg" / "SKILL.md").write_bytes(b"original\n")
+    (root / "replacement").mkdir()
+    (root / "replacement" / "SKILL.md").write_bytes(b"replacement\n")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    root_fd = os.open(os.fspath(root), directory_flags)
+    fds.append(root_fd)
+    pkg_fd = os.open("pkg", directory_flags, dir_fd=root_fd)
+    fds.append(pkg_fd)
+    before = os.fstat(pkg_fd)
+
+    os.rename(root / "pkg", root / "pkg-old")
+    os.rename(root / "replacement", root / "pkg")
+
+    pathname_fd = os.open(os.fspath(root / "pkg" / "SKILL.md"), file_flags)
+    fds.append(pathname_fd)
+    pathname_read = os.read(pathname_fd, 4096).decode().strip()
+
+    bound_fd = os.open("SKILL.md", file_flags, dir_fd=pkg_fd)
+    fds.append(bound_fd)
+    bound_read = os.read(bound_fd, 4096).decode().strip()
+    after = os.fstat(pkg_fd)
+
+    result = {
+        "pkg_fd_survives_rename": True,
+        "pathname_read_after_retarget": pathname_read,
+        "held_pkg_fd_read": bound_read,
+        "pkg_fd_identity_unchanged": [before.st_dev, before.st_ino]
+        == [after.st_dev, after.st_ino],
+        "pkg_fd_identity": [before.st_dev, before.st_ino],
+    }
+finally:
+    for fd in reversed(fds):
+        os.close(fd)
+    shutil.rmtree(root)
+
+result["cleanup_complete"] = not root.exists()
+result["platform"] = f"{platform.system()} {platform.release()} {platform.machine()}"
+print(json.dumps(result, sort_keys=True))
 PY
 ```
 
-Observed on macOS 26.5.2 / Darwin 25.5 / arm64:
+Environment and stdout from the run:
 
-```json
-{
-  "root_fd_dir_survives_rename": true,
-  "pathname_read_after_retarget": "replacement",
-  "held_directory_fd_read": "original",
-  "conclusion": "directory descriptor remains bound to original directory; pathname follows replacement"
-}
+```text
+$ python3 --version
+Python 3.14.6
+$ uname -srm
+Darwin 25.5.0 arm64
+$ sw_vers
+ProductName:    macOS
+ProductVersion: 26.5.2
+BuildVersion:   25F84
+{"cleanup_complete": true, "held_pkg_fd_read": "original", "pathname_read_after_retarget": "replacement", "pkg_fd_identity": [16777234, 137701508], "pkg_fd_identity_unchanged": true, "pkg_fd_survives_rename": true, "platform": "Darwin 25.5.0 arm64"}
 ```
+
+The inode pair is host/run-specific; the observable assertions are the two
+different reads, unchanged `pkg_fd` identity, and completed cleanup.
 
 This is a measured POSIX behavior demonstration, not an adversarial proof. No
 Windows prototype was claimed: this host cannot validate Windows handle,
 reparse, file-ID, or filesystem support behavior.
 
-## Smallest future interface
+## Smallest future interface: existing scanner access backend
 
-Keep this behind one private filesystem seam; do not expose descriptors or
-Windows handles in the CLI or SQLite. A possible semantic interface is:
+Keep this behind one private filesystem seam; it is an **access backend for the
+existing scanner**, not a second enumerator or digest implementation. The
+current scanner remains the owner of traversal order, ignored names, depth and
+size limits, symlink classification, relative-path normalization, digest
+framing, and completeness facts. A possible backend-only interface is:
 
 ```text
-BoundSource::open(root_path, policy) -> BoundTree
-BoundTree::entries(dir) -> sorted Entry { logical_relative_path, kind }
-BoundTree::open_child(dir, name) -> BoundFile | BoundDir | Rejected
-BoundFile::metadata() -> identity, type, size
-BoundFile::read_all() -> bytes
-BoundFile::metadata() -> identity, type, size   # post-read check
+BoundFs::open_root(canonical_root, approved_identity) -> BoundDir
+BoundFs::read_dir(BoundDir) -> raw Entry { name, kind, metadata }
+BoundFs::open_child(BoundDir, name, expected_kind) -> BoundNode | Rejected
+BoundFs::read_file(BoundFile) -> bytes
+BoundFs::read_link(BoundSymlink) -> target spelling
+BoundFs::metadata(BoundNode) -> identity, type, size
 ```
 
-The implementation must retain the object, never follow symlinks/reparse
-points for package content, reject special files, bound depth/entry count/size,
-and return an explicit unsupported result if the platform cannot satisfy the
-policy. `logical_relative_path` is for deterministic digest input and display;
-it is not reopened to obtain bytes.
+`open_root` must perform the immediate handle-vs-approved-identity comparison
+described above. `read_dir` supplies names and object facts only; the existing
+scanner sorts and applies its current filters. The backend must retain the
+opened object, never follow symlinks/reparse points for package content, reject
+special files under the existing policy, enforce bounded reads, and return an
+explicit unsupported result if the platform cannot satisfy the requested
+binding. It must not expose descriptors or Windows handles in the CLI or
+SQLite.
 
-### Package fingerprints
+### Package fingerprints and symlink compatibility
 
-Fingerprint input should be a sorted sequence of logical relative name, object
-kind, size, and bytes read from each bound regular-file handle. A directory is
-not content merely because it has a pathname. Capture metadata from the same
-handle before and after reading; if type, size, or supported identity changes,
-discard the fingerprint and report a typed source drift. This prevents a
-same-size pathname replacement from being silently accepted, but it does not
-promise an atomic multi-file snapshot under concurrent writes.
+The existing scanner's package and routing identity policy is unchanged. Its
+complete package fingerprint includes every retained package file, including
+symlink target spelling; its versioned routing content identity excludes only
+the package-root `.gitignore`. A bound backend must preserve those exact inputs:
+
+- regular-file bytes come from the already-open file handle;
+- POSIX symlink target spelling comes from `readlinkat()` relative to the bound
+  parent directory (see the current POSIX
+  [`readlink`/`readlinkat` function page](https://pubs.opengroup.org/onlinepubs/9799919799/functions/readlink.html));
+- Windows reparse/symlink data is read and classified without following the
+  reparse point, using the existing scanner's target-spelling policy;
+- the existing path separators, delimiters, excluded `.gitignore` rule,
+  `digest_algorithm` value, and completeness semantics remain unchanged.
+
+No new digest algorithm is proposed here. Any future change to those inputs
+must introduce an explicit algorithm version and force a rescan, as required by
+the product spec. A directory is not content merely because it has a pathname.
+Capture metadata from the same handle before and after reading; if type, size,
+or supported identity changes, discard the fingerprint and report typed source
+drift. This prevents a same-size pathname replacement from being silently
+accepted, but it does not promise an atomic multi-file snapshot under concurrent
+writes.
 
 ### Executable discovery
 
@@ -214,6 +304,25 @@ or filesystem cannot provide the requested bound session, the scan must either
 use the existing `path_bound` checkpoint contract and disclose that fact, or
 fail closed when the caller explicitly requested the stronger mode. It must
 not silently upgrade a path check into a handle guarantee.
+
+### Unsafe and platform-abstraction budget
+
+Rust's standard library provides file handles and path-based `read_dir`, but it
+does not provide a portable fd-relative directory enumeration API. A POSIX
+backend therefore needs a very small reviewed unsafe boundary around
+`fdopendir`/`readdir`, `openat`, `readlinkat`, and `fstatat`, or an audited crate
+that owns those wrappers. The wrapper must have RAII fd closure, checked errno,
+bounded names/entries, and no raw descriptor escape. On Windows, the backend
+needs `windows-sys`/Win32 FFI for handle enumeration and metadata; using
+`NtCreateFile` additionally requires a reviewed native ABI boundary and an
+explicit OS/filesystem support matrix.
+
+Reject integration if it requires a second traversal or digest engine, relies
+on undocumented ABI without a tested support matrix, labels a path reopen as
+handle-bound, silently falls back in an explicitly requested handle mode, or
+introduces unsafe code whose fd/handle lifetime and error paths cannot be
+exercised deterministically on CI. The initial POSIX phase should fit one
+private backend module; Windows native API work is a separate approval gate.
 
 ## Options and recommendation
 
