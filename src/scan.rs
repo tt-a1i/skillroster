@@ -18,8 +18,8 @@ const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
 pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-v1";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
-const MAX_SESSION_DISCOVERY_FILES_PER_AGENT: usize = 10_000;
-const MAX_SESSION_FILES_PER_AGENT: usize = 250;
+const MAX_SESSION_DISCOVERY_FILES_PER_ROOT: usize = 10_000;
+const MAX_SESSION_FILES_PER_ROOT: usize = 250;
 const MAX_SESSION_BYTES_PER_AGENT: u64 = 4 * 1024 * 1024;
 const MAX_SESSION_BYTES_PER_FILE: u64 = 512 * 1024;
 const MAX_SESSION_LINES_PER_AGENT: usize = 20_000;
@@ -2141,41 +2141,14 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             continue;
         }
         let mut files = Vec::new();
-        match collect_session_files(
+        let discovery = match collect_session_files(
             root,
             0,
             6,
-            MAX_SESSION_DISCOVERY_FILES_PER_AGENT + 1,
+            MAX_SESSION_DISCOVERY_FILES_PER_ROOT + 1,
             &mut files,
         ) {
-            Ok(discovery) => {
-                if discovery.file_limit {
-                    record_session_limitation(
-                        &mut limitations,
-                        SessionCoverageLimitationCode::DiscoveryFileLimit,
-                        SessionCoverageScope::Root,
-                        SessionCoverageCountKind::LowerBound,
-                        Some(files.len() as u64),
-                        Some(MAX_SESSION_DISCOVERY_FILES_PER_AGENT as u64),
-                        SessionCoverageLimitationSource::SessionDiscovery,
-                    );
-                    coverage.discovery_truncated = true;
-                    coverage.truncated = true;
-                }
-                if discovery.depth_limit {
-                    record_session_limitation(
-                        &mut limitations,
-                        SessionCoverageLimitationCode::DiscoveryDepthLimit,
-                        SessionCoverageScope::Root,
-                        SessionCoverageCountKind::Unknown,
-                        None,
-                        Some(6),
-                        SessionCoverageLimitationSource::SessionDiscovery,
-                    );
-                    coverage.discovery_truncated = true;
-                    coverage.truncated = true;
-                }
-            }
+            Ok(discovery) => discovery,
             Err(_) => {
                 record_session_limitation(
                     &mut limitations,
@@ -2191,28 +2164,54 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 continue;
             }
         };
+        if discovery.file_limit {
+            record_session_limitation(
+                &mut limitations,
+                SessionCoverageLimitationCode::DiscoveryFileLimit,
+                SessionCoverageScope::Root,
+                SessionCoverageCountKind::LowerBound,
+                Some(files.len() as u64),
+                Some(MAX_SESSION_DISCOVERY_FILES_PER_ROOT as u64),
+                SessionCoverageLimitationSource::SessionDiscovery,
+            );
+            coverage.discovery_truncated = true;
+            coverage.truncated = true;
+        }
+        if discovery.depth_limit {
+            record_session_limitation(
+                &mut limitations,
+                SessionCoverageLimitationCode::DiscoveryDepthLimit,
+                SessionCoverageScope::Root,
+                SessionCoverageCountKind::Unknown,
+                None,
+                Some(6),
+                SessionCoverageLimitationSource::SessionDiscovery,
+            );
+            coverage.discovery_truncated = true;
+            coverage.truncated = true;
+        }
         let discovered_count = files.len();
         coverage.files_discovered = coverage.files_discovered.saturating_add(discovered_count);
         files.sort_by_cached_key(|path| {
             (std::cmp::Reverse(session_file_modified(path)), path.clone())
         });
-        files.truncate(MAX_SESSION_DISCOVERY_FILES_PER_AGENT);
-        if files.len() > MAX_SESSION_FILES_PER_AGENT {
+        files.truncate(MAX_SESSION_DISCOVERY_FILES_PER_ROOT);
+        if files.len() > MAX_SESSION_FILES_PER_ROOT {
             coverage.files_skipped = coverage
                 .files_skipped
-                .saturating_add(discovered_count - MAX_SESSION_FILES_PER_AGENT);
+                .saturating_add(discovered_count - MAX_SESSION_FILES_PER_ROOT);
             coverage.truncated = true;
             record_session_limitation(
                 &mut limitations,
                 SessionCoverageLimitationCode::SampledFileLimit,
                 SessionCoverageScope::Root,
-                SessionCoverageCountKind::Exact,
+                discovered_count_kind(&discovery),
                 Some(discovered_count as u64),
-                Some(MAX_SESSION_FILES_PER_AGENT as u64),
+                Some(MAX_SESSION_FILES_PER_ROOT as u64),
                 SessionCoverageLimitationSource::SessionSampling,
             );
         }
-        files.truncate(MAX_SESSION_FILES_PER_AGENT);
+        files.truncate(MAX_SESSION_FILES_PER_ROOT);
         for (index, file) in files.iter().enumerate() {
             let remaining_bytes = MAX_SESSION_BYTES_PER_AGENT.saturating_sub(bytes_observed);
             if remaining_bytes == 0 || lines_observed >= MAX_SESSION_LINES_PER_AGENT {
@@ -2536,6 +2535,9 @@ fn record_session_limitation(
             unit: limitation_unit(code),
             source,
         });
+    debug_assert_eq!(fact.scope, scope);
+    debug_assert_eq!(fact.source, source);
+    fact.count_kind = fact.count_kind.max(count_kind);
     if let Some(value) = observed {
         fact.observed = Some(fact.observed.unwrap_or_default().max(value));
     }
@@ -2579,6 +2581,7 @@ fn read_session_tail_with_facts(
     let mut alignment_lost = false;
     if offset != 0 && align_to_line {
         if let Some(newline) = sample.iter().position(|byte| *byte == b'\n') {
+            alignment_lost = newline > 0;
             sample.drain(..=newline);
         } else {
             alignment_lost = !sample.is_empty();
@@ -2678,6 +2681,14 @@ fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
 struct SessionDiscoveryOutcome {
     file_limit: bool,
     depth_limit: bool,
+}
+
+const fn discovered_count_kind(discovery: &SessionDiscoveryOutcome) -> SessionCoverageCountKind {
+    if discovery.file_limit || discovery.depth_limit {
+        SessionCoverageCountKind::LowerBound
+    } else {
+        SessionCoverageCountKind::Exact
+    }
 }
 
 fn collect_session_files(
@@ -4116,6 +4127,10 @@ enabled = true
                 && limitation.scope == SessionCoverageScope::File
                 && limitation.limit == Some(MAX_SESSION_BYTES_PER_FILE)
         }));
+        assert!(limitations.iter().any(|limitation| {
+            limitation.code == SessionCoverageLimitationCode::LineAlignmentLoss
+                && limitation.source == SessionCoverageLimitationSource::SessionJsonl
+        }));
 
         fs::remove_dir_all(home).unwrap();
     }
@@ -4151,6 +4166,40 @@ enabled = true
                 })
         );
 
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn session_discovery_depth_is_a_typed_denominator_blocker() {
+        let home = temp_directory("deep-session-root");
+        let mut nested = home.join(".codex/sessions");
+        for index in 0..8 {
+            nested.push(format!("level-{index}"));
+        }
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("session.jsonl"), "{}\n").unwrap();
+
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|coverage| coverage.agent == AgentKind::Codex)
+            .unwrap();
+
+        assert!(!coverage.denominator_reliable);
+        assert!(coverage.discovery_truncated);
+        assert!(
+            coverage
+                .limitations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|limitation| {
+                    limitation.code == SessionCoverageLimitationCode::DiscoveryDepthLimit
+                        && limitation.scope == SessionCoverageScope::Root
+                        && limitation.limit == Some(6)
+                })
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -4291,6 +4340,66 @@ enabled = true
                 .iter()
                 .all(|(record, lines)| record == "{}" && *lines == 1)
         );
+    }
+
+    #[test]
+    fn aligned_session_tail_records_discarded_partial_line() {
+        let home = temp_directory("aligned-session-tail");
+        let path = home.join("session.jsonl");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&path, "discarded-partial\nkept\n").unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+        let (sample, bytes_read, alignment_lost) =
+            read_session_tail_with_facts(&path, metadata.len(), 10, true).unwrap();
+
+        assert_eq!(bytes_read, 10);
+        assert_eq!(sample, b"kept\n");
+        assert!(alignment_lost);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn sampled_file_count_is_lower_bound_when_discovery_is_incomplete() {
+        assert_eq!(
+            discovered_count_kind(&SessionDiscoveryOutcome::default()),
+            SessionCoverageCountKind::Exact
+        );
+        assert_eq!(
+            discovered_count_kind(&SessionDiscoveryOutcome {
+                file_limit: true,
+                depth_limit: false,
+            }),
+            SessionCoverageCountKind::LowerBound
+        );
+        assert_eq!(
+            discovered_count_kind(&SessionDiscoveryOutcome {
+                file_limit: false,
+                depth_limit: true,
+            }),
+            SessionCoverageCountKind::LowerBound
+        );
+
+        let mut limitations = BTreeMap::new();
+        for (count_kind, observed) in [
+            (SessionCoverageCountKind::Exact, 300),
+            (SessionCoverageCountKind::LowerBound, 10_001),
+        ] {
+            record_session_limitation(
+                &mut limitations,
+                SessionCoverageLimitationCode::SampledFileLimit,
+                SessionCoverageScope::Root,
+                count_kind,
+                Some(observed),
+                Some(MAX_SESSION_FILES_PER_ROOT as u64),
+                SessionCoverageLimitationSource::SessionSampling,
+            );
+        }
+        let limitation = limitations
+            .get(&SessionCoverageLimitationCode::SampledFileLimit)
+            .unwrap();
+        assert_eq!(limitation.count_kind, SessionCoverageCountKind::LowerBound);
+        assert_eq!(limitation.observed, Some(10_001));
     }
 
     #[test]
@@ -4562,7 +4671,7 @@ enabled = true
         )
         .unwrap();
         let old_time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
-        for index in 0..=MAX_SESSION_FILES_PER_AGENT {
+        for index in 0..=MAX_SESSION_FILES_PER_ROOT {
             let path = sessions.join(format!("old-{index:03}.jsonl"));
             fs::write(&path, "{}\n").unwrap();
             fs::OpenOptions::new()
@@ -4597,11 +4706,11 @@ enabled = true
         }));
         assert_eq!(
             result.coverage[0].files_discovered,
-            MAX_SESSION_FILES_PER_AGENT + 2
+            MAX_SESSION_FILES_PER_ROOT + 2
         );
         assert_eq!(
             result.coverage[0].files_observed,
-            MAX_SESSION_FILES_PER_AGENT
+            MAX_SESSION_FILES_PER_ROOT
         );
         assert_eq!(result.coverage[0].files_skipped, 2);
 

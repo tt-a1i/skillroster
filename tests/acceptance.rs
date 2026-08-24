@@ -542,6 +542,12 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
             )
             .unwrap();
     }
+    connection
+        .execute(
+            "UPDATE evidence SET details_json = json_remove(details_json, '$.limitations', '$.limitation_state', '$.actionability') WHERE kind = 'coverage'",
+            [],
+        )
+        .unwrap();
     drop(connection);
     let report = cli_json(
         &home,
@@ -651,6 +657,17 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         full_coverage_agents.into_iter().collect::<BTreeSet<_>>(),
         expected_agents
     );
+    assert!(
+        full_evidence
+            .iter()
+            .filter(|evidence| evidence["kind"] == "coverage")
+            .all(|evidence| {
+                evidence["details"]["limitation_state"] == "legacy_unknown"
+                    && evidence["details"]["actionability"]["inference_boundary"]
+                        ["usage_denominator_supported"]
+                        == false
+            })
+    );
     let first_observed_activity = full_evidence
         .iter()
         .position(|evidence| {
@@ -706,6 +723,23 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
             .into_iter()
             .collect::<BTreeSet<_>>(),
         expected_agents
+    );
+    assert!(
+        export["data"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|evidence| evidence["kind"] == "coverage")
+            .all(|evidence| {
+                evidence["details"]["limitation_state"] == "legacy_unknown"
+                    && evidence["details"]["actionability"]["supported_next_steps"]
+                        .as_array()
+                        .is_some_and(|steps| {
+                            steps.contains(&Value::String(
+                                "rescan_to_record_typed_limitations".into(),
+                            ))
+                        })
+            })
     );
 }
 

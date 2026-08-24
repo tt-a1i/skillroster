@@ -1496,7 +1496,7 @@ fn lifecycle_export_command(store: &StateStore, state_dir: &Path, output: &Path)
     if let Some(evidence) = data["evidence"].as_array_mut() {
         for record in evidence {
             if record["kind"].as_str() == Some("coverage") {
-                normalize_legacy_coverage_agent(&mut record["details"]);
+                normalize_public_coverage_details(&mut record["details"])?;
             }
         }
     }
@@ -2379,6 +2379,25 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     details["agent"] = json!(coverage.agent.id());
     let legacy = coverage.limitations.is_none();
     let limitations = coverage.limitations.as_deref().unwrap_or_default();
+    details["limitation_state"] = json!(if legacy {
+        "legacy_unknown"
+    } else if coverage.denominator_reliable {
+        "complete"
+    } else if limitations.is_empty() {
+        "incomplete_unknown"
+    } else {
+        "limited"
+    });
+    details["actionability"] =
+        session_coverage_actionability(legacy, coverage.denominator_reliable, limitations)?;
+    Ok(details)
+}
+
+fn session_coverage_actionability(
+    legacy: bool,
+    denominator_reliable: bool,
+    limitations: &[scan::SessionCoverageLimitation],
+) -> Result<Value> {
     let mut same_boundary_expected_codes = Vec::new();
     let mut retry_may_resolve_codes = Vec::new();
     let mut verify_before_rescan_codes = Vec::new();
@@ -2392,7 +2411,7 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
             CoverageRetryDisposition::VerifyBeforeRescan => verify_before_rescan_codes.push(code),
         }
     }
-    let denominator_supported = !legacy && coverage.denominator_reliable;
+    let denominator_supported = !legacy && denominator_reliable;
     let mut next_steps = Vec::new();
     if !denominator_supported {
         next_steps.push("retain_bounded_positive_observations");
@@ -2411,16 +2430,7 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     {
         next_steps.push("report_current_cli_cannot_establish_complete_denominator");
     }
-    details["limitation_state"] = json!(if legacy {
-        "legacy_unknown"
-    } else if coverage.denominator_reliable {
-        "complete"
-    } else if limitations.is_empty() {
-        "incomplete_unknown"
-    } else {
-        "limited"
-    });
-    details["actionability"] = json!({
+    Ok(json!({
         "cap_configurable_by_cli": false,
         "same_boundary_expected_codes": same_boundary_expected_codes,
         "retry_may_resolve_codes": retry_may_resolve_codes,
@@ -2432,24 +2442,33 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
             "unused_claim_supported": false,
             "automatic_governance_supported": false,
         },
-    });
-    Ok(details)
+    }))
 }
 
-fn normalize_legacy_coverage_agent(details: &mut Value) {
-    let Some(agent) = details.get_mut("agent") else {
-        return;
+fn normalize_public_coverage_details(details: &mut Value) -> Result<()> {
+    let Some(object) = details.as_object_mut() else {
+        return Ok(());
     };
-    let canonical = match agent.as_str() {
-        Some("claude_code") => Some(AgentKind::ClaudeCode.id()),
-        Some("open_code") => Some(AgentKind::OpenCode.id()),
-        Some("gemini_cli") => Some(AgentKind::GeminiCli.id()),
-        Some("git_hub_copilot") => Some(AgentKind::GitHubCopilot.id()),
-        _ => None,
-    };
-    if let Some(canonical) = canonical {
-        *agent = json!(canonical);
+    if let Some(agent) = object.get_mut("agent") {
+        let canonical = match agent.as_str() {
+            Some("claude_code") => Some(AgentKind::ClaudeCode.id()),
+            Some("open_code") => Some(AgentKind::OpenCode.id()),
+            Some("gemini_cli") => Some(AgentKind::GeminiCli.id()),
+            Some("git_hub_copilot") => Some(AgentKind::GitHubCopilot.id()),
+            _ => None,
+        };
+        if let Some(canonical) = canonical {
+            *agent = json!(canonical);
+        }
     }
+    if !object.contains_key("limitations") {
+        object.insert("limitation_state".into(), json!("legacy_unknown"));
+        object.insert(
+            "actionability".into(),
+            session_coverage_actionability(true, false, &[])?,
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -2558,7 +2577,7 @@ fn report_command(
                 let mut evidence = store.finding_evidence(&id)?;
                 for record in &mut evidence {
                     if record.kind == EvidenceKind::Coverage {
-                        normalize_legacy_coverage_agent(&mut record.details);
+                        normalize_public_coverage_details(&mut record.details)?;
                     }
                 }
                 evidence.sort_by(|left, right| {
@@ -2658,7 +2677,7 @@ fn report_command(
             };
             for record in &mut evidence {
                 if record.kind == EvidenceKind::Coverage {
-                    normalize_legacy_coverage_agent(&mut record.details);
+                    normalize_public_coverage_details(&mut record.details)?;
                 }
             }
             let total = affected_skill_ids
