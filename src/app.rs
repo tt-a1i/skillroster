@@ -5936,6 +5936,9 @@ fn expand_finding_roster_changes(
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     if !supported.exclusions.is_empty() {
+        if let Some(blocker) = finding_roster_safety_blocker(&supported.exclusions) {
+            return Err(blocker.into());
+        }
         if let Some(exclusion) = supported.exclusions.iter().find(|exclusion| {
             exclusion.reason == "multiple_package_fingerprints_require_explicit_preservation"
         }) {
@@ -5958,9 +5961,6 @@ fn expand_finding_roster_changes(
                 fingerprint_count,
             }
             .into());
-        }
-        if let Some(blocker) = finding_roster_safety_blocker(&supported.exclusions) {
-            return Err(blocker.into());
         }
         return Err(crate::roster_plan::source_confirmation_block(
             finding_id.as_str(),
@@ -9623,19 +9623,29 @@ mod recovery_tests {
         assert_eq!(planning["mutation_scopes"], json!(["provider_read_only"]));
         assert_eq!(planning["protected_placement_count"], 1);
 
-        let blocker = finding_roster_safety_blocker(&[crate::roster_plan::RosterChangeExclusion {
-            agent: "codex".into(),
-            skill_id: "skill_shared".into(),
-            name: "shared".into(),
-            reason: "provider_managed_placement_is_read_only",
-            observed_source_target: None,
-            safety_blocker: Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+        let blocker = finding_roster_safety_blocker(&[
+            crate::roster_plan::RosterChangeExclusion {
+                agent: "claude-code".into(),
+                skill_id: "skill_package_variants".into(),
+                name: "package-variants".into(),
+                reason: "multiple_package_fingerprints_require_explicit_preservation",
+                observed_source_target: None,
+                safety_blocker: None,
+            },
+            crate::roster_plan::RosterChangeExclusion {
+                agent: "codex".into(),
                 skill_id: "skill_shared".into(),
-                placement_ids: vec!["placement_plugin".into()],
-                paths: vec![PathBuf::from("/fixture/placement_plugin")],
-                providers: vec!["plugin@market".into()],
-            }),
-        }])
+                name: "shared".into(),
+                reason: "provider_managed_placement_is_read_only",
+                observed_source_target: None,
+                safety_blocker: Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+                    skill_id: "skill_shared".into(),
+                    placement_ids: vec!["placement_plugin".into()],
+                    paths: vec![PathBuf::from("/fixture/placement_plugin")],
+                    providers: vec!["plugin@market".into()],
+                }),
+            },
+        ])
         .unwrap();
         let blocked: Value = serde_json::from_str(&error_json("plan", &blocker)).unwrap();
         assert_eq!(
