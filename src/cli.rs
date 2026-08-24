@@ -202,6 +202,10 @@ pub struct FindArgs {
 
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=i64::from(MAX_FIND_RESULTS)))]
     pub limit: u16,
+
+    /// Return the complete, verified SKILL.md for the unambiguous Top-1 match.
+    #[arg(long)]
+    pub load: bool,
 }
 
 pub const MAX_FIND_RESULTS: u16 = 100;

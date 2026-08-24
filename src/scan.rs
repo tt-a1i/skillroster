@@ -150,6 +150,10 @@ pub struct SkillPlacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_directory: Option<PathBuf>,
     pub content_digest: String,
+    /// SHA-256 of the exact SKILL.md bytes observed during Scan. Missing on
+    /// legacy Snapshots cannot authorize a verified load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint_digest: Option<String>,
     /// Whether `content_digest` covers the complete Skill package. Bounded or
     /// unreadable fingerprints are inventory facts only and cannot authorize
     /// exact-duplicate governance.
@@ -1565,6 +1569,7 @@ fn materialize_candidates_with_hook(
             entrypoint: candidate.entrypoint,
             physical_directory,
             content_digest: digest,
+            entrypoint_digest: safe_to_read.then(|| stable_digest(content.as_bytes())),
             fingerprint_completeness,
             fingerprint_detail,
             link_target: candidate.link_target,

@@ -9,9 +9,9 @@
 
 因此 SkillRoster 最有价值的定位不是替模型做语义理解，而是提供本地、确定性、可审计的治理与事实层：统一盘点、保留身份和来源、计算各宿主的有效暴露面、发现重复/漂移/失效/信任风险、记录使用证据、生成可确认的分层方案，并提供 Receipt 与 Undo。语义意图、候选取舍和最终回答仍由 Agent 完成。
 
-对已合并 PR #146 的正确解读也应保守：两个 On-demand 臂最终都找到了正确 Skill；Humanizer 臂出现 malformed `Find` 且未完成 full load，更像调用接口契约或提示遵循问题；Architecture 臂才形成干净的 Find→load 链。两个 Core 控制臂都没有通过任务 oracle，且历史 run pair 的 `formal_gate_eligible=false`，所以该实验不能证明 On-demand 优于 Core、Core 优于 On-demand，也不能证明需要新的排序或语义检索子系统。
+对已合并 PR #146 的正确解读也应保守：两个 On-demand 臂最终都找到了正确 Skill；Humanizer 臂出现 malformed `Find` 且未完成 full load，更像调用接口契约或提示遵循问题；Architecture 臂才形成干净的 Find→load 链。两个 Core 控制臂都没有通过任务 oracle，且历史 run pair 的 `formal_gate_eligible=false`，所以该实验不能证明 On-demand 优于 Core、Core 优于 On-demand，也不能证明需要新的排序或语义检索子系统。后续 PR #148 已完成正式协议隔离：Core 3/3，On-demand 1/3；但三个 On-demand trial 的 retrieval、Top-1、精确路径、完整加载、任务 oracle 和安全性均为 3/3，两个拒绝仅来自 Find→load 之间的额外动作和不安全 compound shell shape。
 
-下一步最小且能改变产品决策的动作，是先做一个“协议隔离实验”，验证 Core 控制、oracle、Find 调用和 full-load 链本身是否稳定。只有这层稳定后，才值得研究目录规模、描述重叠和 shortlist 深度。
+因此当前最小动作不是继续研究目录规模或排名，而是 Issue #149：把确定性 Find、治理验证和完整 Skill 加载合成一次可观察的 Agent 调用。该调用减少模型需要正确编排的步骤，但不能替模型判断任务语义，也不能替 harness 证明原始用户文本在进入 CLI 前未被 shell 转义或改写。
 
 ## 证据标签与术语
 
@@ -191,6 +191,127 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 
 它真正暴露的是评测基础设施和 Agent 接口的优先问题：控制臂有效性、调用契约、full-load 可观测性、非脆弱 oracle、配对时序与不可变 ledger。
 
+## Issue #149：一次 Find + 可信完整加载契约
+
+### 是否符合 Agent harness
+
+**官方事实。** Agent Skills 的[客户端实现指南](https://agentskills.io/client-implementation/adding-skills-support) 把专用 activation tool 列为正式实现模式：模型选择 Skill 后，工具可在一次调用中返回完整 instructions、结构化身份标签、Skill 目录和资源清单，并在返回前执行权限检查。指南还明确说，大多数实现把相关性判断留给模型，而不是在 harness 中做关键词触发；专用工具的价值是控制返回内容、施加权限、记录 activation 和避免模型虚构 Skill 名称。
+
+**官方事实。** OpenAI [Agents SDK Function tools](https://openai.github.io/openai-agents-python/tools/) 支持由 JSON Schema 约束输入，并从本地 runtime 返回文本或结构化 tool output。其工具生命周期保留 schema validation、guardrails、timeout、failure handling 和 tracing。Codex 当前也能从本地 shell/exec 工具接收进程输出。因此“一次 Agent tool call 得到完整 Skill bytes”符合常见 harness 的 request→tool result 模型，不要求 MCP、daemon 或内置模型。
+
+**SkillRoster 推论。** #149 应是现有 `find` 的窄扩展，例如显式 `load` mode，而不是第二个路由子系统。这里的“一次”定义为：Agent 发出一个 SkillRoster 调用，并在该调用的单个成功结果中同时取得选中事实和完整、已验证的 `SKILL.md`；不需要再调用文件读取、打开 workspace、使用 MCP 或创建临时 TASK 文件。
+
+“一次调用”不是跨 SQLite 和文件系统的数学事务。准确承诺应是**观察原子性**：一个 CLI 进程要么返回一份内部一致的成功 envelope，要么返回 typed failure；不得返回截断 instructions、部分成功或“路径可用，请自行再读”。
+
+### 一次操作内的确定性边界
+
+推荐顺序如下，全部在同一进程、同一结果边界内完成：
+
+1. 接收完整自然语言 TASK 和可选 HINT；对输入做类型、长度和编码检查，但不改写、翻译或总结。
+2. 在一致的 roster/snapshot 视图上运行现有确定性 ranking，只考虑当前 Agent 可用且允许路由的 placement。
+3. 固定 Top-1 的 identity、logical path、canonical path、expected digest、roster state 和 source baseline。
+4. 在读取前验证 placement 未 archived/disabled，路径可读、是 regular file、没有越出受信 roots，来源状态满足现有信任策略。
+5. 从已验证目标读取**完整原始 bytes**，同时执行硬 byte cap；按真实返回 bytes 计算 digest。读取后复核路径/元数据/expected digest，任何不一致都判 drift。
+6. 解析 UTF-8 和必要的 Agent Skills frontmatter；返回完整 `SKILL.md`，不提前读取 `references/`、`scripts/` 或 `assets/`。
+7. 只在上述全部成立时返回 `ok: true`；成功 envelope 将 retrieval evidence、loaded-content identity 和 governance facts 分开。
+
+这是一种产品设计推论，不是 Agent Skills 标准强制的算法。标准只规定 `SKILL.md` 格式，并明确 activation 时会加载整个文件；它没有规定 path trust、digest、drift、roster 或 byte cap。
+
+### CLI 必须验证的事实
+
+| 事实 | CLI 可验证内容 | 成功结果应提供的证据 |
+|---|---|---|
+| 请求完整性 | CLI 实际收到的 TASK/HINT bytes、编码、长度 | request digest、byte count；不得声称等同于原始用户消息 |
+| 检索 | ranking strategy、query/hint、候选数、Top-1、score/match basis | retrieval block，与内容加载分离 |
+| 治理资格 | Agent、placement、roster state、implicit/explicit eligibility、snapshot | stable IDs、state、snapshot/evidence ID |
+| 路径 | logical path、canonical path、symlink resolution、allowed-root containment、regular file | 两种路径及 containment decision |
+| 来源信任 | source/manager/provider、已确认 root、first-observed baseline、当前 policy state | trust **evidence/state**，而不是笼统 `trusted: true` |
+| 漂移 | expected digest/identity 与本次读取 bytes、metadata 的一致性 | expected/observed content digest、size、checked-at |
+| 内容完整性 | 全量读取、byte cap、UTF-8、frontmatter、name/path consistency | `content_complete: true`、raw-byte digest、byte/line count |
+| 副作用 | 操作是只读的，未创建 Plan/Receipt、未改 roster/Skill/workspace | operation/read-only marker；协议 suite 再用文件 diff 验证 |
+
+两个边界尤其重要：
+
+- CLI 只能证明“它收到的 TASK 是什么”，不能证明上层 shell harness 没有在 argv 构造时丢字符、展开变量或改变引号。若 harness 只有 shell-string 而没有原生 argv/stdin 参数，任意自然语言的安全传输仍是 harness 契约问题。Bootstrap 应给出一个 canonical shape，正式 suite 必须验证 TASK digest；不能让 CLI 宣称自己证明了调用前历史。
+- digest 证明本次 bytes 的完整性与某 baseline 是否一致，不证明内容善意。Agent Skills frontmatter 的 `author`、`version` 属于自声明 metadata；“来源已确认”也不等于“说明无恶意”。执行安全仍由 sandbox、审批和 Agent policy 控制。
+
+### 留给模型的语义
+
+模型继续负责：
+
+- 从完整用户任务产生可选、忠实的 capability HINT；
+- 判断返回的 Top-1 是否与当前任务语义相关；
+- 阅读 instructions，并决定何时按需读取其引用资源；
+- 综合对话、用户偏好和任务状态执行 Skill；
+- 判断最终答案是否解决用户问题。
+
+CLI 不应负责翻译/总结 TASK、生成语义 hint、用 LLM 重排、判断最终任务成功，或把一个低词法分数包装成“语义正确”。如果现有确定性策略返回 empty、wrong-domain evidence 或现有 ambiguity signal，保持 typed branch，让 Agent 安全重试一次；不要用隐藏模型填空。
+
+### fail-closed 的精确定义
+
+`fail-closed` 应满足四个可测试条件：
+
+1. 任何资格、路径、信任、漂移、读取、编码、格式或大小检查失败，整体 `ok: false`。
+2. error envelope 不包含部分 `SKILL.md`、文件前缀或可被误当作 instructions 的正文。
+3. error 使用稳定 code 和机器可读 details，保留 candidate identity 与非敏感诊断；`suggested_actions` 只是下一步选项，不是授权，也不能在同一失败调用中自动执行。
+4. 安全 retry 修复失败原因，而非绕过检查：oversized → 将细节拆到按需 references；drifted → rescan/reconcile；untrusted → 走显式 source confirmation/adopt Plan；archived/disabled → 由用户明确改变 roster 或显式调用策略；path escape/unreadable → 修路径或权限。不要提供通用 `--force`。
+
+建议 typed codes 至少覆盖现有语义中的：`no_match`、`ambiguous`、`placement_ineligible`、`archived`、`source_untrusted`、`path_escape`、`broken_link`、`not_regular_file`、`unreadable`、`content_drifted`、`content_too_large`、`invalid_utf8`、`invalid_skill_format`。最终命名应复用仓库现有 error taxonomy，避免为 #149 建第二套错误系统。
+
+### 内容上限与响应形状
+
+**官方事实。** [Agent Skills specification](https://agentskills.io/specification) 对 `name`（64 chars）、`description`（1,024 chars）等 frontmatter 有限制，但没有给 `SKILL.md` body 设硬上限；它只提醒 activation 会加载整个文件，较长内容应拆到 references。客户端指南也建议 resources 只列出、不要 eager-load。
+
+**SkillRoster 推论。** 因此 byte cap 是 SkillRoster/harness 的安全运输约束，不应伪装成标准限制，也不应随模型 tokenizer 变化。实现应使用版本化、文档化的原始 byte 上限：在分配/读取前检查 metadata size，并在 streaming read 时再次硬限制，以防 metadata 漂移或特殊文件；超过上限整单失败。上限数值应由当前 CLI JSON envelope、Codex tool-output 截断行为和真实 Skill 分布的 fixture 测试决定，不应从论文或猜测得出。
+
+**本机测量（2026-08-24）。** 对最新 SkillRoster Snapshot 的 882 个可读 placement 统计原始 `SKILL.md` 大小：中位数 6,187 bytes，P90 15,311，P95 23,717，P99 56,848，最大 87,253；placement 包含跨 Agent 软链接重复，因此这不是生态总体分布。首版 load transport cap 取 128 KiB，可覆盖当前最大样本并保留约 50% 余量，同时远小于 inventory parser 的 2 MiB 上限。这个数值是本地运输决策，不是 Agent Skills 标准限制；未来只能由真实宿主截断证据和用户 Skill 分布调整。
+
+成功响应至少需要以下逻辑分区，字段可按现有 schema 命名：
+
+```json
+{
+  "retrieval": {
+    "strategy": "existing-deterministic-strategy",
+    "rank": 1,
+    "candidate_count": 1,
+    "match_basis": []
+  },
+  "skill": {
+    "skill_id": "...",
+    "placement_id": "...",
+    "name": "...",
+    "provider": "...",
+    "logical_path": ".../SKILL.md",
+    "canonical_path": ".../SKILL.md"
+  },
+  "governance": {
+    "agent": "codex",
+    "roster_state": "on_demand",
+    "source_trust_state": "confirmed",
+    "snapshot_id": "..."
+  },
+  "loaded_content": {
+    "content": "---\n...complete raw UTF-8 SKILL.md...",
+    "content_complete": true,
+    "content_bytes": 1234,
+    "content_digest": "sha256:..."
+  }
+}
+```
+
+digest 必须针对 JSON 解码后的原始 UTF-8 file bytes，而不是转义后的 JSON 文本。不要在成功 envelope 中声称 `task_success`、`skill_safe` 或 `semantic_match_confirmed`。
+
+### 对 #149 的验收推论
+
+已有[协议隔离 v6](../acceptance/codex-skill-protocol-isolation-v6.md) 是正式 eligible 证据：Core 3/3、On-demand 1/3；三个 On-demand 的 ranking、load、task 和 safety 实际均通过，两个失败只在 ordered Agent contract。因此 #149 的验收重点应是缩短协议，而不是改排名：
+
+- 兼容现有 `find`；load mode 是显式 opt-in。
+- 一条 canonical invocation 返回 Top-1 + 完整内容；不允许中间 workspace/MCP/read 动作。
+- 对 oversized、archived、untrusted、unreadable、escape、drift 分别做 focused core tests，断言无部分 content。
+- 使用完整冻结的 3×2 Codex suite；Core 3/3、On-demand 3/3、formal eligibility、任务和 safety 都是独立门槛。
+- 若 On-demand 仍因 shell argv shape 失败，停止继续堆 CLI 逻辑，确认是否需要 harness-native argv/stdin 支持；这不是 embedding 或 ranking 问题。
+- 若 one-call 全通过，停止扩展 activation 机制，不新增第二个 routing Skill。
+
 ## 产品边界
 
 ### SkillRoster 应该负责
@@ -198,7 +319,7 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 1. **盘点与规范化**：扫描多个宿主的 present/discovered/enabled/listed 状态，保留 provider、scope、namespace、logical/canonical path。
 2. **事实型诊断**：同名/同源/内容重复、破损软链接、版本漂移、来源不明、宿主预算与潜在省略、默认暴露面和跨 Agent 复制。
 3. **保守 usage evidence**：区分明确调用、读取、命令痕迹和仅被发现；证据不足时标 `unknown`，不能把“没看到”写成“从未使用”。
-4. **Agent-facing Find**：输出有界、结构化、可解释候选，包括名称、description、provider、路径、scope 和匹配原因；让模型完成语义判断。
+4. **Agent-facing Find/Load**：默认 Find 输出有界、结构化、可解释候选；显式 load mode 可在同一只读调用中验证并返回完整 Top-1 `SKILL.md`。两者都让模型完成语义判断。
 5. **治理建议**：Core / On-demand / Explicit-only / Archived 分层，按宿主生成 roster；建议必须附证据和不确定性。
 6. **安全执行**：不可变 Plan、一次显式确认、Apply、Receipt、Undo、漂移检测和恢复；不读未信任目标，不静默覆盖用户来源。
 7. **评测 ledger**：分开记录 listing、retrieval、call-shape、load、oracle、safety、Core validity 和 formal eligibility。
@@ -212,11 +333,11 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 - 当前不需要 MCP、daemon、云同步、TUI、HTML 仪表盘、插件 SDK 或自动联网 telemetry。
 - 不在没有稳定控制臂和任务 oracle 时，用昂贵 benchmark 推动新检索子系统。
 
-一个 Bootstrap Skill 可以作为“如何调用 SkillRoster”的窄入口，但应保持单一职责：精确保留 TASK、调用 Find、读取返回的精确路径、在 typed error 下有限重试。治理功能本身继续收敛在 CLI，而不是拆成许多互相竞争的 Skills。
+一个 Bootstrap Skill 可以作为“如何调用 SkillRoster”的窄入口，但应保持单一职责：精确保留 TASK、用 canonical shape 调用 Find/Load、验证 envelope，并在 typed error 下有限重试。治理功能本身继续收敛在 CLI，而不是拆成许多互相竞争的 Skills。
 
 ## 下一步实验：按是否能改变决策排序
 
-### 实验 1：协议隔离与控制臂有效性（现在做）
+### 实验 1：协议隔离与控制臂有效性（已完成）
 
 **问题。** 失败究竟来自路由、Find 调用、full-load、Skill 内容还是 oracle？
 
@@ -224,13 +345,13 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 
 评分器应只对真实产品不变量严格：文件是否创建、字段是否存在、是否越界、返回路径是否被读取。表达质量用 rubric + 盲审，不用精确句子或任意字符阈值。
 
-**停止条件。**
+PR #148 的 v6 suite 已按该设计形成正式 eligible 证据：Core 3/3，On-demand 1/3；后者的 retrieval、full-load、task oracle 和 safety 均为 3/3，失败集中在 ordered contract。因此已经触发下列原定停止条件中的“只修 Bootstrap/CLI seam，不改排名器”。历史设计和停止条件保留如下，作为决策审计：
 
 - Core 少于 3/3 协议有效：停止比较，先修 task/oracle/harness；不得做产品归因。
-- Core 有效，但 On-demand 至少 2/3 malformed Find 或未 load：只改 Bootstrap/CLI schema、错误返回或示例；不改排名器。
+- Core 有效，但 On-demand 至少 2/3 发生调用/加载协议失败：只改 Bootstrap/CLI schema、错误返回或示例；不改排名器。v6 正是这一分支。
 - 两臂 route/load 都稳定但共同 fail oracle：修目标 Skill 或 oracle；不归因路由。
 - 两臂均稳定且任务通过：停止增加机制，保留现状。
-- 只有在控制有效且差异能跨 trial 重现时，才进入实验 2。
+- 只有在 #149 one-call 验收稳定后，才考虑进入实验 2。
 
 ### 实验 2：目录规模 × 描述重叠 × shortlist K（条件触发）
 
@@ -256,13 +377,13 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 
 | 决策 | 现在 | 触发重新评估的证据 |
 |---|---|---|
-| 保持 Agent-first CLI + 一个 Bootstrap Skill | 是 | 协议隔离实验显示该入口反复且不可修复地失败 |
+| 保持 Agent-first CLI + 一个 Bootstrap Skill | 是；用 #149 收窄为一次 Find/Load | one-call 在冻结 suite 中仍反复因 CLI 自身契约失败 |
 | 继续 Core / On-demand / Explicit-only / Archived 分层 | 是，但建议需附证据和确认 | 真实任务显示分层导致稳定回归 |
 | 增加 embedding/reranker | 否 | 控制有效、correct-listed 高、词法 Find 的 correct-in-K 稳定不足，且语义方法提升端到端 |
 | 设置统一 Core 数量上限 | 否 | 多宿主因子实验给出稳定阈值并能跨任务复现 |
 | 自动归档“未使用”Skill | 否 | 有覆盖足够时间和宿主的高置信 invocation 证据，并仍需用户确认 |
 | 做云端同步/MCP/daemon/TUI | 否 | 出现本地 CLI 无法解决且被多用户重复验证的需求 |
-| 扩大昂贵端到端 benchmark | 暂缓 | 实验 1 的控制、oracle、formal eligibility 全部稳定 |
+| 扩大目录规模 benchmark | 暂缓 | #149 one-call 的 3×2 协议、任务、安全与 formal eligibility 全部稳定 |
 
 ## 限制与反例
 
@@ -277,4 +398,4 @@ Codex 的 [app-server 协议文档](https://github.com/openai/codex/blob/main/co
 
 把当前路线概括为一句话：**SkillRoster 管理事实、暴露面和可逆变更；Agent 管理语义与意图；实验负责证明两者的接口是否稳定。**
 
-下一步不要扩展功能面。先完成 3×2 个全新 trial 的协议隔离实验，并严格执行停止条件。若问题落在 malformed Find/full-load，就做一次窄接口修复；若落在共同 oracle，就修评测；若两臂稳定，就停止优化。只有当这些基础门槛全部成立，目录规模和检索机制的实验才有能力改变产品决策。
+下一步不要扩展功能面。按 Issue #149 给现有 Find 增加显式 one-call load mode：同一只读进程完成确定性 Top-1、roster/path/source/drift/content-bound 验证，并只在全部通过时返回完整 `SKILL.md` 和 digest 事实。随后重跑冻结的 3×2 suite；若 Core/On-demand 都达到 3/3 且任务、安全、formal eligibility 不回归，就停止扩展 activation 机制。若仍只失败在 shell argv 形状，问题升级到 harness-native 参数传输边界，而不是排名、embedding 或更多 Skills。只有这条接口稳定后，目录规模和检索机制的实验才可能改变产品决策。

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "suite_id": "codex-skill-protocol-isolation-v7",
+  "status": "passed",
+  "formal_gate_eligible": true,
+  "projection": "redacted_bounded_projection_of_external_raw_summary",
+  "raw_summary_sha256": "4ee49726b7cc288d215d31f449139c5a5522c793f6918de222b4318537d2d105",
+  "source_identity_stable": true,
+  "codex_executable_stable": true,
+  "protocol_decision": {
+    "decision": "retain_current_design",
+    "required_trials_per_arm": 3,
+    "core_accepted": 3,
+    "on_demand_accepted": 3,
+    "on_demand_contract_failures": 0
+  },
+  "frozen": {
+    "source_commit": "eaa0ce0fced0d7bb6a4c8569111cf24acdf054f6",
+    "source_tree": "a28d41ab88a33d0a8feacef933a7acfb5bb10ed3",
+    "snapshot_digest": "58975da7514d5479cb880483dd11820c21257366bb28090601cacc5478f7dd17",
+    "manifest_sha256": "93381b3fad2ef8a1f1d7cf0926eb74686c3f3d540d99569a78a7cf2f4de1ae06",
+    "cli_sha256": "3c6790e0bc1774f922fb51a66607e1d69c2e2ed6d6aed9491b03c0d5f17e4cd4",
+    "bootstrap_sha256": "19ad3d2d59161b8aa7e034d9a4224448fc79594471815523c2c6e3fd678d5656",
+    "targets_sha256": "6bffb2cc895abd550535a74d68b4860b830769885a4d74ab94af7ef30ac8f85c",
+    "codex_version_sha256": "7aa31f8b0864fa0a787657d21167487f49ed01497802a4e5955ef02db3e94272",
+    "codex_executable_content_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "timeout_ms": 180000,
+    "driver_sha256": "1fdf629d1b04c814c6707056f9fb9138a129c63d613f01bdf953b0b0f3c25bf8",
+    "pair_invariants": {
+      "event-manifest-001#1": "0954c9cf669b7a4c1ed2b87184c0f5723b152b403066fc88e12f9d54b0c6db2c",
+      "event-manifest-001#2": "049c124304c0ef14547d33dc0810ebd914f21316459fb06de0888da718e040fd",
+      "event-manifest-001#3": "b72df7520b5a4532bd78ae3a333bfd7961ca1633446319a8455990567602c160"
+    }
+  },
+  "results": [
+    { "trial": 1, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 1, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "top1_correct": true, "returned_path_exact": true, "loaded_content_complete": true, "loaded_content_exact": true, "load": true, "load_evidence": "verified_find_json_content", "route_order": true, "route_violations": [], "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 2, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 2, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "top1_correct": true, "returned_path_exact": true, "loaded_content_complete": true, "loaded_content_exact": true, "load": true, "load_evidence": "verified_find_json_content", "route_order": true, "route_violations": [], "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 3, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
+    { "trial": 3, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "top1_correct": true, "returned_path_exact": true, "loaded_content_complete": true, "loaded_content_exact": true, "load": true, "load_evidence": "verified_find_json_content", "route_order": true, "route_violations": [], "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true }
+  ],
+  "raw_evidence_committed": false,
+  "auth_copies_remaining": 0
+}

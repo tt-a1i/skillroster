@@ -1,9 +1,8 @@
 # Routing details
 
-The root Route gate is authoritative. Read this file for an empty or
-wrong-domain result, `variant_count > 1`, `variants_truncated`, or
-`report_required`. Keep `TASK` verbatim. A non-English or mixed task receives
-exactly one faithful English `--hint` on the first call.
+The root Route gate is authoritative. Read this file for a wrong-domain result
+or `verified_skill_load_blocked`. Keep `TASK` verbatim. A non-English or mixed
+task receives exactly one faithful English `--hint` on the first call.
 Build the hint from the desired surface, object, operation, and state; never
 guess a Skill name.
 
@@ -13,15 +12,16 @@ and `augmented_channel_rank` to distinguish native task evidence from
 hint-expanded evidence. Retry at most once, only for an empty or wrong-domain
 result. Change only the hint; an English task may add one on its retry.
 
-When `variant_count` is above one, keep each path and provider together. Respect
-`variants_truncated` and run the returned read-only `variant_finding.argv`.
-Materialize the current Report first only when the result says
-`report_required`; inspect that exact Finding before choosing content.
+When the blocker reason is `same_name_variants_ambiguous`, use the ordinary
+Find result and its read-only `variant_finding.argv`; keep each path and provider
+together. Materialize the current Report only when the result says
+`report_required`, then inspect that exact Finding before choosing content.
 
-Only after ambiguity is resolved, or when `variant_count == 1`, read the
-selected result's exact `SKILL.md` path directly. Finding a Skill does not
-activate, install, or authorize it, and SkillRoster has no load or activate
-step.
+For `no_routable_match`, retry once with a refined capability hint. For drift,
+legacy Snapshot, unreadable, oversized, escaping, or untrusted-source reasons,
+follow `error.details.next_action`; never bypass the check or recover partial
+instructions. A successful load returns complete instructions but does not
+activate, install, authorize, endorse, or establish task success.
 
 Read `owned_by_agent` as placement-path structure only, never as ownership or
 endorsement of linked source content. Read `mutation_scopes` before governance:

@@ -138,7 +138,7 @@ The first complete command surface is:
 ```bash
 skillroster scan [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
-skillroster find <task> [--hint <text>]... [--json]
+skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--json]
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
@@ -234,6 +234,18 @@ non-governable placement. Read-only placements that remain unchanged may stay in
 the wider Finding scope. Typed reasons distinguish provider read-only, durable
 read-only, untrusted external, and legacy-unknown authority without asking the
 Agent to reconstruct policy.
+
+`find --load` keeps ordinary Find ranking compatible and atomically adds a
+verified Top-1 content result. It requires one unambiguous routable identity, a
+current non-Archived roster state, an eligible placement, complete package and
+entrypoint digests from the latest Snapshot, a regular file contained by an
+approved root, valid UTF-8, and at most 128 KiB of raw `SKILL.md` bytes. The
+success result separates selection, complete content, governance, and
+verification facts. Digest or path drift, legacy Snapshot data, ambiguity,
+Archived state, untrusted source, unreadable content, escape, or oversize fails
+the whole command with typed details and no partial body. The 128 KiB limit is a
+SkillRoster Agent-transport limit, not an Agent Skills format restriction.
+`task_success` remains `not_evaluated`.
 
 All JSON responses use a versioned envelope:
 

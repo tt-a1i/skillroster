@@ -5,15 +5,15 @@ description: >
   local Skill roster. Before reading or changing the workspace for a task that
   may need instructions not already visible, preserve the complete user message
   verbatim as TASK. For non-English or mixed input, run
-  `skillroster find "TASK" --hint "ONE FAITHFUL ENGLISH CAPABILITY PARAPHRASE" --json`;
-  for English input omit `--hint`. Then read the exact returned SKILL.md with
-  the harness file-read tool. There is no load or activation command. Also use
+  `skillroster find "TASK" --hint "ONE FAITHFUL ENGLISH CAPABILITY PARAPHRASE" --load --limit 1 --json`;
+  for English input omit `--hint`. Follow the complete verified SKILL.md in
+  `result.loaded_skill.content.text`. Also use
   for inventory, usage evidence, duplicates, broken links, Core/On-demand
   recommendations, Plans, Receipts, Apply, and Undo. Not for installing
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.21"
+  bootstrap-version: "1.8.22"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -43,16 +43,18 @@ change the workspace and do not execute a non-routing command:
    capability paraphrase as `HINT`. It supplements `TASK`; it never replaces it.
 3. Invoke the fixed SkillRoster executable with `TASK` and `HINT` as separate,
    literal argv values; never interpolate either into shell syntax. Use:
-   - English: `skillroster find "TASK" --json`
-   - Otherwise: `skillroster find "TASK" --hint "HINT" --json`
+   - English: `skillroster find "TASK" --load --limit 1 --json`
+   - Otherwise: `skillroster find "TASK" --hint "HINT" --load --limit 1 --json`
 4. When `HINT` was used, first require
    `ranking_strategy: task_hint_reciprocal_rank_fusion`.
-5. For every unambiguous result, immediately read its exact returned `SKILL.md`
-   path with the harness's existing file-read tool. Do not call or invent
-   `load`, `activate`, `use`, `select`, or another SkillRoster command. For an
-   empty or wrong-domain result, `variant_count > 1`, `variants_truncated`, or
-   `report_required`, read `references/routing.md` and follow its typed branch.
-6. Only after that file is read, follow it and perform the original task.
+5. Require `loaded_skill.selection.rank: 1`, `content.complete: true`, and all
+   `verification` identity/digest checks to be true. The complete instructions
+   are `loaded_skill.content.text`; no second filesystem, workspace, MCP, or
+   SkillRoster read is needed. For a wrong-domain result or typed load blocker,
+   read `references/routing.md` and follow its bounded branch.
+6. Follow the loaded instructions and perform the original task. Treat
+   `task_success: not_evaluated` literally; only the task's own evidence can
+   establish success.
 
 If the result is empty or clearly from another domain, retry once. Keep `TASK`
 unchanged; refine the existing hint, or add one capability hint when the first
