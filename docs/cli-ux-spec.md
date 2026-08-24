@@ -106,9 +106,10 @@ Finding summaries plus `page.next_offset`; it never suggests planning before a
 Finding is selected. `report --full --json` is the explicit exhaustive
 diagnostic export and never the bootstrap workflow default.
 
-`report --finding ID --json` returns at most 20 compact Evidence items. Each
-item combines its stable Evidence ID, subject, path, quality, and decision facts
-without repeating affected-ID, placement, and full Evidence collections.
+`report --finding ID --json` defaults to five compact Evidence items. An
+explicit `--limit` may request 1–100 rows. Each item combines its stable
+Evidence ID, subject, path, quality, and decision facts without repeating
+affected-ID, placement, and full Evidence collections.
 `report --finding ID --full --json` explicitly returns those complete paged
 records. `page.next_offset` is the only pagination cursor; callers request
 another page only when the decision still lacks relevant evidence. Counts and

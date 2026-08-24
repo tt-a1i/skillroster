@@ -297,6 +297,28 @@ fn semantic_overlap_detail_is_decision_complete_for_agent_comparison() {
             .iter()
             .all(|action| action["action"] != "plan")
     );
+    let compact_full_action = compact["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "show_full_finding")
+        .unwrap();
+    assert_eq!(
+        compact_full_action["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--full",
+                "--limit",
+                "1",
+                "--json",
+            ]
+        )
+    );
     let full = json_output(&run(
         &[
             &common[..],
@@ -857,10 +879,21 @@ fn finding_drilldown_is_bounded_and_pageable() {
         second["result"]["items"][0]["evidence_id"]
     );
 
-    let full_output = run(
-        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
-        None,
+    let full_action = first["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "show_full_finding")
+        .unwrap();
+    assert_eq!(
+        full_action["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--full", "--json"]
+        )
     );
+    let full_output = run_suggested_action(full_action);
     let full = json_output(&full_output);
     assert_eq!(full["result"]["detail"]["mode"], "full");
     assert_eq!(full["result"]["page"]["limit"], 20);

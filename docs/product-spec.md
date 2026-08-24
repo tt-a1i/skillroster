@@ -158,8 +158,9 @@ skillroster setup [--modified-choice retain-local|adopt-current] [--json]
 Finding lists and full Finding records default to 20 rows per page. Compact
 `report --finding <id>` detail defaults to five rows so an Agent receives the
 decision and action chain without spending context on a large first page.
-Explicit `--limit` values always win; `page` totals and continuation actions
-remain the authoritative path to omitted rows.
+Explicit `--limit` values always win on paged Finding lists and detail;
+`page` totals and continuation actions remain the authoritative path to
+omitted rows. Top-level `report --full` remains an unpaged exhaustive export.
 
 `source-root confirm` persists one exact local read permission bound to a
 current completed escaping-link Finding, its observed canonical directory, and
