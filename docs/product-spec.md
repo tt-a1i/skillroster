@@ -224,6 +224,14 @@ set to a same-Snapshot divergent-content Finding and provides its read-only
 drilldown. Without a compatible current Report it returns a typed reason and
 the minimum read-only analysis action. A drifted routable variant requires a
 new Scan before any Finding can be linked; stale Finding IDs are never returned.
+When every unreadable variant is still bound to its Snapshot-observed
+unconfirmed external directory, this is a source-trust decision, not drift:
+`variant_finding.state` is `source_confirmation_required` and its read-only
+action opens the current escaping-link Finding. The variants may require
+separate exact source-root decisions; no parent or shared root is inferred.
+Exact-load actions remain absent until the relevant source is confirmed. A
+missing or retargeted link still requires a new Scan. In a mixed group, readable
+variants retain their exact-load actions while unreadable variants do not.
 The corresponding divergent-content Finding carries the affected placements
 and a bounded `choose_same_name_variant` resolution that keeps each digest,
 path, Agent, provider, root, and governability fact together. It offers no Plan

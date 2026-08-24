@@ -1536,6 +1536,379 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert_eq!(full["result"]["placements"].as_array().unwrap().len(), 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_loop() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let sources = temp.path().join("sources");
+    let first_source = sources.join("first");
+    let second_source = sources.join("second");
+    for (source, body) in [(&first_source, "alpha"), (&second_source, "beta")] {
+        fs::create_dir_all(source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            format!(
+                "---\nname: shared-external\ndescription: External comparison route\n---\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let codex_root = home.join(".codex/skills");
+    let claude_root = home.join(".claude/skills");
+    fs::create_dir_all(&codex_root).unwrap();
+    fs::create_dir_all(&claude_root).unwrap();
+    let codex_link = codex_root.join("shared-external");
+    let claude_link = claude_root.join("shared-external");
+    std::os::unix::fs::symlink(&first_source, &codex_link).unwrap();
+    std::os::unix::fs::symlink(&second_source, &claude_link).unwrap();
+
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let retained = [
+        (&codex_link, "content:retained-strong-alpha"),
+        (&claude_link, "content:retained-strong-beta"),
+    ]
+    .map(|(link, identity_key)| {
+        let entrypoint = link.join("SKILL.md");
+        let skill_id = format!(
+            "skill_{:x}",
+            Sha256::digest(format!("unreadable-link:{}", entrypoint.display()).as_bytes())
+        );
+        let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO skills
+                    (id, identity_key, name, description, declared_source, declared_revision,
+                     content_digest, digest_version, governance_state, canonical_path)
+                 VALUES (?1, ?2, 'shared-external', 'External comparison route', NULL, NULL,
+                         ?3, 1, 'managed', ?4)",
+                rusqlite::params![
+                    skill_id,
+                    identity_key,
+                    format!("retained-package-{skill_id}"),
+                    link.to_string_lossy(),
+                ],
+            )
+            .unwrap();
+        (skill_id, identity_key)
+    });
+
+    let untrusted_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(untrusted_scan["result"]["skill_count"], 2);
+    let mut report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let original_report_id = report["result"]["report_id"].as_str().unwrap().to_owned();
+    let original_finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let summary: String = connection
+        .query_row(
+            "SELECT summary_json FROM reports WHERE id = ?1",
+            [&original_report_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_summary: Value = serde_json::from_str(&summary).unwrap();
+    let legacy_finding = legacy_summary["findings"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    legacy_finding.remove("kind");
+    let details: String = connection
+        .query_row(
+            "SELECT details_json FROM findings WHERE id = ?1",
+            [&original_finding_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_details: Value = serde_json::from_str(&details).unwrap();
+    legacy_details.as_object_mut().unwrap().remove("kind");
+    connection
+        .execute(
+            "UPDATE reports SET summary_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_summary.to_string(), original_report_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE findings SET details_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_details.to_string(), original_finding_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let legacy_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", &original_finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        legacy_detail["result"]["kind"],
+        "escaping_link_source_confirmation"
+    );
+    assert_eq!(
+        legacy_detail["result"]["resolution"]["decision"],
+        "confirm_trusted_source_roots"
+    );
+
+    report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_ne!(report["result"]["report_id"], original_report_id);
+    let escaping_finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap();
+    assert_eq!(
+        escaping_finding["kind"],
+        "escaping_link_source_confirmation"
+    );
+    let finding_id = escaping_finding["id"].as_str().unwrap();
+
+    let found = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    let reference = &found["result"]["matches"][0]["variant_finding"];
+    assert_eq!(found["result"]["rescan_required"], false);
+    assert_eq!(reference["state"], "source_confirmation_required");
+    assert_eq!(
+        reference["reason_code"],
+        "untrusted_variants_require_source_confirmation"
+    );
+    assert_eq!(reference["finding_id"], finding_id);
+    assert_eq!(reference["report_id"], report["result"]["report_id"]);
+    assert_eq!(reference["resolution"], "confirm_trusted_source_roots");
+    assert_eq!(
+        reference["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--json"],
+        )
+    );
+    assert!(
+        found["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| {
+                action["action"] != "load_exact_variant_for_comparison"
+                    && action["action"] != "plan"
+                    && action["action"] != "scan"
+                    && action["mutates"] == false
+                    && action["requires_confirmation"] == false
+            })
+    );
+    let blocked_load = run(
+        &[
+            &common[..],
+            &["find", "shared-external", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!blocked_load.status.success());
+    let blocked_load: Value = serde_json::from_slice(&blocked_load.stdout).unwrap();
+    assert_eq!(
+        blocked_load["error"]["details"]["reason"],
+        "same_name_variants_ambiguous"
+    );
+    assert!(blocked_load["error"]["details"].get("content").is_none());
+
+    let repeated_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(
+        repeated_report["result"]["snapshot_id"],
+        repeated_scan["result"]["snapshot_id"]
+    );
+    let repeated_finding_id = repeated_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let repeated = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(repeated["result"]["rescan_required"], false);
+    assert_eq!(
+        repeated["result"]["matches"][0]["variant_finding"]["state"],
+        "source_confirmation_required"
+    );
+    assert_eq!(
+        repeated["result"]["matches"][0]["variant_finding"]["finding_id"],
+        repeated_finding_id
+    );
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for (skill_id, identity_key) in &retained {
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+                [skill_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(&stored.0, identity_key);
+        assert_eq!(stored.1, "managed");
+    }
+    drop(connection);
+
+    let replacement = temp.path().join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    fs::write(
+        replacement.join("SKILL.md"),
+        "---\nname: shared-external\ndescription: External comparison route\n---\nreplacement\n",
+    )
+    .unwrap();
+    fs::remove_file(&codex_link).unwrap();
+    std::os::unix::fs::symlink(&replacement, &codex_link).unwrap();
+    let drifted = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    fs::remove_file(&codex_link).unwrap();
+    std::os::unix::fs::symlink(&first_source, &codex_link).unwrap();
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let recovered_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let recovered_finding_id = recovered_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let confirm_source = |finding_id: &str, source: &Path| {
+        json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "source-root",
+                    "confirm",
+                    "--finding",
+                    finding_id,
+                    "--path",
+                    source.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+            None,
+        ))
+    };
+    let first_confirmation = confirm_source(recovered_finding_id, &first_source);
+    assert_eq!(
+        first_confirmation["result"]["permission_scope"],
+        "exact_local_read_only"
+    );
+    assert_eq!(first_confirmation["result"]["content_endorsed"], false);
+    assert_eq!(first_confirmation["result"]["plan_apply_authorized"], false);
+    assert_eq!(first_confirmation["result"]["files_changed"], false);
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let mixed_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let mixed = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(mixed["result"]["rescan_required"], false);
+    assert_ne!(
+        mixed["result"]["matches"][0]["variant_finding"]["state"],
+        "source_confirmation_required"
+    );
+    let load_actions = mixed["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+        .collect::<Vec<_>>();
+    assert_eq!(load_actions.len(), 1);
+    let readable_variant_id = mixed["result"]["matches"][0]["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| !variant["paths"].as_array().unwrap().is_empty())
+        .unwrap()["skill_id"]
+        .as_str()
+        .unwrap();
+    assert!(
+        load_actions[0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| argument == readable_variant_id)
+    );
+    let mixed_finding_id = mixed_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let second_confirmation = confirm_source(mixed_finding_id, &second_source);
+    assert_eq!(
+        second_confirmation["result"]["permission_scope"],
+        "exact_local_read_only"
+    );
+    assert_eq!(second_confirmation["result"]["content_endorsed"], false);
+    assert_eq!(
+        second_confirmation["result"]["plan_apply_authorized"],
+        false
+    );
+    assert_eq!(second_confirmation["result"]["files_changed"], false);
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let readable = json_output(&run(
+        &[&common[..], &["find", "external comparison route"]].concat(),
+        None,
+    ));
+    assert_eq!(readable["result"]["matches"][0]["variant_count"], 2);
+    assert_eq!(
+        readable["result"]["matches"][0]["variant_finding"]["state"],
+        "available"
+    );
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for (skill_id, identity_key) in &retained {
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+                [skill_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(&stored.0, identity_key);
+        assert_eq!(stored.1, "managed");
+    }
+}
+
 #[test]
 fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
     let temp = TempDir::new().unwrap();

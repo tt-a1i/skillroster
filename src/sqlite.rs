@@ -462,7 +462,7 @@ impl StateStore {
                 "SELECT r.id, r.scan_id, r.created_at, r.summary_json FROM reports r
                  JOIN scan_payloads p ON p.scan_id = r.scan_id
                  WHERE r.created_at >= p.updated_at
-                 ORDER BY r.created_at DESC LIMIT 1",
+                 ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1",
                 [],
                 |row| {
                     Ok((
@@ -3314,6 +3314,60 @@ mod tests {
             store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(latest_id, second.id);
         assert_eq!(payload["order"], 2);
+    }
+
+    #[test]
+    fn latest_report_uses_insertion_order_when_timestamps_tie() {
+        let store = StateStore::open_in_memory().unwrap();
+        let created_at = chrono::Utc::now().timestamp();
+        let first_scan = ScanRun {
+            id: ScanId::parse("scan_ffffffffffffffffffffffffffffffff").unwrap(),
+            started_at: created_at,
+            completed_at: Some(created_at),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        let second_scan = ScanRun {
+            id: ScanId::parse("scan_00000000000000000000000000000000").unwrap(),
+            ..first_scan.clone()
+        };
+        store.save_scan(&first_scan).unwrap();
+        store
+            .save_scan_payload(&first_scan.id, &serde_json::json!({"order": 1}))
+            .unwrap();
+        store
+            .save_report(
+                &ReportRecord {
+                    id: ReportId::parse("report_ffffffffffffffffffffffffffffffff").unwrap(),
+                    scan_id: first_scan.id,
+                    created_at,
+                    summary: serde_json::json!({"order": 1}),
+                },
+                &[],
+            )
+            .unwrap();
+        store.save_scan(&second_scan).unwrap();
+        store
+            .save_scan_payload(&second_scan.id, &serde_json::json!({"order": 2}))
+            .unwrap();
+        let second_report = ReportRecord {
+            id: ReportId::parse("report_00000000000000000000000000000000").unwrap(),
+            scan_id: second_scan.id,
+            created_at,
+            summary: serde_json::json!({"order": 2}),
+        };
+        store.save_report(&second_report, &[]).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE scan_payloads SET updated_at = ?1",
+                rusqlite::params![created_at],
+            )
+            .unwrap();
+
+        let latest = store.latest_report().unwrap().unwrap();
+        assert_eq!(latest.id, second_report.id);
+        assert_eq!(latest.summary["order"], 2);
     }
 
     #[test]
