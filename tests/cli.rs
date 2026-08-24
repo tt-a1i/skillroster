@@ -6643,13 +6643,10 @@ fn find_loads_only_an_exposed_exact_variant_from_the_ambiguous_top_match() {
     fs::create_dir_all(&codex).unwrap();
     fs::create_dir_all(&claude).unwrap();
     fs::create_dir_all(&unique).unwrap();
-    let shared_content = "---\nname: shared-route\ndescription: compare exact variants\n---\nshared-entrypoint-marker\n";
-    fs::write(codex.join("SKILL.md"), shared_content).unwrap();
-    fs::write(claude.join("SKILL.md"), shared_content).unwrap();
-    fs::create_dir_all(codex.join("references")).unwrap();
-    fs::create_dir_all(claude.join("references")).unwrap();
-    fs::write(codex.join("references/provider.md"), "codex package\n").unwrap();
-    fs::write(claude.join("references/provider.md"), "claude package\n").unwrap();
+    let codex_content = "---\nname: shared-route\ndescription: compare exact variants\n---\ncodex-entrypoint-marker\n";
+    let claude_content = "---\nname: shared-route\ndescription: compare exact variants\n---\nclaude-entrypoint-marker\n";
+    fs::write(codex.join("SKILL.md"), codex_content).unwrap();
+    fs::write(claude.join("SKILL.md"), claude_content).unwrap();
     fs::write(
         unique.join("SKILL.md"),
         "---\nname: unique-route\ndescription: unique selector guard\n---\nunique-marker\n",
@@ -6737,7 +6734,16 @@ fn find_loads_only_an_exposed_exact_variant_from_the_ambiguous_top_match() {
             exact["selection"]["variant_selection"]["ranked_variant_count"],
             2
         );
-        assert_eq!(exact["content"]["text"], shared_content);
+        let expected = if variant["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("codex"))
+        {
+            codex_content
+        } else {
+            claude_content
+        };
+        assert_eq!(exact["content"]["text"], expected);
         assert!(
             variant["paths"]
                 .as_array()

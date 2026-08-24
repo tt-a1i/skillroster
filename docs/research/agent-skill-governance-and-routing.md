@@ -314,11 +314,14 @@ digest 必须针对 JSON 解码后的原始 UTF-8 file bytes，而不是转义�
 
 ## Issue #151：同名内容比较与最新研究校准
 
-**真实产品证据。** PR #150 之后的本机只读 dogfood 中，`humanizer-zh`
-与 `agent-session-miner` 都被正确检索为 Top-1，但各自存在两个异内容身份。
-普通 `find --load` 的 `same_name_variants_ambiguous` 是正确安全行为；缺口是
-Agent 无法通过 CLI 精确读取它已看到的某个身份，只能退回原始文件系统读取。
-这会打断“事实由 CLI 提供，语义由模型判断”的边界。
+**真实产品证据。** PR #150 之后的本机只读 dogfood 最初由
+`humanizer-zh` 与 `agent-session-miner` 的同名 blocker 暴露接口缺口；#151 实现后
+精确加载证明这两组入口 digest 实际相同，差异只来自 `.gitignore`。它们是包指纹
+噪声证据，不是语义变体证据。随后同一 Snapshot 中的 `goal-crafter` 提供了真实反例：
+Top-1 有两个身份，入口分别为 8,484 与 7,980 bytes、digest 不同；两者均能由返回的
+精确 action 完整加载且 `files_changed: false`。因此普通 `find --load` 的
+`same_name_variants_ambiguous` 是正确安全行为，而 Agent 也确实需要通过 CLI 精确读取
+已看到的身份，避免退回任意文件系统读取。
 
 **官方事实。** OpenAI 的 [Codex app 文章](https://openai.com/index/introducing-the-codex-app/)
 说明 Skills 可由 Agent 自动选择或由用户显式指定，并披露 OpenAI 内部已构建数百个
@@ -432,7 +435,8 @@ PR #148 的 v6 suite 已按该设计形成正式 eligible 证据：Core 3/3，On
 当前 Top-1 同名组选择一个已暴露身份，CLI 复用现有可信完整加载边界，模型读取完整
 入口说明后自行比较。真实 `humanizer-zh` 与 `agent-session-miner` 的双方入口 digest
 实际上相同，差异仅来自包内其他文件；因此 #151 能证明入口等价，却不能解决包级
-canonical 选择。该观察应另行修复指纹噪声，而不能把两份相同说明说成语义差异。继续用这两个冲突族验证
-blocked→inspect→exact load 闭环；若任意 selector 可越过排名组、Archived、source、
-path 或 digest 边界，立即停止合并。该闭环稳定后，再把“目录规模 × 描述重叠 × K”
-作为独立研究实验，而不是把预印本结果直接实现成 embedding、图或内置模型。
+canonical 选择。该观察应另行修复指纹噪声，而不能把两份相同说明说成语义差异。
+用真实异入口的 `goal-crafter` 验证比较价值，并用前两个冲突族验证入口等价可被识别；
+若任意 selector 可越过排名组、Archived、source、path 或 digest 边界，立即停止合并。
+该闭环稳定后，再把“目录规模 × 描述重叠 × K”作为独立研究实验，而不是把预印本
+结果直接实现成 embedding、图或内置模型。
