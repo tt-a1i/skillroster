@@ -25,10 +25,10 @@ test("on-demand runtime state and audit stay in the sandbox temp boundary", () =
     bootstrap: join(repo, "skill/skillroster/SKILL.md"),
   });
   try {
-    assert.equal(paths.state.startsWith(`${paths.temp}/`), true);
-    assert.equal(paths.runtimeAudit.startsWith(`${paths.temp}/`), true);
-    assert.equal(paths.audit.startsWith(`${root}/`), true);
-    assert.equal(paths.audit.startsWith(`${paths.temp}/`), false);
+    assert.equal(paths.state, join(paths.temp, "state"));
+    assert.equal(paths.runtimeAudit, join(paths.temp, "find-audit.jsonl"));
+    assert.equal(paths.audit, join(root, "find-audit.jsonl"));
+    assert.notEqual(paths.audit, join(paths.temp, "find-audit.jsonl"));
   } finally {
     rmSync(paths.temp, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });

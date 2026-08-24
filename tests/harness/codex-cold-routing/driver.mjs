@@ -12,8 +12,10 @@ const REPO = resolve(HERE, "../../..");
 const SYSTEM_SKILLS = ["imagegen", "openai-docs", "plugin-creator", "skill-creator", "skill-installer"];
 const DEFAULT_MANIFEST = join(REPO, "tests/fixtures/codex-cold-routing-transfer.json");
 const ACTIVE_AUTH_COPIES = new Set();
+const ACTIVE_RUNTIME_DIRS = new Set();
 for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) process.once(signal, () => {
   for (const path of ACTIVE_AUTH_COPIES) rmSync(path, { force: true });
+  for (const path of ACTIVE_RUNTIME_DIRS) rmSync(path, { recursive: true, force: true });
   process.exit(code);
 });
 
@@ -615,6 +617,7 @@ function copyAuth(authSource, codexHome) {
 }
 
 function cleanupAuth(path) { rmSync(path, { force: true }); ACTIVE_AUTH_COPIES.delete(path); }
+function cleanupRuntime(path) { rmSync(path, { recursive: true, force: true }); ACTIVE_RUNTIME_DIRS.delete(path); }
 
 function validateSummaryOutput(path, runsDir) {
   if (!path) return null;
@@ -765,14 +768,20 @@ process.stdout.write(result.stdout ?? ""); process.stderr.write(result.stderr ??
 export function setupArm(root, task, arm, options) {
   const home = join(root, "home"); const codexHome = join(home, ".codex"); const workspace = join(root, "workspace");
   const temp = mkdtempSync(join(canonicalPath(tmpdir()), "skillroster-codex-"));
-  for (const path of [codexHome, workspace]) mkdirSync(path, { recursive: true });
-  writeInputs(workspace, task.workspace_files);
-  const skillDestination = join(codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"); mkdirSync(dirname(skillDestination), { recursive: true });
-  const skillSource = arm === "core" ? join(options.skillsRoot, task.expected_skill) : dirname(options.bootstrap);
-  cpSync(skillSource, skillDestination, { recursive: true, dereference: true });
-  const targetPath = arm === "core" ? join(skillDestination, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
-  if (arm === "on_demand") { const targetDir = dirname(targetPath); mkdirSync(dirname(targetDir), { recursive: true }); cpSync(join(options.skillsRoot, task.expected_skill), targetDir, { recursive: true, dereference: true }); }
-  return { home, codexHome, workspace, temp, targetPath, state: join(temp, "state"), runtimeAudit: join(temp, "find-audit.jsonl"), audit: join(root, "find-audit.jsonl"), transcript: join(root, "codex-events.jsonl") };
+  ACTIVE_RUNTIME_DIRS.add(temp);
+  try {
+    for (const path of [codexHome, workspace]) mkdirSync(path, { recursive: true });
+    writeInputs(workspace, task.workspace_files);
+    const skillDestination = join(codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"); mkdirSync(dirname(skillDestination), { recursive: true });
+    const skillSource = arm === "core" ? join(options.skillsRoot, task.expected_skill) : dirname(options.bootstrap);
+    cpSync(skillSource, skillDestination, { recursive: true, dereference: true });
+    const targetPath = arm === "core" ? join(skillDestination, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
+    if (arm === "on_demand") { const targetDir = dirname(targetPath); mkdirSync(dirname(targetDir), { recursive: true }); cpSync(join(options.skillsRoot, task.expected_skill), targetDir, { recursive: true, dereference: true }); }
+    return { home, codexHome, workspace, temp, targetPath, state: join(temp, "state"), runtimeAudit: join(temp, "find-audit.jsonl"), audit: join(root, "find-audit.jsonl"), transcript: join(root, "codex-events.jsonl") };
+  } catch (error) {
+    cleanupRuntime(temp);
+    throw error;
+  }
 }
 
 function freezeSuite(manifest, options) {
@@ -899,7 +908,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     return { task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
-    rmSync(paths.temp, { recursive: true, force: true });
+    cleanupRuntime(paths.temp);
   }
 }
 
@@ -964,7 +973,7 @@ export function main(argv = process.argv.slice(2)) {
   const sourceIdentityAfter = repositoryIdentity(); const sourceIdentityStable = JSON.stringify(sourceIdentityAfter) === JSON.stringify(frozen.facts.source_identity);
   const codexExecutableAfter = executableIdentity(options.codex); const codexExecutableStable = JSON.stringify(codexExecutableAfter) === JSON.stringify(frozen.facts.codex_executable);
   const formalGateEligible = completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(formalResultEligible) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 
