@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const digest = async (value) => {
   const { createHash } = await import("node:crypto"); return createHash("sha256").update(value).digest("hex");
@@ -16,12 +16,21 @@ test("default is a non-executing plan and execution requires explicit auth", () 
   assert.equal(parseArgs([]).execute, false);
   assert.throws(() => parseArgs(["--execute"]), /explicit --auth-source/u);
   assert.equal(parseArgs(["--execute", "--auth-source", "/tmp/auth.json"]).execute, true);
+  assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
+  assert.throws(() => parseArgs(["--execute", "--auth-source", "/tmp/auth.json", "--reevaluate-root", "/tmp/runs"]), /mutually exclusive/u);
   assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
 });
 
 test("runs directory cannot hide a repository target behind a symlink", { skip: process.platform === "win32" }, () => {
   const root = mkdtempSync(join(tmpdir(), "codex-runs-link-")); const alias = join(root, "runs"); const repo = new URL("../../../", import.meta.url).pathname;
   symlinkSync(repo, alias, "dir"); assert.throws(() => main(["--runs-dir", alias]), /resolves inside the repository/u);
+});
+
+test("offline reevaluation writes only outside the immutable source run tree", () => {
+  const parent = mkdtempSync(join(tmpdir(), "codex-reevaluate-")); const source = join(parent, "runs"); mkdirSync(source); const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer.json", import.meta.url)));
+  assert.throws(() => main(["--reevaluate-root", source, "--reevaluate-output", join(source, "summary.json")]), /outside the source run root/u);
+  for (const task of fixture.tasks) for (const arm of ["core", "on_demand"]) { const root = join(source, `${task.id}-${arm}-fixture`); mkdirSync(join(root, "workspace"), { recursive: true }); for (const [path, value] of Object.entries(task.workspace_files)) writeFileSync(join(root, "workspace", path), value); writeFileSync(join(root, "codex-events.jsonl"), ""); }
+  const before = snapshotWorkspace(source); const output = join(parent, "post-hoc.json"); assert.equal(main(["--reevaluate-root", source, "--reevaluate-output", output]), 0); assert.deepEqual(snapshotWorkspace(source), before); const summary = JSON.parse(readFileSync(output)); assert.equal(summary.raw_runs_modified, false); assert.equal(summary.formal_gate_eligible, false); assert.equal(summary.source_tree_sha256_before, summary.source_tree_sha256_after); assert.ok(summary.results.every((result) => result.formal_evidence_accepted === null && result.post_hoc_only === true));
 });
 
 test("manifest is restricted to the two-family Codex transfer contract", () => {
@@ -137,6 +146,7 @@ test("exact target load is established from audited Codex command text", () => {
   const canonical = realpathSync(path);
   const transcript = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat -- '${canonical}'`, aggregated_output: "skill", exit_code: 0, status: "completed" } });
   assert.equal(assessExactLoad(transcript, path).passed, true);
+  const failed = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat -- '${canonical}'`, aggregated_output: "skill", exit_code: 0, status: "failed" } }); assert.equal(assessExactLoad(failed, path).passed, false);
   assert.equal(assessExactLoad(transcript, join(root, "source", "other", "SKILL.md")).passed, false);
 });
 
@@ -193,6 +203,9 @@ test("target read cannot start until the matching Find completion is ledger-auth
   const transcript = [started("boot", boot), completed("boot", boot, "bootstrap"), started("find", find), started("load", load), completed("load", load, "target"), completed("find", find, "")].join("\n");
   const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) };
   assert.match(assessRouteOrder(transcript, { bootstrapPath: bootstrap, targetPath: target, findAudit: { count: 1, calls: [call] }, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /target_load_before_find_complete/u);
+  const failedFind = JSON.stringify({ type: "item.completed", item: { id: "find", type: "command_execution", command: find, aggregated_output: "failed", exit_code: 1, status: "failed" } });
+  const failedTranscript = [started("boot", boot), completed("boot", boot, "bootstrap"), started("find", find), failedFind, started("load", load), completed("load", load, "target")].join("\n");
+  assert.match(assessRouteOrder(failedTranscript, { bootstrapPath: bootstrap, targetPath: target, findAudit: { count: 1, calls: [{ ...call, exit_code: 1, envelope_valid: false }] }, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /target_load_before_find_complete/u);
 });
 
 test("Core control rejects todo or workspace action before exact target full load", () => {
@@ -220,6 +233,9 @@ test("transcript integrity requires complete JSONL, one turn completion, and a s
   assert.equal(assessTranscriptIntegrity(`${command}\nnot-json\n${completed}`).passed, false);
   assert.equal(assessTranscriptIntegrity(command).passed, false);
   assert.equal(assessTranscriptIntegrity(JSON.stringify({ type: "turn.completed" })).passed, false);
+  const failed = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "false", exit_code: 1, status: "failed" } });
+  const assessed = assessTranscriptIntegrity(`${failed}\n${command}\n${completed}`);
+  assert.equal(assessed.passed, true); assert.equal(assessed.unsuccessful_command_count, 1); assert.doesNotMatch(assessed.violations.join(","), /incomplete/u);
 });
 
 test("oracle and safety remain independent outcome dimensions", () => {
@@ -234,24 +250,52 @@ test("oracle and safety remain independent outcome dimensions", () => {
   assert.equal(coreWithoutLoad.load, "load_wrong"); assert.equal(coreWithoutLoad.accepted, false);
 });
 
-test("Archify oracle requires bound validate and deliver receipts with final artifact digest", async () => {
+test("Archify transcript attempts require exact shape and lifecycle order", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-archify-receipts-")); const workspace = join(root, "workspace"); const target = join(root, "archify"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const script = join(target, "bin", "archify.mjs");
   mkdirSync(join(workspace, "scratch"), { recursive: true }); mkdirSync(join(workspace, "outputs"), { recursive: true }); mkdirSync(join(target, "bin"), { recursive: true }); writeFileSync(spec, "{\"type\":\"architecture\"}\n"); writeFileSync(artifact, "<html>static token stuffing</html>\n"); writeFileSync(script, "// frozen tool");
   const contract = { type: "architecture", spec_path: "scratch/order.spec.json", artifact_path: "outputs/order.html", quality: "showcase", validation_check_count: 9 };
-  assert.match(evaluateArchifyReceipts("", workspace, target, contract).join(","), /validate_missing/u);
-  const checks = Array.from({ length: 9 }, (_, index) => ({ name: `check_${index}`, ok: true, details: [] }));
-  const validateReceipt = { schemaVersion: 1, ok: true, command: "validate", type: "architecture", input: spec, checks, composition: { status: "pass", summary: { errors: 0, warnings: 0 } } };
-  const deliverReceipt = { schemaVersion: 1, ok: true, command: "deliver", type: "architecture", input: spec, output: artifact, specification: { sha256: await digest(readFileSync(spec)), bytes: readFileSync(spec).length }, artifact: { sha256: await digest(readFileSync(artifact)), bytes: readFileSync(artifact).length }, validation: { checksPassed: 9, checkCount: 9, compositionProfile: "showcase", compositionStatus: "pass", errors: 0, warnings: 0 } };
+  assert.match(evaluateArchifyReceipts("", workspace, contract).join(","), /validate_attempt_missing/u);
   const started = (id, command) => JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } });
-  const completed = (id, command, receipt) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: JSON.stringify(receipt), exit_code: 0, status: "completed" } });
-  const validateCommand = `node '${realpathSync(script)}' validate architecture '${realpathSync(spec)}' --quality showcase --json`; const deliverCommand = `node '${realpathSync(script)}' deliver architecture '${realpathSync(spec)}' '${realpathSync(artifact)}' --quality showcase --json`;
-  const transcript = [started("validate", validateCommand), completed("validate", validateCommand, validateReceipt), started("deliver", deliverCommand), completed("deliver", deliverCommand, deliverReceipt)].join("\n");
-  assert.deepEqual(evaluateArchifyReceipts(transcript, workspace, target, contract), []);
-  const overlapping = [started("validate", validateCommand), started("deliver", deliverCommand), completed("validate", validateCommand, validateReceipt), completed("deliver", deliverCommand, deliverReceipt)].join("\n");
-  assert.match(evaluateArchifyReceipts(overlapping, workspace, target, contract).join(","), /deliver_started_before_validate_completed/u);
-  const forged = { ...deliverReceipt, artifact: { ...deliverReceipt.artifact, sha256: "0".repeat(64) } };
-  const forgedTranscript = [started("validate", validateCommand), completed("validate", validateCommand, validateReceipt), started("deliver", deliverCommand), completed("deliver", deliverCommand, forged)].join("\n");
-  assert.match(evaluateArchifyReceipts(forgedTranscript, workspace, target, contract).join(","), /deliver_missing_or_invalid/u);
+  const completed = (id, command) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: "untrusted agent output", exit_code: 0, status: "completed" } });
+  const validateCommand = `node bin/archify.mjs validate architecture '${realpathSync(spec)}' --quality showcase --json`; const deliverCommand = `/bin/zsh -lc 'mkdir -p ${realpathSync(join(workspace, "outputs"))} && node bin/archify.mjs deliver architecture ${realpathSync(spec)} ${realpathSync(artifact)} --quality showcase --json'`;
+  const transcript = [started("validate", validateCommand), completed("validate", validateCommand), started("deliver", deliverCommand), completed("deliver", deliverCommand)].join("\n");
+  assert.deepEqual(evaluateArchifyReceipts(transcript, workspace, contract), []);
+  const overlapping = [started("validate", validateCommand), started("deliver", deliverCommand), completed("validate", validateCommand), completed("deliver", deliverCommand)].join("\n");
+  assert.match(evaluateArchifyReceipts(overlapping, workspace, contract).join(","), /deliver_started_before_validate_completed/u);
+  assert.match(evaluateArchifyReceipts(transcript.replace("mkdir -p", "echo unsafe && mkdir -p"), workspace, contract).join(","), /command_shape_invalid/u);
+});
+
+test("parent-owned Archify verification reproduces final bytes with frozen tooling", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-parent-archify-")); const workspace = join(root, "workspace"); const target = join(root, "archify"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const script = join(target, "bin", "archify.mjs");
+  for (const path of [join(workspace, "scratch"), join(workspace, "outputs"), join(target, "bin")]) mkdirSync(path, { recursive: true });
+  writeFileSync(spec, JSON.stringify({ meta: { output: artifact } })); writeFileSync(artifact, "<html>frozen reproduction</html>\n");
+  writeFileSync(script, `import fs from "node:fs"; const [command,type,input,output]=process.argv.slice(2); const checks=Array.from({length:9},(_,i)=>({name:String(i),ok:true})); if(command==="validate") process.stdout.write(JSON.stringify({schemaVersion:1,ok:true,command,type,input,checks,composition:{status:"pass",summary:{errors:0,warnings:0}}})); else { fs.writeFileSync(output,"<html>frozen reproduction</html>\\n"); process.stdout.write(JSON.stringify({schemaVersion:1,ok:true,command,type,input,output})); }`);
+  const contract = { type: "architecture", spec_path: "scratch/order.spec.json", artifact_path: "outputs/order.html", quality: "showcase", validation_check_count: 9 };
+  const scriptDigest = await digest(readFileSync(script)); const authority = { protected_scopes_passed: true, expected: { script_content_sha256: scriptDigest, package_tree_sha256: await digest(`bin/archify.mjs\0${scriptDigest}`) } };
+  const verified = verifyArchifyParent(workspace, target, contract, authority); assert.equal(verified.passed, true, verified.failures.join(",")); assert.equal(verified.source_workspace_sha256_before, verified.source_workspace_sha256_after); writeFileSync(artifact, "tampered\n"); assert.match(verifyArchifyParent(workspace, target, contract, authority).failures.join(","), /artifact_reproduction_mismatch/u);
+});
+
+test("parent verification rejects linked or digest-drifted frozen tools without execution", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-parent-tool-attack-")); const workspace = join(root, "workspace"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const external = join(root, "external"); const marker = join(root, "executed.marker");
+  for (const path of [join(workspace, "scratch"), join(workspace, "outputs"), join(external, "bin")]) mkdirSync(path, { recursive: true }); writeFileSync(spec, JSON.stringify({ meta: { output: artifact } })); writeFileSync(artifact, "agent\n"); const malicious = join(external, "bin", "archify.mjs"); writeFileSync(malicious, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(marker)},"executed");`);
+  const scriptDigest = await digest(readFileSync(malicious)); const expected = { script_content_sha256: scriptDigest, package_tree_sha256: await digest(`bin/archify.mjs\0${scriptDigest}`) }; const contract = { type: "architecture", spec_path: "scratch/order.spec.json", artifact_path: "outputs/order.html", quality: "showcase", validation_check_count: 9 };
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  const rootLink = join(root, "root-link"); symlinkSync(external, rootLink, linkType); assert.match(verifyArchifyParent(workspace, rootLink, contract, { protected_scopes_passed: true, expected }).failures.join(","), /frozen_tool_(unsafe|escape)/u); assert.equal(existsSync(marker), false);
+  const packageWithLinkedBin = join(root, "linked-bin-package"); mkdirSync(packageWithLinkedBin); symlinkSync(join(external, "bin"), join(packageWithLinkedBin, "bin"), linkType); assert.match(verifyArchifyParent(workspace, packageWithLinkedBin, contract, { protected_scopes_passed: true, expected }).failures.join(","), /frozen_tool_(unsafe|escape)/u); assert.equal(existsSync(marker), false);
+  assert.match(verifyArchifyParent(workspace, external, contract, { protected_scopes_passed: true, expected: { ...expected, script_content_sha256: "0".repeat(64) } }).failures.join(","), /digest_mismatch/u); assert.equal(existsSync(marker), false);
+});
+
+test("architecture spec contract requires the exact bounded topology and partition", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer.json", import.meta.url))); const contract = fixture.tasks.find((task) => task.expected_skill === "archify").oracle.architecture_spec_contract;
+  const root = mkdtempSync(join(tmpdir(), "codex-architecture-spec-")); const path = join(root, contract.spec_path); mkdirSync(join(root, "scratch"));
+  const value = {
+    components: contract.components.map((component) => ({ ...component, type: "backend" })),
+    boundaries: contract.boundaries.map((boundary) => ({ label: `信任边界：${boundary.label}`, wraps: boundary.members })),
+    connections: contract.connections.map((edge) => ({ id: edge.id, from: edge.from, to: edge.to, label: ({ "web-to-gateway": "HTTPS", "gateway-to-order": "HTTPS", "order-to-db": "SQL", "gateway-to-auth": "HTTPS 认证检查", "order-to-queue": "发布异步事件", "queue-to-worker": "消费异步事件", "worker-to-storage": "写入订单文档" })[edge.id] })),
+  };
+  writeFileSync(path, JSON.stringify(value)); assert.deepEqual(evaluateArchitectureSpec(root, contract), []);
+  writeFileSync(path, JSON.stringify({ ...value, components: [...value.components, { id: "extra", label: "Extra" }] })); assert.match(evaluateArchitectureSpec(root, contract).join(","), /component_set_mismatch/u);
+  writeFileSync(path, JSON.stringify({ ...value, boundaries: value.boundaries.map((boundary, index) => index ? boundary : { ...boundary, wraps: [...boundary.wraps, "api-gateway"] }) })); assert.match(evaluateArchitectureSpec(root, contract).join(","), /boundary_(members_mismatch|partition_invalid)/u);
 });
 
 test("a failed Core control prevents cold-routing attribution", () => {
