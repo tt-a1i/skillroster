@@ -5003,7 +5003,7 @@ fn matching_report_finding_id(
     affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
 ) -> Result<Option<String>> {
     let matches = matching_report_finding_ids(store, report, kind, affected_ids_match)?;
-    Ok((matches.len() == 1).then(|| matches[0].clone()))
+    Ok(matches.into_iter().next())
 }
 
 fn matching_report_finding_ids(
