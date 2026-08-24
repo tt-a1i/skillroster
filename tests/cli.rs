@@ -8272,13 +8272,25 @@ fn unreadable_link_scan_preserves_a_retained_skill_identity() {
             "INSERT INTO skills
                 (id, identity_key, name, description, declared_source, declared_revision,
                  content_digest, digest_version, governance_state, canonical_path)
-             VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, 1, 'managed', ?5)",
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, 1, 'managed', ?6)",
             rusqlite::params![
                 skill_id,
                 "content:retained-strong-identity",
                 "retained-external",
+                "Historical generic helper metadata",
                 "retained-package-digest",
                 linked.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO skills_fts (skill_id, name, description, triggers, body)
+             VALUES (?1, 'retained-external', ?2, '', ?3)",
+            rusqlite::params![
+                skill_id,
+                "Historical generic helper metadata",
+                "instructions include phosphorescent telemetry reconciliation",
             ],
         )
         .unwrap();
@@ -8288,6 +8300,16 @@ fn unreadable_link_scan_preserves_a_retained_skill_identity() {
     assert_eq!(first["result"]["skill_count"], 1);
     let second = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     assert_eq!(second["result"]["skill_count"], 1);
+
+    let historical_only = json_output(&run(
+        &[
+            &common[..],
+            &["find", "phosphorescent telemetry reconciliation"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(historical_only["result"]["matches"], json!([]));
 
     let report = json_output(&run(
         &[&common[..], &["report", "--summary"]].concat(),
@@ -8326,15 +8348,24 @@ fn unreadable_link_scan_preserves_a_retained_skill_identity() {
     );
 
     let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
-    let retained: (String, String) = connection
+    let retained: (String, String, String) = connection
         .query_row(
-            "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+            "SELECT identity_key, governance_state, description FROM skills WHERE id = ?1",
             [&skill_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
     assert_eq!(retained.0, "content:retained-strong-identity");
     assert_eq!(retained.1, "managed");
+    assert_eq!(retained.2, "Historical generic helper metadata");
+    let current_index: (String, String) = connection
+        .query_row(
+            "SELECT description, body FROM skills_fts WHERE skill_id = ?1",
+            [&skill_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(current_index, (String::new(), String::new()));
 }
 
 #[test]
