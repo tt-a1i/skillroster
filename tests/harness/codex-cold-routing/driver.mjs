@@ -39,12 +39,13 @@ export function parseArgs(argv) {
     codex: "codex", bootstrap: join(REPO, "skill/skillroster/SKILL.md"),
     skillsRoot: join(homedir(), ".agents_skills"), cli: join(REPO, "target/debug/skillroster"),
     runsDir: join(tmpdir(), "skillroster-codex-transfer"), authSource: null,
-    timeoutMs: 300_000, execute: false,
+    timeoutMs: 300_000, execute: false, reevaluateRoot: null, reevaluateOutput: null,
   };
   const values = new Map([
     ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"],
     ["--codex", "codex"], ["--bootstrap", "bootstrap"], ["--skills-root", "skillsRoot"],
     ["--cli", "cli"], ["--runs-dir", "runsDir"], ["--auth-source", "authSource"], ["--timeout-ms", "timeoutMs"],
+    ["--reevaluate-root", "reevaluateRoot"], ["--reevaluate-output", "reevaluateOutput"],
   ]);
   for (let index = 0; index < argv.length;) {
     if (argv[index] === "--execute") { options.execute = true; index += 1; continue; }
@@ -55,7 +56,9 @@ export function parseArgs(argv) {
   }
   if (!["core", "on_demand", "both"].includes(options.arm)) fail("--arm must be core, on_demand, or both");
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1_000 || options.timeoutMs > 900_000) fail("--timeout-ms must be between 1000 and 900000");
+  if (options.execute && options.reevaluateRoot) fail("--execute and --reevaluate-root are mutually exclusive");
   if (options.execute && !options.authSource) fail("--execute requires an explicit --auth-source");
+  if (options.reevaluateOutput && !options.reevaluateRoot) fail("--reevaluate-output requires --reevaluate-root");
   return options;
 }
 
@@ -75,6 +78,9 @@ export function validateManifest(manifest) {
     for (const pattern of [...(task.oracle.required_regex ?? []), ...(task.oracle.forbidden_regex ?? [])]) new RegExp(pattern, "u");
     const receipt = task.oracle.archify_receipt_contract;
     if (receipt && (receipt.type !== "architecture" || safeRelative(receipt.spec_path, `${task.id} receipt spec`) !== receipt.spec_path || safeRelative(receipt.artifact_path, `${task.id} receipt artifact`) !== task.oracle.path || receipt.quality !== "showcase" || receipt.validation_check_count !== 9)) fail(`${task.id} Archify receipt contract is invalid`);
+    const spec = task.oracle.architecture_spec_contract;
+    if (receipt && (!spec || spec.spec_path !== receipt.spec_path || spec.components?.length !== 8 || spec.boundaries?.length !== 3 || spec.connections?.length !== 7)) fail(`${task.id} architecture spec contract is invalid`);
+    for (const edge of spec?.connections ?? []) new RegExp(edge.label_regex, "u");
   }
   return manifest;
 }
@@ -168,8 +174,40 @@ export function evaluateOracle(workspace, oracle, evidence = {}) {
   for (const value of oracle.forbidden_substrings ?? []) if (text.includes(value)) failures.push(`forbidden_substring:${value}`);
   for (const value of oracle.required_regex ?? []) if (!new RegExp(value, "u").test(text)) failures.push(`missing_regex:${value}`);
   for (const value of oracle.forbidden_regex ?? []) if (new RegExp(value, "u").test(text)) failures.push(`forbidden_regex:${value}`);
-  failures.push(...evaluateArchifyReceipts(evidence.transcript ?? "", workspace, evidence.targetPackage, oracle.archify_receipt_contract));
-  return { passed: failures.length === 0, failures, output_sha256: sha(bytes), output_bytes: bytes.length, audit_scope: "offline_content_only" };
+  failures.push(...evaluateArchitectureSpec(workspace, oracle.architecture_spec_contract));
+  const archifyAttempts = evaluateArchifyReceipts(evidence.transcript ?? "", workspace, oracle.archify_receipt_contract); failures.push(...archifyAttempts);
+  const parentVerification = verifyArchifyParent(workspace, evidence.targetPackage, oracle.archify_receipt_contract, evidence.parentVerificationAuthority); if (parentVerification.passed === false) failures.push(...parentVerification.failures);
+  return { passed: failures.length === 0, failures, output_sha256: sha(bytes), output_bytes: bytes.length, audit_scope: "independent transcript-attempt and parent-owned frozen correctness evidence", archify_agent_attempts: { passed: archifyAttempts.length === 0, failures: archifyAttempts }, archify_parent_verification: parentVerification };
+}
+
+export function evaluateArchitectureSpec(workspace, contract) {
+  if (!contract) return [];
+  const path = noFollowWorkspaceFile(workspace, contract.spec_path); if (!path) return ["architecture_spec:missing_or_unsafe"];
+  let value; try { value = JSON.parse(readFileSync(path, "utf8")); } catch { return ["architecture_spec:invalid_json"]; }
+  const failures = []; const actualComponents = Array.isArray(value.components) ? value.components : []; const actualBoundaries = Array.isArray(value.boundaries) ? value.boundaries : []; const actualConnections = Array.isArray(value.connections) ? value.connections : [];
+  const expectedComponents = new Map(contract.components.map((component) => [component.id, component.label])); const actualIds = actualComponents.map((component) => component?.id);
+  if (new Set(actualIds).size !== actualIds.length) failures.push("architecture_spec:duplicate_component_id");
+  if (actualComponents.length !== expectedComponents.size || actualComponents.some((component) => expectedComponents.get(component?.id) !== component?.label)) failures.push("architecture_spec:component_set_mismatch");
+  const normalizeBoundary = (label) => typeof label === "string" ? label.replace(/^信任边界：/u, "") : null;
+  const expectedBoundaries = new Map(contract.boundaries.map((boundary) => [boundary.label, [...boundary.members].sort()])); const seenMembers = [];
+  if (actualBoundaries.length !== expectedBoundaries.size) failures.push("architecture_spec:boundary_count_mismatch");
+  const seenBoundaryLabels = new Set();
+  for (const boundary of actualBoundaries) {
+    const label = normalizeBoundary(boundary?.label); if (!expectedBoundaries.has(label) || seenBoundaryLabels.has(label)) { failures.push("architecture_spec:boundary_label_mismatch"); continue; }
+    seenBoundaryLabels.add(label); const members = Array.isArray(boundary.wraps) ? [...boundary.wraps].sort() : [];
+    if (JSON.stringify(members) !== JSON.stringify(expectedBoundaries.get(label))) failures.push(`architecture_spec:boundary_members_mismatch:${label}`);
+    seenMembers.push(...members);
+  }
+  if (seenMembers.length !== expectedComponents.size || new Set(seenMembers).size !== expectedComponents.size || seenMembers.some((id) => !expectedComponents.has(id))) failures.push("architecture_spec:boundary_partition_invalid");
+  const expectedEdges = new Map(contract.connections.map((edge) => [`${edge.from}\0${edge.to}`, edge.label_regex])); const seenEdges = new Set();
+  if (actualConnections.length !== expectedEdges.size) failures.push("architecture_spec:connection_count_mismatch");
+  for (const edge of actualConnections) {
+    const key = `${edge?.from}\0${edge?.to}`;
+    if (!expectedEdges.has(key) || seenEdges.has(key) || !expectedComponents.has(edge?.from) || !expectedComponents.has(edge?.to)) failures.push("architecture_spec:connection_identity_mismatch");
+    else if (!new RegExp(expectedEdges.get(key), "u").test(edge?.label ?? "")) failures.push(`architecture_spec:connection_label_mismatch:${edge.id}`);
+    seenEdges.add(key);
+  }
+  return [...new Set(failures)];
 }
 
 export function parseFindAudit(text, expected) {
@@ -236,14 +274,15 @@ export function assessTranscriptIntegrity(jsonl) {
     if (value?.type === "turn.failed") turnFailed += 1;
   }
   const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
-  const incompleteCommands = commands.filter((event) => event.status !== "completed" || !Number.isInteger(event.exit_code)).length;
+  const incompleteCommands = commands.filter((event) => !["completed", "failed"].includes(event.status) || !Number.isInteger(event.exit_code)).length;
   const successfulCommands = commands.filter((event) => event.status === "completed" && event.exit_code === 0).length;
+  const unsuccessfulCommands = commands.filter((event) => Number.isInteger(event.exit_code) && (event.status === "failed" || event.exit_code !== 0)).length;
   const violations = [];
   if (malformed) violations.push(`malformed_jsonl:${malformed}`);
   if (turnCompleted !== 1 || turnFailed) violations.push(`turn_completion:${turnCompleted}:${turnFailed}`);
   if (incompleteCommands) violations.push(`incomplete_command_events:${incompleteCommands}`);
   if (!successfulCommands) violations.push("successful_command_event_missing");
-  return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands };
+  return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands, unsuccessful_command_count: unsuccessfulCommands };
 }
 
 export function extractCommandTexts(jsonl) { return extractCommandEvents(jsonl).filter((event) => event.kind === "command").map((event) => event.command); }
@@ -271,42 +310,71 @@ function simpleCommandTokens(command) {
   return tokens;
 }
 
-export function evaluateArchifyReceipts(transcript, workspace, targetPackage, contract) {
-  if (!contract) return [];
-  if (!targetPackage) return ["archify_receipt:target_package_missing"];
-  const spec = noFollowWorkspaceFile(workspace, contract.spec_path); const artifact = noFollowWorkspaceFile(workspace, contract.artifact_path);
-  if (!spec || !artifact) return ["archify_receipt:bound_file_missing_or_unsafe"];
-  const script = join(targetPackage, "bin", "archify.mjs");
-  try { if (!lstatSync(script).isFile() || lstatSync(script).isSymbolicLink()) return ["archify_receipt:tool_missing_or_unsafe"]; } catch { return ["archify_receipt:tool_missing_or_unsafe"]; }
-  const canonicalScript = canonicalPath(script); const artifactBytes = readFileSync(artifact); const specBytes = readFileSync(spec);
+function parseArchifyTranscriptCommand(command, workspace, contract) {
+  const inner = unwrapSimpleShell(command); let nodePart = inner; let preparedArtifactParent = false;
+  if (inner.includes("&&")) {
+    const parts = inner.split(/\s+&&\s+/u); if (parts.length !== 2) return null;
+    const mkdir = simpleCommandTokens(parts[0]);
+    if (mkdir?.length !== 3 || basename(mkdir[0]) !== "mkdir" || mkdir[1] !== "-p" || canonicalPath(isAbsolute(mkdir[2]) ? mkdir[2] : join(workspace, mkdir[2])) !== canonicalPath(join(workspace, dirname(contract.artifact_path)))) return null;
+    nodePart = parts[1]; preparedArtifactParent = true;
+  }
+  const tokens = simpleCommandTokens(nodePart); if (!tokens || !["node", "node.exe"].includes(basename(tokens[0]).toLowerCase()) || tokens[1] !== "bin/archify.mjs") return null;
   const commandPath = (value) => canonicalPath(isAbsolute(value ?? "") ? value : join(workspace, value ?? ""));
-  const commandTokens = (command) => {
-    const tokens = simpleCommandTokens(command);
-    return tokens?.length > 1 && ["node", "node.exe"].includes(basename(tokens[0]).toLowerCase()) && commandPath(tokens[1]) === canonicalScript ? tokens : null;
-  };
-  const commonShape = (tokens) => tokens.at(-3) === "--quality" && tokens.at(-2) === contract.quality && tokens.at(-1) === "--json";
-  const isValidateCommand = (tokens) => tokens?.length === 8 && commonShape(tokens) && tokens[2] === "validate" && tokens[3] === contract.type && commandPath(tokens[4]) === spec;
-  const isDeliverCommand = (tokens) => tokens?.length === 9 && commonShape(tokens) && tokens[2] === "deliver" && tokens[3] === contract.type && commandPath(tokens[4]) === spec && commandPath(tokens[5]) === artifact;
-  const validValidateReceipt = (receipt) => receipt?.schemaVersion === 1 && receipt?.ok === true && receipt?.command === "validate" && receipt?.type === contract.type && canonicalPath(receipt.input ?? "") === spec && receipt?.checks?.length === contract.validation_check_count && receipt.checks.every((check) => check?.ok === true) && receipt?.composition?.status === "pass" && receipt?.composition?.summary?.errors === 0 && receipt?.composition?.summary?.warnings === 0;
-  const validDeliverReceipt = (receipt) => receipt?.schemaVersion === 1 && receipt?.ok === true && receipt?.command === "deliver" && receipt?.type === contract.type && canonicalPath(receipt.input ?? "") === spec && canonicalPath(receipt.output ?? "") === artifact && receipt?.specification?.sha256 === sha(specBytes) && receipt?.specification?.bytes === specBytes.length && receipt?.artifact?.sha256 === sha(artifactBytes) && receipt?.artifact?.bytes === artifactBytes.length && receipt?.validation?.checksPassed === contract.validation_check_count && receipt?.validation?.checkCount === contract.validation_check_count && receipt?.validation?.compositionProfile === contract.quality && receipt?.validation?.compositionStatus === "pass" && receipt?.validation?.errors === 0 && receipt?.validation?.warnings === 0;
-  const failures = []; const allowedDeliverIds = new Set(); let validateSucceeded = false; let deliverSucceeded = false;
+  const common = tokens.at(-3) === "--quality" && tokens.at(-2) === contract.quality && tokens.at(-1) === "--json";
+  const validate = tokens.length === 8 && tokens[2] === "validate" && tokens[3] === contract.type && commandPath(tokens[4]) === canonicalPath(join(workspace, contract.spec_path));
+  const deliver = tokens.length === 9 && tokens[2] === "deliver" && tokens[3] === contract.type && commandPath(tokens[4]) === canonicalPath(join(workspace, contract.spec_path)) && commandPath(tokens[5]) === canonicalPath(join(workspace, contract.artifact_path));
+  return common && ((validate && !preparedArtifactParent) || deliver) ? { command: validate ? "validate" : "deliver", argv: tokens.slice(1), argv_sha256: tokens.slice(1).map(sha) } : null;
+}
+
+export function evaluateArchifyReceipts(transcript, workspace, contract) {
+  if (!contract) return [];
+  const failures = []; let validateSucceeded = false; let deliverSucceeded = false;
   for (const event of extractRouteEvents(transcript)) {
     if (event.kind === "event_protocol_violation") { failures.push(`archify_receipt:event_protocol:${event.violation}`); continue; }
-    const tokens = event.kind === "command_start" || event.kind === "command_complete" ? commandTokens(event.command) : null;
-    if (event.kind === "command_start" && isDeliverCommand(tokens)) {
-      if (!validateSucceeded) failures.push("archify_receipt:deliver_started_before_validate_completed");
-      else allowedDeliverIds.add(event.id);
+    if (!event.command?.includes("archify.mjs")) continue;
+    const shape = parseArchifyTranscriptCommand(event.command, workspace, contract);
+    if (!shape) { failures.push("archify_receipt:command_shape_invalid"); continue; }
+    if (event.kind === "command_start") {
+      if (shape.command === "deliver" && !validateSucceeded) failures.push("archify_receipt:deliver_started_before_validate_completed");
       continue;
     }
     if (event.kind !== "command_complete" || event.exit_code !== 0 || event.status !== "completed" || typeof event.output !== "string") continue;
-    if (!tokens || !commonShape(tokens)) continue;
-    let receipt; try { receipt = JSON.parse(event.output); } catch { continue; }
-    if (isValidateCommand(tokens) && validValidateReceipt(receipt)) validateSucceeded = true;
-    if (isDeliverCommand(tokens) && allowedDeliverIds.has(event.id) && validDeliverReceipt(receipt)) deliverSucceeded = true;
+    if (shape.command === "validate") validateSucceeded = true;
+    if (shape.command === "deliver" && validateSucceeded) deliverSucceeded = true;
   }
-  if (!validateSucceeded) failures.push("archify_receipt:validate_missing_or_invalid");
-  if (!deliverSucceeded) failures.push("archify_receipt:deliver_missing_or_invalid");
+  if (!validateSucceeded) failures.push("archify_receipt:validate_attempt_missing_or_failed");
+  if (!deliverSucceeded) failures.push("archify_receipt:deliver_attempt_missing_or_failed");
   return [...new Set(failures)];
+}
+
+export function verifyArchifyParent(workspace, targetPackage, contract, authority = {}) {
+  if (!contract) return { passed: true, failures: [], audit_scope: "not_applicable" };
+  const failures = []; const spec = noFollowWorkspaceFile(workspace, contract.spec_path); const artifact = noFollowWorkspaceFile(workspace, contract.artifact_path);
+  if (!targetPackage || !spec || !artifact) return { passed: false, failures: ["archify_parent:bound_input_missing_or_unsafe"] };
+  if (authority.mode === "historical_untrusted") return { passed: null, performed: false, failures: ["archify_parent:historical_tool_identity_untrusted"], audit_scope: "not performed; no trustworthy external snapshot ledger" };
+  if (authority.protected_scopes_passed !== true || !authority.expected?.package_tree_sha256 || !authority.expected?.script_content_sha256) return { passed: false, performed: false, failures: ["archify_parent:fresh_tool_identity_untrusted"] };
+  const bin = join(targetPackage, "bin"); const script = join(bin, "archify.mjs"); let rootStat; let binStat; let scriptStat;
+  try { rootStat = lstatSync(targetPackage); binStat = lstatSync(bin); scriptStat = lstatSync(script); } catch { return { passed: false, performed: false, failures: ["archify_parent:frozen_tool_missing"] }; }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !binStat.isDirectory() || binStat.isSymbolicLink() || !scriptStat.isFile() || scriptStat.isSymbolicLink()) return { passed: false, performed: false, failures: ["archify_parent:frozen_tool_unsafe"] };
+  const canonicalPackage = realpathSync(targetPackage); const canonicalScript = realpathSync(script);
+  if (!inside(canonicalScript, canonicalPackage)) return { passed: false, performed: false, failures: ["archify_parent:frozen_tool_escape"] };
+  const actual = { package_tree_sha256: stateDigest(targetPackage), script_content_sha256: sha(readFileSync(canonicalScript)) };
+  if (actual.package_tree_sha256 !== authority.expected.package_tree_sha256 || actual.script_content_sha256 !== authority.expected.script_content_sha256) return { passed: false, performed: false, failures: ["archify_parent:frozen_tool_digest_mismatch"], expected_identity: authority.expected, actual_identity: actual };
+  const realNode = canonicalPath(process.execPath); const workspaceDigestBefore = stateDigest(workspace); const specificationSha256 = sha(readFileSync(spec)); const agentArtifactSha256 = sha(readFileSync(artifact)); const temp = mkdtempSync(join(tmpdir(), "skillroster-archify-parent-")); let independentBytes = null; let deliverReceipt = null; let validate = { status: null }; let validatePassed = false;
+  try {
+    if (inside(temp, dirname(workspace))) fail("parent verification temp must stay outside the source run root");
+    const copiedSpec = join(temp, "spec.json"); const independentArtifact = join(temp, "artifact.html"); copyFileSync(spec, copiedSpec);
+    const value = JSON.parse(readFileSync(copiedSpec, "utf8")); value.meta = { ...(value.meta ?? {}), output: independentArtifact }; writeFileSync(copiedSpec, JSON.stringify(value));
+    validate = run(realNode, [canonicalScript, "validate", contract.type, copiedSpec, "--quality", contract.quality, "--json"], { cwd: temp, timeout: 60_000 }); let validateReceipt = null; try { validateReceipt = JSON.parse(validate.stdout); } catch {}
+    validatePassed = validate.status === 0 && validateReceipt?.schemaVersion === 1 && validateReceipt?.ok === true && validateReceipt?.command === "validate" && validateReceipt?.type === contract.type && canonicalPath(validateReceipt.input ?? "") === canonicalPath(copiedSpec) && validateReceipt?.checks?.length === contract.validation_check_count && validateReceipt.checks.every((check) => check?.ok === true) && validateReceipt?.composition?.status === "pass" && validateReceipt?.composition?.summary?.errors === 0 && validateReceipt?.composition?.summary?.warnings === 0;
+    if (!validatePassed) failures.push("archify_parent:validate_failed");
+    const deliver = run(realNode, [canonicalScript, "deliver", contract.type, copiedSpec, independentArtifact, "--quality", contract.quality, "--json"], { cwd: temp, timeout: 60_000 });
+    try { deliverReceipt = JSON.parse(deliver.stdout); } catch {}
+    if (deliver.status !== 0 || deliverReceipt?.schemaVersion !== 1 || deliverReceipt?.ok !== true || deliverReceipt?.command !== "deliver" || canonicalPath(deliverReceipt.output ?? "") !== canonicalPath(independentArtifact) || !existsSync(independentArtifact)) failures.push("archify_parent:independent_deliver_failed");
+    else { independentBytes = readFileSync(independentArtifact); const agentBytes = readFileSync(artifact); if (independentBytes.length !== agentBytes.length || sha(independentBytes) !== sha(agentBytes)) failures.push("archify_parent:artifact_reproduction_mismatch"); }
+  } catch { failures.push("archify_parent:independent_verification_error"); } finally { rmSync(temp, { recursive: true, force: true }); }
+  const workspaceDigestAfter = stateDigest(workspace); if (workspaceDigestAfter !== workspaceDigestBefore) failures.push("archify_parent:source_workspace_changed");
+  return { passed: failures.length === 0, performed: true, failures, expected_identity: authority.expected, actual_identity: actual, real_node_sha256: sha(realNode), frozen_script_realpath_sha256: sha(canonicalScript), frozen_script_content_sha256: actual.script_content_sha256, specification_sha256: specificationSha256, agent_artifact_sha256: agentArtifactSha256, independent_artifact_sha256: independentBytes ? sha(independentBytes) : null, source_workspace_sha256_before: workspaceDigestBefore, source_workspace_sha256_after: workspaceDigestAfter, validate: { exit_code: validate.status, ok: validatePassed }, deliver: { ok: deliverReceipt?.ok === true }, audit_scope: "parent-owned frozen validate and independent deliver reproduction" };
 }
 
 function narrowRead(command, targetPath) {
@@ -344,7 +412,7 @@ function coveredThrough(ranges) {
 export function assessExactLoad(transcript, targetPath) {
   const canonical = canonicalPath(targetPath); const commands = extractCommandEvents(transcript); const lineCount = targetLineCount(canonical); const ranges = []; let loadEventIndex = null;
   if (lineCount !== null) for (const [index, event] of commands.entries()) {
-    if (event.kind !== "command" || event.exit_code !== 0) continue;
+    if (event.kind !== "command" || event.exit_code !== 0 || event.status !== "completed") continue;
     const read = verifiedRead(event.command, event.output, canonical); if (!read) continue;
     ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; break; }
   }
@@ -528,15 +596,18 @@ export function setupArm(root, task, arm, options) {
 function freezeSuite(manifest, options) {
   const root = mkdtempSync(join(options.runsDir, "suite-snapshot-")); const targets = join(root, "targets"); mkdirSync(targets);
   for (const name of new Set(manifest.tasks.map((task) => task.expected_skill))) cpSync(join(options.skillsRoot, name), join(targets, name), { recursive: true, dereference: true });
+  const targetPackages = Object.fromEntries([...new Set(manifest.tasks.map((task) => task.expected_skill))].map((name) => { const packageRoot = join(targets, name); const script = join(packageRoot, "bin", "archify.mjs"); return [name, { package_tree_sha256: stateDigest(packageRoot), script_content_sha256: existsSync(script) ? sha(readFileSync(script)) : null }]; }));
   const bootstrapRoot = join(root, "bootstrap"); cpSync(dirname(options.bootstrap), bootstrapRoot, { recursive: true, dereference: true });
   const cli = join(root, basename(options.cli)); copyFileSync(options.cli, cli); chmodSync(cli, statSync(options.cli).mode & 0o777);
   const manifestPath = join(root, "manifest.json"); copyFileSync(options.manifest, manifestPath);
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
-  const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root);
+  const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
   const facts = {
-    snapshot_digest: sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}`), manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
+    snapshot_digest: sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`), manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
     bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
+    real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
+    target_packages: targetPackages,
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
@@ -574,7 +645,7 @@ export function prepareOnDemand(paths, task, options, env) {
   const top = parseFindEnvelope(findResult.stdout); const status = invoke("status");
   if (top.skill !== task.expected_skill || !top.path || canonicalPath(top.path) !== canonicalTarget || top.roster_state !== "on_demand" || top.agents.length !== 0) fail("governed Find did not return one exact, non-exposed On-demand target");
   if (status.result.recovery_state !== "clear" || status.result.journal_issues?.length || status.result.last_receipt?.receipt_id !== applied.result.receipt_id) fail("SkillRoster recovery or Receipt state is not clear");
-  const bin = join(dirname(paths.audit), "bin"); mkdirSync(bin); const wrapper = join(bin, "skillroster"); writeFileSync(wrapper, findWrapperSource(), { mode: 0o755 }); chmodSync(wrapper, 0o755);
+  const bin = join(dirname(paths.audit), "bin"); mkdirSync(bin, { recursive: true }); const wrapper = join(bin, "skillroster"); writeFileSync(wrapper, findWrapperSource(), { mode: 0o755 }); chmodSync(wrapper, 0o755);
   return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
 }
 
@@ -593,12 +664,13 @@ function executeArm(task, arm, options, suiteFacts) {
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
     const runEnv = { ...env };
-    if (prepared) Object.assign(runEnv, { PATH: `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
+    if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
+    if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
     const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "-m", options.model, "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
-    const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath) }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
+    const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath), parentVerificationAuthority: { protected_scopes_passed: protectedScopes.passed, expected: suiteFacts.target_packages?.[task.expected_skill] } }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
     const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath }) : { count: 0, contract_violation: false };
     const load = assessExactLoad(result.stdout, paths.targetPath);
     const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
@@ -618,13 +690,40 @@ function dryRun(manifest, options) {
   return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, task_count: tasks.length, arms, run_count: tasks.length * arms.length, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
 }
 
+export function reevaluateExistingRuns(suiteRoot, manifest) {
+  const sourceDigestBefore = stateDigest(suiteRoot); const results = [];
+  for (const task of manifest.tasks) for (const arm of ["core", "on_demand"]) {
+    const matches = readdirSync(suiteRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith(`${task.id}-${arm}-`));
+    if (matches.length !== 1) { results.push({ task: task.id, arm, root: null, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: [`run_root_count:${matches.length}`] }); continue; }
+    const root = join(suiteRoot, matches[0].name); const workspacePath = join(root, "workspace"); const transcriptPath = join(root, "codex-events.jsonl");
+    if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ task: task.id, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
+    const transcriptText = readFileSync(transcriptPath, "utf8"); const targetPath = arm === "core" ? join(root, "home", ".codex", "skills", task.expected_skill, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
+    const initial = new Map(Object.entries(task.workspace_files).map(([path, content]) => [path, sha(content)])); const workspace = assessWorkspaceChanges(initial, walk(workspacePath), Object.keys(task.workspace_files), task.allowed_changed_paths);
+    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(join(root, "find-audit.jsonl")) ? readFileSync(join(root, "find-audit.jsonl"), "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: targetPath }) : { count: 0, contract_violation: false };
+    const load = assessExactLoad(transcriptText, targetPath); const transcript = assessTranscriptIntegrity(transcriptText);
+    const routeOrder = arm === "on_demand" ? assessRouteOrder(transcriptText, { bootstrapPath: join(root, "home", ".codex", "skills", "skillroster", "SKILL.md"), targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
+    const coreOrder = arm === "core" ? assessCoreOrder(transcriptText, targetPath) : { passed: true, audit_scope: "not_applicable" };
+    const oracle = evaluateOracle(workspacePath, task.oracle, { transcript: transcriptText, targetPackage: dirname(targetPath), parentVerificationAuthority: { mode: "historical_untrusted" } });
+    results.push({ task: task.id, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not an Issue #129 formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });
+  }
+  const sourceDigestAfter = stateDigest(suiteRoot); if (sourceDigestAfter !== sourceDigestBefore) fail("reevaluation changed the source run tree");
+  return { status: "reevaluated", source_root: canonicalPath(suiteRoot), source_tree_sha256_before: sourceDigestBefore, source_tree_sha256_after: sourceDigestAfter, raw_runs_modified: false, formal_gate_eligible: false, results };
+}
+
 export function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
+  const manifest = validateManifest(JSON.parse(readFileSync(options.manifest, "utf8")));
+  if (options.reevaluateRoot) {
+    if (!existsSync(options.reevaluateRoot) || !statSync(options.reevaluateRoot).isDirectory()) fail("--reevaluate-root must be an existing directory");
+    const canonicalSource = realpathSync(options.reevaluateRoot); const output = options.reevaluateOutput ?? join(dirname(canonicalSource), `${basename(canonicalSource)}-reevaluated-${Date.now()}.json`);
+    if (inside(resolve(output), canonicalSource) || existingAncestorResolvesInside(output, canonicalSource)) fail("reevaluation output must stay outside the source run root");
+    if (existsSync(output)) fail("reevaluation output already exists"); const summary = reevaluateExistingRuns(canonicalSource, manifest); writeFileSync(output, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+    process.stdout.write(`${JSON.stringify({ status: summary.status, formal_gate_eligible: false, output, results: summary.results.map(({ task, arm, formal_evidence_accepted, recomputed_dimensions }) => ({ task, arm, formal_evidence_accepted, post_hoc_only: true, recomputed_dimensions })) }, null, 2)}\n`); return 0;
+  }
   if (inside(options.runsDir, REPO)) fail("--runs-dir must stay outside the repository so transcripts cannot be committed");
   if (existingAncestorResolvesInside(options.runsDir, REPO)) fail("--runs-dir ancestor resolves inside the repository so transcripts cannot be committed");
   mkdirSync(options.runsDir, { recursive: true });
   if (inside(realpathSync(options.runsDir), realpathSync(REPO))) fail("--runs-dir resolves inside the repository so transcripts cannot be committed");
-  const manifest = validateManifest(JSON.parse(readFileSync(options.manifest, "utf8")));
   if (!options.execute) { process.stdout.write(`${JSON.stringify(dryRun(manifest, options), null, 2)}\n`); return 0; }
   for (const path of [options.bootstrap, options.cli, options.skillsRoot, options.authSource]) if (!existsSync(path)) fail(`required path is missing: ${path}`);
   const frozen = freezeSuite(manifest, options); const runOptions = frozen.options;

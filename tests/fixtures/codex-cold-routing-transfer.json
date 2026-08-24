@@ -33,7 +33,7 @@
       "oracle": {
         "path": "outputs/order-architecture.html",
         "minimum_bytes": 20000,
-        "required_substrings": ["<svg", "<style", "<script", "data-theme", "btn-theme", "Web 客户端", "API Gateway", "Auth Service", "Order Service", "PostgreSQL", "Queue", "Worker", "Object Storage", "HTTPS", "SQL", "异步事件", "信任边界"],
+        "required_substrings": ["<svg", "<style", "<script", "data-theme", "btn-theme", "Web 客户端", "API Gateway", "Auth Service", "Order Service", "PostgreSQL", "Queue", "Worker", "Object Storage", "HTTPS", "SQL", "异步事件"],
         "required_regex": ["(btn-node-finder|data-node-finder-trigger|search)", "(data-intent-trace-active|data-route-probe-overlay|trace)"],
         "forbidden_regex": ["<script\\b[^>]*\\bsrc\\s*=", "<link\\b(?=[^>]*\\brel\\s*=\\s*['\"]?stylesheet)(?=[^>]*\\bhref\\s*=)[^>]*>"],
         "forbidden_substrings": [],
@@ -43,6 +43,33 @@
           "artifact_path": "outputs/order-architecture.html",
           "quality": "showcase",
           "validation_check_count": 9
+        },
+        "architecture_spec_contract": {
+          "spec_path": "scratch/order-architecture.spec.json",
+          "components": [
+            { "id": "web-client", "label": "Web 客户端" },
+            { "id": "api-gateway", "label": "API Gateway" },
+            { "id": "auth-service", "label": "Auth Service" },
+            { "id": "order-service", "label": "Order Service" },
+            { "id": "postgresql", "label": "PostgreSQL" },
+            { "id": "queue", "label": "Queue" },
+            { "id": "worker", "label": "Worker" },
+            { "id": "object-storage", "label": "Object Storage" }
+          ],
+          "boundaries": [
+            { "label": "用户端", "members": ["web-client"] },
+            { "label": "应用服务区", "members": ["api-gateway", "auth-service", "order-service"] },
+            { "label": "数据与异步基础设施区", "members": ["postgresql", "queue", "worker", "object-storage"] }
+          ],
+          "connections": [
+            { "id": "web-to-gateway", "from": "web-client", "to": "api-gateway", "label_regex": "^HTTPS$" },
+            { "id": "gateway-to-order", "from": "api-gateway", "to": "order-service", "label_regex": "^HTTPS$" },
+            { "id": "order-to-db", "from": "order-service", "to": "postgresql", "label_regex": "^SQL$" },
+            { "id": "gateway-to-auth", "from": "api-gateway", "to": "auth-service", "label_regex": "HTTPS.*(认证|Auth)|(?:认证|Auth).*HTTPS" },
+            { "id": "order-to-queue", "from": "order-service", "to": "queue", "label_regex": "(发布|publish).*(异步事件|event)|(异步事件|event).*(发布|publish)" },
+            { "id": "queue-to-worker", "from": "queue", "to": "worker", "label_regex": "(消费|consume).*(异步事件|event)|(异步事件|event).*(消费|consume)" },
+            { "id": "worker-to-storage", "from": "worker", "to": "object-storage", "label_regex": "(写入|write).*(订单文档|document)|(订单文档|document).*(写入|write)" }
+          ]
         }
       }
     }
