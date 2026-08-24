@@ -152,8 +152,8 @@ before any directory enumeration.
 
 ## Measured macOS prototype
 
-Only a disposable `/tmp` directory was used; no repository, Skill, Agent file,
-or persistent SkillRoster state was touched. The prototype opened `pkg` as a
+Only a disposable OS temporary directory was used; no repository, Skill, Agent
+file, or persistent SkillRoster state was touched. The prototype opened `pkg` as a
 directory descriptor, renamed that directory away, installed a different
 directory at the old pathname, then read once by pathname and once relative to
 the held descriptor.
