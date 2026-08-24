@@ -91,7 +91,7 @@
         ],
         "blocked_skill_ids": [
           "skill_2c6fe4bed6fb02c0c78c917af720327c53ae46a03a5c9941f1c0b36f1cf4f58d",
-          "skill_5dc20339363defdb0a534aa5c5e327569ecefe05b1d9ac69ff84067b4643f",
+          "skill_5dc20339363defdb0a534aa5c5e327569ecefe05b1d9ac69ff84050067b4643f",
           "skill_641ea724b4a47d839a27556c81bbcc13afebcbb2762bed5a9b128b682c3c545a"
         ],
         "plan_error_code": "roster_package_fingerprint_variants"
