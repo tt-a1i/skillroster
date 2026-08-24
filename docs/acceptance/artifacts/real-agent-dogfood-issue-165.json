@@ -10,7 +10,14 @@
   "execution": {
     "sequence": ["ledger_before", "scan", "report", "find", "find", "status", "ledger_after", "compare"],
     "state_isolated": true,
+    "estate_assumption": "quiescent",
+    "directory_race_guarantee": "drift_detecting_not_adversarial_concurrent_capability",
     "raw_evidence": "external_isolated_directory_not_committed",
+    "evidence_bundle": {
+      "record_count": 10,
+      "bundle_sha256": "2c1a2e48245dce1f256ef030a178c1932c541f8be3617afae6e93bfaac716c71",
+      "exploratory_attempts_included": false
+    },
     "mutations_allowed": false,
     "product_network_used": false
   },
@@ -54,6 +61,7 @@
   },
   "decision": {
     "approved_scoped_estate_byte_stable": true,
+    "concurrent_hostile_directory_race_proven": false,
     "all_home_files_unchanged": false,
     "semantic_or_routing_claim": false,
     "governance_authorized": false

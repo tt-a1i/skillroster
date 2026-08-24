@@ -6,7 +6,10 @@ This addendum strengthens the read-only real-agent dogfood from Issue #163. It
 uses the independent Node standard-library ledger helper in
 `tests/harness/byte-ledger/ledger.mjs`; raw ledgers and command output remain
 outside the repository. The public artifact contains only aggregates,
-digests, and boundary statements.
+digests, and boundary statements. The run assumes a quiescent estate: the
+helper detects observed path drift and refuses unsafe inputs, but Node's
+cross-platform standard library has no `openat/readdir(fd)` capability to
+provide an adversarial concurrent-directory guarantee.
 
 ## Run and scope
 
@@ -20,6 +23,10 @@ digests, and boundary statements.
   newline-delimited list
 - State and evidence were isolated; no Apply, Setup, Undo, Plan persistence,
   delete, purge, roster/config/Skill mutation, or external-target read ran.
+- Frozen evidence bundle: 10 JSON records, bundle digest
+  `2c1a2e48245dce1f256ef030a178c1932c541f8be3617afae6e93bfaac716c71`.
+  Earlier exploratory captures and failed invocations are excluded from this
+  acceptance bundle and are not used for its claims.
 
 ## Byte-ledger result
 
@@ -44,11 +51,12 @@ Plans.
 
 ## Acceptance boundary
 
-The approved Skill/config estate covered by this ledger was byte-stable across
-the flow. This does not prove that every file in Home, dynamic sessions/logs,
+The approved Skill/config estate covered by this quiescent run was byte-stable
+across the flow. This does not prove that every file in Home, dynamic sessions/logs,
 caches, repository files, isolated state, or external symlink targets was
-unchanged. It also does not add semantic intent quality, routing superiority,
-or a governance authorization claim.
+unchanged, nor does it claim byte stability against a concurrent hostile
+directory rename/symlink race. It also does not add semantic intent quality,
+routing superiority, or a governance authorization claim.
 
 The redacted machine record is
 [`real-agent-dogfood-issue-165.json`](artifacts/real-agent-dogfood-issue-165.json).

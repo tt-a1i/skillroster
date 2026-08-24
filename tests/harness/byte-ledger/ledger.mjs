@@ -14,7 +14,7 @@ import {
   writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, parse, relative, resolve, sep } from "node:path";
 
 export class LedgerError extends Error {
   constructor(code, message) {
@@ -39,7 +39,10 @@ const isWithin = (child, parent) => {
 const requireAbsolute = (value, label) => {
   if (typeof value !== "string" || value.trim() === "") fail("empty_scope", `${label} must be a non-empty path`);
   if (!isAbsolute(value)) fail("relative_scope", `${label} must be absolute`);
-  return resolve(value);
+  if (value.split(/[\\/]+/u).some((segment) => segment === "." || segment === "..")) fail("path_traversal", `${label} contains traversal`);
+  const absolute = resolve(value);
+  if (parse(absolute).root === absolute) fail("unsafe_scope", `${label} must not be a filesystem root`);
+  return absolute;
 };
 
 const uniquePaths = (paths, label) => {
@@ -64,6 +67,24 @@ const modeKind = (mode) => {
   return "special";
 };
 
+const sameIdentity = (opened, current) => opened.ino === 0 || current.ino === 0 || (opened.ino === current.ino && opened.dev === current.dev);
+const openNoFollow = (path, directory = false) => {
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (directory ? (constants.O_DIRECTORY ?? 0) : 0);
+  const descriptor = openSync(path, flags);
+  const opened = fstatSync(descriptor);
+  const current = lstatSync(path);
+  if (!sameIdentity(opened, current) || (directory ? !opened.isDirectory() || current.isSymbolicLink() : !opened.isFile() || current.isSymbolicLink())) {
+    closeSync(descriptor); fail("file_drift", "path changed while it was being opened");
+  }
+  return { descriptor, opened };
+};
+
+const assertDirectoryStable = (path, opened) => {
+  let current;
+  try { current = lstatSync(path); } catch { fail("directory_drift", "directory changed while it was being read"); }
+  if (current.isSymbolicLink() || !current.isDirectory() || !sameIdentity(opened, current)) fail("directory_drift", "directory changed while it was being read");
+};
+
 export const parsePathList = (text, label = "path list") => {
   if (typeof text !== "string") fail("invalid_list", `${label} must be text`);
   return text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line !== "");
@@ -83,12 +104,23 @@ export const validateScope = ({ approvedRoots, configPaths = [], evidenceDir, re
   }
   const roots = uniquePaths(rootInputs, "approved root");
   const configs = uniquePaths(configInputs, "config path");
+  if (!evidenceDir || !repositoryDir || !stateDir || !homeDir) fail("invalid_scope", "evidence, repository, state, and home directories are required");
   const home = canonical(requireAbsolute(homeDir, "home directory"));
-  const forbidden = [evidenceDir, repositoryDir, stateDir]
+  const evidenceInput = requireAbsolute(evidenceDir, "evidence directory");
+  const repositoryInput = requireAbsolute(repositoryDir, "repository directory");
+  const stateInput = requireAbsolute(stateDir, "state directory");
+  for (const [input, label] of [[evidenceInput, "evidence directory"], [repositoryInput, "repository directory"], [stateInput, "state directory"]]) {
+    try { if (lstatSync(input).isSymbolicLink()) fail("unsafe_scope", `${label} must not be a symlink`); } catch (error) { if (error instanceof LedgerError) throw error; }
+  }
+  const evidence = canonical(evidenceInput);
+  const repository = canonical(repositoryInput);
+  const state = canonical(stateInput);
+  if (overlapsForbidden(evidence, [home, repository, state]) || overlapsForbidden(repository, [state])) fail("unsafe_scope", "evidence, repository, and state directories overlap");
+  const forbidden = [evidence, repository, state]
     .filter((entry) => entry !== undefined && entry !== null)
-    .map((entry) => canonical(requireAbsolute(entry, "forbidden scope")));
+    .map((entry) => canonical(entry));
   for (const root of roots) {
-    if (root === resolve(sep)) fail("unsafe_scope", "filesystem root is not an approved scope");
+    if (parse(root).root === root) fail("unsafe_scope", "filesystem root is not an approved scope");
     if (root === home || isWithin(home, root) || overlapsForbidden(root, forbidden)) fail("unsafe_scope", "approved root overlaps a forbidden scope");
     let mode;
     try { mode = lstatSync(root); } catch { fail("unreadable_scope", "approved root cannot be inspected"); }
@@ -106,14 +138,13 @@ export const validateScope = ({ approvedRoots, configPaths = [], evidenceDir, re
 const hashFile = async (path) => {
   const hash = createHash("sha256");
   let descriptor;
+  let size;
   try {
     // O_NOFOLLOW (where provided) and a descriptor-bound read close the
     // lstat-to-read gap: a replacement symlink is never opened and hashed.
-    const noFollow = constants.O_NOFOLLOW ?? 0;
-    descriptor = openSync(path, constants.O_RDONLY | noFollow);
-    const opened = fstatSync(descriptor);
-    const current = lstatSync(path);
-    if (!opened.isFile() || current.isSymbolicLink() || (opened.ino !== 0 && current.ino !== 0 && (opened.ino !== current.ino || opened.dev !== current.dev))) fail("file_drift", "regular file changed while it was being opened");
+    const opened = openNoFollow(path);
+    descriptor = opened.descriptor;
+    size = opened.opened.size;
     for await (const chunk of createReadStream(null, { fd: descriptor, autoClose: false })) hash.update(chunk);
   } catch (error) {
     if (error instanceof LedgerError) throw error;
@@ -121,7 +152,7 @@ const hashFile = async (path) => {
   } finally {
     if (descriptor !== undefined) closeSync(descriptor);
   }
-  return hash.digest("hex");
+  return { size, sha256: hash.digest("hex") };
 };
 
 const relativeIdentity = (root, entry, rootIndex) => {
@@ -132,33 +163,54 @@ const relativeIdentity = (root, entry, rootIndex) => {
 const targetScope = (entry, spelling, roots) => {
   const target = resolve(dirname(entry), spelling);
   const index = roots.findIndex((root) => isWithin(target, root));
-  return index < 0 ? "external_target_not_hashed" : `approved_root_${index}`;
+  if (index < 0) return "external_target_not_hashed";
+  const root = roots[index];
+  const components = relative(root, target).split(sep).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = resolve(current, component);
+    let mode;
+    try { mode = lstatSync(current); } catch { return "external_target_not_hashed"; }
+    if (mode.isSymbolicLink() || (!mode.isDirectory() && !mode.isFile())) return "external_target_not_hashed";
+  }
+  return `approved_root_${index}`;
 };
 
 const walkRoot = async (root, rootIndex, roots, records) => {
   records.push({ id: `root-${rootIndex}`, kind: "directory" });
   const visit = async (directory) => {
+    let descriptor;
+    let opened;
     let entries;
-    try { entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name)); }
-    catch { fail("unreadable_directory", "directory cannot be read"); }
-    for (const entry of entries) {
-      const absolute = resolve(directory, entry.name);
-      const id = relativeIdentity(root, absolute, rootIndex);
-      let mode;
-      try { mode = lstatSync(absolute); } catch { fail("unreadable_entry", "entry cannot be inspected"); }
-      const kind = modeKind(mode);
-      if (kind === "file") {
-        records.push({ id, kind, size: mode.size, sha256: await hashFile(absolute) });
-      } else if (kind === "directory") {
-        records.push({ id, kind });
-        await visit(absolute);
-      } else if (kind === "symlink") {
-        let spelling;
-        try { spelling = readlinkSync(absolute); } catch { fail("unreadable_symlink", "symlink target spelling cannot be read"); }
-        records.push({ id, kind, target_spelling: spelling, target_scope: targetScope(absolute, spelling, roots) });
-      } else {
-        fail("special_file", "special files are outside the safe ledger format");
+    try {
+      opened = openNoFollow(directory, true); descriptor = opened.descriptor;
+      try { entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name)); }
+      catch { fail("unreadable_directory", "directory cannot be read"); }
+      assertDirectoryStable(directory, opened.opened);
+      for (const entry of entries) {
+        assertDirectoryStable(directory, opened.opened);
+        const absolute = resolve(directory, entry.name);
+        const id = relativeIdentity(root, absolute, rootIndex);
+        let mode;
+        try { mode = lstatSync(absolute); } catch { fail("unreadable_entry", "entry cannot be inspected"); }
+        const kind = modeKind(mode);
+        if (kind === "file") {
+          const hashed = await hashFile(absolute);
+          records.push({ id, kind, size: hashed.size, sha256: hashed.sha256 });
+        } else if (kind === "directory") {
+          records.push({ id, kind });
+          await visit(absolute);
+        } else if (kind === "symlink") {
+          let spelling;
+          try { spelling = readlinkSync(absolute); } catch { fail("unreadable_symlink", "symlink target spelling cannot be read"); }
+          records.push({ id, kind, target_spelling: spelling, target_scope: targetScope(absolute, spelling, roots) });
+        } else {
+          fail("special_file", "special files are outside the safe ledger format");
+        }
       }
+      assertDirectoryStable(directory, opened.opened);
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
     }
   };
   await visit(root);
@@ -172,6 +224,41 @@ const aggregate = (records) => records.reduce((result, record) => {
   return result;
 }, { record_count: 0, file_count: 0, directory_count: 0, symlink_count: 0, special_count: 0, regular_file_bytes: 0, external_target_count: 0 });
 
+const exactKeys = (value, keys, label) => {
+  if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join("\0") !== [...keys].sort().join("\0")) fail("invalid_ledger", `${label} has an invalid shape`);
+};
+const integer = (value, label) => { if (!Number.isSafeInteger(value) || value < 0) fail("invalid_ledger", `${label} must be a non-negative integer`); };
+const digest = (value, label) => { if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) fail("invalid_ledger", `${label} must be a SHA-256 digest`); };
+
+export const validateLedger = (ledger, label = "ledger") => {
+  exactKeys(ledger, ["schema_version", "format", "scope", "aggregate", "records"], label);
+  if (ledger.schema_version !== 1 || ledger.format !== "skillroster-byte-ledger") fail("invalid_ledger", `${label} has an unsupported format`);
+  exactKeys(ledger.scope, ["approved_root_count", "config_path_count"], `${label} scope`);
+  integer(ledger.scope.approved_root_count, `${label} root count`); integer(ledger.scope.config_path_count, `${label} config count`);
+  if (!Array.isArray(ledger.records) || ledger.records.length === 0) fail("invalid_ledger", `${label} records are required`);
+  const ids = new Set(); let rootCount = 0; let configCount = 0;
+  for (const record of ledger.records) {
+    if (!record || typeof record.id !== "string" || !(/^(?:root-\d+(?:\/[^/]+)+|root-\d+|config-\d+)$/u.test(record.id)) || record.id.startsWith("/") || record.id.split("/").some((segment) => segment === ".." || segment === ".") || ids.has(record.id)) fail("invalid_ledger", `${label} contains an invalid or duplicate identity`);
+    ids.add(record.id);
+    if (/^root-\d+$/u.test(record.id)) rootCount += 1;
+    if (/^config-\d+$/u.test(record.id)) configCount += 1;
+    if (record.kind === "file") {
+      exactKeys(record, ["id", "kind", "size", "sha256"], `${label} file`); integer(record.size, `${label} file size`); digest(record.sha256, `${label} file digest`);
+    } else if (record.kind === "directory") {
+      exactKeys(record, ["id", "kind"], `${label} directory`);
+    } else if (record.kind === "symlink") {
+      exactKeys(record, ["id", "kind", "target_scope", "target_spelling"], `${label} symlink`);
+      if (typeof record.target_spelling !== "string" || record.target_spelling.length === 0 || record.target_spelling.includes("\0")) fail("invalid_ledger", `${label} symlink spelling is invalid`);
+      if (record.target_scope !== "external_target_not_hashed" && (!/^approved_root_\d+$/u.test(record.target_scope) || Number(record.target_scope.slice("approved_root_".length)) >= ledger.scope.approved_root_count)) fail("invalid_ledger", `${label} symlink scope is invalid`);
+    } else fail("invalid_ledger", `${label} contains an unknown record kind`);
+  }
+  if (rootCount !== ledger.scope.approved_root_count || configCount !== ledger.scope.config_path_count) fail("invalid_ledger", `${label} scope counts do not match records`);
+  exactKeys(ledger.aggregate, ["record_count", "file_count", "directory_count", "symlink_count", "special_count", "regular_file_bytes", "external_target_count"], `${label} aggregate`);
+  const expected = aggregate(ledger.records);
+  if (JSON.stringify(expected) !== JSON.stringify(ledger.aggregate)) fail("invalid_ledger", `${label} aggregate does not match records`);
+  return ledger;
+};
+
 export const collectLedger = async (scope) => {
   const validated = validateScope(scope);
   const records = [];
@@ -180,7 +267,8 @@ export const collectLedger = async (scope) => {
     let mode;
     try { mode = lstatSync(config); } catch { fail("unreadable_file", "config path cannot be read"); }
     if (!mode.isFile() || mode.isSymbolicLink()) fail("unsafe_config", "config path changed to a non-regular file");
-    records.push({ id: `config-${index}`, kind: "file", size: mode.size, sha256: await hashFile(config) });
+    const hashed = await hashFile(config);
+    records.push({ id: `config-${index}`, kind: "file", size: hashed.size, sha256: hashed.sha256 });
   }
   records.sort((left, right) => left.id.localeCompare(right.id));
   return {
@@ -193,9 +281,11 @@ export const collectLedger = async (scope) => {
 };
 
 const stableJson = (value) => JSON.stringify(value);
-export const ledgerDigest = (ledger) => createHash("sha256").update(stableJson(ledger)).digest("hex");
+export const ledgerDigest = (ledger) => { validateLedger(ledger); return createHash("sha256").update(stableJson(ledger)).digest("hex"); };
 
 export const compareLedgers = (before, after) => {
+  validateLedger(before, "before ledger"); validateLedger(after, "after ledger");
+  if (JSON.stringify(before.scope) !== JSON.stringify(after.scope)) fail("scope_mismatch", "ledger scopes do not match");
   const beforeById = new Map(before.records.map((record) => [record.id, stableJson(record)]));
   const afterById = new Map(after.records.map((record) => [record.id, stableJson(record)]));
   let added = 0; let removed = 0; let changed = 0;
@@ -221,13 +311,14 @@ export const redactedComparison = (before, after) => {
 };
 
 export const writeRawLedger = (ledger, outputPath, evidenceDir) => {
+  validateLedger(ledger);
   const output = requireAbsolute(outputPath, "ledger output");
   const lexicalEvidence = requireAbsolute(evidenceDir, "evidence directory");
   if (!isWithin(output, lexicalEvidence) || output === lexicalEvidence) fail("unsafe_output", "raw ledger must be written inside evidence directory");
   try { mkdirSync(lexicalEvidence, { recursive: true }); } catch { fail("write_failed", "evidence directory could not be created"); }
   const evidence = canonical(lexicalEvidence);
   const safeOutput = resolve(evidence, relative(lexicalEvidence, output));
-  if (!isWithin(canonical(dirname(safeOutput)), evidence)) fail("unsafe_output", "raw ledger parent escapes evidence directory");
+  if (dirname(safeOutput) !== evidence || !isWithin(canonical(dirname(safeOutput)), evidence)) fail("unsafe_output", "raw ledger must be directly inside evidence directory");
   let descriptor;
   try { descriptor = openSync(safeOutput, "wx", 0o600); writeSync(descriptor, `${JSON.stringify(ledger, null, 2)}\n`); }
   catch { fail("write_failed", "raw ledger could not be written exclusively"); }
@@ -237,9 +328,14 @@ export const writeRawLedger = (ledger, outputPath, evidenceDir) => {
 
 const readListArg = (path, label) => {
   const absolute = requireAbsolute(path, `${label} file`);
-  let mode; let text;
-  try { mode = lstatSync(absolute); if (!mode.isFile() || mode.isSymbolicLink()) fail("unsafe_input", `${label} file must be a regular file`); text = readFileSync(absolute, "utf8"); }
-  catch (error) { if (error instanceof LedgerError) throw error; fail("unreadable_input", `${label} file cannot be read`); }
+  let opened; let text;
+  try {
+    opened = openNoFollow(absolute);
+    text = readFileSync(opened.descriptor, "utf8");
+    const current = lstatSync(absolute);
+    if (!sameIdentity(opened.opened, current) || current.isSymbolicLink()) fail("input_drift", `${label} file changed while it was read`);
+  } catch (error) { if (error instanceof LedgerError) throw error; fail("unreadable_input", `${label} file cannot be read`); }
+  finally { if (opened !== undefined) closeSync(opened.descriptor); }
   return parsePathList(text, label);
 };
 const argValue = (args, flag) => {
@@ -254,8 +350,9 @@ const cli = async (args) => {
   const mode = args[0];
   if (mode === "capture") {
     const rootsFile = argValue(args, "--roots-file"); const configFile = argValue(args, "--config-file"); const evidenceDir = argValue(args, "--evidence-dir"); const output = argValue(args, "--output");
-    if (!rootsFile || !evidenceDir || !output) fail("invalid_args", "capture requires --roots-file, --evidence-dir, and --output");
-    const ledger = await collectLedger({ approvedRoots: readListArg(rootsFile, "approved root list"), configPaths: configFile ? readListArg(configFile, "config path list") : [], evidenceDir, repositoryDir: argValue(args, "--repository-dir"), stateDir: argValue(args, "--state-dir"), homeDir: argValue(args, "--home-dir") ?? homedir() });
+    const repositoryDir = argValue(args, "--repository-dir"); const stateDir = argValue(args, "--state-dir"); const homeDir = argValue(args, "--home-dir");
+    if (!rootsFile || !evidenceDir || !output || !repositoryDir || !stateDir || !homeDir) fail("invalid_args", "capture requires explicit roots, evidence, output, repository, state, and home paths");
+    const ledger = await collectLedger({ approvedRoots: readListArg(rootsFile, "approved root list"), configPaths: configFile ? readListArg(configFile, "config path list") : [], evidenceDir, repositoryDir, stateDir, homeDir });
     writeRawLedger(ledger, output, evidenceDir);
     process.stdout.write(`${JSON.stringify({ format: ledger.format, aggregate: ledger.aggregate, ledger_sha256: ledgerDigest(ledger) })}\n`);
   } else if (mode === "compare") {

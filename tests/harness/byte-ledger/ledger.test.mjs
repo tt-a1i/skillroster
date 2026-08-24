@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { collectLedger, compareLedgers, LedgerError, redactedComparison, validateScope, writeRawLedger } from "./ledger.mjs";
+import { collectLedger, compareLedgers, LedgerError, redactedComparison, validateLedger, validateScope, writeRawLedger } from "./ledger.mjs";
 
 const tempRoot = () => mkdtempSync(join(resolve(tmpdir()), "skillroster-byte-ledger-"));
 const scope = (root, extras = {}) => ({ approvedRoots: [root], configPaths: extras.configPaths ?? [], evidenceDir: extras.evidenceDir ?? join(dirname(root), "evidence"), repositoryDir: extras.repositoryDir ?? join(dirname(root), "repo"), stateDir: extras.stateDir ?? join(dirname(root), "state"), homeDir: extras.homeDir ?? join(dirname(root), "home") });
@@ -27,13 +27,18 @@ test("symlink retargeting changes identity but never hashes its target", { skip:
   const outsideDigest = createHash("sha256").update("secret").digest("hex"); assert.equal(linkBefore.target_scope, "approved_root_0"); assert.equal(linkAfter.target_scope, "external_target_not_hashed"); assert.equal(compareLedgers(before, after).changed, 1); assert.equal(after.records.some((record) => record.sha256 === outsideDigest), false); rmSync(outside, { force: true }); rmSync(root, { recursive: true, force: true });
 });
 
+test("symlink target classification is conservative for indirect external links", { skip: process.platform === "win32" }, async () => {
+  const root = tempRoot(); const outside = `${root}-outside`; mkdirSync(outside); writeFileSync(join(outside, "secret"), "secret"); symlinkSync(outside, join(root, "alias"), "dir"); symlinkSync("alias/secret", join(root, "indirect")); const ledger = await collectLedger(scope(root));
+  assert.equal(ledger.records.find((record) => record.id === "root-0/indirect").target_scope, "external_target_not_hashed"); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true });
+});
+
 test("external symlink targets are explicitly out of scope even when unreadable", { skip: process.platform === "win32" }, async () => {
   const root = tempRoot(); const target = join(root, "link"); symlinkSync("/path/that/does/not/exist", target); const ledger = await collectLedger(scope(root)); const link = ledger.records.find((record) => record.kind === "symlink");
   assert.equal(link.target_scope, "external_target_not_hashed"); assert.equal(ledger.aggregate.external_target_count, 1); rmSync(root, { recursive: true, force: true });
 });
 
 test("unsafe scopes fail closed", () => {
-  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); assert.throws(() => validateScope({ ...common, approvedRoots: [] }), (error) => error instanceof LedgerError && error.code === "empty_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: ["/"] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root, root] }), (error) => error instanceof LedgerError && error.code === "conflicting_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], repositoryDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], homeDir: join(root, "subhome") }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true });
+  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); assert.throws(() => validateScope({ ...common, approvedRoots: [] }), (error) => error instanceof LedgerError && error.code === "empty_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: ["/"] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root, root] }), (error) => error instanceof LedgerError && error.code === "conflicting_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], repositoryDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], homeDir: join(root, "subhome") }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: join(dirname(root), "evidence"), homeDir: dirname(root) }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true });
 });
 
 test("special files fail closed", { skip: process.platform === "win32" }, async () => {
@@ -61,6 +66,17 @@ test("CLI fails closed for unsafe list inputs and missing flag values", () => {
   const script = fileURLToPath(new URL("../../../scripts/byte-ledger.mjs", import.meta.url));
   const missing = spawnSync(process.execPath, [script, "capture", "--roots-file"], { encoding: "utf8" });
   assert.notEqual(missing.status, 0); assert.match(missing.stderr, /requires a value/u);
-  const unreadable = spawnSync(process.execPath, [script, "capture", "--roots-file", "/path/does/not/exist", "--evidence-dir", "/tmp/evidence", "--output", "/tmp/evidence/x.json"], { encoding: "utf8" });
+  const unreadable = spawnSync(process.execPath, [script, "capture", "--roots-file", "/path/does/not/exist", "--evidence-dir", "/tmp/evidence", "--output", "/tmp/evidence/x.json", "--repository-dir", "/tmp/repo", "--state-dir", "/tmp/state", "--home-dir", "/tmp/home"], { encoding: "utf8" });
   assert.notEqual(unreadable.status, 0); assert.match(unreadable.stderr, /unreadable_input/u);
+  const incomplete = spawnSync(process.execPath, [script, "capture", "--roots-file", "/tmp/roots.txt", "--evidence-dir", "/tmp/evidence", "--output", "/tmp/evidence/x.json"], { encoding: "utf8" });
+  assert.notEqual(incomplete.status, 0); assert.match(incomplete.stderr, /explicit roots/u);
+});
+
+test("compare validates schema, identities, scope, and aggregates before redaction", async () => {
+  const root = tempRoot(); const ledger = await collectLedger(scope(root));
+  assert.throws(() => validateLedger({ ...ledger, aggregate: { ...ledger.aggregate, file_count: ledger.aggregate.file_count + 1 } }), (error) => error instanceof LedgerError && error.code === "invalid_ledger");
+  assert.throws(() => validateLedger({ ...ledger, records: [{ ...ledger.records[0], id: "../private" }, ...ledger.records.slice(1)] }), (error) => error instanceof LedgerError && error.code === "invalid_ledger");
+  assert.throws(() => compareLedgers(ledger, { ...ledger, scope: { ...ledger.scope, config_path_count: 1 } }), (error) => error instanceof LedgerError && error.code === "invalid_ledger");
+  const redacted = redactedComparison(ledger, ledger); assert.deepEqual(Object.keys(redacted).sort(), ["after", "before", "comparison", "external_target_bytes", "format", "privacy", "schema_version"]); assert.equal(JSON.stringify(redacted).includes(root), false);
+  rmSync(root, { recursive: true, force: true });
 });
