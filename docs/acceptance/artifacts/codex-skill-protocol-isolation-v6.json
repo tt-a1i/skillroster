@@ -3,6 +3,8 @@
   "suite_id": "codex-skill-protocol-isolation-v6",
   "status": "failed",
   "formal_gate_eligible": true,
+  "projection": "redacted_bounded_projection_of_external_raw_summary",
+  "raw_summary_sha256": "22bf011f6386829f334e30df8e82d57cb1b884072ca485c0d2f0c899f5a79e81",
   "source_identity_stable": true,
   "codex_executable_stable": true,
   "protocol_decision": {
@@ -25,6 +27,14 @@
     "model": "gpt-5.6-luna",
     "reasoning_effort": "medium",
     "timeout_ms": 180000,
+    "execution_contract": {
+      "sandbox": "workspace-write",
+      "ephemeral": true,
+      "ignore_user_config": true,
+      "arm_schedule": ["core", "on_demand"],
+      "trials_per_arm": 3,
+      "preflight": "same model config in fresh config-free CODEX_HOME; debug prompt-input does not support execution-only flags"
+    },
     "driver_sha256": "95ef089929e0a2761b4ed568f7a02515c1236e90e50198a9eda776c3082569ee",
     "pair_invariants": {
       "event-manifest-001#1": "cb17cf8f87c40d115fb269372c04f907947e24ed1a81f5b1062c030c48bb99d2",
@@ -33,12 +43,12 @@
     }
   },
   "results": [
-    { "trial": 1, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
-    { "trial": 1, "arm": "on_demand", "find_count": 1, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "load": true, "route_order": false, "route_violations": ["mcp_tool_call_before_load"], "oracle": true, "workspace": true, "protected_scopes": true, "accepted": false },
-    { "trial": 2, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
-    { "trial": 2, "arm": "on_demand", "find_count": 1, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "load": true, "route_order": false, "route_violations": ["unsafe_find_shell_shape"], "oracle": true, "workspace": true, "protected_scopes": true, "accepted": false },
-    { "trial": 3, "arm": "core", "surface": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true },
-    { "trial": 3, "arm": "on_demand", "find_count": 1, "first_call_argv_exact": true, "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": true, "oracle": true, "workspace": true, "protected_scopes": true, "accepted": true }
+    { "trial": 1, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": true },
+    { "trial": 1, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "retry_classification": "single_attempt", "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": false, "route_violations_raw": ["unclassified_action_before_load:4:mcp_tool_call", "unclassified_action_before_load:5:mcp_tool_call"], "route_violation_normalized": "mcp_tool_call_before_load", "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": false },
+    { "trial": 2, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": true },
+    { "trial": 2, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "retry_classification": "single_attempt", "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": false, "route_violations_raw": ["find_shell_shape_invalid:0"], "route_violation_normalized": "unsafe_find_shell_shape", "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": false },
+    { "trial": 3, "arm": "core", "surface": true, "transcript": true, "harness_valid": true, "load": true, "load_evidence": "content_echo", "core_order": true, "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": true },
+    { "trial": 3, "arm": "on_demand", "surface": true, "transcript": true, "harness_valid": true, "find_count": 1, "first_call_argv_exact": true, "first_call_hint_valid": true, "retry_classification": "single_attempt", "top1_correct": true, "returned_path_exact": true, "load": true, "load_evidence": "content_echo", "route_order": true, "route_violations_raw": [], "oracle": true, "workspace": { "passed": true, "changed": ["outputs/events.json"], "unexpected_changes": [] }, "protected_scopes": { "passed": true, "changed": [] }, "accepted": true }
   ],
   "raw_evidence_committed": false,
   "auth_copies_remaining": 0

@@ -51,7 +51,8 @@ v2 remained diagnostic after independent review invalidated its frozen identity.
 v3 through v5 were never retroactively promoted: they exposed formal-eligibility,
 shell-audit, binary-identity, preflight, and Core-control gaps that v6 closes.
 
-The [redacted artifact](artifacts/codex-skill-protocol-isolation-v6.json)
-contains bounded facts only. Raw prompts, transcripts, absolute run paths,
+The [redacted artifact](artifacts/codex-skill-protocol-isolation-v6.json) is a
+bounded projection that preserves the machine violation strings alongside
+human-normalized labels. Raw prompts, transcripts, absolute run paths,
 outputs, and authentication remain outside the repository; isolated auth copies
 remaining after the run: `0`.
