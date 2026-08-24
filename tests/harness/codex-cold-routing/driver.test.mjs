@@ -240,17 +240,17 @@ test("cumulative sed reads prove full load only after all lines are covered", ()
 
 test("exact target load classifies every compound suffix and rejects writes", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-leading-load-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\n"); const canonical = realpathSync(target);
-  const command = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && printf '\\nDONE\\n'"`;
+  const command = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && printf '\\nDONE\\n'"`;
   const event = (type, output = null, value = command) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command: value, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
   const transcript = `${event("started")}\n${event("completed", "one\ntwo\n\nDONE\n")}`;
   assert.equal(assessExactLoad(transcript, target).passed, true);
   assert.equal(assessCoreOrder(transcript, target).passed, true);
   const tailOnly = `${event("started")}\n${event("completed", "DONE\n")}`; assert.equal(assessExactLoad(tailOnly, target).passed, false);
-  const mutatingCommand = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && touch /tmp/unaudited"`;
+  const mutatingCommand = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && touch /tmp/unaudited"`;
   const mutating = `${event("started", null, mutatingCommand)}\n${event("completed", "one\ntwo\n", mutatingCommand)}`; assert.equal(assessExactLoad(mutating, target).passed, false);
-  const outsideRead = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && cat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideRead), target).passed, false);
-  const outsideReadSequence = `/bin/zsh -lc "cat ${canonical}\ncat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideReadSequence), target).passed, false);
-  const unsafeListing = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && rg --files /tmp"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", unsafeListing), target).passed, false);
+  const outsideRead = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && cat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideRead), target).passed, false);
+  const outsideReadSequence = `/bin/zsh -lc "cat '${canonical}'\ncat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideReadSequence), target).passed, false);
+  const unsafeListing = `/bin/zsh -lc "sed -n '1,240p' '${canonical}' && rg --files /tmp"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", unsafeListing), target).passed, false);
   const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
 });
 
