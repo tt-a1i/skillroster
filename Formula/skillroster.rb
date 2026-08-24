@@ -4,6 +4,7 @@ class Skillroster < Formula
   url "https://github.com/tt-a1i/skillroster.git",
       revision: "dde059ad39d9dbe9021cef0acbeb7b428afb0268"
   version "1.8.24"
+  license "Apache-2.0"
 
   depends_on "rust" => :build
 

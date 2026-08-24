@@ -30,10 +30,15 @@ install the binary from that directory (not from the current directory):
 SKILLROSTER_VERSION=1.8.24
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
+mkdir -p "$HOME/.local/bin"
 install "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}/skillroster" \
   "$HOME/.local/bin/skillroster"
+export PATH="$HOME/.local/bin:$PATH"
 skillroster --version
 ```
+
+Persist the PATH entry in the startup file for the shell that launches your
+Agent, then restart that Agent so future sessions can resolve `skillroster`.
 
 On Windows, compare `Get-FileHash .\skillroster-*.zip -Algorithm SHA256` with
 the checksum file. Extract the archive, open its versioned directory, then
@@ -54,21 +59,18 @@ installation with `skillroster --version` and `skillroster --help`.
 
 ## Homebrew
 
-The repository includes a source-building Formula. Until a public tap exists,
-clone the release tag and install the checked-in Formula:
+The public repository also acts as a source-building Homebrew tap:
 
 ```sh
-git clone https://github.com/tt-a1i/skillroster.git
-cd skillroster
-git checkout v1.8.24
-brew install --formula ./Formula/skillroster.rb
+brew tap tt-a1i/skillroster https://github.com/tt-a1i/skillroster.git
+brew install tt-a1i/skillroster/skillroster
 brew test skillroster
 ```
 
 The repository is public, so cloning the source and downloading Release
-archives do not require GitHub authentication. This is a checked-in Formula,
-not yet a published Homebrew tap. Never paste a GitHub token into the Formula
-or a command line.
+archives do not require GitHub authentication. This is a repository-backed
+custom tap, not a Homebrew/core Formula. Never paste a GitHub token into the
+Formula or a command line.
 
 ## Install or upgrade the Agent bootstrap Skill
 
