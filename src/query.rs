@@ -350,7 +350,7 @@ pub fn build_report(scan: &ScanResult) -> Report {
         agents_with_reliable_session_denominator: scan
             .coverage
             .iter()
-            .filter(|coverage| coverage.denominator_reliable)
+            .filter(|coverage| coverage.denominator_is_reliable())
             .count(),
         agents_with_session_roots: scan
             .coverage
@@ -365,7 +365,7 @@ pub fn build_report(scan: &ScanResult) -> Report {
         agents_with_limited_session_data: scan
             .coverage
             .iter()
-            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
+            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_is_reliable())
             .count(),
         agents_missing_session_roots: scan
             .coverage
@@ -882,12 +882,12 @@ pub(crate) fn usage_overview(scan: &ScanResult) -> UsageOverview {
         complete_agent_count: scan
             .coverage
             .iter()
-            .filter(|coverage| coverage.denominator_reliable)
+            .filter(|coverage| coverage.denominator_is_reliable())
             .count(),
         limited_agent_count: scan
             .coverage
             .iter()
-            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_reliable)
+            .filter(|coverage| coverage.roots_present > 0 && !coverage.denominator_is_reliable())
             .count(),
         missing_agent_count: scan
             .coverage
@@ -1097,7 +1097,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let unreliable = scan
         .coverage
         .iter()
-        .filter(|coverage| !coverage.denominator_reliable)
+        .filter(|coverage| !coverage.denominator_is_reliable())
         .collect::<Vec<_>>();
     let incomplete_count = coverage
         .supported_agent_count
@@ -1493,7 +1493,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let reliable_agents = scan
         .coverage
         .iter()
-        .filter(|coverage| coverage.denominator_reliable)
+        .filter(|coverage| coverage.denominator_is_reliable())
         .map(|coverage| coverage.agent)
         .collect::<BTreeSet<_>>();
     let now = std::time::SystemTime::now()
@@ -2919,6 +2919,7 @@ mod tests {
             discovery_truncated: false,
             first_seen_unix: Some(10),
             last_seen_unix: Some(20),
+            limitations: Some(Vec::new()),
         });
 
         let report = build_report(&scan);
@@ -2929,6 +2930,21 @@ mod tests {
             .unwrap();
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("candidate evidence only"));
+
+        scan.coverage[0].limitations = None;
+        let legacy_report = build_report(&scan);
+        assert_eq!(
+            legacy_report
+                .metrics
+                .agents_with_reliable_session_denominator,
+            0
+        );
+        assert!(
+            !legacy_report
+                .findings
+                .iter()
+                .any(|finding| finding.title == "Stale archive candidates require review")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
