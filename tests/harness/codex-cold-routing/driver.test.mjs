@@ -257,7 +257,8 @@ test("Archify transcript attempts require exact shape and lifecycle order", () =
   assert.match(evaluateArchifyReceipts("", workspace, contract).join(","), /validate_attempt_missing/u);
   const started = (id, command) => JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } });
   const completed = (id, command) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: "untrusted agent output", exit_code: 0, status: "completed" } });
-  const validateCommand = `node bin/archify.mjs validate architecture '${realpathSync(spec)}' --quality showcase --json`; const deliverCommand = `/bin/zsh -lc 'mkdir -p ${realpathSync(join(workspace, "outputs"))} && node bin/archify.mjs deliver architecture ${realpathSync(spec)} ${realpathSync(artifact)} --quality showcase --json'`;
+  const transcriptPath = (path) => realpathSync(path).replaceAll("\\", "/");
+  const validateCommand = `node bin/archify.mjs validate architecture '${transcriptPath(spec)}' --quality showcase --json`; const deliverCommand = `/bin/zsh -lc 'mkdir -p ${transcriptPath(join(workspace, "outputs"))} && node bin/archify.mjs deliver architecture ${transcriptPath(spec)} ${transcriptPath(artifact)} --quality showcase --json'`;
   const transcript = [started("validate", validateCommand), completed("validate", validateCommand), started("deliver", deliverCommand), completed("deliver", deliverCommand)].join("\n");
   assert.deepEqual(evaluateArchifyReceipts(transcript, workspace, contract), []);
   const overlapping = [started("validate", validateCommand), started("deliver", deliverCommand), completed("validate", validateCommand), completed("deliver", deliverCommand)].join("\n");
