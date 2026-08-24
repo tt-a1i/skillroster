@@ -2,7 +2,8 @@
   "schema_version": 1,
   "suite_id": "codex-skill-protocol-isolation-v2",
   "status": "failed",
-  "formal_gate_eligible": true,
+  "driver_reported_formal_gate_eligible": true,
+  "formal_gate_eligible": false,
   "protocol_decision": {
     "decision": "fix_bootstrap_or_cli_contract",
     "required_trials_per_arm": 3,
@@ -36,6 +37,7 @@
   ],
   "manual_review": {
     "trial_1_on_demand": "Find shared a compound shell command with a preceding write to /tmp/TASK; the frozen v2 ledger did not classify that side effect explicitly.",
+    "formal_eligibility": "Independent review invalidated the driver field because timeout_ms and repository source identity were not frozen.",
     "retroactive_upgrade": false
   },
   "raw_evidence_committed": false,

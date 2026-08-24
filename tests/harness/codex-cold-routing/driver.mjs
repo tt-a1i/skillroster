@@ -623,6 +623,14 @@ function run(command, args, options) {
 function canonicalPath(path) { try { return realpathSync(path); } catch { return resolve(path); } }
 function stateDigest(root) { return sha([...walk(root)].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
 
+function repositoryIdentity() {
+  const head = run("git", ["-C", REPO, "rev-parse", "HEAD"], { timeout: 30_000 });
+  const tree = run("git", ["-C", REPO, "rev-parse", "HEAD^{tree}"], { timeout: 30_000 });
+  const status = run("git", ["-C", REPO, "status", "--porcelain"], { timeout: 30_000 });
+  if (head.status !== 0 || tree.status !== 0 || status.status !== 0) fail("unable to freeze repository source identity");
+  return { commit: head.stdout.trim(), tree: tree.stdout.trim(), clean: status.stdout.trim() === "" };
+}
+
 function protectedPackage(path) {
   try {
     const stat = lstatSync(path); const state = walk(path); const specials = [...state].filter(([, digest]) => digest.startsWith("special:"));
@@ -698,6 +706,7 @@ export function setupArm(root, task, arm, options) {
 }
 
 function freezeSuite(manifest, options) {
+  const sourceIdentity = repositoryIdentity(); if (!sourceIdentity.clean) fail("formal suite requires a clean repository worktree");
   const root = mkdtempSync(join(options.runsDir, "suite-snapshot-")); const targets = join(root, "targets"); mkdirSync(targets);
   for (const name of new Set(manifest.tasks.map((task) => task.expected_skill))) cpSync(join(options.skillsRoot, name), join(targets, name), { recursive: true, dereference: true });
   const targetPackages = Object.fromEntries([...new Set(manifest.tasks.map((task) => task.expected_skill))].map((name) => { const packageRoot = join(targets, name); const script = join(packageRoot, "bin", "archify.mjs"); return [name, { package_tree_sha256: stateDigest(packageRoot), script_content_sha256: existsSync(script) ? sha(readFileSync(script)) : null }]; }));
@@ -706,14 +715,15 @@ function freezeSuite(manifest, options) {
   const manifestPath = join(root, "manifest.json"); copyFileSync(options.manifest, manifestPath);
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
-  const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
-  const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${options.reasoningEffort}\0${driverSha256}\0${parentVerifierIdentity}`);
   const trialsPerArm = manifest.trials_per_arm ?? 1;
+  const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
+  const executionContract = { model: options.model, reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs, sandbox: "workspace-write", ephemeral: true, ignore_user_config: true, arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm };
+  const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${driverSha256}\0${parentVerifierIdentity}`);
   const pairInvariants = {};
   for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) pairInvariants[trialKey(task.id, trial, trialsPerArm)] = pairInvariant(snapshotDigest, task, trial);
   const facts = {
     snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
-    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, reasoning_effort: options.reasoningEffort, driver_sha256: driverSha256,
+    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version: version.stdout.trim(), codex_version_sha256: sha(version.stdout.trim()), source_identity: sourceIdentity, execution_contract: executionContract, model: options.model, reasoning_effort: options.reasoningEffort, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
@@ -856,8 +866,9 @@ export function main(argv = process.argv.slice(2)) {
     return coreResult && onDemandResult ? { task: task.id, trial, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, trial, attribution: "pair_incomplete", cold_routing_regression: null };
   }));
   const completeSchedule = tasks.length === manifest.tasks.length && arms.length === 2 && results.length === manifest.tasks.length * trialsPerArm * 2;
-  const formalGateEligible = completeSchedule && results.every((result) => result.pair_invariant && result.surface && result.workspace && result.protected_scopes && result.outcome) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
+  const sourceIdentityAfter = repositoryIdentity(); const sourceIdentityStable = JSON.stringify(sourceIdentityAfter) === JSON.stringify(frozen.facts.source_identity);
+  const formalGateEligible = completeSchedule && sourceIdentityStable && results.every((result) => result.pair_invariant && result.surface && result.workspace && result.protected_scopes && result.outcome) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 

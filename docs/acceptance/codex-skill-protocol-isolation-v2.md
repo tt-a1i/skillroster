@@ -8,8 +8,11 @@ catalog-scale claim.
 
 ## Outcome
 
-The frozen six-run suite was formally eligible but **failed** its protocol gate.
-Core controls passed 3/3. On-demand passed 1/3. All six runs produced the exact
+The frozen six-run suite **failed** its protocol gate. Its driver reported
+`formal_gate_eligible: true`, but independent review invalidated that field:
+the snapshot omitted the configured timeout and repository source identity.
+The run remains diagnostic evidence and is not a formal gate. Core controls
+passed 3/3 and On-demand passed 1/3. All six runs produced the exact
 expected JSON, changed only the allowlisted workspace output, preserved the
 protected Skill/auth scopes, and exited normally.
 
@@ -40,7 +43,8 @@ Bootstrap description through normal catalog disclosure, while exact target
 reads appeared as standalone reads, leading reads before `&&`, or a sequence of
 read commands.
 
-v2 froze a new manifest and driver. It permits the model-visible Bootstrap
+v2 froze a new manifest and driver, but incompletely froze the execution
+contract. It permits the model-visible Bootstrap
 description to authorize Find, still requires one valid Find, exact Top-1/path,
 full target-Skill read before task action, a mechanically exact JSON oracle,
 and unchanged safety scopes.
@@ -54,6 +58,10 @@ and unchanged safety scopes.
 - Driver: `cb687834d3116e28f5dea126b9ba13e9dacdb526bc248d4e0fa78e679f041cc3`
 - Summary mode: `0600`; isolated auth copies remaining: `0`
 
+Missing from the frozen v2 snapshot: `timeout_ms`, source commit/tree, and a
+post-run source-identity comparison. v3 corrects those omissions; v2 is never
+upgraded retroactively.
+
 The [redacted artifact](artifacts/codex-skill-protocol-isolation-v2.json)
 contains bounded per-trial facts. Raw prompts, transcripts, absolute run paths,
 output files, and authentication remain outside the repository.
@@ -64,4 +72,3 @@ Do not add embeddings, reranking, a semantic router, or more routing Skills.
 Open one narrow follow-up for a safer, easier single-call Find contract, then
 repeat the complete frozen suite under a new version. Keep Core validity,
 retrieval, call shape, target load, task oracle, and safety as separate gates.
-
