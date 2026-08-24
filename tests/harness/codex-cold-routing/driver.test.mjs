@@ -16,6 +16,9 @@ const digest = async (value) => {
 
 test("default is a non-executing plan and execution requires explicit auth", () => {
   assert.equal(parseArgs([]).execute, false);
+  assert.equal(parseArgs([]).reasoningEffort, "medium");
+  assert.equal(parseArgs(["--reasoning-effort", "high"]).reasoningEffort, "high");
+  assert.throws(() => parseArgs(["--reasoning-effort", "ultra"]), /reasoning-effort/u);
   assert.throws(() => parseArgs(["--execute"]), /explicit --auth-source/u);
   assert.equal(parseArgs(["--execute", "--auth-source", "/tmp/auth.json"]).execute, true);
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);

@@ -35,14 +35,14 @@ function safeRelative(path, label = "path") {
 
 export function parseArgs(argv) {
   const options = {
-    manifest: DEFAULT_MANIFEST, task: "all", arm: "both", model: "gpt-5.6-sol",
+    manifest: DEFAULT_MANIFEST, task: "all", arm: "both", model: "gpt-5.6-sol", reasoningEffort: "medium",
     codex: "codex", bootstrap: join(REPO, "skill/skillroster/SKILL.md"),
     skillsRoot: join(homedir(), ".agents_skills"), cli: join(REPO, "target/debug/skillroster"),
     runsDir: join(tmpdir(), "skillroster-codex-transfer"), authSource: null,
     timeoutMs: 300_000, execute: false, reevaluateRoot: null, reevaluateOutput: null, summaryOutput: null,
   };
   const values = new Map([
-    ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"],
+    ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"], ["--reasoning-effort", "reasoningEffort"],
     ["--codex", "codex"], ["--bootstrap", "bootstrap"], ["--skills-root", "skillsRoot"],
     ["--cli", "cli"], ["--runs-dir", "runsDir"], ["--auth-source", "authSource"], ["--timeout-ms", "timeoutMs"],
     ["--reevaluate-root", "reevaluateRoot"], ["--reevaluate-output", "reevaluateOutput"], ["--summary-output", "summaryOutput"],
@@ -51,10 +51,11 @@ export function parseArgs(argv) {
     if (argv[index] === "--execute") { options.execute = true; index += 1; continue; }
     const key = values.get(argv[index]); const value = argv[index + 1];
     if (!key || value === undefined) fail(`unknown or incomplete argument: ${argv[index] ?? "<missing>"}`);
-    options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "model", "codex"].includes(key) ? value : resolve(value);
+    options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "model", "reasoningEffort", "codex"].includes(key) ? value : resolve(value);
     index += 2;
   }
   if (!["core", "on_demand", "both"].includes(options.arm)) fail("--arm must be core, on_demand, or both");
+  if (!["low", "medium", "high", "xhigh"].includes(options.reasoningEffort)) fail("--reasoning-effort must be low, medium, high, or xhigh");
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1_000 || options.timeoutMs > 900_000) fail("--timeout-ms must be between 1000 and 900000");
   if (options.execute && options.reevaluateRoot) fail("--execute and --reevaluate-root are mutually exclusive");
   if (options.execute && !options.authSource) fail("--execute requires an explicit --auth-source");
@@ -678,13 +679,13 @@ function freezeSuite(manifest, options) {
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
-  const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`);
+  const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${options.reasoningEffort}\0${driverSha256}\0${parentVerifierIdentity}`);
   const trialsPerArm = manifest.trials_per_arm ?? 1;
   const pairInvariants = {};
   for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) pairInvariants[trialKey(task.id, trial, trialsPerArm)] = pairInvariant(snapshotDigest, task, trial);
   const facts = {
     snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
-    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
+    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, reasoning_effort: options.reasoningEffort, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
@@ -751,7 +752,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const runEnv = { ...env };
     if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
-    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "-m", options.model, "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "-m", options.model, "-c", `model_reasoning_effort=${options.reasoningEffort}`, "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
@@ -774,7 +775,7 @@ function dryRun(manifest, options) {
   if (!tasks.length) fail(`unknown task: ${options.task}`);
   const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm];
   const trialsPerArm = manifest.trials_per_arm ?? 1;
-  return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, task_count: tasks.length, trials_per_arm: trialsPerArm, arms, run_count: tasks.length * arms.length * trialsPerArm, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
+  return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, reasoning_effort: options.reasoningEffort, task_count: tasks.length, trials_per_arm: trialsPerArm, arms, run_count: tasks.length * arms.length * trialsPerArm, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
 }
 
 export function reevaluateExistingRuns(suiteRoot, manifest) {
