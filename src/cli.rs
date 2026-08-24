@@ -139,9 +139,9 @@ pub struct ReportArgs {
     #[arg(long, value_enum, requires = "findings")]
     pub severity: Option<ReportSeverity>,
 
-    /// Maximum Finding summaries or detail rows returned.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=100))]
-    pub limit: u16,
+    /// Maximum rows returned. Defaults to 5 for compact detail and 20 otherwise.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=100))]
+    pub limit: Option<u16>,
 
     /// Zero-based offset for Finding list or detail pagination.
     #[arg(long, default_value_t = 0)]

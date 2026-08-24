@@ -144,6 +144,10 @@ fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
     );
     assert!(help.contains("--full"), "{help}");
     assert!(help.contains("exhaustive report"), "{help}");
+    assert!(
+        help.contains("Defaults to 5 for compact detail and 20 otherwise"),
+        "{help}"
+    );
 }
 
 #[test]
@@ -292,6 +296,28 @@ fn semantic_overlap_detail_is_decision_complete_for_agent_comparison() {
             .unwrap()
             .iter()
             .all(|action| action["action"] != "plan")
+    );
+    let compact_full_action = compact["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "show_full_finding")
+        .unwrap();
+    assert_eq!(
+        compact_full_action["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "report",
+                "--finding",
+                finding_id,
+                "--full",
+                "--limit",
+                "1",
+                "--json",
+            ]
+        )
     );
     let full = json_output(&run(
         &[
@@ -800,9 +826,9 @@ fn finding_drilldown_is_bounded_and_pageable() {
     assert!(first_output.stdout.len() < 20_000);
     let first = json_output(&first_output);
     assert_eq!(first["result"]["page"]["offset"], 0);
-    assert_eq!(first["result"]["page"]["limit"], 20);
-    assert_eq!(first["result"]["page"]["next_offset"], 20);
-    assert_eq!(first["result"]["items"].as_array().unwrap().len(), 20);
+    assert_eq!(first["result"]["page"]["limit"], 5);
+    assert_eq!(first["result"]["page"]["next_offset"], 5);
+    assert_eq!(first["result"]["items"].as_array().unwrap().len(), 5);
     assert_eq!(first["result"]["detail"]["mode"], "compact");
     assert!(first["result"].get("placements").is_none());
     assert!(first["result"].get("affected_placement_ids").is_none());
@@ -821,9 +847,9 @@ fn finding_drilldown_is_bounded_and_pageable() {
                 "--finding",
                 finding_id,
                 "--limit",
-                "20",
+                "5",
                 "--offset",
-                "20",
+                "5",
                 "--json",
             ]
         )
@@ -846,17 +872,31 @@ fn finding_drilldown_is_bounded_and_pageable() {
         None,
     ));
     assert_eq!(second["result"]["page"]["offset"], 20);
+    assert_eq!(second["result"]["page"]["limit"], 20);
+    assert_eq!(second["result"]["items"].as_array().unwrap().len(), 20);
     assert_ne!(
         first["result"]["items"][0]["evidence_id"],
         second["result"]["items"][0]["evidence_id"]
     );
 
-    let full_output = run(
-        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
-        None,
+    let full_action = first["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "show_full_finding")
+        .unwrap();
+    assert_eq!(
+        full_action["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--full", "--json"]
+        )
     );
+    let full_output = run_suggested_action(full_action);
     let full = json_output(&full_output);
     assert_eq!(full["result"]["detail"]["mode"], "full");
+    assert_eq!(full["result"]["page"]["limit"], 20);
     assert!(full["result"]["placements"].is_array());
     assert!(full["result"]["evidence"].is_array());
     assert!(full["result"]["affected_placement_ids"].is_array());

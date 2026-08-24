@@ -367,7 +367,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 ReportRequest::Finding {
                     id,
                     full: args.full,
-                    limit: usize::from(args.limit),
+                    limit: args.limit.map(usize::from),
                     offset: usize::try_from(args.offset)?,
                 }
             } else if args.full {
@@ -378,7 +378,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 ReportRequest::Findings {
                     category: args.category,
                     severity: args.severity,
-                    limit: usize::from(args.limit),
+                    limit: args.limit.map_or(DEFAULT_REPORT_PAGE_LIMIT, usize::from),
                     offset: usize::try_from(args.offset)?,
                 }
             } else {
@@ -2347,10 +2347,21 @@ enum ReportRequest<'a> {
     Finding {
         id: &'a str,
         full: bool,
-        limit: usize,
+        limit: Option<usize>,
         offset: usize,
     },
     Exhaustive,
+}
+
+const DEFAULT_FINDING_DETAIL_LIMIT: usize = 5;
+const DEFAULT_REPORT_PAGE_LIMIT: usize = 20;
+
+const fn finding_page_limit(full: bool, explicit: Option<usize>) -> usize {
+    match explicit {
+        Some(limit) => limit,
+        None if full => DEFAULT_REPORT_PAGE_LIMIT,
+        None => DEFAULT_FINDING_DETAIL_LIMIT,
+    }
 }
 
 fn report_command(
@@ -2365,6 +2376,7 @@ fn report_command(
         offset,
     } = request
     {
+        let limit = finding_page_limit(full, limit);
         let id = FindingId::parse(id.to_string())?;
         let stored = store
             .get_finding(&id)?
@@ -3156,13 +3168,14 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
             let returned = findings.map_or(0, |findings| findings.len() as u64);
             let mut actions = Vec::new();
             if total > returned {
+                let limit = DEFAULT_REPORT_PAGE_LIMIT.to_string();
                 actions.push(action(
                     "list_findings",
                     &[
                         "report",
                         "--findings",
                         "--limit",
-                        "20",
+                        &limit,
                         "--offset",
                         "0",
                         "--json",
@@ -3228,6 +3241,7 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
             limit,
             offset,
         } => {
+            let page_limit = finding_page_limit(full, limit);
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
             let requires_variant_decision =
@@ -3241,7 +3255,7 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                 }
                 argv.extend([
                     "--limit".to_owned(),
-                    limit.to_string(),
+                    page_limit.to_string(),
                     "--offset".to_owned(),
                     next_offset.to_string(),
                     "--json".to_owned(),
@@ -3307,21 +3321,23 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                 }
             }
             if !full {
-                let limit = limit.to_string();
-                let offset = offset.to_string();
+                let mut argv = vec![
+                    "report".to_owned(),
+                    "--finding".to_owned(),
+                    id.to_owned(),
+                    "--full".to_owned(),
+                ];
+                if let Some(limit) = limit {
+                    argv.extend(["--limit".to_owned(), limit.to_string()]);
+                }
+                if offset != 0 {
+                    argv.extend(["--offset".to_owned(), offset.to_string()]);
+                }
+                argv.push("--json".to_owned());
+                let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
                 actions.push(action(
                     "show_full_finding",
-                    &[
-                        "report",
-                        "--finding",
-                        id,
-                        "--full",
-                        "--limit",
-                        &limit,
-                        "--offset",
-                        &offset,
-                        "--json",
-                    ],
+                    &argv,
                     false,
                     false,
                     "finding_full_detail_available",
