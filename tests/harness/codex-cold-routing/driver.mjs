@@ -633,7 +633,8 @@ export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, worksp
 
 export function classifyPair(core, onDemand) {
   if (!core.harness_valid || core.task !== "succeeded" || core.load !== "loaded" || core.safety !== "passed") return { attribution: "invalid_core_control", cold_routing_regression: null };
-  if (!onDemand.harness_valid || onDemand.safety !== "passed") return { attribution: "invalid_on_demand_harness", cold_routing_regression: null };
+  if (!onDemand.harness_valid) return { attribution: "invalid_on_demand_harness", cold_routing_regression: null };
+  if (onDemand.safety !== "passed") return { attribution: "on_demand_safety_failure", cold_routing_regression: null };
   const regression = onDemand.task !== "succeeded" || onDemand.retrieval !== "retrieved" || onDemand.load !== "loaded" || onDemand.safety !== "passed" || onDemand.contract_violation;
   return { attribution: regression ? "on_demand_specific_failure" : "no_observed_regression", cold_routing_regression: regression };
 }
@@ -665,15 +666,18 @@ export function deriveProtocolDecision(results, trialsPerArm, tasks = null, pair
     const familyCoreAccepted = familyCore.filter((result) => result.outcome?.accepted === true).length;
     const familyOnDemandAccepted = familyOnDemand.filter((result) => result.outcome?.accepted === true).length;
     const familyContractFailures = familyOnDemand.filter((result) => result.outcome?.contract_violation === true || result.outcome?.load !== "loaded").length;
+    const familySafetyInvalid = familyResults.some((result) => result.outcome?.safety !== "passed");
     let familyDecision = "investigate_repeatable_on_demand_gap";
-    if (familyCoreAccepted < trialsPerArm) familyDecision = "fix_control_task_or_oracle";
+    if (familySafetyInvalid) familyDecision = "stop_invalid_safety_evidence";
+    else if (familyCoreAccepted < trialsPerArm) familyDecision = "fix_control_task_or_oracle";
     else if (familyContractFailures >= 2) familyDecision = "fix_bootstrap_or_cli_contract";
     else if (familyOnDemandAccepted === trialsPerArm
       && (pairs ? familyPairs.length === trialsPerArm && familyPairs.every((pair) => pair.gate === "passed") : familyCore.length === trialsPerArm && familyOnDemand.length === trialsPerArm)) familyDecision = "retain_current_design";
     return { family, required_trials_per_arm: trialsPerArm, pair_count: familyPairs.length, core_accepted: familyCoreAccepted, on_demand_accepted: familyOnDemandAccepted, on_demand_contract_failures: familyContractFailures, gate: familyDecision === "retain_current_design" ? "passed" : "failed", decision: familyDecision };
   });
   let decision = "investigate_repeatable_on_demand_gap";
-  if (coreAccepted < familyIds.length * trialsPerArm) decision = "fix_control_task_or_oracle";
+  if (results.some((result) => result.outcome?.safety !== "passed")) decision = "stop_invalid_safety_evidence";
+  else if (coreAccepted < familyIds.length * trialsPerArm) decision = "fix_control_task_or_oracle";
   else if (family_gates.some((gate) => gate.on_demand_contract_failures >= 2)) decision = "fix_bootstrap_or_cli_contract";
   else if (family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed")) decision = "retain_current_design";
   return { decision, required_trials_per_arm: trialsPerArm, expected_runs: familyIds.length * trialsPerArm * 2, family_count: familyIds.length, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures, family_gates, overall_gate: family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed") };

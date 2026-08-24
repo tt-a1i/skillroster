@@ -163,7 +163,7 @@ test("pair invariant is frozen from the suite snapshot and complete task input",
 });
 
 test("protocol decision applies the frozen stop conditions", () => {
-  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, load: "loaded", contract_violation: false, ...overrides } });
+  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, safety: "passed", load: "loaded", contract_violation: false, ...overrides } });
   assert.equal(deriveProtocolDecision([result("core", true), result("core", false), result("core", true)], 3).decision, "fix_control_task_or_oracle");
   const core = Array.from({ length: 3 }, () => result("core", true));
   const contractFailures = [result("on_demand", false, { load: "load_wrong" }), result("on_demand", false, { contract_violation: true }), result("on_demand", true)];
@@ -177,6 +177,16 @@ test("repeated contract failures must occur within one family", () => {
   const pairs = [{ family: "a", gate: "failed" }, { family: "b", gate: "failed" }];
   const results = [result("a", "core", true), result("a", "on_demand", false, true), result("b", "core", true), result("b", "on_demand", false, true)];
   assert.equal(deriveProtocolDecision(results, 1, tasks, pairs).decision, "investigate_repeatable_on_demand_gap");
+});
+
+test("safety-invalid evidence takes the family and global stop path", () => {
+  const result = (family, arm, safety) => ({ family, arm, outcome: { accepted: false, harness_valid: true, safety, task: "succeeded", load: "loaded", contract_violation: false } });
+  const tasks = [{ id: "safe", family: "safe" }, { id: "unsafe", family: "unsafe" }];
+  const pairs = [{ family: "safe", gate: "failed" }, { family: "unsafe", gate: "failed" }];
+  const results = [result("safe", "core", "passed"), result("safe", "on_demand", "passed"), result("unsafe", "core", "passed"), result("unsafe", "on_demand", "failed")];
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.decision, "stop_invalid_safety_evidence");
+  assert.equal(decision.family_gates.find((gate) => gate.family === "unsafe").decision, "stop_invalid_safety_evidence");
 });
 
 test("external write audit rejects redirections outside workspace and run temp", () => {
@@ -515,7 +525,7 @@ test("a failed Core control prevents cold-routing attribution", () => {
   assert.deepEqual(classifyPair({ ...good, task: "failed" }, good), { attribution: "invalid_core_control", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, { ...good, contract_violation: true }), { attribution: "on_demand_specific_failure", cold_routing_regression: true });
   assert.deepEqual(classifyPair(good, { ...good, harness_valid: false }), { attribution: "invalid_on_demand_harness", cold_routing_regression: null });
-  assert.deepEqual(classifyPair(good, { ...good, safety: "failed" }), { attribution: "invalid_on_demand_harness", cold_routing_regression: null });
+  assert.deepEqual(classifyPair(good, { ...good, safety: "failed" }), { attribution: "on_demand_safety_failure", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, good), { attribution: "no_observed_regression", cold_routing_regression: false });
 });
 

@@ -11,6 +11,7 @@
     "post_evidence_hardening": true,
     "rerun_after_hardening": false
   },
+  "attribution_phase": "pre_hardening_historical_run; pair attributions below are preserved and not retroactively recomputed",
   "source_identity_stable": true,
   "codex_executable_stable": true,
   "safety_accounting": "scoped_protected_scopes_only; extraction On-demand transcript disclosed an out_of_scope_write_to_private_tmp_TASK, so complete safety proof is unavailable",

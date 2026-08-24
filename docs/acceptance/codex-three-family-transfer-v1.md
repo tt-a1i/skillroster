@@ -53,7 +53,8 @@ and `/tmp`, granting only the unique run-owned temp directory needed by the
 Find audit; a command-visible redirection audit also reports writes outside
 the workspace/run temp. The OS sandbox is the actual confinement boundary,
 while the transcript audit is defense-in-depth. These changes are not applied
-retroactively and no model suite is rerun here.
+retroactively: the artifact's historical pair attributions are explicitly
+pre-hardening and remain unchanged. No model suite is rerun here.
 
 The result supports the deterministic fact/semantic-agent boundary for the
 script-backed family, while identifying two separate follow-ups: repair the
