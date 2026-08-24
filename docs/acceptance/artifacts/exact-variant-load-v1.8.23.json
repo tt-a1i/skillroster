@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "issue": 151,
+  "baseline_commit": "60964802c2d3881a73286321e87310b400adcb0a",
+  "candidate_commit": "71dea6b72ee4e8ba4d7276f28e70012c3ea92d9f",
+  "snapshot": {
+    "id": "scan_00000000000015f918ceb3305f81ba08",
+    "independent_skills": 260,
+    "placements": 887,
+    "isolated_state": true
+  },
+  "families": [
+    {
+      "name": "goal-crafter",
+      "variant_count": 2,
+      "exact_action_count": 2,
+      "entrypoints": [
+        {
+          "skill_id": "skill_1b0fc17a285ebc5488c29bdf3e12c996cfe94261b4b45185b05681093f2976c1",
+          "bytes": 8484,
+          "sha256": "378f4c526746255c172d0fe300ff8b741a054b042b82e1726b1caa4772a41f17"
+        },
+        {
+          "skill_id": "skill_fce502f30df488ee882d0bb49a4914bb6b3c9500f9fa63ac29512e776101018d",
+          "bytes": 7980,
+          "sha256": "5f1762d57f9dd3fecdf0168112fe8b6ff42968831155e436b3e15fe2b61f7337"
+        }
+      ],
+      "requested_identity_matched": true,
+      "content_complete": true,
+      "files_changed": false
+    },
+    {
+      "name": "humanizer-zh",
+      "variant_count": 2,
+      "exact_action_count": 2,
+      "entrypoint_bytes": [18898, 18898],
+      "entrypoint_sha256": [
+        "e0edbdbc9008644263d5573fb59beac95794e188fd99c35012bfd79e9ae4beeb",
+        "e0edbdbc9008644263d5573fb59beac95794e188fd99c35012bfd79e9ae4beeb"
+      ],
+      "observed_package_only_difference": [".gitignore"],
+      "requested_identity_matched": true,
+      "content_complete": true,
+      "files_changed": false
+    },
+    {
+      "name": "agent-session-miner",
+      "variant_count": 2,
+      "exact_action_count": 2,
+      "entrypoint_bytes": [3698, 3698],
+      "entrypoint_sha256": [
+        "cebe54a3fc8cda92f46cd08553750e609935a8e66dc1a15551b8f85ec252f1a3",
+        "cebe54a3fc8cda92f46cd08553750e609935a8e66dc1a15551b8f85ec252f1a3"
+      ],
+      "observed_package_only_difference": [".gitignore", ".git (already excluded from package fingerprint)"],
+      "requested_identity_matched": true,
+      "content_complete": true,
+      "files_changed": false
+    }
+  ],
+  "claims": {
+    "selector_bypassed_ranking": false,
+    "task_success_evaluated": false,
+    "canonical_variant_selected": false,
+    "agent_files_changed": false
+  }
+}

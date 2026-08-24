@@ -4423,6 +4423,7 @@ fn find_command(
         let selected = select_explicit_variant(ranked, variant_skill_id)?;
         let mut loaded = verified_top_skill_load(&scan_id, &scan, state_dir, &selected)?;
         if let Some(skill_id) = variant_skill_id {
+            loaded["selection"]["ranking_evidence_scope"] = json!("ranked_capability_group");
             loaded["selection"]["variant_selection"] = json!({
                 "mode": "explicit_skill_id",
                 "requested_skill_id": skill_id,
@@ -4466,7 +4467,7 @@ fn find_command(
             ),
         });
     }
-    if !load {
+    if !load && !variant_rescan_required {
         if let Some(found) = matches.first().filter(|found| found.variant_count > 1) {
             actions.extend(explicit_variant_load_actions(task, &retrieval_hints, found));
         }
@@ -5082,6 +5083,7 @@ fn verified_top_skill_load(
             "name": matched.name,
             "snapshot_id": scan_id,
             "ranking_evidence": matched.match_reasons,
+            "ranking_evidence_scope": "loaded_identity",
         },
         "content": {
             "path": placement.entrypoint,

@@ -1472,6 +1472,13 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         "rescan_required"
     );
     assert!(drifted["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert!(
+        drifted["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "load_exact_variant_for_comparison")
+    );
 }
 
 #[test]
@@ -6734,6 +6741,10 @@ fn find_loads_only_an_exposed_exact_variant_from_the_ambiguous_top_match() {
             exact["selection"]["variant_selection"]["ranked_variant_count"],
             2
         );
+        assert_eq!(
+            exact["selection"]["ranking_evidence_scope"],
+            "ranked_capability_group"
+        );
         let expected = if variant["agents"]
             .as_array()
             .unwrap()
@@ -7061,6 +7072,10 @@ fn find_load_returns_the_complete_verified_top_match_in_one_envelope() {
     let loaded = &found["result"]["loaded_skill"];
     assert_eq!(found["result"]["matches"][0]["name"], "event-manifest");
     assert_eq!(loaded["selection"]["rank"], 1);
+    assert_eq!(
+        loaded["selection"]["ranking_evidence_scope"],
+        "loaded_identity"
+    );
     assert_eq!(loaded["content"]["text"], content);
     assert_eq!(loaded["content"]["byte_length"], content.len());
     assert_eq!(

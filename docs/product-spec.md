@@ -253,9 +253,11 @@ retry with `--load --variant-skill-id <skill-id>` only for an identity exposed
 inside that current ranked group. The selector cannot name an arbitrary catalog
 Skill, bypass ranking, revive Archived content, or weaken snapshot, source,
 path, digest, UTF-8, and size checks. A successful result identifies both the
-ranked group and the explicitly loaded identity. It supplies content facts for
-the model's comparison; it does not endorse, canonicalize, mutate, or establish
-task success.
+ranked group and the explicitly loaded identity. Its `ranking_evidence` remains
+evidence for the ranked capability group and is explicitly scoped as such; it
+is not attributed to the selected package identity. It supplies content facts
+for the model's comparison; it does not endorse, canonicalize, mutate, or
+establish task success.
 
 All JSON responses use a versioned envelope:
 
