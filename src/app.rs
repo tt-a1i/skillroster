@@ -933,7 +933,17 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
         };
     }
     if let Some(blocker) = error.downcast_ref::<crate::roster_plan::RosterSafetyBlocker>() {
-        let (code, reason, skill_id, placement_ids, paths, providers, next_action) = match blocker {
+        let (
+            code,
+            reason,
+            skill_id,
+            placement_ids,
+            paths,
+            providers,
+            mutation_scopes,
+            owned_by_agent,
+            next_action,
+        ) = match blocker {
             crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
                 skill_id,
                 placement_ids,
@@ -946,7 +956,26 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 placement_ids,
                 paths,
                 Some(providers),
+                None,
+                json!(false),
                 "exclude_provider_managed_placement",
+            ),
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                skill_id,
+                placement_ids,
+                paths,
+                owned_by_agent,
+                mutation_scopes,
+            } => (
+                "roster_mutation_scope_read_only",
+                "non_mutable_placement_blocks_mutation",
+                skill_id,
+                placement_ids,
+                paths,
+                None,
+                Some(mutation_scopes),
+                json!(owned_by_agent),
+                "rescan_or_choose_mutable_placement",
             ),
             crate::roster_plan::RosterSafetyBlocker::DependentSource {
                 skill_id,
@@ -959,6 +988,8 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 placement_ids,
                 paths,
                 None,
+                None,
+                Value::Null,
                 "preserve_or_retarget_dependent_source",
             ),
         };
@@ -971,6 +1002,8 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "placement_ids": placement_ids,
                 "paths": paths,
                 "providers": providers,
+                "mutation_scopes": mutation_scopes,
+                "owned_by_agent": owned_by_agent,
                 "files_changed": false,
                 "next_action": next_action
             })),
@@ -1578,7 +1611,14 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
                 let skill_id = blocker["skill_id"].as_str()?;
                 SkillId::parse(skill_id.to_owned()).ok()?;
                 (!blocker["name"].as_str()?.trim().is_empty()).then_some(())?;
-                (blocker["reason"] == "no_owned_exact_content_to_preserve").then_some(())?;
+                match blocker["reason"].as_str()? {
+                    "no_owned_exact_content_to_preserve" => {}
+                    "untrusted_external_placement_blocks_mutation" => {
+                        let scopes = blocker["mutation_scopes"].as_array()?;
+                        (scopes.len() == 1 && scopes[0] == "untrusted_external").then_some(())?;
+                    }
+                    _ => return None,
+                }
                 (blocker["state"] == "unchanged").then_some(())?;
                 let observed_source_target =
                     if let Some(target) = blocker.get("observed_source_target") {
@@ -2272,7 +2312,9 @@ fn report_command(
                         "link_target": placement.link_target,
                         "link_status": placement.link_status,
                         "default_exposed": placement.default_exposed,
-                        "governable": placement.governable,
+                        "owned_by_agent": placement.owned_by_agent,
+                        "mutation_scope": placement.mutation_scope,
+                        "governable": placement.is_mutable(),
                         "provider": placement.provider,
                         "content_digest": placement.content_digest,
                         "fingerprint_completeness": placement.fingerprint_completeness,
@@ -2548,7 +2590,8 @@ fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &
                 .iter()
                 .map(|placement| placement.root.display().to_string())
                 .collect::<BTreeSet<_>>();
-            let governable = placements.iter().any(|placement| placement.governable);
+            let governable = placements.iter().any(|placement| placement.is_mutable());
+            let authority = placement_authority_summary(&placements);
             Some(json!({
                 "skill_id": skill_id,
                 "content_digests": content_digests,
@@ -2559,7 +2602,9 @@ fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &
                 "providers": providers,
                 "roots": roots,
                 "source": skill.metadata.source.clone(),
-                "governable": governable
+                "governable": governable,
+                "owned_by_agent": authority.owned_by_agent,
+                "mutation_scopes": authority.mutation_scopes
             }))
         })
         .collect::<Vec<_>>();
@@ -2574,6 +2619,73 @@ fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &
             "next_step": "compare_variant_content_and_choose_canonical"
         }),
     );
+}
+
+struct PlacementAuthoritySummary {
+    owned_by_agent: Option<bool>,
+    mutation_scopes: Vec<scan::MutationScope>,
+}
+
+fn placement_authority_summary(placements: &[&scan::SkillPlacement]) -> PlacementAuthoritySummary {
+    let owned_by_agent = (!placements.is_empty()
+        && placements
+            .iter()
+            .all(|placement| placement.owned_by_agent.is_some()))
+    .then(|| {
+        placements
+            .iter()
+            .any(|placement| placement.owned_by_agent == Some(true))
+    });
+    let mutation_scopes = placements
+        .iter()
+        .filter_map(|placement| placement.mutation_scope)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    PlacementAuthoritySummary {
+        owned_by_agent,
+        mutation_scopes,
+    }
+}
+
+fn read_only_placement_reason(
+    placements: &[&scan::SkillPlacement],
+) -> (&'static str, &'static str) {
+    let scopes = placements
+        .iter()
+        .filter_map(|placement| placement.mutation_scope)
+        .collect::<BTreeSet<_>>();
+    if placements
+        .iter()
+        .any(|placement| placement.mutation_scope.is_none())
+    {
+        return (
+            "mutation_scope_unknown",
+            "Rescan with the current SkillRoster before preparing a mutating Plan.",
+        );
+    }
+    if scopes == BTreeSet::from([scan::MutationScope::ProviderReadOnly]) {
+        return (
+            "provider_managed_read_only",
+            "Keep provider-managed placements read-only.",
+        );
+    }
+    if scopes == BTreeSet::from([scan::MutationScope::DurableReadOnly]) {
+        return (
+            "durable_source_read_only",
+            "The source-read permission permits inspection only; choose a mutable placement for governance.",
+        );
+    }
+    if scopes == BTreeSet::from([scan::MutationScope::UntrustedExternal]) {
+        return (
+            "untrusted_external_source",
+            "Confirm the exact source root for reading, then rescan; confirmation does not authorize mutation.",
+        );
+    }
+    (
+        "non_mutable_placements",
+        "Resolve each typed mutation scope before preparing a mutating Plan.",
+    )
 }
 
 const SEMANTIC_COMPARISON_NAME_LIMIT: usize = 160;
@@ -2670,7 +2782,8 @@ fn add_semantic_overlap_comparison(
                 .iter()
                 .filter_map(|placement| placement.provider.clone())
                 .collect::<BTreeSet<_>>();
-            let governable = placements.iter().any(|placement| placement.governable);
+            let governable = placements.iter().any(|placement| placement.is_mutable());
+            let authority = placement_authority_summary(&placements);
             let (name, name_truncated) =
                 bounded_semantic_text(&skill.name, SEMANTIC_COMPARISON_NAME_LIMIT);
             let (description, description_truncated) = bounded_semantic_optional_text(
@@ -2729,7 +2842,9 @@ fn add_semantic_overlap_comparison(
                         "agent": placement.agent.map(AgentKind::id),
                         "provider": provider,
                         "provider_truncated": provider_truncated,
-                        "governable": placement.governable,
+                        "owned_by_agent": placement.owned_by_agent,
+                        "mutation_scope": placement.mutation_scope,
+                        "governable": placement.is_mutable(),
                         "default_exposed": placement.default_exposed,
                         "link_status": placement.link_status,
                         "fingerprint_completeness": placement.fingerprint_completeness,
@@ -2766,6 +2881,8 @@ fn add_semantic_overlap_comparison(
                 "provider_count": provider_count,
                 "providers_truncated": providers_truncated,
                 "governable": governable,
+                "owned_by_agent": authority.owned_by_agent,
+                "mutation_scopes": authority.mutation_scopes,
                 "placement_count": placements.len(),
                 "readable_path_count": readable_path_count,
                 "readable_paths_truncated": readable_path_count > current_paths.paths.len(),
@@ -2807,6 +2924,7 @@ fn compact_finding_detail(mut details: Value) -> Value {
                 .unwrap_or_else(|| json!({}));
             if let Some(facts) = facts.as_object_mut() {
                 facts.remove("root_id");
+                facts.retain(|_, value| !value.is_null());
             }
             json!({
                 "evidence_id": evidence["id"],
@@ -3044,18 +3162,37 @@ fn finding_library_planning(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
-    let protected_count = scan
+    let protected = scan
         .placements
         .iter()
-        .filter(|placement| affected.contains(placement.id.as_str()) && !placement.governable)
-        .count();
-    if protected_count > 0 {
+        .filter(|placement| affected.contains(placement.id.as_str()) && !placement.is_mutable())
+        .collect::<Vec<_>>();
+    let protected_count = protected.len();
+    if !protected.is_empty() {
+        let (reason, next_step) = read_only_placement_reason(&protected);
+        let authority = placement_authority_summary(&protected);
+        let blocked_placements = protected
+            .iter()
+            .take(5)
+            .map(|placement| {
+                json!({
+                    "placement_id": placement.id,
+                    "owned_by_agent": placement.owned_by_agent,
+                    "mutation_scope": placement.mutation_scope,
+                    "provider": placement.provider
+                })
+            })
+            .collect::<Vec<_>>();
         return Some(json!({
             "supported": false,
-            "reason": "external_observed_placements",
+            "reason": reason,
             "snapshot_id": scan_id,
             "protected_placement_count": protected_count,
-            "next_step": "Keep provider-managed plugin Skills read-only; govern only Agent-owned placements."
+            "blocked_placements": blocked_placements,
+            "blocked_placements_truncated": protected_count > 5,
+            "owned_by_agent": authority.owned_by_agent,
+            "mutation_scopes": authority.mutation_scopes,
+            "next_step": next_step
         }));
     }
     let mut physical_groups =
@@ -3063,7 +3200,7 @@ fn finding_library_planning(
     for placement in scan
         .placements
         .iter()
-        .filter(|placement| affected.contains(placement.id.as_str()) && placement.governable)
+        .filter(|placement| affected.contains(placement.id.as_str()) && placement.is_mutable())
     {
         physical_groups
             .entry(placement.physical_directory_or_logical().to_path_buf())
@@ -3091,7 +3228,9 @@ fn finding_library_planning(
                     "path": placement.entrypoint,
                     "agent": placement.agent.map(AgentKind::id),
                     "default_exposed": placement.default_exposed,
-                    "governable": placement.governable,
+                    "governable": placement.is_mutable(),
+                    "owned_by_agent": placement.owned_by_agent,
+                    "mutation_scope": placement.mutation_scope,
                     "reason": reason
                 }),
             ))
@@ -3297,16 +3436,7 @@ fn finding_roster_planning(
         .exclusions
         .iter()
         .take(5)
-        .map(|exclusion| {
-            json!({
-                "agent": exclusion.agent,
-                "skill_id": exclusion.skill_id,
-                "name": exclusion.name,
-                "reason": exclusion.reason,
-                "state": "unchanged",
-                "observed_source_target": exclusion.observed_source_target
-            })
-        })
+        .map(crate::roster_plan::blocked_change_json)
         .collect::<Vec<_>>();
     if blocked_change_count > 0 {
         let blocked_skills = blocked_skill_planning(&supported.exclusions, full);
@@ -3414,6 +3544,39 @@ fn finding_roster_planning(
                         "use user-approved source-link preservation, then retry from fresh evidence; another independent blocker may still fail closed"
                     }
                 }
+            })));
+        }
+        let mutation_scopes = supported
+            .exclusions
+            .iter()
+            .flat_map(|exclusion| match exclusion.safety_blocker.as_ref() {
+                Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged { .. }) => {
+                    vec!["provider_read_only".to_owned()]
+                }
+                Some(crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                    mutation_scopes,
+                    ..
+                }) => mutation_scopes.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<BTreeSet<_>>();
+        let requires_more_than_read_confirmation = mutation_scopes.is_empty()
+            || mutation_scopes
+                .iter()
+                .any(|scope| scope != "untrusted_external");
+        if requires_more_than_read_confirmation {
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": "mutation_scope_blocks_roster_change",
+                "decision": "choose_mutable_placements_or_keep_unchanged",
+                "automatic_change_supported": false,
+                "snapshot_id": scan_id,
+                "request_field": "finding_roster_changes",
+                "mutation_scopes": mutation_scopes,
+                "blocked_change_count": blocked_change_count,
+                "blocked_changes": blocked_changes,
+                "blocked_changes_truncated": blocked_change_count > 5,
+                "next": "Provider and durable read permissions authorize inspection only; keep these placements unchanged or choose current mutable placements. Rescan when scope facts are missing."
             })));
         }
         return Ok(Some(json!({
@@ -5206,7 +5369,14 @@ fn finding_roster_safety_blocker(
 ) -> Option<crate::roster_plan::RosterSafetyBlocker> {
     exclusions
         .iter()
-        .find_map(|exclusion| exclusion.safety_blocker.clone())
+        .filter_map(|exclusion| exclusion.safety_blocker.clone())
+        .find(|blocker| match blocker {
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                mutation_scopes,
+                ..
+            } => mutation_scopes.len() != 1 || mutation_scopes[0].as_str() != "untrusted_external",
+            _ => true,
+        })
 }
 
 fn exact_duplicate_finding_scope(
@@ -5449,10 +5619,14 @@ fn normalize_agent_plan(
                 request.skill_id
             );
         }
-        if !placement.governable {
+        if !placement.is_mutable() {
             bail!(
-                "Placement {} is provider-managed and read-only; source updates are not allowed",
-                request.placement_id
+                "Placement {} has read-only mutation_scope {}; source updates require mutable",
+                request.placement_id,
+                placement
+                    .mutation_scope
+                    .map(scan::MutationScope::id)
+                    .unwrap_or("unknown")
             );
         }
         if placement.content_digest != request.current_fingerprint {
@@ -5725,10 +5899,24 @@ fn normalize_library_plan(
         {
             return Err(blocker.into());
         }
-        if all_placements.iter().any(|placement| !placement.governable) {
+        if all_placements
+            .iter()
+            .any(|placement| !placement.is_mutable())
+        {
+            let scopes = all_placements
+                .iter()
+                .filter(|placement| !placement.is_mutable())
+                .map(|placement| {
+                    placement
+                        .mutation_scope
+                        .map(scan::MutationScope::id)
+                        .unwrap_or("unknown")
+                })
+                .collect::<BTreeSet<_>>();
             bail!(
-                "Library change for {} includes provider-managed read-only placements",
-                request.skill_id
+                "Library change for {} includes read-only placements with mutation_scope {:?}",
+                request.skill_id,
+                scopes
             );
         }
         let expected_ids = all_placements
@@ -7151,7 +7339,9 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
-                "governable": placement.governable,
+                "governable": placement.is_mutable(),
+                "owned_by_agent": placement.owned_by_agent,
+                "mutation_scope": placement.mutation_scope,
                 "provider": placement.provider,
                 "fingerprint_completeness": placement.fingerprint_completeness,
                 "fingerprint_detail": placement.fingerprint_detail,
@@ -7301,6 +7491,7 @@ fn validate_roster_changes(
     plan: &PreparedPlan,
     scan: &ScanResult,
 ) -> Result<()> {
+    validate_governance_operation_mutation_scopes(plan, scan)?;
     let mut requested = std::collections::HashSet::new();
     for change in &plan.roster_changes {
         let agent = harness_agent(&change.agent)?;
@@ -7317,12 +7508,29 @@ fn validate_roster_changes(
         if !store.skill_exists(&skill_id)? {
             bail!("Skill {skill_id} is not present in the Library index");
         }
-        if !scan
+        let has_mutable_placement = scan
             .placements
             .iter()
-            .any(|placement| placement.skill_id == change.skill_id && placement.governable)
-        {
-            bail!("Skill {skill_id} is provider-managed and read-only");
+            .any(|placement| placement.skill_id == change.skill_id && placement.is_mutable());
+        let read_only_placement_remains_unchanged = change.state == "core"
+            && scan.placements.iter().any(|placement| {
+                placement.skill_id == change.skill_id
+                    && placement.agent == Some(agent)
+                    && placement.default_exposed
+            });
+        if !has_mutable_placement && !read_only_placement_remains_unchanged {
+            let scopes = scan
+                .placements
+                .iter()
+                .filter(|placement| placement.skill_id == change.skill_id)
+                .map(|placement| {
+                    placement
+                        .mutation_scope
+                        .map(scan::MutationScope::id)
+                        .unwrap_or("unknown")
+                })
+                .collect::<BTreeSet<_>>();
+            bail!("Skill {skill_id} has no mutable placement; read-only mutation_scope {scopes:?}");
         }
         if !requested.insert((change.agent.as_str(), change.skill_id.as_str())) {
             bail!(
@@ -7333,6 +7541,56 @@ fn validate_roster_changes(
         roster_state(&change.state)?;
     }
     Ok(())
+}
+
+fn validate_governance_operation_mutation_scopes(
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+) -> Result<()> {
+    let has_governance_changes = !plan.roster_changes.is_empty()
+        || !plan.source_updates.is_empty()
+        || !plan.library_changes.is_empty();
+    if !has_governance_changes || plan.operations.is_empty() {
+        return Ok(());
+    }
+    for operation in &plan.operations {
+        let mutation_paths = match operation {
+            Operation::MoveRecoverable { source, target, .. } => {
+                vec![source.as_path(), target.as_path()]
+            }
+            Operation::CreateSymlink { target, .. }
+            | Operation::WriteFile { target, .. }
+            | Operation::ReplaceFile { target, .. }
+            | Operation::RemoveSymlink { target, .. }
+            | Operation::Copy { target, .. } => vec![target.as_path()],
+            Operation::CreateDirectory { .. } => Vec::new(),
+        };
+        for mutation_path in mutation_paths {
+            let mut blocked_by_skill = BTreeMap::<&str, Vec<&scan::SkillPlacement>>::new();
+            for placement in scan.placements.iter().filter(|placement| {
+                !placement.is_mutable()
+                    && (paths_overlap(mutation_path, &placement.directory)
+                        || placement
+                            .physical_directory
+                            .as_ref()
+                            .is_some_and(|physical| paths_overlap(mutation_path, physical)))
+            }) {
+                blocked_by_skill
+                    .entry(&placement.skill_id)
+                    .or_default()
+                    .push(placement);
+            }
+            if let Some((skill_id, mut placements)) = blocked_by_skill.into_iter().next() {
+                placements.sort_by(|left, right| left.id.cmp(&right.id));
+                return Err(crate::roster_plan::read_only_blocker(skill_id, &placements).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn validate_governance_fingerprint_completeness(
@@ -7930,6 +8188,36 @@ fn action(
 mod recovery_tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn placement_with_scope(
+        id: &str,
+        skill_id: &str,
+        directory: &str,
+        mutation_scope: Option<scan::MutationScope>,
+    ) -> scan::SkillPlacement {
+        let directory = PathBuf::from(directory);
+        scan::SkillPlacement {
+            id: id.into(),
+            skill_id: skill_id.into(),
+            agent: Some(AgentKind::Codex),
+            root: PathBuf::from("/fixture/root"),
+            entrypoint: directory.join("SKILL.md"),
+            directory,
+            physical_directory: None,
+            content_digest: "legacy-digest".into(),
+            fingerprint_completeness: scan::FingerprintCompleteness::Complete,
+            fingerprint_detail: None,
+            link_target: None,
+            link_status: scan::LinkStatus::NotLink,
+            default_exposed: true,
+            owned_by_agent: mutation_scope.map(|_| true),
+            mutation_scope,
+            governable: mutation_scope == Some(scan::MutationScope::Mutable),
+            provider: None,
+            executable_files: vec![],
+            declared_name_matches_directory: Some(true),
+        }
+    }
 
     #[test]
     fn scan_detected_source_root_drift_cannot_be_promoted_back_to_active() {
@@ -8617,6 +8905,12 @@ mod recovery_tests {
             link_target: None,
             link_status: scan::LinkStatus::NotLink,
             default_exposed: governable,
+            owned_by_agent: Some(governable),
+            mutation_scope: Some(if governable {
+                scan::MutationScope::Mutable
+            } else {
+                scan::MutationScope::ProviderReadOnly
+            }),
             governable,
             provider: (!governable).then(|| "plugin@market".into()),
             executable_files: Vec::new(),
@@ -8647,7 +8941,8 @@ mod recovery_tests {
         let planning = finding_library_planning(&finding, &scan_id, &scan_id, &scan).unwrap();
 
         assert_eq!(planning["supported"], false);
-        assert_eq!(planning["reason"], "external_observed_placements");
+        assert_eq!(planning["reason"], "provider_managed_read_only");
+        assert_eq!(planning["mutation_scopes"], json!(["provider_read_only"]));
         assert_eq!(planning["protected_placement_count"], 1);
 
         let blocker = finding_roster_safety_blocker(&[crate::roster_plan::RosterChangeExclusion {
@@ -8699,6 +8994,8 @@ mod recovery_tests {
             link_target: None,
             link_status: scan::LinkStatus::NotLink,
             default_exposed: true,
+            owned_by_agent: Some(true),
+            mutation_scope: Some(scan::MutationScope::Mutable),
             governable: true,
             provider: None,
             executable_files: Vec::new(),
@@ -8793,6 +9090,8 @@ mod recovery_tests {
                 link_target: None,
                 link_status: scan::LinkStatus::NotLink,
                 default_exposed: true,
+                owned_by_agent: Some(true),
+                mutation_scope: Some(scan::MutationScope::Mutable),
                 governable: true,
                 provider: None,
                 executable_files: vec![],
@@ -8812,6 +9111,248 @@ mod recovery_tests {
             blocked["error"]["details"]["remediation"]["required_before_rescan"],
             false
         );
+    }
+
+    #[test]
+    fn apply_validation_rejects_legacy_roster_operations_on_unknown_scope() {
+        let placement_path = PathBuf::from("/fixture/root/legacy");
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::MoveRecoverable {
+                source: placement_path.clone(),
+                target: PathBuf::from("/fixture/state/backup/legacy"),
+                expected_fingerprint: "sha256:legacy".into(),
+            }],
+            roster_changes: vec![change::RosterChange {
+                agent: "codex".into(),
+                skill_id: "skill_legacy".into(),
+                state: "core".into(),
+            }],
+            source_updates: vec![],
+            library_changes: vec![],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        let scan = ScanResult {
+            placements: vec![scan::SkillPlacement {
+                id: "placement_legacy".into(),
+                skill_id: "skill_legacy".into(),
+                agent: Some(AgentKind::Codex),
+                root: PathBuf::from("/fixture/root"),
+                directory: placement_path,
+                entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
+                physical_directory: None,
+                content_digest: "legacy-digest".into(),
+                fingerprint_completeness: scan::FingerprintCompleteness::Complete,
+                fingerprint_detail: None,
+                link_target: None,
+                link_status: scan::LinkStatus::NotLink,
+                default_exposed: true,
+                owned_by_agent: None,
+                mutation_scope: None,
+                governable: true,
+                provider: None,
+                executable_files: vec![],
+                declared_name_matches_directory: Some(true),
+            }],
+            ..ScanResult::default()
+        };
+
+        let error = validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap_err();
+
+        let blocker = error
+            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+            .unwrap();
+        assert!(matches!(
+            blocker,
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                mutation_scopes,
+                ..
+            } if mutation_scopes == &["unknown"]
+        ));
+    }
+
+    #[test]
+    fn apply_validation_rejects_legacy_library_operations_on_unknown_scope() {
+        let placement_path = PathBuf::from("/fixture/root/legacy");
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::MoveRecoverable {
+                source: placement_path.clone(),
+                target: PathBuf::from("/fixture/state/backup/legacy"),
+                expected_fingerprint: "sha256:legacy".into(),
+            }],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![change::LibraryChangeAction {
+                skill_id: "skill_legacy".into(),
+                canonical_placement_id: "placement_legacy".into(),
+                placement_ids: vec!["placement_legacy".into()],
+                requested_state: "managed".into(),
+                canonical_path: placement_path.clone(),
+                library_path: None,
+            }],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        let scan = ScanResult {
+            placements: vec![placement_with_scope(
+                "placement_legacy",
+                "skill_legacy",
+                placement_path.to_str().unwrap(),
+                None,
+            )],
+            ..ScanResult::default()
+        };
+
+        let error = validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap_err();
+
+        let blocker = error
+            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+            .unwrap();
+        assert!(matches!(
+            blocker,
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                skill_id,
+                placement_ids,
+                mutation_scopes,
+                ..
+            } if skill_id == "skill_legacy"
+                && placement_ids == &["placement_legacy"]
+                && mutation_scopes == &["unknown"]
+        ));
+    }
+
+    #[test]
+    fn apply_validation_rejects_legacy_source_updates_on_unknown_scope() {
+        let placement_path = PathBuf::from("/fixture/root/legacy");
+        let entrypoint = placement_path.join("SKILL.md");
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::ReplaceFile {
+                target: entrypoint.clone(),
+                content: "replacement".into(),
+                expected_fingerprint: "sha256:legacy".into(),
+            }],
+            roster_changes: vec![],
+            source_updates: vec![change::SourceUpdateAction {
+                skill_id: "skill_legacy".into(),
+                placement_id: "placement_legacy".into(),
+                choice: "adopt".into(),
+                source: "fixture".into(),
+                from_revision: "old".into(),
+                to_revision: "new".into(),
+                current_digest: "legacy-digest".into(),
+                expected_file_fingerprint: "sha256:legacy".into(),
+                upstream_digest: "upstream-digest".into(),
+                baseline_trusted: true,
+                choice_reason: "fixture".into(),
+                target: entrypoint,
+            }],
+            library_changes: vec![],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        let scan = ScanResult {
+            placements: vec![placement_with_scope(
+                "placement_legacy",
+                "skill_legacy",
+                placement_path.to_str().unwrap(),
+                None,
+            )],
+            ..ScanResult::default()
+        };
+
+        let error = validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap_err();
+
+        let blocker = error
+            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+            .unwrap();
+        assert!(matches!(
+            blocker,
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                skill_id,
+                placement_ids,
+                mutation_scopes,
+                ..
+            } if skill_id == "skill_legacy"
+                && placement_ids == &["placement_legacy"]
+                && mutation_scopes == &["unknown"]
+        ));
+    }
+
+    #[test]
+    fn operation_scope_blocker_groups_nested_matches_by_skill() {
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::MoveRecoverable {
+                source: PathBuf::from("/fixture/root/shared"),
+                target: PathBuf::from("/fixture/state/backup/shared"),
+                expected_fingerprint: "sha256:legacy".into(),
+            }],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![change::LibraryChangeAction {
+                skill_id: "skill_a".into(),
+                canonical_placement_id: "placement_a2".into(),
+                placement_ids: vec!["placement_a2".into()],
+                requested_state: "managed".into(),
+                canonical_path: PathBuf::from("/fixture/root/shared/a2"),
+                library_path: None,
+            }],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        let scan = ScanResult {
+            placements: vec![
+                placement_with_scope(
+                    "placement_z",
+                    "skill_z",
+                    "/fixture/root/shared/z",
+                    Some(scan::MutationScope::DurableReadOnly),
+                ),
+                placement_with_scope(
+                    "placement_a2",
+                    "skill_a",
+                    "/fixture/root/shared/a2",
+                    Some(scan::MutationScope::DurableReadOnly),
+                ),
+                placement_with_scope(
+                    "placement_a1",
+                    "skill_a",
+                    "/fixture/root/shared/a1",
+                    Some(scan::MutationScope::DurableReadOnly),
+                ),
+            ],
+            ..ScanResult::default()
+        };
+
+        let error = validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap_err();
+
+        let blocker = error
+            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+            .unwrap();
+        assert!(matches!(
+            blocker,
+            crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                skill_id,
+                placement_ids,
+                ..
+            } if skill_id == "skill_a"
+                && placement_ids == &["placement_a1", "placement_a2"]
+        ));
     }
 
     #[test]
@@ -9358,15 +9899,26 @@ mod recovery_tests {
                 .to_string(),
         ];
         let exclusions = (0..11)
-            .map(|index| crate::roster_plan::RosterChangeExclusion {
-                agent: "codex".into(),
-                skill_id: format!("skill_{index:032}"),
-                name: format!("skill-{index:02}"),
-                reason: "no_owned_exact_content_to_preserve",
-                observed_source_target: Some(crate::roster_plan::test_absolute_path(&format!(
-                    "opt/root-{index:02}/pkg"
-                ))),
-                safety_blocker: None,
+            .map(|index| {
+                let skill_id = format!("skill_{index:032}");
+                let path =
+                    crate::roster_plan::test_absolute_path(&format!("opt/root-{index:02}/pkg"));
+                crate::roster_plan::RosterChangeExclusion {
+                    agent: "codex".into(),
+                    skill_id: skill_id.clone(),
+                    name: format!("skill-{index:02}"),
+                    reason: "untrusted_external_placement_blocks_mutation",
+                    observed_source_target: Some(path.clone()),
+                    safety_blocker: Some(
+                        crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+                            skill_id,
+                            placement_ids: vec![format!("placement_{index:032}")],
+                            paths: vec![path],
+                            owned_by_agent: Some(true),
+                            mutation_scopes: vec!["untrusted_external".into()],
+                        },
+                    ),
+                }
             })
             .collect::<Vec<_>>();
         let blocked = crate::roster_plan::source_confirmation_block(
@@ -9463,9 +10015,21 @@ mod recovery_tests {
             );
         }
         validate_source_confirmation_detail(Path::new(detail_path)).unwrap();
+        assert_eq!(
+            source_confirmation_detail_summary(state.path()).unwrap()["count"],
+            1
+        );
+        assert_eq!(
+            read_source_confirmation_details(state.path())
+                .unwrap()
+                .len(),
+            1
+        );
         let mut unrecognized = complete.clone();
         unrecognized["action_context_argv"] = json!(["--yes", "true"]);
         assert!(!recognized_source_confirmation_detail(&unrecognized));
+        assert_eq!(remove_source_confirmation_details(state.path()).unwrap(), 1);
+        assert!(!Path::new(detail_path).exists());
     }
 
     #[test]

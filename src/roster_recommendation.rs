@@ -764,6 +764,8 @@ mod tests {
                 link_target: None,
                 link_status: LinkStatus::NotLink,
                 default_exposed: true,
+                owned_by_agent: Some(true),
+                mutation_scope: Some(crate::scan::MutationScope::Mutable),
                 governable: true,
                 provider: None,
                 executable_files: Vec::new(),

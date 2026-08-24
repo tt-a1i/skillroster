@@ -28,7 +28,7 @@ The first complete release directly supports:
 
 Supported platforms are macOS, Linux, and Windows. WSL is treated as Linux. A platform or Agent is not declared supported until its adapter passes fixtures and a real-environment acceptance run.
 
-SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
+SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
 
 ## 3. Primary interaction
 
@@ -120,7 +120,7 @@ sources or operation targets. Before deriving operations, planning revalidates
 each captured physical source against the current logical entrypoint and stores
 those logical-entrypoint-to-physical-source bindings in the immutable Plan.
 Apply revalidates the complete binding set before entering Applying. A
-physical object shared with any provider-managed placement remains read-only,
+physical object shared with any non-mutable placement remains read-only,
 and a non-Agent source link that would be broken blocks the Plan. These
 blockers expose stable reasons, IDs, paths, and next actions in `error.details`;
 Agent callers never need to parse the human message.
@@ -226,8 +226,14 @@ path, Agent, provider, root, and governability fact together. It offers no Plan
 until the caller has compared the variants and chosen canonical content.
 Variant details keep provider, governance, and path facts bound to one identity;
 the response preserves the total count and marks bounded detail truncation.
-Provider-managed results include their plugin identity and a non-governable
-marker so Agents can route to them without proposing filesystem governance.
+Find and Finding detail keep bounded `owned_by_agent`, `mutation_scope`, and
+compatibility `governable` facts together. Provider-managed results also include
+their plugin identity. Planning remains Finding-specific: `planning.supported`
+is never true when a proposed demotion, removal, or operation would touch a
+non-governable placement. Read-only placements that remain unchanged may stay in
+the wider Finding scope. Typed reasons distinguish provider read-only, durable
+read-only, untrusted external, and legacy-unknown authority without asking the
+Agent to reconstruct policy.
 
 All JSON responses use a versioned envelope:
 

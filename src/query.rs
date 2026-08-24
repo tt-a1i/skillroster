@@ -213,6 +213,14 @@ pub struct FindMatch {
     pub providers: Vec<String>,
     /// True when at least one placement may participate in a governance Plan.
     pub governable: bool,
+    /// Whether any placement path is structurally Agent-owned. `None` means a
+    /// legacy Snapshot did not record complete ownership facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by_agent: Option<bool>,
+    /// Distinct mutation scopes across the matched placements. An empty set on
+    /// a legacy Snapshot means unknown, not mutable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation_scopes: Vec<crate::scan::MutationScope>,
     pub match_reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_channel_rank: Option<usize>,
@@ -274,6 +282,31 @@ pub struct FindVariant {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
     pub governable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by_agent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation_scopes: Vec<crate::scan::MutationScope>,
+}
+
+fn placement_authority_facts(
+    placements: &[&crate::scan::SkillPlacement],
+) -> (Option<bool>, Vec<crate::scan::MutationScope>) {
+    let owned_by_agent = (!placements.is_empty()
+        && placements
+            .iter()
+            .all(|placement| placement.owned_by_agent.is_some()))
+    .then(|| {
+        placements
+            .iter()
+            .any(|placement| placement.owned_by_agent == Some(true))
+    });
+    let mutation_scopes = placements
+        .iter()
+        .filter_map(|placement| placement.mutation_scope)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    (owned_by_agent, mutation_scopes)
 }
 
 #[derive(Clone, Debug)]
@@ -1820,7 +1853,8 @@ pub(crate) fn find_matching(
                 .collect::<Vec<_>>();
             providers.sort();
             providers.dedup();
-            let governable = placements.iter().any(|placement| placement.governable);
+            let governable = placements.iter().any(|placement| placement.is_mutable());
+            let (owned_by_agent, mutation_scopes) = placement_authority_facts(&placements);
             let variants = if variant_count > 1 {
                 variant_skill_ids
                     .iter()
@@ -1852,6 +1886,8 @@ pub(crate) fn find_matching(
                             .collect::<Vec<_>>();
                         providers.sort();
                         providers.dedup();
+                        let (owned_by_agent, mutation_scopes) =
+                            placement_authority_facts(&variant_placements);
                         Some(FindVariant {
                             skill_id: variant_id.clone(),
                             paths,
@@ -1861,7 +1897,9 @@ pub(crate) fn find_matching(
                             providers,
                             governable: variant_placements
                                 .iter()
-                                .any(|placement| placement.governable),
+                                .any(|placement| placement.is_mutable()),
+                            owned_by_agent,
+                            mutation_scopes,
                         })
                     })
                     .collect()
@@ -1879,6 +1917,8 @@ pub(crate) fn find_matching(
                 source: skill.metadata.source.clone(),
                 providers,
                 governable,
+                owned_by_agent,
+                mutation_scopes,
                 match_reasons: reasons,
                 task_channel_rank: None,
                 augmented_channel_rank: None,
@@ -3052,6 +3092,8 @@ mod tests {
                 source: None,
                 providers: Vec::new(),
                 governable: true,
+                owned_by_agent: Some(true),
+                mutation_scopes: vec![crate::scan::MutationScope::Mutable],
                 match_reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
                 task_channel_rank: None,
                 augmented_channel_rank: None,
@@ -3431,6 +3473,8 @@ mod tests {
                     link_target: None,
                     link_status: crate::scan::LinkStatus::NotLink,
                     default_exposed: true,
+                    owned_by_agent: Some(true),
+                    mutation_scope: Some(crate::scan::MutationScope::Mutable),
                     governable: true,
                     provider: None,
                     executable_files: Vec::new(),

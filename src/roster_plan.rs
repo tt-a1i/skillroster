@@ -89,6 +89,13 @@ pub enum RosterSafetyBlocker {
         paths: Vec<PathBuf>,
         providers: Vec<String>,
     },
+    MutationScopeReadOnly {
+        skill_id: String,
+        placement_ids: Vec<String>,
+        paths: Vec<PathBuf>,
+        owned_by_agent: Option<bool>,
+        mutation_scopes: Vec<String>,
+    },
     DependentSource {
         skill_id: String,
         placement_ids: Vec<String>,
@@ -103,11 +110,82 @@ impl std::fmt::Display for RosterSafetyBlocker {
                 formatter,
                 "Skill {skill_id} includes a provider-managed placement that is read-only"
             ),
+            Self::MutationScopeReadOnly {
+                skill_id,
+                mutation_scopes,
+                ..
+            } => write!(
+                formatter,
+                "Skill {skill_id} includes a read-only placement with mutation_scope {}",
+                mutation_scopes.join(", ")
+            ),
             Self::DependentSource { skill_id, .. } => write!(
                 formatter,
                 "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
             ),
         }
+    }
+}
+
+pub(crate) fn read_only_blocker(
+    skill_id: &str,
+    placements: &[&SkillPlacement],
+) -> RosterSafetyBlocker {
+    let providers = placements
+        .iter()
+        .filter_map(|placement| placement.provider.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if placements.iter().all(|placement| {
+        placement.mutation_scope == Some(crate::scan::MutationScope::ProviderReadOnly)
+    }) {
+        return RosterSafetyBlocker::ProviderManaged {
+            skill_id: skill_id.to_owned(),
+            placement_ids: placements
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            paths: placements
+                .iter()
+                .map(|placement| placement.directory.clone())
+                .collect(),
+            providers,
+        };
+    }
+    let mutation_scopes = placements
+        .iter()
+        .map(|placement| {
+            placement
+                .mutation_scope
+                .map(crate::scan::MutationScope::id)
+                .unwrap_or("unknown")
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let owned_by_agent = (!placements.is_empty()
+        && placements
+            .iter()
+            .all(|placement| placement.owned_by_agent.is_some()))
+    .then(|| {
+        placements
+            .iter()
+            .any(|placement| placement.owned_by_agent == Some(true))
+    });
+    RosterSafetyBlocker::MutationScopeReadOnly {
+        skill_id: skill_id.to_owned(),
+        placement_ids: placements
+            .iter()
+            .map(|placement| placement.id.clone())
+            .collect(),
+        paths: placements
+            .iter()
+            .map(|placement| placement.directory.clone())
+            .collect(),
+        owned_by_agent,
+        mutation_scopes,
     }
 }
 
@@ -255,7 +333,7 @@ pub fn source_confirmation_block(
     })
 }
 
-fn blocked_change_json(exclusion: &RosterChangeExclusion) -> Value {
+pub(crate) fn blocked_change_json(exclusion: &RosterChangeExclusion) -> Value {
     let mut item = json!({
         "agent": exclusion.agent,
         "skill_id": exclusion.skill_id,
@@ -265,6 +343,27 @@ fn blocked_change_json(exclusion: &RosterChangeExclusion) -> Value {
     });
     if let Some(target) = &exclusion.observed_source_target {
         item["observed_source_target"] = json!(target);
+    }
+    if let Some(blocker) = &exclusion.safety_blocker {
+        let mutation_scopes = match blocker {
+            RosterSafetyBlocker::ProviderManaged { .. } => {
+                item["owned_by_agent"] = json!(false);
+                item["mutation_scope"] = json!("provider_read_only");
+                json!(["provider_read_only"])
+            }
+            RosterSafetyBlocker::MutationScopeReadOnly {
+                owned_by_agent,
+                mutation_scopes,
+                ..
+            } => {
+                item["owned_by_agent"] = json!(owned_by_agent);
+                item["mutation_scope"] =
+                    json!((mutation_scopes.len() == 1).then(|| mutation_scopes[0].as_str()));
+                json!(mutation_scopes)
+            }
+            RosterSafetyBlocker::DependentSource { .. } => json!([]),
+        };
+        item["mutation_scopes"] = mutation_scopes;
     }
     item
 }
@@ -418,8 +517,8 @@ pub fn exclude_unpreservable_demotions(
                     .is_some_and(|agent| demoted_agents.contains(&agent))
             })
             .collect::<Vec<_>>();
-        let provider_managed_removals =
-            provider_placements_on_physical_removal(&placements, &removable).collect::<Vec<_>>();
+        let read_only_removals =
+            read_only_placements_on_physical_removal(&placements, &removable).collect::<Vec<_>>();
         let skill = scan
             .skills
             .iter()
@@ -442,27 +541,28 @@ pub fn exclude_unpreservable_demotions(
             .filter(|placement| placement.agent.is_none())
             .filter(|placement| depends_on_physical_removal(placement, &removable))
             .collect::<Vec<_>>();
-        let (reason, safety_blocker) = if !provider_managed_removals.is_empty() {
-            (
-                "provider_managed_placement_is_read_only",
-                Some(RosterSafetyBlocker::ProviderManaged {
-                    skill_id: skill_id.to_owned(),
-                    placement_ids: provider_managed_removals
-                        .iter()
-                        .map(|placement| placement.id.clone())
-                        .collect(),
-                    paths: provider_managed_removals
-                        .iter()
-                        .map(|placement| placement.directory.clone())
-                        .collect(),
-                    providers: provider_managed_removals
-                        .iter()
-                        .filter_map(|placement| placement.provider.clone())
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                }),
-            )
+        let (reason, safety_blocker) = if !read_only_removals.is_empty() {
+            let blocker = read_only_blocker(skill_id, &read_only_removals);
+            let reason = match &blocker {
+                RosterSafetyBlocker::ProviderManaged { .. } => {
+                    "provider_managed_placement_is_read_only"
+                }
+                RosterSafetyBlocker::MutationScopeReadOnly {
+                    mutation_scopes, ..
+                } if mutation_scopes == &["durable_read_only"] => {
+                    "durable_read_only_placement_blocks_mutation"
+                }
+                RosterSafetyBlocker::MutationScopeReadOnly {
+                    mutation_scopes, ..
+                } if mutation_scopes == &["untrusted_external"] => {
+                    "untrusted_external_placement_blocks_mutation"
+                }
+                RosterSafetyBlocker::MutationScopeReadOnly { .. } => {
+                    "non_mutable_placement_blocks_mutation"
+                }
+                RosterSafetyBlocker::DependentSource { .. } => unreachable!(),
+            };
+            (reason, Some(blocker))
         } else if !non_agent_source_dependencies.is_empty() {
             (
                 "non_agent_source_link_depends_on_removal",
@@ -558,25 +658,23 @@ pub fn derive(
         if placements.is_empty() {
             bail!("Skill {skill_id} has no verified placement");
         }
-        if !placements.iter().any(|placement| placement.governable) {
-            return Err(RosterSafetyBlocker::ProviderManaged {
-                skill_id: skill_id.to_owned(),
-                placement_ids: placements
-                    .iter()
-                    .map(|placement| placement.id.clone())
-                    .collect(),
-                paths: placements
-                    .iter()
-                    .map(|placement| placement.directory.clone())
-                    .collect(),
-                providers: placements
-                    .iter()
-                    .filter_map(|placement| placement.provider.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-            }
-            .into());
+        let desired = requests
+            .iter()
+            .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let read_only_placements_remain_unchanged = requests.iter().all(|request| {
+            matches!(roster_state(&request.state), Ok(RosterState::Core))
+                && agent(&request.agent).is_ok_and(|requested_agent| {
+                    placements.iter().any(|placement| {
+                        placement.agent == Some(requested_agent)
+                            && unchanged_core_exposure(placement, &skill.content_digest)
+                    })
+                })
+        });
+        if !placements.iter().any(|placement| placement.is_mutable())
+            && !read_only_placements_remain_unchanged
+        {
+            return Err(read_only_blocker(skill_id, &placements).into());
         }
         for placement in placements
             .iter()
@@ -584,10 +682,6 @@ pub fn derive(
         {
             placement.validated_physical_directory()?;
         }
-        let desired = requests
-            .iter()
-            .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
         ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
             .iter()
@@ -602,27 +696,17 @@ pub fn derive(
         for placement in &removal {
             placement.validated_physical_directory()?;
         }
-        let provider_placement_ids = provider_placements_on_physical_removal(&placements, &removal)
-            .map(|placement| placement.id.clone())
-            .collect::<Vec<_>>();
-        if !provider_placement_ids.is_empty() {
-            return Err(RosterSafetyBlocker::ProviderManaged {
-                skill_id: skill_id.to_owned(),
-                placement_ids: provider_placement_ids.clone(),
-                paths: placements
-                    .iter()
-                    .filter(|placement| provider_placement_ids.contains(&placement.id))
-                    .map(|placement| placement.directory.clone())
-                    .collect(),
-                providers: placements
-                    .iter()
-                    .filter(|placement| provider_placement_ids.contains(&placement.id))
-                    .filter_map(|placement| placement.provider.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-            }
-            .into());
+        let read_only_placement_ids =
+            read_only_placements_on_physical_removal(&placements, &removal)
+                .map(|placement| placement.id.clone())
+                .collect::<Vec<_>>();
+        if !read_only_placement_ids.is_empty() {
+            let blocked = placements
+                .iter()
+                .copied()
+                .filter(|placement| read_only_placement_ids.contains(&placement.id))
+                .collect::<Vec<_>>();
+            return Err(read_only_blocker(skill_id, &blocked).into());
         }
         let mut source = verified_real_source(&placements, &removal, &skill.content_digest);
         let mut source_fingerprint = source
@@ -697,6 +781,14 @@ pub fn derive(
             .into());
         }
         if !dependent_links.is_empty() {
+            let read_only = dependent_links
+                .iter()
+                .copied()
+                .filter(|placement| !placement.is_mutable())
+                .collect::<Vec<_>>();
+            if !read_only.is_empty() {
+                return Err(read_only_blocker(skill_id, &read_only).into());
+            }
             let source = source
                 .clone()
                 .ok_or_else(|| anyhow!("Skill {skill_id} has no verified canonical source"))?;
@@ -782,9 +874,7 @@ pub fn derive(
                 continue;
             }
             if existing.iter().any(|placement| {
-                placement.default_exposed
-                    && placement.link_status != LinkStatus::Broken
-                    && placement.content_digest == skill.content_digest
+                unchanged_core_exposure(placement, &skill.content_digest)
                     && !placement.link_target.as_ref().is_some_and(|target| {
                         removal.iter().any(|removed| target == &removed.directory)
                     })
@@ -796,6 +886,14 @@ pub fn derive(
                     "reason": "already_exposed_exact_content"
                 }));
                 continue;
+            }
+            let read_only = existing
+                .iter()
+                .copied()
+                .filter(|placement| !placement.is_mutable())
+                .collect::<Vec<_>>();
+            if !read_only.is_empty() {
+                return Err(read_only_blocker(skill_id, &read_only).into());
             }
             let source = source
                 .clone()
@@ -962,7 +1060,7 @@ fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlac
         })
 }
 
-fn provider_placements_on_physical_removal<'a>(
+fn read_only_placements_on_physical_removal<'a>(
     placements: &'a [&SkillPlacement],
     removal: &[&SkillPlacement],
 ) -> impl Iterator<Item = &'a SkillPlacement> {
@@ -971,7 +1069,7 @@ fn provider_placements_on_physical_removal<'a>(
         .map(|placement| physical_mutation_path(placement))
         .collect::<BTreeSet<_>>();
     placements.iter().copied().filter(move |placement| {
-        !placement.governable && removal_paths.contains(&physical_mutation_path(placement))
+        !placement.is_mutable() && removal_paths.contains(&physical_mutation_path(placement))
     })
 }
 
@@ -1054,12 +1152,18 @@ fn verified_real_source(
 }
 
 fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
-    placement.governable
+    placement.is_mutable()
         && placement.fingerprint_completeness == FingerprintCompleteness::Complete
         && placement.content_digest == digest
         && placement.link_target.is_none()
         && std::fs::symlink_metadata(&placement.directory)
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+}
+
+fn unchanged_core_exposure(placement: &SkillPlacement, digest: &str) -> bool {
+    placement.default_exposed
+        && placement.link_status != LinkStatus::Broken
+        && placement.content_digest == digest
 }
 
 fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
@@ -1424,6 +1528,8 @@ mod tests {
             .clone();
         provider.id = "placement_provider_fixture".into();
         provider.agent = None;
+        provider.owned_by_agent = Some(false);
+        provider.mutation_scope = Some(crate::scan::MutationScope::ProviderReadOnly);
         provider.governable = false;
         provider.provider = Some("fixture-provider".into());
         let provider_directory = provider.directory.clone();
@@ -1590,7 +1696,7 @@ mod tests {
         assert_eq!(supported.exclusions[0].name, "external");
         assert_eq!(
             supported.exclusions[0].reason,
-            "no_owned_exact_content_to_preserve"
+            "untrusted_external_placement_blocks_mutation"
         );
         assert_eq!(
             supported.exclusions[0].observed_source_target.as_deref(),
@@ -1632,6 +1738,46 @@ mod tests {
         assert!(plan.operations.is_empty());
         assert!(fs::read_dir(&state).unwrap().next().is_none());
         assert!(outside.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutable_sibling_cannot_authorize_replacing_a_read_only_core_placement() {
+        let (temp, mut snapshot, shared_skill) = shared_agent_root_fixture();
+        let codex = snapshot
+            .placements
+            .iter_mut()
+            .find(|placement| placement.agent == Some(AgentKind::Codex))
+            .unwrap();
+        codex.content_digest = "different-observed-digest".into();
+        codex.mutation_scope = Some(crate::scan::MutationScope::DurableReadOnly);
+        codex.governable = false;
+        let codex_path = codex.directory.clone();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+
+        let error = derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "codex".into(),
+                skill_id: snapshot.skills[0].id.clone(),
+                state: "core".into(),
+            }],
+        )
+        .unwrap_err();
+
+        let blocker = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+        assert!(matches!(
+            blocker,
+            RosterSafetyBlocker::MutationScopeReadOnly {
+                mutation_scopes,
+                ..
+            } if mutation_scopes == &["durable_read_only"]
+        ));
+        assert!(codex_path.join("SKILL.md").is_file());
+        assert!(shared_skill.join("SKILL.md").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

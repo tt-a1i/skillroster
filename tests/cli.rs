@@ -4822,7 +4822,10 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
             .iter()
             .all(|item| {
                 item["agent"] == "codex"
-                    && item["reason"] == "no_owned_exact_content_to_preserve"
+                    && item["reason"] == "untrusted_external_placement_blocks_mutation"
+                    && item["owned_by_agent"] == true
+                    && item["mutation_scope"] == "untrusted_external"
+                    && item["mutation_scopes"] == json!(["untrusted_external"])
                     && item["observed_source_target"]
                         .as_str()
                         .is_some_and(|path| path.starts_with(reviewed.to_str().unwrap()))
@@ -6830,6 +6833,12 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
     );
     let found = json_output(&run(&[&common[..], &["find", "fixture"]].concat(), None));
     assert_eq!(found["result"]["matches"][0]["name"], "external");
+    assert_eq!(found["result"]["matches"][0]["owned_by_agent"], true);
+    assert_eq!(
+        found["result"]["matches"][0]["mutation_scopes"],
+        json!(["durable_read_only"])
+    );
+    assert_eq!(found["result"]["matches"][0]["governable"], false);
 
     let snapshot = rescanned["result"]["snapshot_id"].as_str().unwrap();
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
@@ -6859,6 +6868,16 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
         placements
             .iter()
             .all(|placement| placement["governable"] == false)
+    );
+    assert!(
+        placements
+            .iter()
+            .any(|placement| placement["owned_by_agent"] == true)
+    );
+    assert!(
+        placements
+            .iter()
+            .all(|placement| placement["mutation_scope"] == "durable_read_only")
     );
     assert!(
         placements
@@ -6936,12 +6955,17 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&roster_change.to_string()),
     );
-    assert!(!roster_change.status.success());
-    assert!(String::from_utf8_lossy(&roster_change.stdout).contains("read-only"));
+    assert!(roster_change.status.success());
+    let roster_change: Value = serde_json::from_slice(&roster_change.stdout).unwrap();
+    assert_eq!(roster_change["result"]["files_changed"], false);
+    assert_eq!(
+        roster_change["result"]["change_summary"]["operation_count"],
+        0
+    );
     let plan_count: i64 = database
         .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(plan_count, 0);
+    assert_eq!(plan_count, 1);
 
     let stale = run_suggested_action(confirm);
     assert!(!stale.status.success());

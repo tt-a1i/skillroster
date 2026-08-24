@@ -58,6 +58,17 @@ _Avoid_: Proof, confidence
 The typed coverage of a Skill package digest: Complete, Bounded, Unreadable, or Unknown. Only Complete may authorize an exact-content governance decision; the other states remain inventory facts.
 _Avoid_: Best-effort exact hash
 
+**Placement Path Ownership**:
+Whether a placement path is structurally inside a supported Agent's Skill root.
+It does not claim ownership or endorsement of content reached through a link.
+_Avoid_: Source ownership, Trusted content
+
+**Mutation Scope**:
+A typed Snapshot fact describing whether a placement is Mutable,
+Provider-read-only, Durable-read-only, or Untrusted-external. Only Mutable may
+authorize placement mutation; a missing legacy fact remains unknown.
+_Avoid_: Governable reason, Trust level
+
 **Usage Observation**:
 A privacy-preserving bounded observation for one Skill, Agent, usage stage,
 quality, and session-source path. Unchanged observations deduplicate across
