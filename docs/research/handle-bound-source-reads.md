@@ -58,7 +58,7 @@ pathname races. `fstat()` obtains status from the open descriptor, and
 defines `O_DIRECTORY` and the security rationale for `O_NOFOLLOW`.
 
 - [POSIX `open`/`openat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html)
-- [POSIX `fstat`](https://pubs.opengroup.org/onlinepubs/009696699/functions/fstat.html)
+- [POSIX `fstat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fstat.html)
 - [POSIX `fstatat`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/fstatat.html)
 - [Linux `stat`/`fstatat`](https://man7.org/linux/man-pages/man2/lstat.2.html)
 - [Linux `openat2`](https://man7.org/linux/man-pages/man2/openat2.2.html)
@@ -117,6 +117,7 @@ the final reparse point.
 - [`FILE_ID_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info)
 - [`FILE_ATTRIBUTE_TAG_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_attribute_tag_info)
 - [Reparse-point operations](https://learn.microsoft.com/en-us/windows/win32/fileio/reparse-point-operations)
+- [`FSCTL_GET_REPARSE_POINT`](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_get_reparse_point)
 - [`OpenFileById`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-openfilebyid)
 
 This is not the same API shape as POSIX `openat`: ordinary `CreateFileW` takes
@@ -128,7 +129,10 @@ varies. Directory enumeration can return file IDs through the official
 [`FILE_ID_EXTD_DIR_INFO`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_extd_dir_info)
 structure, but a backend still has to open by ID, reject unsupported
 filesystems, inspect reparse tags, and verify the returned handle before
-consuming it.
+consuming it. For a symlink/reparse entry, target spelling must come from
+[`FSCTL_GET_REPARSE_POINT`](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_get_reparse_point)
+via `DeviceIoControl` on that already-verified handle; reopening the entry by
+parent pathname after enumeration is not handle-bound.
 
 Windows Native System Services document `NtCreateFile` with a
 `RootDirectory` handle and relative path names, plus `FILE_OPEN_BY_FILE_ID`.
@@ -269,11 +273,22 @@ symlink target spelling; its versioned routing content identity excludes only
 the package-root `.gitignore`. A bound backend must preserve those exact inputs:
 
 - regular-file bytes come from the already-open file handle;
-- POSIX symlink target spelling comes from `readlinkat()` relative to the bound
-  parent directory (see the current POSIX
-  [`readlink`/`readlinkat` function page](https://pubs.opengroup.org/onlinepubs/9799919799/functions/readlink.html));
-- Windows reparse/symlink data is read and classified without following the
-  reparse point, using the existing scanner's target-spelling policy;
+- Linux symlink target spelling can be bound to the symlink object itself:
+  open the entry with `openat(parent_fd, name, O_PATH | O_NOFOLLOW)`, then use
+  `readlinkat(link_fd, "", ...)`. Linux documents both the `O_PATH` symlink fd
+  behavior and the empty-path form in [`readlinkat(2)`](https://man7.org/linux/man-pages/man2/readlinkat.2.html)
+  and [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html).
+- Darwin can use its `O_SYMLINK` open mode plus `freadlink(fd, ...)` on macOS
+  13+; Apple's XNU source provides [`O_SYMLINK` in `fcntl.h`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h),
+  the [`freadlink(2)` entry](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/freadlink.2),
+  and the [`freadlink` syscall definition](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/syscalls.master).
+  Older Darwin releases or filesystems without this capability must mark a
+  symlink-containing handle-bound fingerprint incomplete/unsupported/fail
+  closed; they must not fall back to parent-relative `readlinkat` or a path
+  reopen and label it bound.
+- Windows reparse/symlink data must be read and classified without following
+  the reparse point, using `FSCTL_GET_REPARSE_POINT` on the verified handle and
+  the existing scanner's target-spelling policy;
 - the existing path separators, delimiters, excluded `.gitignore` rule,
   `digest_algorithm` value, and completeness semantics remain unchanged.
 
@@ -361,12 +376,20 @@ Deterministic future tests should include:
 
 - rename/retarget after root and child directory opens;
 - final and intermediate symlink insertion, deletion, and escape;
+- symlink replacement between directory enumeration and target read: a
+  parent-relative `readlinkat(parent_fd, name)` result must never be labelled
+  handle-bound;
+- Linux `O_PATH|O_NOFOLLOW` symlink fd plus empty-path `readlinkat` after
+  pathname retarget; Darwin `O_SYMLINK` plus `freadlink` where available, and
+  explicit unsupported/incomplete behavior on older or unsupported systems;
 - same-size, same-mtime content replacement;
 - deletion and replacement between enumeration and child open;
 - hard links, directory reorder, depth/entry/size bounds, and special files;
 - Linux `openat2` unavailable/unsupported and macOS stronger flags unavailable;
-- Windows reparse tags, file-ID mismatch/reuse, share violations, NTFS/ReFS,
-  unsupported filesystem behavior, and relative native-open failure;
+- Windows reparse tags read from a verified `FILE_FLAG_OPEN_REPARSE_POINT`
+  handle via `FSCTL_GET_REPARSE_POINT`, file-ID mismatch/reuse, share
+  violations, NTFS/ReFS, unsupported filesystem behavior, and relative
+  native-open failure;
 - temporary `--source-root` with one root bound and one root unsupported;
 - digest and executable-discovery outputs proving no pathname reopen;
 - a negative test that a path-bound result is never labelled handle-bound.
