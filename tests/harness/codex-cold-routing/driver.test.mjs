@@ -556,3 +556,90 @@ test("sealed transfer fixture keeps three distinct capability families and six s
   assert.equal(fixture.tasks.length * 2 * fixture.trials_per_arm, 6);
   assert.equal(new Set(fixture.tasks.map((task) => task.family)).size, 3);
 });
+
+test("fresh symmetric transfer fixture is sealed to two families and four planned runs", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v3.json", import.meta.url)));
+  validateManifest(fixture);
+  assert.equal(fixture.suite_id, "codex-symmetric-transfer-v1");
+  assert.equal(fixture.formal_protocol_gate, true);
+  assert.equal(fixture.trials_per_arm, 1);
+  assert.deepEqual(fixture.tasks.map((task) => task.family), ["symmetric_instruction_rewriting", "symmetric_reference_extraction"]);
+  assert.equal(fixture.tasks.length * 2 * fixture.trials_per_arm, 4);
+  assert.equal(new Set(fixture.tasks.map((task) => task.family)).size, 2);
+  for (const task of fixture.tasks) {
+    assert.equal(task.one_call_load, true);
+    assert.equal(task.required_find_calls, 1);
+    assert.equal(task.allowed_changed_paths.length, 1);
+    assert.equal(Object.keys(task.workspace_files).length, 1);
+    assert.equal(task.prompt.includes(task.expected_skill), false);
+  }
+  const old = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v2.json", import.meta.url)));
+  assert.equal(fixture.tasks.some((task) => old.tasks.some((candidate) => candidate.prompt === task.prompt)), false);
+  assert.deepEqual(fixture.tasks.map((task) => task.expected_skill).sort(), ["domain-extractor-v2", "zh-rewrite-v2"]);
+});
+
+test("fresh target packages carry the identical conditional activation contract", () => {
+  const root = fileURLToPath(new URL("../../fixtures/codex-protocol-skills-v3/", import.meta.url));
+  const packages = ["zh-rewrite-v2", "domain-extractor-v2"].map((name) => readFileSync(join(root, name, "SKILL.md"), "utf8"));
+  const descriptions = packages.map((text) => text.match(/^description:\s*"([^"]+)"$/mu)?.[1] ?? null);
+  assert.ok(descriptions.every(Boolean));
+  const activationContract = "Activation contract: when this Skill is directly visible as Core, load the complete SKILL.md in one standalone read before task work; when a verified activation result already supplied this exact complete content, do not read SKILL.md again.";
+  assert.deepEqual(descriptions.map((description) => description.match(/Activation contract:.*$/u)?.[0] ?? null), [activationContract, activationContract]);
+  for (const text of packages) {
+    assert.match(text, /when this Skill is directly visible as Core, load the\s+complete `SKILL\.md` in one standalone read before task work/u);
+    assert.match(text, /when a verified\s+activation result already supplied this exact complete content, do not read\s+`SKILL\.md` again/u);
+  }
+});
+
+test("fresh Core and On-demand setup copies the same target package bytes", () => {
+  const repo = fileURLToPath(new URL("../../../", import.meta.url));
+  const skillsRoot = join(repo, "tests/fixtures/codex-protocol-skills-v3");
+  const task = { expected_skill: "domain-extractor-v2", workspace_files: { "memo.txt": "fixture\n" } };
+  const root = mkdtempSync(join(tmpdir(), "codex-symmetric-package-copy-"));
+  const core = setupArm(join(root, "core"), task, "core", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
+  const onDemand = setupArm(join(root, "on-demand"), task, "on_demand", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
+  try {
+    const corePackage = snapshotWorkspace(join(core.codexHome, "skills", task.expected_skill));
+    const onDemandPackage = snapshotWorkspace(join(onDemand.root ?? join(root, "on-demand"), "source", task.expected_skill));
+    assert.deepEqual([...corePackage], [...onDemandPackage]);
+    assert.equal([...corePackage.values()].some((value) => value.startsWith("special:")), false);
+  } finally {
+    rmSync(core.temp, { recursive: true, force: true });
+    rmSync(onDemand.temp, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh rewrite oracle accepts harmless date spacing but rejects invented claims", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v3.json", import.meta.url)));
+  const task = fixture.tasks.find((candidate) => candidate.family === "symmetric_instruction_rewriting");
+  const root = mkdtempSync(join(tmpdir(), "codex-symmetric-rewrite-oracle-"));
+  mkdirSync(join(root, "outputs"));
+  try {
+    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
+    assert.equal(evaluateOracle(root, task.oracle).passed, true);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间，开放测试后另外 12 人加入。\n");
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /开放测试后/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh extraction oracle uses the reference relation vocabulary and exact values", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v3.json", import.meta.url)));
+  const task = fixture.tasks.find((candidate) => candidate.family === "symmetric_reference_extraction");
+  const reference = readFileSync(new URL("../../fixtures/codex-protocol-skills-v3/domain-extractor-v2/references/domain-schema.md", import.meta.url), "utf8");
+  assert.match(reference, /only\s+allowed relation type[\s\S]*`emits-record`/u);
+  const root = mkdtempSync(join(tmpdir(), "codex-symmetric-extraction-oracle-"));
+  mkdirSync(join(root, "outputs"));
+  try {
+    writeFileSync(join(root, task.oracle.path), `${JSON.stringify(task.oracle.json_equals)}\n`);
+    assert.equal(evaluateOracle(root, task.oracle).passed, true);
+    const altered = structuredClone(task.oracle.json_equals);
+    altered.terms[0].relations[0].type = "sends-record";
+    writeFileSync(join(root, task.oracle.path), `${JSON.stringify(altered)}\n`);
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /json_equals:mismatch/u);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
