@@ -594,18 +594,24 @@ test("fresh target packages carry the identical conditional activation contract"
 test("fresh Core and On-demand setup copies the same target package bytes", () => {
   const repo = fileURLToPath(new URL("../../../", import.meta.url));
   const skillsRoot = join(repo, "tests/fixtures/codex-protocol-skills-v3");
-  const task = { expected_skill: "domain-extractor-v2", workspace_files: { "memo.txt": "fixture\n" } };
   const root = mkdtempSync(join(tmpdir(), "codex-symmetric-package-copy-"));
-  const core = setupArm(join(root, "core"), task, "core", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
-  const onDemand = setupArm(join(root, "on-demand"), task, "on_demand", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
   try {
-    const corePackage = snapshotWorkspace(join(core.codexHome, "skills", task.expected_skill));
-    const onDemandPackage = snapshotWorkspace(join(onDemand.root ?? join(root, "on-demand"), "source", task.expected_skill));
-    assert.deepEqual([...corePackage], [...onDemandPackage]);
-    assert.equal([...corePackage.values()].some((value) => value.startsWith("special:")), false);
+    for (const expected_skill of ["domain-extractor-v2", "zh-rewrite-v2"]) {
+      const task = { expected_skill, workspace_files: { "input.txt": "fixture\n" } };
+      const caseRoot = join(root, expected_skill);
+      const core = setupArm(join(caseRoot, "core"), task, "core", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
+      const onDemand = setupArm(join(caseRoot, "on-demand"), task, "on_demand", { skillsRoot, bootstrap: join(repo, "skill/skillroster/SKILL.md") });
+      try {
+        const corePackage = snapshotWorkspace(join(core.codexHome, "skills", task.expected_skill));
+        const onDemandPackage = snapshotWorkspace(join(caseRoot, "on-demand", "source", task.expected_skill));
+        assert.deepEqual([...corePackage], [...onDemandPackage]);
+        assert.equal([...corePackage.values()].some((value) => value.startsWith("special:")), false);
+      } finally {
+        rmSync(core.temp, { recursive: true, force: true });
+        rmSync(onDemand.temp, { recursive: true, force: true });
+      }
+    }
   } finally {
-    rmSync(core.temp, { recursive: true, force: true });
-    rmSync(onDemand.temp, { recursive: true, force: true });
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -618,6 +624,8 @@ test("fresh rewrite oracle accepts harmless date spacing but rejects invented cl
   try {
     writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
     assert.equal(evaluateOracle(root, task.oracle).passed, true);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日关闭测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:开放\\s\*测试/u);
     writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间，开放测试后另外 12 人加入。\n");
     assert.match(evaluateOracle(root, task.oracle).failures.join(","), /开放测试后/u);
   } finally {
