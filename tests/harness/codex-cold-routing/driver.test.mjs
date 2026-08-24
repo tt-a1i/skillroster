@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -48,10 +48,11 @@ test("default is a non-executing plan and execution requires explicit auth", () 
 });
 
 test("Codex execution freezes temp confinement and grants only the unique run temp", () => {
-  const policy = codexSandboxPolicy("/tmp/run-temp");
-  assert.deepEqual(policy, { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: ["/tmp/run-temp"] });
-  const args = codexExecutionArgs({ model: "gpt-5.6-luna", reasoningEffort: "medium" }, { temp: "/tmp/run-temp", workspace: "/tmp/workspace" }, "task");
-  assert.ok(args.includes("--add-dir")); assert.ok(args.includes("/tmp/run-temp"));
+  const runTemp = resolve("/tmp/run-temp");
+  const policy = codexSandboxPolicy(runTemp);
+  assert.deepEqual(policy, { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: [runTemp] });
+  const args = codexExecutionArgs({ model: "gpt-5.6-luna", reasoningEffort: "medium" }, { temp: runTemp, workspace: resolve("/tmp/workspace") }, "task");
+  assert.ok(args.includes("--add-dir")); assert.ok(args.includes(runTemp));
   assert.ok(args.includes("sandbox_workspace_write.exclude_tmpdir_env_var=true"));
   assert.ok(args.includes("sandbox_workspace_write.exclude_slash_tmp=true"));
 });
@@ -194,9 +195,9 @@ test("external write audit rejects redirections outside workspace and run temp",
   const safe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf ok > outputs/result.txt", aggregated_output: "", exit_code: 0, status: "completed" } });
   const unsafe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf secret > /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
   assert.equal(assessExternalWrites(safe, workspace, temp).passed, true);
-  assert.match(assessExternalWrites(unsafe, workspace, temp).violations.join("\n"), /private\/tmp\/TASK/u);
+  assert.equal(assessExternalWrites(unsafe, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
   const commandWrite = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "mkdir -p /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
-  assert.match(assessExternalWrites(commandWrite, workspace, temp).violations.join("\n"), /private\/tmp\/TASK/u);
+  assert.equal(assessExternalWrites(commandWrite, workspace, temp).violations.includes(`external_write_target:${resolve("/private/tmp/TASK")}`), true);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
