@@ -434,6 +434,12 @@ pub struct SessionCoverage {
     pub limitations: Option<Vec<SessionCoverageLimitation>>,
 }
 
+impl SessionCoverage {
+    pub fn denominator_is_reliable(&self) -> bool {
+        self.limitations.is_some() && self.denominator_reliable
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
     pub roots: Vec<RootObservation>,

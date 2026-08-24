@@ -2379,9 +2379,11 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     details["agent"] = json!(coverage.agent.id());
     let legacy = coverage.limitations.is_none();
     let limitations = coverage.limitations.as_deref().unwrap_or_default();
+    let denominator_reliable = coverage.denominator_is_reliable();
+    details["denominator_reliable"] = json!(denominator_reliable);
     details["limitation_state"] = json!(if legacy {
         "legacy_unknown"
-    } else if coverage.denominator_reliable {
+    } else if denominator_reliable {
         "complete"
     } else if limitations.is_empty() {
         "incomplete_unknown"
@@ -2389,7 +2391,7 @@ fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
         "limited"
     });
     details["actionability"] =
-        session_coverage_actionability(legacy, coverage.denominator_reliable, limitations)?;
+        session_coverage_actionability(legacy, denominator_reliable, limitations)?;
     Ok(details)
 }
 
@@ -2462,6 +2464,7 @@ fn normalize_public_coverage_details(details: &mut Value) -> Result<()> {
         }
     }
     if !object.contains_key("limitations") {
+        object.insert("denominator_reliable".into(), json!(false));
         object.insert("limitation_state".into(), json!("legacy_unknown"));
         object.insert(
             "actionability".into(),
@@ -4560,7 +4563,7 @@ fn session_finding_coverage(
                 .iter()
                 .find(|coverage| coverage.agent == agent)
             {
-                Some(coverage) if coverage.denominator_reliable => {
+                Some(coverage) if coverage.denominator_is_reliable() => {
                     reliable_agents.push(agent.id());
                 }
                 Some(_) => limited_agents.push(agent.id()),
@@ -8461,7 +8464,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             scan_id,
             &format!("coverage:{}", coverage.agent.id()),
             EvidenceKind::Coverage,
-            if coverage.denominator_reliable {
+            if coverage.denominator_is_reliable() {
                 EvidenceQuality::Observed
             } else {
                 EvidenceQuality::Unknown
@@ -9581,6 +9584,14 @@ mod recovery_tests {
                 .unwrap()
                 .contains(&json!("cursor"))
         );
+        scan.coverage[0].denominator_reliable = true;
+        scan.coverage[0].limitations = None;
+        let legacy_usage = finding_coverage(
+            &coverage_finding(crate::query::FindingCoverageBasis::SessionUsage),
+            &scan,
+        );
+        assert_eq!(legacy_usage["reliable_agents"], json!([]));
+        assert_eq!(legacy_usage["limited_agents"], json!(["codex"]));
 
         scan.roots.extend([
             session_root(
@@ -9698,6 +9709,7 @@ mod recovery_tests {
         coverage.limitations = None;
         let legacy = session_coverage_details(&coverage).unwrap();
         assert_eq!(legacy["limitation_state"], "legacy_unknown");
+        assert_eq!(legacy["denominator_reliable"], false);
         assert_eq!(
             legacy["actionability"]["same_boundary_expected_codes"],
             json!([])

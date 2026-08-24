@@ -663,6 +663,7 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
             .filter(|evidence| evidence["kind"] == "coverage")
             .all(|evidence| {
                 evidence["details"]["limitation_state"] == "legacy_unknown"
+                    && evidence["details"]["denominator_reliable"] == false
                     && evidence["details"]["actionability"]["inference_boundary"]
                         ["usage_denominator_supported"]
                         == false
