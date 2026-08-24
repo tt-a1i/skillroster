@@ -622,15 +622,19 @@ test("fresh rewrite oracle accepts harmless date spacing but rejects invented cl
   const root = mkdtempSync(join(tmpdir(), "codex-symmetric-rewrite-oracle-"));
   mkdirSync(join(root, "outputs"));
   try {
-    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
+    writeFileSync(join(root, task.oracle.path), "移动端工作台计划于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
     assert.equal(evaluateOracle(root, task.oracle).passed, true);
-    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日关闭测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
+    writeFileSync(join(root, task.oracle.path), "11月14日，移动端工作台计划开放测试，首轮将上线语音速记和离线搜索。36名试用用户中，24人反馈离线搜索缩短了查找时间。\n");
+    assert.equal(evaluateOracle(root, task.oracle).passed, true);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台计划于11月14日开放测试，首轮包括语音速记与离线搜索。36名用户参与试用，其中24人反馈离线搜索缩短了查找时间。\n");
+    assert.equal(evaluateOracle(root, task.oracle).passed, true);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台计划于 11月14日关闭测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
     assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
     writeFileSync(join(root, task.oracle.path), "移动端工作台拟于11月14日开放测试，首轮未包含语音速记和离线搜索。试用共有36人，其中24人并未表示离线搜索缩短了查找时间。\n");
     assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
-    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间，开放测试后另外 12 人加入。\n");
+    writeFileSync(join(root, task.oracle.path), "移动端工作台计划于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间，开放测试后另外 12 人加入。\n");
     assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
-    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。预计12月再新增50人。\n");
+    writeFileSync(join(root, task.oracle.path), "移动端工作台计划于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。预计12月再新增50人。\n");
     assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
