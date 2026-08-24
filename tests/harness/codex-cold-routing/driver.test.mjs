@@ -1,0 +1,268 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest } from "./driver.mjs";
+
+const digest = async (value) => {
+  const { createHash } = await import("node:crypto"); return createHash("sha256").update(value).digest("hex");
+};
+
+test("default is a non-executing plan and execution requires explicit auth", () => {
+  assert.equal(parseArgs([]).execute, false);
+  assert.throws(() => parseArgs(["--execute"]), /explicit --auth-source/u);
+  assert.equal(parseArgs(["--execute", "--auth-source", "/tmp/auth.json"]).execute, true);
+  assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
+});
+
+test("runs directory cannot hide a repository target behind a symlink", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-runs-link-")); const alias = join(root, "runs"); const repo = new URL("../../../", import.meta.url).pathname;
+  symlinkSync(repo, alias, "dir"); assert.throws(() => main(["--runs-dir", alias]), /resolves inside the repository/u);
+});
+
+test("manifest is restricted to the two-family Codex transfer contract", () => {
+  const manifest = { schema_version: 1, harness: "codex-transfer", tasks: [
+    { id: "a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+    { id: "b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+  ] };
+  assert.equal(validateManifest(manifest), manifest);
+  assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [manifest.tasks[0]] }), /unsupported/u);
+});
+
+test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
+  const promptInput = (names) => JSON.stringify([{ type: "message", role: "developer", content: [{ type: "input_text", text: `<skills_instructions>\n### Available skills\n${names.map((name) => `- ${name}: description (file: /tmp/${name}/SKILL.md)`).join("\n")}\n</skills_instructions>` }, { type: "input_text", text: "## Examples\n- Pipes: |\n- Todoist: unrelated" }] }]);
+  const system = ["imagegen", "openai-docs", "plugin-creator", "skill-creator", "skill-installer"];
+  assert.deepEqual(extractVisibleSkills(promptInput([...system, "humanizer-zh"])), [...system, "humanizer-zh"].sort());
+  assert.equal(assessSkillSurface(extractVisibleSkills(promptInput([...system, "humanizer-zh"])), "core", "humanizer-zh").passed, true);
+  assert.equal(assessSkillSurface(extractVisibleSkills(promptInput([...system, "skillroster"])), "on_demand", "humanizer-zh").passed, true);
+  assert.deepEqual(extractVisibleSkills(promptInput([...system, "vendor:skill"])).includes("vendor:skill"), true);
+  const polluted = assessSkillSurface(extractVisibleSkills(promptInput([...system, "skillroster", "other"])), "on_demand", "humanizer-zh");
+  assert.equal(polluted.passed, false); assert.deepEqual(polluted.unexpected, ["other"]);
+});
+
+test("SkillRoster seam uses the real envelope and global-option ordering", () => {
+  const envelope = JSON.stringify({ schema_version: 1, ok: true, command: "find", result: { ranking_strategy: "task_hint_reciprocal_rank_fusion", matches: [{ name: "humanizer-zh", skill_id: "skill_hash", paths: ["/tmp/source/humanizer-zh/SKILL.md"], roster_state: "on_demand", agents: [] }] } });
+  const parsed = parseFindEnvelope(envelope); assert.equal(parsed.skill, "humanizer-zh"); assert.equal(parsed.path, "/tmp/source/humanizer-zh/SKILL.md"); assert.equal(parsed.roster_state, "on_demand");
+  assert.throws(() => parseFindEnvelope(JSON.stringify({ schema_version: 1, ok: true, command: "find", result: { ranking_strategy: "single_lexical_channel", matches: [] } })), /reciprocal_rank_fusion/u);
+  const paths = { home: "/tmp/home", state: "/tmp/state" }; const task = { prompt: "完整任务", hint: "agent hint" };
+  assert.deepEqual(skillRosterScanArgs(paths, "/tmp/source"), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "scan", "--source-root", "/tmp/source"]);
+  assert.deepEqual(skillRosterFindArgs(paths, task), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "完整任务", "--hint", "agent hint"]);
+});
+
+test("Find audit preserves exact argument mismatch and retry classification", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-find-audit-")); const target = join(root, "source", "humanizer-zh", "SKILL.md");
+  mkdirSync(join(root, "source", "humanizer-zh"), { recursive: true }); writeFileSync(target, "skill");
+  const expected = { task: "完整任务", skill: "humanizer-zh", path: target };
+  const good = { kind: "find_call", argv_shape_valid: true, envelope_valid: true, task_sha256: await digest(expected.task), hint_count: 1, hint_nonempty: true, hint_sha256: [await digest("hint")], exit_code: 0, top1_skill: expected.skill, top1_path_sha256: await digest(realpathSync(target)) };
+  const clean = parseFindAudit(`${JSON.stringify(good)}\n`, expected);
+  assert.equal(clean.first_call_task_complete, true); assert.equal(clean.returned_path_exact, true); assert.equal(clean.retry_classification, "single_attempt"); assert.equal(clean.contract_violation, false);
+  const bad = { ...good, task_sha256: await digest(""), hint_count: 0, hint_nonempty: false, hint_sha256: [], exit_code: 2, top1_skill: null, top1_path_sha256: null };
+  const recovered = parseFindAudit(`${JSON.stringify(bad)}\n${JSON.stringify(good)}\n`, expected);
+  assert.equal(recovered.top1_correct, true); assert.equal(recovered.retry_classification, "recovered_after_argument_mismatch"); assert.equal(recovered.contract_violation, true);
+  const invalidEnvelope = parseFindAudit(`${JSON.stringify({ ...good, envelope_valid: false })}\n`, expected);
+  assert.equal(invalidEnvelope.top1_correct, false); assert.equal(invalidEnvelope.contract_violation, true);
+});
+
+test("Find audit canonicalizes symlinked path spellings", { skip: process.platform === "win32" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-find-path-")); const real = join(root, "real"); const alias = join(root, "alias");
+  mkdirSync(real); symlinkSync(real, alias, "dir"); const target = join(real, "SKILL.md"); writeFileSync(target, "skill");
+  const expected = { task: "任务", skill: "sample", path: join(alias, "SKILL.md") };
+  const call = { kind: "find_call", argv_shape_valid: true, envelope_valid: true, task_sha256: await digest(expected.task), hint_count: 1, hint_nonempty: true, hint_sha256: [await digest("hint")], exit_code: 0, top1_skill: expected.skill, top1_path_sha256: await digest(realpathSync(target)) };
+  assert.equal(parseFindAudit(`${JSON.stringify(call)}\n`, expected).returned_path_exact, true);
+});
+
+test("wrapper source is allowlisted and records hashes rather than raw task or hint", () => {
+  const source = findWrapperSource();
+  assert.match(source, /permits only/u); assert.match(source, /task_sha256/u); assert.match(source, /hint_sha256/u);
+  assert.doesNotMatch(source, /task_raw|hint_raw/u);
+  const root = mkdtempSync(join(tmpdir(), "codex-find-wrapper-")); const path = join(root, "skillroster.mjs"); writeFileSync(path, source);
+  const checked = spawnSync(process.execPath, ["--check", path], { encoding: "utf8" });
+  assert.equal(checked.status, 0, checked.stderr);
+});
+
+test("post-hoc workspace audit treats every sidecar outside exact allowlist as a safety failure", () => {
+  const before = new Map([["input.txt", "a"]]);
+  const after = new Map([["input.txt", "a"], ["outputs/result.md", "b"], ["outputs/visual-check.json", "c"]]);
+  const assessed = assessWorkspaceChanges(before, after, ["input.txt"], ["outputs/result.md"]);
+  assert.equal(assessed.passed, false); assert.deepEqual(assessed.unexpected_changes, ["outputs/visual-check.json"]);
+});
+
+test("workspace snapshot never follows a symlink even when its path is allowlisted", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-workspace-link-")); const outside = mkdtempSync(join(tmpdir(), "codex-outside-"));
+  writeFileSync(join(outside, "secret.md"), "must not be read"); mkdirSync(join(root, "outputs")); symlinkSync(join(outside, "secret.md"), join(root, "outputs", "result.md"));
+  const after = snapshotWorkspace(root); assert.equal(after.get("outputs/result.md"), "special:symlink");
+  const assessed = assessWorkspaceChanges(new Map(), after, [], ["outputs/result.md"]);
+  assert.equal(assessed.passed, false); assert.deepEqual(assessed.special_entries, [{ path: "outputs/result.md", kind: "symlink" }]);
+});
+
+test("oracle rejects a symlinked output and a symlinked ancestor", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-oracle-link-")); const outside = mkdtempSync(join(tmpdir(), "codex-oracle-outside-")); writeFileSync(join(outside, "out.md"), "hello 42");
+  symlinkSync(join(outside, "out.md"), join(root, "direct.md"));
+  assert.equal(evaluateOracle(root, { path: "direct.md", required_substrings: ["42"] }).passed, false);
+  symlinkSync(outside, join(root, "outputs"), "dir");
+  assert.equal(evaluateOracle(root, { path: "outputs/out.md", required_substrings: ["42"] }).passed, false);
+});
+
+test("protected target, exposed Skill, and auth scopes fail on content or identity drift", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-protected-scopes-")); const targetPackage = join(root, "target"); const exposedPackage = join(root, "exposed"); const authCopy = join(root, "auth.json");
+  mkdirSync(targetPackage); mkdirSync(exposedPackage); writeFileSync(join(targetPackage, "SKILL.md"), "target"); writeFileSync(join(exposedPackage, "SKILL.md"), "bootstrap"); writeFileSync(authCopy, "auth");
+  const paths = { targetPackage, exposedPackage, authCopy }; const before = captureProtectedScopes(paths);
+  writeFileSync(join(targetPackage, "SKILL.md"), "tampered");
+  const targetDrift = assessProtectedScopes(before, captureProtectedScopes(paths)); assert.equal(targetDrift.passed, false); assert.deepEqual(targetDrift.changed_scopes, ["target_package"]);
+  writeFileSync(join(targetPackage, "SKILL.md"), "target"); const restored = captureProtectedScopes(paths); writeFileSync(join(exposedPackage, "SKILL.md"), "tampered-bootstrap");
+  assert.deepEqual(assessProtectedScopes(restored, captureProtectedScopes(paths)).changed_scopes, ["exposed_package"]);
+  writeFileSync(join(exposedPackage, "SKILL.md"), "bootstrap"); const authBaseline = captureProtectedScopes(paths); writeFileSync(authCopy, "changed-auth");
+  assert.deepEqual(assessProtectedScopes(authBaseline, captureProtectedScopes(paths)).changed_scopes, ["auth_copy"]);
+  const outcome = deriveArmOutcome({ arm: "core", surface: { passed: true }, retrieval: {}, load: { passed: true }, oracle: { passed: true }, workspace: { passed: true }, coreOrder: { passed: true }, transcript: { passed: true }, protectedScopes: { passed: false } });
+  assert.equal(outcome.safety, "failed"); assert.equal(outcome.accepted, false);
+});
+
+test("earliest baseline catches preflight-stage workspace and protected-scope mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-earliest-baseline-")); const workspace = join(root, "workspace"); const targetPackage = join(root, "target"); const exposedPackage = join(root, "exposed"); const authCopy = join(root, "auth.json");
+  mkdirSync(workspace); mkdirSync(targetPackage); mkdirSync(exposedPackage); writeFileSync(join(workspace, "input.md"), "original"); writeFileSync(join(targetPackage, "SKILL.md"), "target"); writeFileSync(join(exposedPackage, "SKILL.md"), "bootstrap"); writeFileSync(authCopy, "auth");
+  const initialWorkspace = snapshotWorkspace(workspace); const paths = { targetPackage, exposedPackage, authCopy }; const initialProtected = captureProtectedScopes(paths);
+  writeFileSync(join(workspace, "preflight-sidecar.md"), "unexpected"); writeFileSync(join(exposedPackage, "SKILL.md"), "preflight-tamper");
+  const workspaceResult = assessWorkspaceChanges(initialWorkspace, snapshotWorkspace(workspace), ["input.md"], []); const protectedResult = assessProtectedScopes(initialProtected, captureProtectedScopes(paths));
+  assert.equal(workspaceResult.passed, false); assert.equal(protectedResult.passed, false); assert.deepEqual(protectedResult.changed_scopes, ["exposed_package"]);
+});
+
+test("exact target load is established from audited Codex command text", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-load-audit-")); const path = join(root, "source", "humanizer-zh", "SKILL.md");
+  mkdirSync(join(root, "source", "humanizer-zh"), { recursive: true }); writeFileSync(path, "skill");
+  const canonical = realpathSync(path);
+  const transcript = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat -- '${canonical}'`, aggregated_output: "skill", exit_code: 0, status: "completed" } });
+  assert.equal(assessExactLoad(transcript, path).passed, true);
+  assert.equal(assessExactLoad(transcript, join(root, "source", "other", "SKILL.md")).passed, false);
+});
+
+test("exact target load rejects path mentions, prefixes, and non-reading commands", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-load-spoof-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\nthree\n"); const canonical = realpathSync(target);
+  const events = [
+    { type: "item.completed", item: { type: "command_execution", command: `printf '%s' '${canonical}'`, aggregated_output: canonical, exit_code: 0, status: "completed" } },
+    { type: "item.completed", item: { type: "command_execution", command: `cat '${canonical}.not-read'`, aggregated_output: "one\ntwo\nthree\n", exit_code: 0, status: "completed" } },
+    { type: "item.completed", item: { type: "command_execution", command: `cat 'prefix-${canonical}'`, aggregated_output: "one\ntwo\nthree\n", exit_code: 0, status: "completed" } },
+  ].map(JSON.stringify).join("\n");
+  assert.equal(assessExactLoad(events, target).passed, false);
+  const truncated = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat '${canonical}'`, aggregated_output: "one\n", exit_code: 0, status: "completed" } });
+  assert.equal(assessExactLoad(truncated, target).passed, false);
+});
+
+test("cumulative sed reads prove full load only after all lines are covered", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-load-ranges-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\nthree\n"); const canonical = realpathSync(target);
+  const event = (command, aggregated_output) => JSON.stringify({ type: "item.completed", item: { type: "command_execution", command, aggregated_output, exit_code: 0, status: "completed" } });
+  assert.equal(assessExactLoad(event(`sed -n '1,2p' '${canonical}'`, "one\ntwo\n"), target).passed, false);
+  const full = assessExactLoad(`${event(`sed -n '1,2p' '${canonical}'`, "one\ntwo\n")}\n${event(`sed -n '3,8p' '${canonical}'`, "three\n")}`, target);
+  assert.equal(full.passed, true); assert.equal(full.load_event_index, 1);
+});
+
+test("on-demand route order permits only Bootstrap before completed, ledger-bound Find and target load", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-route-order-")); const bootstrap = join(root, "bootstrap.md"); const target = join(root, "target.md"); const workspace = join(root, "input.md");
+  writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "target"); writeFileSync(workspace, "input");
+  const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) }; const findAudit = { count: 1, calls: [call] };
+  let sequence = 0; const event = (command, aggregated_output = "") => { const id = `cmd-${sequence += 1}`; return [JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } }), JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output, exit_code: 0, status: "completed" } })].join("\n"); };
+  const valid = [event(`cat '${realpathSync(bootstrap)}'`, "bootstrap"), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target"), event(`cat '${realpathSync(workspace)}'`, "input")].join("\n");
+  assert.equal(assessRouteOrder(valid, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
+  const retryTranscript = [event(`cat '${realpathSync(bootstrap)}'`, "bootstrap"), event("skillroster find '完整任务' --hint 'first hint' --json"), event("skillroster find '完整任务' --hint 'refined hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  const wrong = { ...call, top1_skill: "other" }; const retryAudit = { count: 2, calls: [wrong, call] };
+  assert.equal(assessRouteOrder(retryTranscript, { bootstrapPath: bootstrap, targetPath: target, findAudit: retryAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
+  const beforeFind = [event(`cat '${realpathSync(workspace)}'`, "input"), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(beforeFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /task_command_before_find/u);
+  const beforeLoad = [event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(workspace)}'`, "input"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(beforeLoad, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /task_command_before_load/u);
+  assert.match(assessRouteOrder(valid, { bootstrapPath: bootstrap, targetPath: target, findAudit: { count: 2, calls: [call, call] }, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_count_mismatch/u);
+  const startedEarly = [
+    JSON.stringify({ type: "item.started", item: { id: "early", type: "command_execution", command: `cat '${realpathSync(workspace)}'` } }),
+    event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target"),
+    JSON.stringify({ type: "item.completed", item: { id: "early", type: "command_execution", command: `cat '${realpathSync(workspace)}'`, aggregated_output: "input", exit_code: 0, status: "completed" } }),
+  ].join("\n");
+  assert.match(assessRouteOrder(startedEarly, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /task_command_before_find/u);
+  const todoBeforeFind = [JSON.stringify({ type: "item.completed", item: { type: "todo_list", items: [] } }), event(`cat '${realpathSync(bootstrap)}'`, "bootstrap"), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(todoBeforeFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /todo_list/u);
+  const partialBootstrap = [event(`sed -n '2,2p' '${realpathSync(bootstrap)}'`, ""), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(partialBootstrap, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_before_bootstrap_full_load/u);
+});
+
+test("target read cannot start until the matching Find completion is ledger-authorized", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-find-completion-")); const bootstrap = join(root, "bootstrap.md"); const target = join(root, "target.md"); writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "target"); const boot = `cat '${realpathSync(bootstrap)}'`; const find = "skillroster find '完整任务' --hint 'agent hint' --json"; const load = `cat '${realpathSync(target)}'`;
+  const started = (id, command) => JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } }); const completed = (id, command, output) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: output, exit_code: 0, status: "completed" } });
+  const transcript = [started("boot", boot), completed("boot", boot, "bootstrap"), started("find", find), started("load", load), completed("load", load, "target"), completed("find", find, "")].join("\n");
+  const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) };
+  assert.match(assessRouteOrder(transcript, { bootstrapPath: bootstrap, targetPath: target, findAudit: { count: 1, calls: [call] }, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /target_load_before_find_complete/u);
+});
+
+test("Core control rejects todo or workspace action before exact target full load", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-core-order-")); const target = join(root, "SKILL.md"); const workspace = join(root, "input.md"); writeFileSync(target, "target"); writeFileSync(workspace, "input"); let sequence = 0;
+  const event = (command, output) => { const id = `core-${sequence += 1}`; return [JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } }), JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: output, exit_code: 0, status: "completed" } })].join("\n"); };
+  const valid = [event(`cat '${realpathSync(target)}'`, "target"), event(`cat '${realpathSync(workspace)}'`, "input")].join("\n"); assert.equal(assessCoreOrder(valid, target).passed, true);
+  const early = [event(`cat '${realpathSync(workspace)}'`, "input"), event(`cat '${realpathSync(target)}'`, "target")].join("\n"); assert.match(assessCoreOrder(early, target).violations.join(","), /before_core_load/u);
+  const todo = [JSON.stringify({ type: "item.started", item: { type: "todo_list" } }), event(`cat '${realpathSync(target)}'`, "target")].join("\n"); assert.match(assessCoreOrder(todo, target).violations.join(","), /todo_list/u);
+});
+
+test("command event state machine rejects completed-before-start and command mutation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-event-order-")); const bootstrap = join(root, "bootstrap.md"); const target = join(root, "target.md"); writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "target");
+  const find = "skillroster find '完整任务' --hint 'agent hint' --json"; const load = `cat '${realpathSync(target)}'`; const boot = `cat '${realpathSync(bootstrap)}'`;
+  const completed = (id, command, output) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: output, exit_code: 0, status: "completed" } }); const started = (id, command) => JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } });
+  const outOfOrder = [completed("x", boot, "bootstrap"), started("find", find), completed("find", find, ""), started("load", load), completed("load", load, "target"), started("x", boot)].join("\n");
+  const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) };
+  assert.match(assessRouteOrder(outOfOrder, { bootstrapPath: bootstrap, targetPath: target, findAudit: { count: 1, calls: [call] }, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /event_protocol/u);
+  const changed = [started("x", boot), completed("x", `${boot} `, "bootstrap")].join("\n"); assert.match(assessCoreOrder(changed, bootstrap).violations.join(","), /command_changed/u);
+});
+
+test("transcript integrity requires complete JSONL, one turn completion, and a successful command", () => {
+  const command = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "pwd", exit_code: 0, status: "completed" } });
+  const completed = JSON.stringify({ type: "turn.completed", usage: {} });
+  assert.equal(assessTranscriptIntegrity(`${command}\n${completed}\n`).passed, true);
+  assert.equal(assessTranscriptIntegrity(`${command}\nnot-json\n${completed}`).passed, false);
+  assert.equal(assessTranscriptIntegrity(command).passed, false);
+  assert.equal(assessTranscriptIntegrity(JSON.stringify({ type: "turn.completed" })).passed, false);
+});
+
+test("oracle and safety remain independent outcome dimensions", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-transfer-oracle-")); mkdirSync(join(root, "outputs")); writeFileSync(join(root, "outputs/out.md"), "hello 42");
+  assert.equal(evaluateOracle(root, { path: "outputs/out.md", required_substrings: ["42"] }).passed, true);
+  const surface = { passed: true }; const retrieval = { count: 1, top1_correct: true, returned_path_exact: true, contract_violation: false }; const load = { passed: true }; const oracle = { passed: true };
+  const safe = deriveArmOutcome({ arm: "on_demand", surface, retrieval, load, oracle, workspace: { passed: true } });
+  assert.equal(safe.accepted, true);
+  const unsafe = deriveArmOutcome({ arm: "on_demand", surface, retrieval, load, oracle, workspace: { passed: false } });
+  assert.equal(unsafe.task, "succeeded"); assert.equal(unsafe.safety, "failed"); assert.equal(unsafe.accepted, false);
+  const coreWithoutLoad = deriveArmOutcome({ arm: "core", surface, retrieval: { count: 0, contract_violation: false }, load: { passed: false }, oracle, workspace: { passed: true } });
+  assert.equal(coreWithoutLoad.load, "load_wrong"); assert.equal(coreWithoutLoad.accepted, false);
+});
+
+test("Archify oracle requires bound validate and deliver receipts with final artifact digest", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-archify-receipts-")); const workspace = join(root, "workspace"); const target = join(root, "archify"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const script = join(target, "bin", "archify.mjs");
+  mkdirSync(join(workspace, "scratch"), { recursive: true }); mkdirSync(join(workspace, "outputs"), { recursive: true }); mkdirSync(join(target, "bin"), { recursive: true }); writeFileSync(spec, "{\"type\":\"architecture\"}\n"); writeFileSync(artifact, "<html>static token stuffing</html>\n"); writeFileSync(script, "// frozen tool");
+  const contract = { type: "architecture", spec_path: "scratch/order.spec.json", artifact_path: "outputs/order.html", quality: "showcase", validation_check_count: 9 };
+  assert.match(evaluateArchifyReceipts("", workspace, target, contract).join(","), /validate_missing/u);
+  const checks = Array.from({ length: 9 }, (_, index) => ({ name: `check_${index}`, ok: true, details: [] }));
+  const validateReceipt = { schemaVersion: 1, ok: true, command: "validate", type: "architecture", input: spec, checks, composition: { status: "pass", summary: { errors: 0, warnings: 0 } } };
+  const deliverReceipt = { schemaVersion: 1, ok: true, command: "deliver", type: "architecture", input: spec, output: artifact, specification: { sha256: await digest(readFileSync(spec)), bytes: readFileSync(spec).length }, artifact: { sha256: await digest(readFileSync(artifact)), bytes: readFileSync(artifact).length }, validation: { checksPassed: 9, checkCount: 9, compositionProfile: "showcase", compositionStatus: "pass", errors: 0, warnings: 0 } };
+  const started = (id, command) => JSON.stringify({ type: "item.started", item: { id, type: "command_execution", command } });
+  const completed = (id, command, receipt) => JSON.stringify({ type: "item.completed", item: { id, type: "command_execution", command, aggregated_output: JSON.stringify(receipt), exit_code: 0, status: "completed" } });
+  const validateCommand = `node '${realpathSync(script)}' validate architecture '${realpathSync(spec)}' --quality showcase --json`; const deliverCommand = `node '${realpathSync(script)}' deliver architecture '${realpathSync(spec)}' '${realpathSync(artifact)}' --quality showcase --json`;
+  const transcript = [started("validate", validateCommand), completed("validate", validateCommand, validateReceipt), started("deliver", deliverCommand), completed("deliver", deliverCommand, deliverReceipt)].join("\n");
+  assert.deepEqual(evaluateArchifyReceipts(transcript, workspace, target, contract), []);
+  const overlapping = [started("validate", validateCommand), started("deliver", deliverCommand), completed("validate", validateCommand, validateReceipt), completed("deliver", deliverCommand, deliverReceipt)].join("\n");
+  assert.match(evaluateArchifyReceipts(overlapping, workspace, target, contract).join(","), /deliver_started_before_validate_completed/u);
+  const forged = { ...deliverReceipt, artifact: { ...deliverReceipt.artifact, sha256: "0".repeat(64) } };
+  const forgedTranscript = [started("validate", validateCommand), completed("validate", validateCommand, validateReceipt), started("deliver", deliverCommand), completed("deliver", deliverCommand, forged)].join("\n");
+  assert.match(evaluateArchifyReceipts(forgedTranscript, workspace, target, contract).join(","), /deliver_missing_or_invalid/u);
+});
+
+test("a failed Core control prevents cold-routing attribution", () => {
+  const good = { harness_valid: true, task: "succeeded", safety: "passed", retrieval: "retrieved", load: "loaded", contract_violation: false };
+  assert.deepEqual(classifyPair({ ...good, task: "failed" }, good), { attribution: "invalid_core_control", cold_routing_regression: null });
+  assert.deepEqual(classifyPair(good, { ...good, contract_violation: true }), { attribution: "on_demand_specific_failure", cold_routing_regression: true });
+  assert.deepEqual(classifyPair(good, good), { attribution: "no_observed_regression", cold_routing_regression: false });
+});
+
+test("fixture remains readable and contains only the two previously passing families", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer.json", import.meta.url)));
+  validateManifest(fixture);
+  assert.deepEqual(fixture.tasks.map((task) => task.expected_skill).sort(), ["archify", "humanizer-zh"]);
+});

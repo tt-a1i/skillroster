@@ -86,13 +86,14 @@ jobs:
         with:
           node-version: 24
 
-      - name: Check Pi cold-routing harness
+      - name: Check cold-routing harnesses
         shell: bash
         run: |
           node --check tests/harness/pi-cold-routing/bounds.mjs
           node --check tests/harness/pi-cold-routing/runner.mjs
+          node --check tests/harness/codex-cold-routing/driver.mjs
           node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
-          node --test tests/harness/pi-cold-routing/*.test.mjs
+          node --test tests/harness/pi-cold-routing/*.test.mjs tests/harness/codex-cold-routing/*.test.mjs
 
   portability:
     name: ${{ matrix.name }}
@@ -131,14 +132,15 @@ jobs:
         with:
           node-version: 24
 
-      - name: Check Pi cold-routing harness
+      - name: Check cold-routing harnesses
         if: runner.os == 'Windows'
         shell: bash
         run: |
           node --check tests/harness/pi-cold-routing/bounds.mjs
           node --check tests/harness/pi-cold-routing/runner.mjs
+          node --check tests/harness/codex-cold-routing/driver.mjs
           node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
-          node --test tests/harness/pi-cold-routing/*.test.mjs
+          node --test tests/harness/pi-cold-routing/*.test.mjs tests/harness/codex-cold-routing/*.test.mjs
 
   gate:
     name: CI gate
