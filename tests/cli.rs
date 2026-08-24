@@ -7916,6 +7916,42 @@ fn unreadable_link_scan_preserves_a_retained_skill_identity() {
     let second = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     assert_eq!(second["result"]["skill_count"], 1);
 
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["severity"], "high");
+    assert!(
+        detail["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["facts"]["link_target"] == json!(source))
+    );
+
+    let load = run(
+        &[&common[..], &["find", "retained-external", "--load"]].concat(),
+        None,
+    );
+    assert!(!load.status.success());
+    let load: Value = serde_json::from_slice(&load.stdout).unwrap();
+    assert_eq!(
+        load["error"]["details"]["reason"],
+        "untrusted_external_source"
+    );
+
     let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     let retained: (String, String) = connection
         .query_row(
