@@ -7863,6 +7863,107 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_link_scan_preserves_a_retained_skill_identity() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".claude/skills");
+    let source = temp.path().join("external-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: retained-external\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    let linked = root.join("retained-external");
+    std::os::unix::fs::symlink(&source, &linked).unwrap();
+    let entrypoint = linked.join("SKILL.md");
+    let skill_id = format!(
+        "skill_{:x}",
+        Sha256::digest(format!("unreadable-link:{}", entrypoint.display()).as_bytes())
+    );
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO skills
+                (id, identity_key, name, description, declared_source, declared_revision,
+                 content_digest, digest_version, governance_state, canonical_path)
+             VALUES (?1, ?2, ?3, NULL, NULL, NULL, ?4, 1, 'managed', ?5)",
+            rusqlite::params![
+                skill_id,
+                "content:retained-strong-identity",
+                "retained-external",
+                "retained-package-digest",
+                linked.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let first = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(first["result"]["skill_count"], 1);
+    let second = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(second["result"]["skill_count"], 1);
+
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(detail["result"]["severity"], "high");
+    assert!(
+        detail["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["facts"]["link_target"] == json!(source))
+    );
+
+    let load = run(
+        &[&common[..], &["find", "retained-external", "--load"]].concat(),
+        None,
+    );
+    assert!(!load.status.success());
+    let load: Value = serde_json::from_slice(&load.stdout).unwrap();
+    assert_eq!(
+        load["error"]["details"]["reason"],
+        "untrusted_external_source"
+    );
+
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let retained: (String, String) = connection
+        .query_row(
+            "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+            [&skill_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(retained.0, "content:retained-strong-identity");
+    assert_eq!(retained.1, "managed");
+}
+
 #[test]
 fn report_distinguishes_inaccessible_and_missing_session_roots() {
     let temp = TempDir::new().unwrap();

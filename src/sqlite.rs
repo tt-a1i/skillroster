@@ -566,6 +566,24 @@ impl StateStore {
             )?;
             return SkillId::parse(id).map_err(invalid_id);
         }
+        if let Some(existing_identity) = self
+            .connection
+            .query_row(
+                "SELECT identity_key FROM skills WHERE id = ?1",
+                [skill.id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let expected_weak_identity = format!("incomplete-snapshot-skill:{}", skill.id.as_str());
+            if skill.identity_key == expected_weak_identity {
+                return Ok(skill.id.clone());
+            }
+            return Err(StorageError::InvalidData(format!(
+                "Skill {} conflicts with retained identity {existing_identity}",
+                skill.id
+            )));
+        }
         self.connection.execute(
             "INSERT INTO skills
                 (id, identity_key, name, description, declared_source, declared_revision,
@@ -2657,6 +2675,13 @@ mod tests {
             store.skill_governance_state(&stable).unwrap(),
             Some(GovernanceState::Managed)
         );
+
+        let conflicting = SkillRecord {
+            id: stable,
+            identity_key: "content:different-strong-identity".to_owned(),
+            ..skill
+        };
+        assert!(store.save_skill(&conflicting).is_err());
     }
 
     #[test]
