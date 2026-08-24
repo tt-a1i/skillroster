@@ -2356,6 +2356,14 @@ enum ReportRequest<'a> {
 const DEFAULT_FINDING_DETAIL_LIMIT: usize = 5;
 const DEFAULT_REPORT_PAGE_LIMIT: usize = 20;
 
+const fn finding_page_limit(full: bool, explicit: Option<usize>) -> usize {
+    match explicit {
+        Some(limit) => limit,
+        None if full => DEFAULT_REPORT_PAGE_LIMIT,
+        None => DEFAULT_FINDING_DETAIL_LIMIT,
+    }
+}
+
 fn report_command(
     store: &StateStore,
     state_dir: &Path,
@@ -2368,11 +2376,7 @@ fn report_command(
         offset,
     } = request
     {
-        let limit = limit.unwrap_or(if full {
-            DEFAULT_REPORT_PAGE_LIMIT
-        } else {
-            DEFAULT_FINDING_DETAIL_LIMIT
-        });
+        let limit = finding_page_limit(full, limit);
         let id = FindingId::parse(id.to_string())?;
         let stored = store
             .get_finding(&id)?
@@ -3237,11 +3241,7 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
             limit,
             offset,
         } => {
-            let page_limit = limit.unwrap_or(if full {
-                DEFAULT_REPORT_PAGE_LIMIT
-            } else {
-                DEFAULT_FINDING_DETAIL_LIMIT
-            });
+            let page_limit = finding_page_limit(full, limit);
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
             let requires_variant_decision =
