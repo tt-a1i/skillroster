@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, cpSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -39,13 +39,13 @@ export function parseArgs(argv) {
     codex: "codex", bootstrap: join(REPO, "skill/skillroster/SKILL.md"),
     skillsRoot: join(homedir(), ".agents_skills"), cli: join(REPO, "target/debug/skillroster"),
     runsDir: join(tmpdir(), "skillroster-codex-transfer"), authSource: null,
-    timeoutMs: 300_000, execute: false, reevaluateRoot: null, reevaluateOutput: null,
+    timeoutMs: 300_000, execute: false, reevaluateRoot: null, reevaluateOutput: null, summaryOutput: null,
   };
   const values = new Map([
     ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"],
     ["--codex", "codex"], ["--bootstrap", "bootstrap"], ["--skills-root", "skillsRoot"],
     ["--cli", "cli"], ["--runs-dir", "runsDir"], ["--auth-source", "authSource"], ["--timeout-ms", "timeoutMs"],
-    ["--reevaluate-root", "reevaluateRoot"], ["--reevaluate-output", "reevaluateOutput"],
+    ["--reevaluate-root", "reevaluateRoot"], ["--reevaluate-output", "reevaluateOutput"], ["--summary-output", "summaryOutput"],
   ]);
   for (let index = 0; index < argv.length;) {
     if (argv[index] === "--execute") { options.execute = true; index += 1; continue; }
@@ -59,6 +59,7 @@ export function parseArgs(argv) {
   if (options.execute && options.reevaluateRoot) fail("--execute and --reevaluate-root are mutually exclusive");
   if (options.execute && !options.authSource) fail("--execute requires an explicit --auth-source");
   if (options.reevaluateOutput && !options.reevaluateRoot) fail("--reevaluate-output requires --reevaluate-root");
+  if (options.summaryOutput && options.reevaluateRoot) fail("--summary-output and --reevaluate-root are mutually exclusive");
   return options;
 }
 
@@ -511,6 +512,53 @@ function copyAuth(authSource, codexHome) {
 
 function cleanupAuth(path) { rmSync(path, { force: true }); ACTIVE_AUTH_COPIES.delete(path); }
 
+function validateSummaryOutput(path, runsDir) {
+  if (!path) return null;
+  const absolute = resolve(path);
+  try { lstatSync(absolute); fail("summary output already exists"); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const parent = dirname(absolute); let stat;
+  try { stat = lstatSync(parent); } catch { fail("summary output parent must already exist"); }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) fail("summary output parent must be a real directory");
+  let current = parse(parent).root;
+  for (const part of relative(current, parent).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    if (lstatSync(current).isSymbolicLink()) fail("summary output path must not contain linked ancestors");
+  }
+  if (inside(absolute, REPO) || existingAncestorResolvesInside(absolute, REPO)) fail("summary output must stay outside the repository");
+  if (inside(absolute, runsDir) || existingAncestorResolvesInside(absolute, runsDir)) fail("summary output must stay outside the run root");
+  return { path: absolute, parent, parentDevice: stat.dev, parentInode: stat.ino, canonicalParent: realpathSync(parent) };
+}
+
+function assertSummaryBoundary(boundary, descriptor = null) {
+  const parent = lstatSync(boundary.parent);
+  if (!parent.isDirectory() || parent.isSymbolicLink() || parent.dev !== boundary.parentDevice || parent.ino !== boundary.parentInode || realpathSync(boundary.parent) !== boundary.canonicalParent) fail("summary output parent changed during persistence");
+  if (descriptor !== null) {
+    const opened = fstatSync(descriptor); const named = lstatSync(boundary.path);
+    if (!opened.isFile() || named.isSymbolicLink() || opened.dev !== named.dev || opened.ino !== named.ino || opened.nlink !== 1) fail("summary output changed during persistence");
+  }
+}
+
+function persistSummary(encoded, options) {
+  const boundary = validateSummaryOutput(options.summaryOutput, options.runsDir); let descriptor = null;
+  try {
+    descriptor = openSync(boundary.path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    assertSummaryBoundary(boundary, descriptor); writeFileSync(descriptor, encoded); fchmodSync(descriptor, 0o600); assertSummaryBoundary(boundary, descriptor);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { const opened = fstatSync(descriptor); const named = lstatSync(boundary.path); if (opened.dev === named.dev && opened.ino === named.ino) rmSync(boundary.path, { force: true }); } catch {}
+    }
+    fail(`summary output persistence failed: ${error.message}`);
+  } finally { if (descriptor !== null) closeSync(descriptor); }
+}
+
+function emitSummary(summary, options) {
+  const encoded = `${JSON.stringify(summary, null, 2)}\n`;
+  let persistenceError = null;
+  if (options.summaryOutput) try { persistSummary(encoded, options); } catch (error) { persistenceError = error; }
+  process.stdout.write(encoded);
+  if (persistenceError) throw persistenceError;
+}
+
 function run(command, args, options) {
   const result = spawnSync(command, args, { encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024, ...options });
   return { ...result, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
@@ -603,11 +651,12 @@ function freezeSuite(manifest, options) {
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
+  const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`);
   const facts = {
-    snapshot_digest: sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`), manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
+    snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
     bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
-    target_packages: targetPackages,
+    target_packages: targetPackages, pair_invariants: Object.fromEntries(manifest.tasks.map((task) => [task.id, pairInvariant(snapshotDigest, task)])),
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
@@ -649,7 +698,10 @@ export function prepareOnDemand(paths, task, options, env) {
   return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
 }
 
+export function pairInvariant(snapshotDigest, task) { return sha(`${snapshotDigest}\0${JSON.stringify(task)}`); }
+
 function executeArm(task, arm, options, suiteFacts) {
+  const frozenPairInvariant = suiteFacts.pair_invariants?.[task.id]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${task.id}`);
   const root = mkdtempSync(join(options.runsDir, `${task.id}-${arm}-`)); const paths = setupArm(root, task, arm, options);
   const authCopy = copyAuth(options.authSource, paths.codexHome);
   const env = { ...process.env, HOME: paths.home, CODEX_HOME: paths.codexHome, TMPDIR: paths.temp };
@@ -677,7 +729,7 @@ function executeArm(task, arm, options, suiteFacts) {
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
     const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
-    return { task: task.id, arm, root, pair_invariant: sha(`${suiteFacts.snapshot_digest}\0${JSON.stringify(task)}`), codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    return { task: task.id, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
   }
@@ -724,7 +776,8 @@ export function main(argv = process.argv.slice(2)) {
   if (existingAncestorResolvesInside(options.runsDir, REPO)) fail("--runs-dir ancestor resolves inside the repository so transcripts cannot be committed");
   mkdirSync(options.runsDir, { recursive: true });
   if (inside(realpathSync(options.runsDir), realpathSync(REPO))) fail("--runs-dir resolves inside the repository so transcripts cannot be committed");
-  if (!options.execute) { process.stdout.write(`${JSON.stringify(dryRun(manifest, options), null, 2)}\n`); return 0; }
+  validateSummaryOutput(options.summaryOutput, options.runsDir);
+  if (!options.execute) { emitSummary(dryRun(manifest, options), options); return 0; }
   for (const path of [options.bootstrap, options.cli, options.skillsRoot, options.authSource]) if (!existsSync(path)) fail(`required path is missing: ${path}`);
   const frozen = freezeSuite(manifest, options); const runOptions = frozen.options;
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`unknown task: ${options.task}`);
@@ -736,7 +789,7 @@ export function main(argv = process.argv.slice(2)) {
     return coreResult && onDemandResult ? { task: task.id, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, attribution: "pair_incomplete", cold_routing_regression: null };
   });
   const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
-  process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`); return summary.status === "passed" ? 0 : 2;
+  emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

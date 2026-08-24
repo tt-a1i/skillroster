@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+
+const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
 const digest = async (value) => {
   const { createHash } = await import("node:crypto"); return createHash("sha256").update(value).digest("hex");
@@ -19,6 +21,36 @@ test("default is a non-executing plan and execution requires explicit auth", () 
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
   assert.throws(() => parseArgs(["--execute", "--auth-source", "/tmp/auth.json", "--reevaluate-root", "/tmp/runs"]), /mutually exclusive/u);
   assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
+});
+
+test("summary output preserves stdout JSON in a private external file", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-summary-output-")); const runs = join(root, "runs"); const output = join(root, "summary.json");
+  const result = spawnSync(process.execPath, [DRIVER, "--runs-dir", runs, "--model", "gpt-5.6-luna", "--summary-output", output], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr); assert.equal(existsSync(output), true);
+  assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), JSON.parse(result.stdout));
+  assert.equal(statSync(output).mode & 0o777, 0o600);
+});
+
+test("summary output refuses existing, run-root, repository, and linked-parent targets", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-summary-boundary-")); const runs = join(root, "runs");
+  const invoke = (output) => spawnSync(process.execPath, [DRIVER, "--runs-dir", runs, "--summary-output", output], { encoding: "utf8" });
+  const existing = join(root, "existing.json"); writeFileSync(existing, "keep");
+  const existingResult = invoke(existing); assert.notEqual(existingResult.status, 0); assert.equal(readFileSync(existing, "utf8"), "keep");
+  const runOutput = join(runs, "summary.json"); const runResult = invoke(runOutput); assert.notEqual(runResult.status, 0); assert.equal(existsSync(runOutput), false);
+  const repositoryOutput = join(fileURLToPath(new URL("../../../", import.meta.url)), `.forbidden-summary-${process.pid}.json`);
+  const repositoryResult = invoke(repositoryOutput); assert.notEqual(repositoryResult.status, 0); assert.equal(existsSync(repositoryOutput), false);
+  const realParent = join(root, "real-parent"); const linkedParent = join(root, "linked-parent"); mkdirSync(realParent); symlinkSync(realParent, linkedParent, "dir");
+  const linkedOutput = join(linkedParent, "summary.json"); const linkedResult = invoke(linkedOutput); assert.notEqual(linkedResult.status, 0); assert.equal(existsSync(linkedOutput), false);
+  const nestedParent = join(realParent, "nested"); mkdirSync(nestedParent);
+  const nestedLinkedOutput = join(linkedParent, "nested", "summary.json"); const nestedLinkedResult = invoke(nestedLinkedOutput); assert.notEqual(nestedLinkedResult.status, 0); assert.equal(existsSync(nestedLinkedOutput), false);
+});
+
+test("summary persistence failure keeps the stdout JSON contract and fails the command", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-summary-failure-")); const runs = join(root, "runs"); const outputParent = join(root, "read-only"); mkdirSync(outputParent); chmodSync(outputParent, 0o500);
+  try {
+    const result = spawnSync(process.execPath, [DRIVER, "--runs-dir", runs, "--model", "gpt-5.6-luna", "--summary-output", join(outputParent, "summary.json")], { encoding: "utf8" });
+    assert.notEqual(result.status, 0); assert.equal(JSON.parse(result.stdout).status, "planned"); assert.match(result.stderr, /summary output persistence failed/u);
+  } finally { chmodSync(outputParent, 0o700); }
 });
 
 test("runs directory cannot hide a repository target behind a symlink", { skip: process.platform === "win32" }, () => {
@@ -41,6 +73,14 @@ test("manifest is restricted to the two-family Codex transfer contract", () => {
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
   assert.throws(() => validateManifest({ ...manifest, tasks: [manifest.tasks[0]] }), /unsupported/u);
+});
+
+test("pair invariant is frozen from the suite snapshot and complete task input", () => {
+  const task = { id: "transfer-a", prompt: "fixed", workspace_files: { "input.txt": "one" } };
+  const frozen = pairInvariant("suite-snapshot", task);
+  assert.equal(pairInvariant("suite-snapshot", task), frozen);
+  assert.notEqual(pairInvariant("other-snapshot", task), frozen);
+  assert.notEqual(pairInvariant("suite-snapshot", { ...task, prompt: "changed" }), frozen);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
