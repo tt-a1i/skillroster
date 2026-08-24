@@ -592,7 +592,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         (LinkStatus::Broken, "Broken Skill links", Severity::High),
         (
             LinkStatus::EscapesRoot,
-            "Skill links escape an approved root",
+            crate::source_policy::ESCAPING_LINK_FINDING_TITLE,
             Severity::High,
         ),
     ] {

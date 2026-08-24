@@ -29,6 +29,8 @@ use crate::sqlite::{StateStore, StorageResult};
 
 /// Stable Finding title a confirmation may be bound to.
 pub const ESCAPING_LINK_FINDING_TITLE: &str = "Skill links escape an approved root";
+/// Stable Finding kind used by Agent-facing references and validation.
+pub const ESCAPING_LINK_FINDING_KIND: &str = "escaping_link_source_confirmation";
 
 static NEXT_PERMISSION_ID: AtomicU64 = AtomicU64::new(0);
 

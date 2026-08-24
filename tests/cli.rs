@@ -1571,23 +1571,115 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         state.to_str().unwrap(),
         "--json",
     ];
-    let trusted_scan = [
-        &common[..],
-        &["--source-root", sources.to_str().unwrap(), "scan"],
+    json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let retained = [
+        (&codex_link, "content:retained-strong-alpha"),
+        (&claude_link, "content:retained-strong-beta"),
     ]
-    .concat();
-    let seeded = json_output(&run(&trusted_scan, None));
-    assert_eq!(seeded["result"]["skill_count"], 2);
+    .map(|(link, identity_key)| {
+        let entrypoint = link.join("SKILL.md");
+        let skill_id = format!(
+            "skill_{:x}",
+            Sha256::digest(format!("unreadable-link:{}", entrypoint.display()).as_bytes())
+        );
+        let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO skills
+                    (id, identity_key, name, description, declared_source, declared_revision,
+                     content_digest, digest_version, governance_state, canonical_path)
+                 VALUES (?1, ?2, 'shared-external', 'External comparison route', NULL, NULL,
+                         ?3, 1, 'managed', ?4)",
+                rusqlite::params![
+                    skill_id,
+                    identity_key,
+                    format!("retained-package-{skill_id}"),
+                    link.to_string_lossy(),
+                ],
+            )
+            .unwrap();
+        (skill_id, identity_key)
+    });
 
     let untrusted_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     assert_eq!(untrusted_scan["result"]["skill_count"], 2);
-    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let mut report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let original_report_id = report["result"]["report_id"].as_str().unwrap().to_owned();
+    let original_finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let summary: String = connection
+        .query_row(
+            "SELECT summary_json FROM reports WHERE id = ?1",
+            [&original_report_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_summary: Value = serde_json::from_str(&summary).unwrap();
+    let legacy_finding = legacy_summary["findings"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    legacy_finding.remove("kind");
+    let details: String = connection
+        .query_row(
+            "SELECT details_json FROM findings WHERE id = ?1",
+            [&original_finding_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_details: Value = serde_json::from_str(&details).unwrap();
+    legacy_details.as_object_mut().unwrap().remove("kind");
+    connection
+        .execute(
+            "UPDATE reports SET summary_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_summary.to_string(), original_report_id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE findings SET details_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy_details.to_string(), original_finding_id],
+        )
+        .unwrap();
+    drop(connection);
+
+    let legacy_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", &original_finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        legacy_detail["result"]["kind"],
+        "escaping_link_source_confirmation"
+    );
+    assert_eq!(
+        legacy_detail["result"]["resolution"]["decision"],
+        "confirm_trusted_source_roots"
+    );
+
+    report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_ne!(report["result"]["report_id"], original_report_id);
     let escaping_finding = report["result"]["findings"]
         .as_array()
         .unwrap()
         .iter()
         .find(|finding| finding["title"] == "Skill links escape an approved root")
         .unwrap();
+    assert_eq!(
+        escaping_finding["kind"],
+        "escaping_link_source_confirmation"
+    );
     let finding_id = escaping_finding["id"].as_str().unwrap();
 
     let found = json_output(&run(
@@ -1668,6 +1760,19 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         repeated["result"]["matches"][0]["variant_finding"]["finding_id"],
         repeated_finding_id
     );
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for (skill_id, identity_key) in &retained {
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+                [skill_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(&stored.0, identity_key);
+        assert_eq!(stored.1, "managed");
+    }
+    drop(connection);
 
     let replacement = temp.path().join("replacement");
     fs::create_dir(&replacement).unwrap();
@@ -1700,30 +1805,85 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         .as_str()
         .unwrap();
 
-    for source in [&first_source, &second_source] {
-        let confirmed = json_output(&run(
+    let confirm_source = |finding_id: &str, source: &Path| {
+        json_output(&run(
             &[
                 &common[..],
                 &[
                     "source-root",
                     "confirm",
                     "--finding",
-                    recovered_finding_id,
+                    finding_id,
                     "--path",
                     source.to_str().unwrap(),
                 ],
             ]
             .concat(),
             None,
-        ));
-        assert_eq!(
-            confirmed["result"]["permission_scope"],
-            "exact_local_read_only"
-        );
-        assert_eq!(confirmed["result"]["content_endorsed"], false);
-        assert_eq!(confirmed["result"]["plan_apply_authorized"], false);
-        assert_eq!(confirmed["result"]["files_changed"], false);
-    }
+        ))
+    };
+    let first_confirmation = confirm_source(recovered_finding_id, &first_source);
+    assert_eq!(
+        first_confirmation["result"]["permission_scope"],
+        "exact_local_read_only"
+    );
+    assert_eq!(first_confirmation["result"]["content_endorsed"], false);
+    assert_eq!(first_confirmation["result"]["plan_apply_authorized"], false);
+    assert_eq!(first_confirmation["result"]["files_changed"], false);
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let mixed_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let mixed = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(mixed["result"]["rescan_required"], false);
+    assert_ne!(
+        mixed["result"]["matches"][0]["variant_finding"]["state"],
+        "source_confirmation_required"
+    );
+    let load_actions = mixed["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+        .collect::<Vec<_>>();
+    assert_eq!(load_actions.len(), 1);
+    let readable_variant_id = mixed["result"]["matches"][0]["variants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| !variant["paths"].as_array().unwrap().is_empty())
+        .unwrap()["skill_id"]
+        .as_str()
+        .unwrap();
+    assert!(
+        load_actions[0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|argument| argument == readable_variant_id)
+    );
+    let mixed_finding_id = mixed_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let second_confirmation = confirm_source(mixed_finding_id, &second_source);
+    assert_eq!(
+        second_confirmation["result"]["permission_scope"],
+        "exact_local_read_only"
+    );
+    assert_eq!(second_confirmation["result"]["content_endorsed"], false);
+    assert_eq!(
+        second_confirmation["result"]["plan_apply_authorized"],
+        false
+    );
+    assert_eq!(second_confirmation["result"]["files_changed"], false);
+
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
     json_output(&run(&[&common[..], &["report"]].concat(), None));
     let readable = json_output(&run(
@@ -1735,6 +1895,18 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         readable["result"]["matches"][0]["variant_finding"]["state"],
         "available"
     );
+    let connection = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for (skill_id, identity_key) in &retained {
+        let stored: (String, String) = connection
+            .query_row(
+                "SELECT identity_key, governance_state FROM skills WHERE id = ?1",
+                [skill_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(&stored.0, identity_key);
+        assert_eq!(stored.1, "managed");
+    }
 }
 
 #[test]

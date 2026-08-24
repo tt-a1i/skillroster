@@ -2372,12 +2372,12 @@ fn report_command(
         let mut details = stored.details.clone();
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
-            object.entry("kind").or_insert_with(|| {
-                json!(crate::roster_recommendation::finding_kind(
-                    &stored.category,
-                    &stored.title
-                ))
-            });
+            if object.get("kind").and_then(Value::as_str).is_none() {
+                object.insert(
+                    "kind".into(),
+                    json!(stable_finding_kind(&stored.category, &stored.title)),
+                );
+            }
             object.insert("files_changed".into(), json!(false));
             let report = store
                 .get_report(&stored.report_id)?
@@ -2573,7 +2573,7 @@ fn report_command(
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
     require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
-        if existing.scan_id == scan_id {
+        if existing.scan_id == scan_id && report_supports_source_confirmation_kind(&existing) {
             return Ok(select_report_view(&existing.summary, request));
         }
     }
@@ -2683,8 +2683,21 @@ fn report_command(
     Ok(select_report_view(&value, request))
 }
 
+fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
+    report.summary["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .all(|finding| {
+            finding["title"] != crate::source_policy::ESCAPING_LINK_FINDING_TITLE
+                || finding["kind"] == crate::source_policy::ESCAPING_LINK_FINDING_KIND
+        })
+}
+
 fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
-    if object.get("title").and_then(Value::as_str) != Some("Skill links escape an approved root") {
+    if object.get("kind").and_then(Value::as_str)
+        != Some(crate::source_policy::ESCAPING_LINK_FINDING_KIND)
+    {
         return;
     }
     let observed_link_targets = object
@@ -4081,12 +4094,7 @@ fn finding_json(
     scan: &ScanResult,
 ) -> Value {
     let category = finding_category(finding.category);
-    let kind =
-        crate::roster_recommendation::finding_kind(&category, &finding.title).or_else(|| {
-            (finding.category == crate::query::FindingCategory::Layout
-                && finding.title == crate::query::SAME_NAME_DIVERGENT_FINDING_TITLE)
-                .then_some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
-        });
+    let kind = stable_finding_kind(&category, &finding.title);
     let mut value = json!({
         "id": id,
         "kind": kind,
@@ -4108,6 +4116,20 @@ fn finding_json(
         value["usage_overview"] = json!(crate::query::usage_overview(scan));
     }
     value
+}
+
+fn stable_finding_kind(category: &FindingCategory, title: &str) -> Option<&'static str> {
+    crate::roster_recommendation::finding_kind(category, title).or_else(|| {
+        if *category != FindingCategory::Layout {
+            None
+        } else if title == crate::query::SAME_NAME_DIVERGENT_FINDING_TITLE {
+            Some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
+        } else if title == crate::source_policy::ESCAPING_LINK_FINDING_TITLE {
+            Some(crate::source_policy::ESCAPING_LINK_FINDING_KIND)
+        } else {
+            None
+        }
+    })
 }
 
 fn finding_impact(finding: &crate::query::Finding) -> Value {
@@ -4643,6 +4665,7 @@ fn explicit_variant_load_actions(
     ranked
         .variants
         .iter()
+        .filter(|variant| !variant.paths.is_empty())
         .map(|variant| {
             let mut argv = vec!["skillroster".to_owned(), "find".to_owned(), task.to_owned()];
             for hint in hints {
@@ -4727,7 +4750,7 @@ fn bind_variant_findings(
                 suggested,
             )
         } else if let Some(report) = report.as_ref() {
-            if !source_confirmation_variant_ids.is_empty() {
+            if !variant_ids.is_empty() && source_confirmation_variant_ids == variant_ids {
                 if let Some(finding_id) = matching_escaping_link_finding_id(
                     store,
                     report,
@@ -4851,43 +4874,12 @@ fn matching_variant_finding_id(
     report: &ReportRecord,
     variant_ids: &BTreeSet<String>,
 ) -> Result<Option<String>> {
-    let Some(candidate) = report.summary["findings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find_map(|finding| {
-            if finding["kind"] != crate::query::SAME_NAME_DIVERGENT_FINDING_KIND {
-                return None;
-            }
-            let affected = finding["affected_skill_ids"]
-                .as_array()?
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<BTreeSet<_>>();
-            (affected == *variant_ids)
-                .then(|| finding["id"].as_str())
-                .flatten()
-        })
-    else {
-        return Ok(None);
-    };
-    let id = FindingId::parse(candidate.to_owned())?;
-    let Some(stored) = store.get_finding(&id)? else {
-        return Ok(None);
-    };
-    let stored_variant_ids = stored.details["affected_skill_ids"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    Ok((stored.report_id == report.id
-        && stored.category == FindingCategory::Layout
-        && stored.details["kind"] == crate::query::SAME_NAME_DIVERGENT_FINDING_KIND
-        && stored_variant_ids == *variant_ids)
-        .then(|| id.to_string()))
+    matching_report_finding_id(
+        store,
+        report,
+        crate::query::SAME_NAME_DIVERGENT_FINDING_KIND,
+        |affected| affected == variant_ids,
+    )
 }
 
 fn matching_escaping_link_finding_id(
@@ -4895,22 +4887,30 @@ fn matching_escaping_link_finding_id(
     report: &ReportRecord,
     untrusted_variant_ids: &BTreeSet<String>,
 ) -> Result<Option<String>> {
+    matching_report_finding_id(
+        store,
+        report,
+        crate::source_policy::ESCAPING_LINK_FINDING_KIND,
+        |affected| untrusted_variant_ids.is_subset(affected),
+    )
+}
+
+fn matching_report_finding_id(
+    store: &StateStore,
+    report: &ReportRecord,
+    kind: &str,
+    affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
+) -> Result<Option<String>> {
     let Some(candidate) = report.summary["findings"]
         .as_array()
         .into_iter()
         .flatten()
         .find_map(|finding| {
-            if finding["title"] != "Skill links escape an approved root" {
+            if finding["kind"] != kind {
                 return None;
             }
-            let affected = finding["affected_skill_ids"]
-                .as_array()?
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<BTreeSet<_>>();
-            untrusted_variant_ids
-                .is_subset(&affected)
+            let affected = finding_skill_ids(finding)?;
+            affected_ids_match(&affected)
                 .then(|| finding["id"].as_str())
                 .flatten()
         })
@@ -4921,18 +4921,22 @@ fn matching_escaping_link_finding_id(
     let Some(stored) = store.get_finding(&id)? else {
         return Ok(None);
     };
-    let stored_skill_ids = stored.details["affected_skill_ids"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
+    let Some(stored_skill_ids) = finding_skill_ids(&stored.details) else {
+        return Ok(None);
+    };
     Ok((stored.report_id == report.id
         && stored.category == FindingCategory::Layout
-        && stored.title == "Skill links escape an approved root"
-        && untrusted_variant_ids.is_subset(&stored_skill_ids))
+        && stored.details["kind"] == kind
+        && affected_ids_match(&stored_skill_ids))
     .then(|| id.to_string()))
+}
+
+fn finding_skill_ids(finding: &Value) -> Option<BTreeSet<String>> {
+    finding["affected_skill_ids"]
+        .as_array()?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {
