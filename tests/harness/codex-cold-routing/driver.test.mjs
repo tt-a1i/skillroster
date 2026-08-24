@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+
+const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
 const digest = async (value) => {
   const { createHash } = await import("node:crypto"); return createHash("sha256").update(value).digest("hex");
@@ -19,6 +21,26 @@ test("default is a non-executing plan and execution requires explicit auth", () 
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
   assert.throws(() => parseArgs(["--execute", "--auth-source", "/tmp/auth.json", "--reevaluate-root", "/tmp/runs"]), /mutually exclusive/u);
   assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
+});
+
+test("summary output preserves stdout JSON in a private external file", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-summary-output-")); const runs = join(root, "runs"); const output = join(root, "summary.json");
+  const result = spawnSync(process.execPath, [DRIVER, "--runs-dir", runs, "--model", "gpt-5.6-luna", "--summary-output", output], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr); assert.equal(existsSync(output), true);
+  assert.deepEqual(JSON.parse(readFileSync(output, "utf8")), JSON.parse(result.stdout));
+  assert.equal(statSync(output).mode & 0o777, 0o600);
+});
+
+test("summary output refuses existing, run-root, repository, and linked-parent targets", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-summary-boundary-")); const runs = join(root, "runs");
+  const invoke = (output) => spawnSync(process.execPath, [DRIVER, "--runs-dir", runs, "--summary-output", output], { encoding: "utf8" });
+  const existing = join(root, "existing.json"); writeFileSync(existing, "keep");
+  const existingResult = invoke(existing); assert.notEqual(existingResult.status, 0); assert.equal(readFileSync(existing, "utf8"), "keep");
+  const runOutput = join(runs, "summary.json"); const runResult = invoke(runOutput); assert.notEqual(runResult.status, 0); assert.equal(existsSync(runOutput), false);
+  const repositoryOutput = join(fileURLToPath(new URL("../../../", import.meta.url)), `.forbidden-summary-${process.pid}.json`);
+  const repositoryResult = invoke(repositoryOutput); assert.notEqual(repositoryResult.status, 0); assert.equal(existsSync(repositoryOutput), false);
+  const realParent = join(root, "real-parent"); const linkedParent = join(root, "linked-parent"); mkdirSync(realParent); symlinkSync(realParent, linkedParent, "dir");
+  const linkedOutput = join(linkedParent, "summary.json"); const linkedResult = invoke(linkedOutput); assert.notEqual(linkedResult.status, 0); assert.equal(existsSync(linkedOutput), false);
 });
 
 test("runs directory cannot hide a repository target behind a symlink", { skip: process.platform === "win32" }, () => {
