@@ -4872,6 +4872,23 @@ fn current_readable_skill_paths(
     approved_roots.sort();
     approved_roots.dedup();
 
+    let mut fingerprints_by_resolved_path =
+        std::collections::BTreeMap::<PathBuf, std::collections::BTreeSet<&str>>::new();
+    let mut known_fingerprints = std::collections::BTreeSet::new();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+    {
+        known_fingerprints.insert(placement.content_digest.as_str());
+        if let Ok(resolved) = std::fs::canonicalize(&placement.entrypoint) {
+            fingerprints_by_resolved_path
+                .entry(resolved)
+                .or_default()
+                .insert(placement.content_digest.as_str());
+        }
+    }
+
     let mut paths = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for path in candidates {
@@ -4887,7 +4904,10 @@ fn current_readable_skill_paths(
         let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
             continue;
         };
-        if actual_id != skill.id || actual_fingerprint != skill.content_digest {
+        let expected_fingerprints = fingerprints_by_resolved_path
+            .get(&resolved)
+            .unwrap_or(&known_fingerprints);
+        if actual_id != skill.id || !expected_fingerprints.contains(actual_fingerprint.as_str()) {
             continue;
         }
         paths.push(path.display().to_string());
@@ -7795,16 +7815,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             .version
             .clone()
             .or_else(|| skill.metadata.revision.clone());
-        let identity_key = match (&skill.metadata.source, &declared_revision) {
-            (Some(source), Some(revision)) => format!("source:{source}@{revision}"),
-            _ => format!(
-                "content:{}",
-                skill
-                    .content_identity_digest
-                    .as_deref()
-                    .unwrap_or(&skill.content_digest)
-            ),
-        };
+        let identity_key = persistence_identity_key(skill, declared_revision.as_deref());
         let stored_id = store.save_skill(&SkillRecord {
             id,
             identity_key,
@@ -7859,6 +7870,25 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             json!({"algorithm": skill.digest_algorithm, "name": skill.name}),
             observed_at,
         )?;
+        if let Some(content_identity_digest) = skill.content_identity_digest.as_deref() {
+            save_reference_evidence(
+                store,
+                scan_id,
+                &format!("routing_content_digest:{content_identity_digest}"),
+                EvidenceKind::Digest,
+                EvidenceQuality::Observed,
+                "skill",
+                stored_id.as_str(),
+                None,
+                Some(content_identity_digest.to_owned()),
+                json!({
+                    "algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
+                    "name": skill.name,
+                    "scope": "routing_content_identity"
+                }),
+                observed_at,
+            )?;
+        }
     }
 
     for placement in &scan.placements {
@@ -8011,6 +8041,18 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
         })?;
     }
     Ok(())
+}
+
+fn persistence_identity_key(skill: &scan::ScannedSkill, declared_revision: Option<&str>) -> String {
+    match (
+        skill.metadata.source.as_deref(),
+        declared_revision,
+        skill.content_identity_digest.as_deref(),
+    ) {
+        (Some(source), Some(revision), _) => format!("source:{source}@{revision}"),
+        (_, _, Some(content_identity)) => format!("content:{content_identity}"),
+        _ => format!("incomplete-snapshot-skill:{}", skill.id),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9617,6 +9659,14 @@ mod recovery_tests {
             ],
             ..ScanResult::default()
         };
+        assert_eq!(
+            persistence_identity_key(&scan.skills[0], None),
+            "incomplete-snapshot-skill:skill_bounded"
+        );
+        assert_ne!(
+            persistence_identity_key(&scan.skills[0], None),
+            "content:same-fallback-digest"
+        );
         let request = LibraryChangeRequest {
             skill_id: "skill_bounded".into(),
             canonical_placement_id: "placement_b".into(),

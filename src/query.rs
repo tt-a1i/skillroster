@@ -654,14 +654,19 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 Severity::Medium,
                 SAME_NAME_DIVERGENT_FINDING_TITLE,
                 format!(
-                    "{name} resolves to {} distinct content digests.",
+                    "{name} resolves to {} distinct routing content identities.",
                     content_identity_digests.len()
                 ),
                 affected_skill_ids,
                 affected_placement_ids,
                 skills
                     .iter()
-                    .map(|skill| format!("digest:{}", skill.content_digest))
+                    .filter_map(|skill| {
+                        skill
+                            .content_identity_digest
+                            .as_deref()
+                            .map(|digest| format!("routing_content_digest:{digest}"))
+                    })
                     .collect(),
                 EvidenceQuality::Observed,
             );

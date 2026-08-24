@@ -1314,6 +1314,13 @@ fn gitignore_only_copies_share_routing_identity_but_keep_integrity_drift_checks(
         None,
     ));
     assert_eq!(found["result"]["matches"][0]["variant_count"], 1);
+    assert_eq!(
+        found["result"]["matches"][0]["paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
 
     let loaded_entrypoint = Path::new(
