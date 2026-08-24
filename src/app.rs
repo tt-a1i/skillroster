@@ -168,7 +168,9 @@ pub fn run(cli: Cli) -> Result<Output> {
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
-    let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
+    let requires_exclusive_state_lock = command_requires_exclusive_state_lock(cli.command.as_ref())
+        || StateStore::requires_migration(&database_path)?;
+    let _state_lock = if requires_exclusive_state_lock {
         change::StateLock::acquire_exclusive(&state_dir)?
     } else {
         change::StateLock::acquire_shared(&state_dir)?

@@ -76,8 +76,9 @@ Progress must describe real stages or measured counts. It must not display 100% 
 Success, cancellation, interruption, timeout, and compensated failure all end with a final summary. Cursor state is restored on every exit path. A partial result states what completed, what did not, and whether any files changed.
 
 Commands that create or reconcile persisted state are serialized behind one
-exclusive state lock. True read and detail commands may run together behind the
-shared lock. A lock conflict returns typed `write_locked` with
+exclusive state lock. First initialization and schema migration use the same
+exclusive boundary. True read and detail commands may run together behind the
+shared lock once the current schema exists. A lock conflict returns typed `write_locked` with
 `retryable: true`; an Agent waits for the active local command to finish and
 retries with a bound instead of polling in a tight loop.
 
