@@ -5294,10 +5294,7 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
     );
     assert_eq!(source_action["mutates"], false);
     assert_eq!(source_action["requires_confirmation"], false);
-    let source_detail = json_output(&run(
-        &[&common[..], &["report", "--finding", source_finding_id]].concat(),
-        None,
-    ));
+    let source_detail = json_output(&run_suggested_action(source_action));
     assert_eq!(
         source_detail["result"]["kind"],
         "escaping_link_source_confirmation"
