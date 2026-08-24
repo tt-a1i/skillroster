@@ -4,7 +4,7 @@
   "status": "passed",
   "formal_gate_eligible": true,
   "projection": "redacted_bounded_projection_of_external_raw_summary",
-  "raw_summary_sha256": "bbeb07921333500921cfd4faec34dc8aa6932d4178639eea1033ac86f294d143",
+  "raw_summary_sha256": "4ee49726b7cc288d215d31f449139c5a5522c793f6918de222b4318537d2d105",
   "source_identity_stable": true,
   "codex_executable_stable": true,
   "protocol_decision": {
@@ -15,23 +15,23 @@
     "on_demand_contract_failures": 0
   },
   "frozen": {
-    "source_commit": "549f5a233a9f05f76716ad8f9cd75c6ddbe55d11",
-    "source_tree": "c9680400a99371d66df63aa96552f284969c985c",
-    "snapshot_digest": "b369644e6a243076eae1acb762232c9845426e980e62ed93b8d075e39000988b",
+    "source_commit": "eaa0ce0fced0d7bb6a4c8569111cf24acdf054f6",
+    "source_tree": "a28d41ab88a33d0a8feacef933a7acfb5bb10ed3",
+    "snapshot_digest": "58975da7514d5479cb880483dd11820c21257366bb28090601cacc5478f7dd17",
     "manifest_sha256": "93381b3fad2ef8a1f1d7cf0926eb74686c3f3d540d99569a78a7cf2f4de1ae06",
     "cli_sha256": "3c6790e0bc1774f922fb51a66607e1d69c2e2ed6d6aed9491b03c0d5f17e4cd4",
     "bootstrap_sha256": "19ad3d2d59161b8aa7e034d9a4224448fc79594471815523c2c6e3fd678d5656",
-    "targets_sha256": "13d8055a97e0e0fcb2d6eb7c96c6f352bc5d0ad0c2e7a5a87e4df0ff8cc3eb45",
+    "targets_sha256": "6bffb2cc895abd550535a74d68b4860b830769885a4d74ab94af7ef30ac8f85c",
     "codex_version_sha256": "7aa31f8b0864fa0a787657d21167487f49ed01497802a4e5955ef02db3e94272",
     "codex_executable_content_sha256": "134063e133f0b4244fa3b251acf973d4fe4b4aeeacbdc135211bf480f59f1477",
     "model": "gpt-5.6-luna",
     "reasoning_effort": "medium",
     "timeout_ms": 180000,
-    "driver_sha256": "d986a4406ea6106dfafade6e28cc2344d23a58b230aa95bf2db7e2d02d3e59f9",
+    "driver_sha256": "1fdf629d1b04c814c6707056f9fb9138a129c63d613f01bdf953b0b0f3c25bf8",
     "pair_invariants": {
-      "event-manifest-001#1": "48dc358df1a741445effb6516745ac66a483b81411859c34f1eb165828fc7c4f",
-      "event-manifest-001#2": "f27fb42d64d8371286da333892762fbda6dfd1d9498a41988cde73dd86afd0c4",
-      "event-manifest-001#3": "2099d9d33d915fda0adf0eb527c50a703485e7c96601c618070769ed32d64880"
+      "event-manifest-001#1": "0954c9cf669b7a4c1ed2b87184c0f5723b152b403066fc88e12f9d54b0c6db2c",
+      "event-manifest-001#2": "049c124304c0ef14547d33dc0810ebd914f21316459fb06de0888da718e040fd",
+      "event-manifest-001#3": "b72df7520b5a4532bd78ae3a333bfd7961ca1633446319a8455990567602c160"
     }
   },
   "results": [

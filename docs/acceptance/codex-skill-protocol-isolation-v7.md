@@ -42,7 +42,9 @@ copied into external raw evidence, and the temporary state was removed.
 The target fixture treats a complete verified activation result as equivalent
 to a complete visible-Skill load; the gate still rejects any redundant target
 read. Earlier diagnostic attempts are not promoted: one exposed an unwritable
-harness audit path, and the next exposed a contradictory legacy fixture contract.
+harness audit path, another exposed a contradictory legacy fixture contract,
+and a later rerun exposed that the Core description no longer required direct
+loading. The final fixture states the two activation branches explicitly.
 
 The [redacted artifact](artifacts/codex-skill-protocol-isolation-v7.json) omits
 prompts, transcripts, absolute paths, full Skill content, task output, and
