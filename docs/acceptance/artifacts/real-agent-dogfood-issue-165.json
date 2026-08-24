@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "suite_id": "real-agent-dogfood-issue-165",
+  "issue": 165,
+  "status": "completed_read_only_byte_ledger",
+  "source": {
+    "commit": "26a60ee6b76a9cb3c76e0d71b2f76e1bf2281b4e",
+    "binary_version": "skillroster 1.8.24"
+  },
+  "execution": {
+    "sequence": ["ledger_before", "scan", "report", "find", "find", "status", "ledger_after", "compare"],
+    "state_isolated": true,
+    "estate_assumption": "quiescent",
+    "directory_race_guarantee": "drift_detecting_not_adversarial_concurrent_capability",
+    "raw_evidence": "external_isolated_directory_not_committed",
+    "evidence_bundle": {
+      "record_count": 10,
+      "bundle_sha256": "eb965d82044f24351f4817e07be17809ffcdfac2cd2bf76a2a08d229c9de0346",
+      "exploratory_attempts_included": false
+    },
+    "mutations_allowed": false,
+    "product_network_used": false
+  },
+  "scope": {
+    "scan_skill_roots_included": 21,
+    "canonical_non_symlink_roots_ledgered": 18,
+    "symlink_root_aliases_refused": 3,
+    "explicit_config_paths": 4,
+    "regular_file_content_hashed": true,
+    "directory_structure_recorded": true,
+    "symlink_targets_followed": false
+  },
+  "ledger": {
+    "before_digest": "db32a5511ea6658cfe3236ff3328869b0dccf9aa0ffeb4340414c516c2eab2d2",
+    "after_digest": "db32a5511ea6658cfe3236ff3328869b0dccf9aa0ffeb4340414c516c2eab2d2",
+    "equal": true,
+    "added_records": 0,
+    "removed_records": 0,
+    "changed_records": 0,
+    "record_count": 3944,
+    "regular_file_count": 2797,
+    "directory_count": 1140,
+    "symlink_count": 7,
+    "regular_file_bytes": 70262720,
+    "external_target_count": 7,
+    "external_target_bytes": "out_of_scope_and_not_hashed"
+  },
+  "cli": {
+    "scan": {"independent_skills": 251, "placements": 887, "files_changed": false},
+    "report": {"finding_count": 177, "default_exposure": 521, "observed_use_agents": 3},
+    "coverage": {"limited_agents": 5, "missing_agents": 3, "complete_agents": 0},
+    "status": {"files_changed": false, "recovery_state": "clear", "journal_issues": 0, "pending_plan_count": 0},
+    "commands_mutating_real_estate": false
+  },
+  "privacy": {
+    "absolute_paths": false,
+    "file_names": false,
+    "file_contents": false,
+    "credentials": false,
+    "raw_session_text": false
+  },
+  "decision": {
+    "approved_scoped_estate_byte_stable": true,
+    "concurrent_hostile_directory_race_proven": false,
+    "all_home_files_unchanged": false,
+    "semantic_or_routing_claim": false,
+    "governance_authorized": false
+  }
+}
