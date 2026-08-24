@@ -24,7 +24,7 @@ provide an adversarial concurrent-directory guarantee.
 - State and evidence were isolated; no Apply, Setup, Undo, Plan persistence,
   delete, purge, roster/config/Skill mutation, or external-target read ran.
 - Frozen evidence bundle: 10 JSON records, bundle digest
-  `2c1a2e48245dce1f256ef030a178c1932c541f8be3617afae6e93bfaac716c71`.
+  `eb965d82044f24351f4817e07be17809ffcdfac2cd2bf76a2a08d229c9de0346`.
   Earlier exploratory captures and failed invocations are excluded from this
   acceptance bundle and are not used for its claims.
 

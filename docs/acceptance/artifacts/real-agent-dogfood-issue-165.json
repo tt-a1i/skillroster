@@ -15,7 +15,7 @@
     "raw_evidence": "external_isolated_directory_not_committed",
     "evidence_bundle": {
       "record_count": 10,
-      "bundle_sha256": "2c1a2e48245dce1f256ef030a178c1932c541f8be3617afae6e93bfaac716c71",
+      "bundle_sha256": "eb965d82044f24351f4817e07be17809ffcdfac2cd2bf76a2a08d229c9de0346",
       "exploratory_attempts_included": false
     },
     "mutations_allowed": false,
