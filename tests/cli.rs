@@ -6458,6 +6458,11 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
         archived_load["error"]["details"]["reason"],
         "archived_skill_not_routable"
     );
+    assert_eq!(
+        archived_load["error"]["details"]["retry_mode"],
+        "agent_choice_required"
+    );
+    assert_eq!(archived_load["suggested_actions"], json!([]));
     assert!(archived_load["error"]["details"].get("content").is_none());
 
     json_output(&run(
@@ -6521,6 +6526,17 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     assert_eq!(
         ambiguous_load["error"]["details"]["reason"],
         "same_name_variants_ambiguous"
+    );
+    let retry_argv = ambiguous_load["suggested_actions"][0]["argv"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        &retry_argv[retry_argv.len() - 3..],
+        &[json!("report"), json!("--summary"), json!("--json")]
+    );
+    assert_eq!(
+        ambiguous_load["suggested_actions"][0]["requires_confirmation"],
+        false
     );
 
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
@@ -6640,6 +6656,11 @@ fn find_rejects_content_drift_and_requests_rescan() {
         loaded["error"]["details"]["reason"],
         "entrypoint_content_drift"
     );
+    let retry_argv = loaded["suggested_actions"][0]["argv"].as_array().unwrap();
+    assert_eq!(
+        &retry_argv[retry_argv.len() - 2..],
+        &[json!("scan"), json!("--json")]
+    );
     assert!(loaded["error"]["details"].get("content").is_none());
 
     fs::write(skill.join("SKILL.md"), vec![b'x'; 128 * 1024 + 1]).unwrap();
@@ -6657,6 +6678,11 @@ fn find_rejects_content_drift_and_requests_rescan() {
         oversized["error"]["details"]["reason"],
         "entrypoint_exceeds_content_limit"
     );
+    assert_eq!(
+        oversized["error"]["details"]["retry_mode"],
+        "manual_resolution_required"
+    );
+    assert_eq!(oversized["suggested_actions"], json!([]));
 
     fs::remove_file(skill.join("SKILL.md")).unwrap();
     let unreadable = run(
@@ -6672,6 +6698,10 @@ fn find_rejects_content_drift_and_requests_rescan() {
     assert_eq!(
         unreadable["error"]["details"]["reason"],
         "entrypoint_unreadable"
+    );
+    assert_eq!(
+        unreadable["error"]["details"]["next_action"],
+        "repair_local_read_access_then_scan"
     );
 }
 

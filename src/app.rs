@@ -633,6 +633,45 @@ pub fn error_json_with_context(
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
     }
+    if let Some(blocked) = error.downcast_ref::<SkillLoadBlocked>() {
+        let classified = classify_error(error);
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: classified.code.into(),
+                message: error.to_string(),
+                retryable: classified.retryable,
+                details: classified.details,
+                relevant_ids: extract_relevant_ids(&error.to_string()),
+                paths: extract_paths(&error.to_string()),
+            },
+        );
+        let safe_retry = match blocked.reason {
+            "same_name_variants_ambiguous" | "no_routable_match" => Some((
+                "inspect_current_report",
+                vec!["report", "--summary", "--json"],
+            )),
+            "placement_missing_from_snapshot"
+            | "package_fingerprint_incomplete"
+            | "legacy_snapshot_requires_rescan"
+            | "eligible_placement_missing"
+            | "entrypoint_content_drift"
+            | "package_identity_drift" => Some(("refresh_snapshot", vec!["scan", "--json"])),
+            _ => None,
+        };
+        if let Some((name, argv)) = safe_retry {
+            envelope.suggested_actions = vec![action(
+                name,
+                &argv,
+                false,
+                false,
+                "verified_skill_load_blocked",
+            )];
+            action_context.apply(&mut envelope.suggested_actions);
+        }
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     let classified = classify_error(error);
     serde_json::to_string(&JsonEnvelope::<Value>::failure(
         command,
@@ -783,11 +822,45 @@ fn fingerprint_remediation(completeness: scan::FingerprintCompleteness) -> Value
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
     if let Some(blocker) = error.downcast_ref::<SkillLoadBlocked>() {
-        let next_action = match blocker.reason {
-            "same_name_variants_ambiguous" => "inspect_variant_finding",
-            "untrusted_external_source" => "confirm_exact_source_root_then_scan",
-            "archived_skill_not_routable" => "choose_non_archived_skill",
-            _ => "scan",
+        let (next_action, retry_mode) = match blocker.reason {
+            "same_name_variants_ambiguous" => {
+                ("inspect_variant_finding", "read_only_command_available")
+            }
+            "no_routable_match" => (
+                "inspect_current_report_or_refine_task",
+                "read_only_command_available",
+            ),
+            "untrusted_external_source" => (
+                "confirm_exact_source_root_then_scan",
+                "user_decision_required",
+            ),
+            "archived_skill_not_routable" => ("choose_non_archived_skill", "agent_choice_required"),
+            "entrypoint_exceeds_content_limit" => (
+                "reduce_entrypoint_below_limit_then_scan",
+                "manual_resolution_required",
+            ),
+            "entrypoint_unreadable" | "package_identity_unreadable" => (
+                "repair_local_read_access_then_scan",
+                "manual_resolution_required",
+            ),
+            "entrypoint_escapes_approved_roots" => (
+                "move_under_approved_root_or_confirm_source_then_scan",
+                "user_decision_required",
+            ),
+            "entrypoint_not_utf8" => (
+                "convert_entrypoint_to_utf8_then_scan",
+                "manual_resolution_required",
+            ),
+            "package_fingerprint_incomplete" => (
+                "resolve_incomplete_package_then_scan",
+                "read_only_command_available",
+            ),
+            "placement_missing_from_snapshot"
+            | "legacy_snapshot_requires_rescan"
+            | "eligible_placement_missing"
+            | "entrypoint_content_drift"
+            | "package_identity_drift" => ("scan", "read_only_command_available"),
+            _ => ("inspect_blocker", "manual_resolution_required"),
         };
         return ClassifiedError {
             code: "verified_skill_load_blocked",
@@ -806,6 +879,7 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "state_files_changed": false,
                 "task_success": "not_evaluated",
                 "next_action": next_action,
+                "retry_mode": retry_mode,
             })),
         };
     }
@@ -4850,14 +4924,15 @@ fn verified_top_skill_load(
             Some(actual_entrypoint_digest.clone()),
         )
     })?;
-    let (actual_id, actual_package_digest) = scan::inspect_skill_identity(&path).map_err(|_| {
-        blocked(
-            "package_identity_unreadable",
-            Some(path.clone()),
-            Some(placement.content_digest.clone()),
-            None,
-        )
-    })?;
+    let (actual_id, actual_package_digest) =
+        scan::inspect_skill_identity(&before).map_err(|_| {
+            blocked(
+                "package_identity_unreadable",
+                Some(path.clone()),
+                Some(placement.content_digest.clone()),
+                None,
+            )
+        })?;
     let after = std::fs::canonicalize(&path).map_err(|_| {
         blocked(
             "entrypoint_unreadable",
