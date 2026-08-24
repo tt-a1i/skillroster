@@ -387,18 +387,22 @@ struct SkillRootPolicy {
     provider: Option<String>,
 }
 
-struct DiscoveryContext<'a> {
-    policy: &'a SkillRootPolicy,
-    placement_root: &'a Path,
-    approved_roots: &'a [PathBuf],
-    max_depth: usize,
-}
-
 #[derive(Clone, Copy, Default)]
 struct DiscoveryState {
     hidden_ancestor: bool,
     inside_skill_package: bool,
     harness_excluded: bool,
+}
+
+impl DiscoveryState {
+    fn descend(self, agent: Option<AgentKind>, child_name: &str, containing_skill: bool) -> Self {
+        Self {
+            hidden_ancestor: self.hidden_ancestor || child_name.starts_with('.'),
+            inside_skill_package: self.inside_skill_package || containing_skill,
+            harness_excluded: self.harness_excluded
+                || hermes_excludes_directory(agent, child_name, containing_skill),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -996,13 +1000,15 @@ fn observe_skill_root(
         return;
     }
 
-    let context = DiscoveryContext {
-        policy: &policy,
-        placement_root: root,
+    match discover_entrypoints(
+        &policy,
+        root,
         approved_roots,
+        root,
         max_depth,
-    };
-    match discover_entrypoints(&context, root, 0, DiscoveryState::default(), candidates) {
+        DiscoveryState::default(),
+        candidates,
+    ) {
         Ok(true) => {}
         Ok(false) => {
             let detail = format!("Skill discovery was bounded at depth {max_depth}");
@@ -1116,13 +1122,19 @@ fn observe_durable_skill_root_with_hook(
 }
 
 fn discover_entrypoints(
-    context: &DiscoveryContext<'_>,
+    policy: &SkillRootPolicy,
+    placement_root: &Path,
+    approved_roots: &[PathBuf],
     directory: &Path,
-    depth: usize,
+    max_depth: usize,
     state: DiscoveryState,
     output: &mut Vec<EntryCandidate>,
 ) -> io::Result<bool> {
-    if depth > context.max_depth {
+    let depth = directory
+        .strip_prefix(placement_root)
+        .map(|path| path.components().count())
+        .unwrap_or(max_depth.saturating_add(1));
+    if depth > max_depth {
         return Ok(false);
     }
     let mut complete = true;
@@ -1134,21 +1146,14 @@ fn discover_entrypoints(
         let metadata = fs::symlink_metadata(&path)?;
         let file_name = entry.file_name();
         if file_name == "SKILL.md" {
-            let (target, link_status) = inspect_link(context.approved_roots, &path, &metadata);
-            let default_exposed = default_exposure_for_candidate(
-                context.policy,
-                context.placement_root,
-                &path,
-                depth,
-                state.hidden_ancestor,
-                state.inside_skill_package,
-                state.harness_excluded,
-            );
+            let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
+            let default_exposed =
+                default_exposure_for_candidate(policy, placement_root, &path, depth, state);
             output.push(EntryCandidate {
-                agent: context.policy.agent,
-                root: context.placement_root.to_path_buf(),
-                governable: context.policy.governable,
-                provider: context.policy.provider.clone(),
+                agent: policy.agent,
+                root: placement_root.to_path_buf(),
+                governable: policy.governable,
+                provider: policy.provider.clone(),
                 expected_physical_directory: canonical_entrypoint_directory(&path),
                 entrypoint: path,
                 link_target: target,
@@ -1157,48 +1162,36 @@ fn discover_entrypoints(
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
             let child_name = file_name.to_string_lossy();
-            let child_state = DiscoveryState {
-                hidden_ancestor: state.hidden_ancestor || child_name.starts_with('.'),
-                inside_skill_package: state.inside_skill_package || directory_has_skill,
-                harness_excluded: state.harness_excluded
-                    || hermes_excludes_directory(
-                        context.policy.agent,
-                        &child_name,
-                        directory_has_skill,
-                    ),
-            };
-            complete &= discover_entrypoints(context, &path, depth + 1, child_state, output)?;
+            let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
+            complete &= discover_entrypoints(
+                policy,
+                placement_root,
+                approved_roots,
+                &path,
+                max_depth,
+                child_state,
+                output,
+            )?;
         } else if metadata.file_type().is_symlink() {
             // A linked Skill directory is a placement too, but it is never
             // traversed recursively before the boundary has been evaluated.
             let linked_entrypoint = path.join("SKILL.md");
-            let (target, status) = inspect_link(context.approved_roots, &path, &metadata);
+            let (target, status) = inspect_link(approved_roots, &path, &metadata);
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
                 let child_name = file_name.to_string_lossy();
-                let child_state = DiscoveryState {
-                    hidden_ancestor: state.hidden_ancestor || child_name.starts_with('.'),
-                    inside_skill_package: state.inside_skill_package || directory_has_skill,
-                    harness_excluded: state.harness_excluded
-                        || hermes_excludes_directory(
-                            context.policy.agent,
-                            &child_name,
-                            directory_has_skill,
-                        ),
-                };
+                let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
                 let default_exposed = default_exposure_for_candidate(
-                    context.policy,
-                    context.placement_root,
+                    policy,
+                    placement_root,
                     &linked_entrypoint,
                     depth + 1,
-                    child_state.hidden_ancestor,
-                    child_state.inside_skill_package,
-                    child_state.harness_excluded,
+                    child_state,
                 );
                 output.push(EntryCandidate {
-                    agent: context.policy.agent,
-                    root: context.placement_root.to_path_buf(),
-                    governable: context.policy.governable,
-                    provider: context.policy.provider.clone(),
+                    agent: policy.agent,
+                    root: placement_root.to_path_buf(),
+                    governable: policy.governable,
+                    provider: policy.provider.clone(),
                     expected_physical_directory: canonical_entrypoint_directory(&linked_entrypoint),
                     entrypoint: linked_entrypoint,
                     link_target: target,
@@ -1241,9 +1234,7 @@ fn default_exposure_for_candidate(
     placement_root: &Path,
     entrypoint: &Path,
     depth: usize,
-    hidden_ancestor: bool,
-    inside_skill_package: bool,
-    harness_excluded: bool,
+    state: DiscoveryState,
 ) -> bool {
     let Some(agent) = policy.agent else {
         return false;
@@ -1251,27 +1242,42 @@ fn default_exposure_for_candidate(
     match agent.skill_discovery_semantics() {
         SkillDiscoverySemantics::Codex => {
             let relative = entrypoint.strip_prefix(placement_root).ok();
-            let system_root = placement_root
+            let scanning_system_root = placement_root
                 .file_name()
-                .is_some_and(|name| name == ".system")
-                || relative
-                    .and_then(|path| path.components().next())
-                    .is_some_and(|component| component.as_os_str() == ".system");
-            system_root || !hidden_ancestor && !harness_excluded
+                .is_some_and(|name| name == ".system");
+            let visible_below_system_root = relative
+                .and_then(Path::parent)
+                .and_then(|path| {
+                    let mut components = path.components();
+                    (components.next()?.as_os_str() == ".system").then(|| {
+                        components.all(|component| {
+                            !component.as_os_str().to_string_lossy().starts_with('.')
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            !state.harness_excluded
+                && if scanning_system_root {
+                    !state.hidden_ancestor
+                } else if visible_below_system_root {
+                    true
+                } else {
+                    !state.hidden_ancestor
+                }
         }
         SkillDiscoverySemantics::ClaudeCode => {
             depth == 1
-                && !hidden_ancestor
-                && !harness_excluded
+                && !state.hidden_ancestor
+                && !state.harness_excluded
                 && entrypoint
                     .parent()
                     .and_then(Path::file_name)
                     .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
         }
         SkillDiscoverySemantics::Pi => {
-            !hidden_ancestor && !inside_skill_package && !harness_excluded
+            !state.hidden_ancestor && !state.inside_skill_package && !state.harness_excluded
         }
-        SkillDiscoverySemantics::Hermes => !harness_excluded,
+        SkillDiscoverySemantics::Hermes => !state.harness_excluded,
         SkillDiscoverySemantics::Conservative => true,
     }
 }

@@ -135,6 +135,7 @@ fn public_scan_and_report_use_verified_agent_exposure_rules() {
     skill(".codex/skills/visible");
     skill(".codex/skills/.bak-test/hidden");
     skill(".codex/skills/.system/system");
+    skill(".codex/skills/.system/.bak-test/hidden");
     skill(".claude/skills/direct");
     skill(".claude/skills/.hidden");
     skill(".claude/skills/category/nested");
@@ -187,6 +188,10 @@ fn public_scan_and_report_use_verified_agent_exposure_rules() {
     assert!(exposed("codex", ".codex/skills/visible/SKILL.md"));
     assert!(!exposed("codex", ".codex/skills/.bak-test/hidden/SKILL.md"));
     assert!(exposed("codex", ".codex/skills/.system/system/SKILL.md"));
+    assert!(!exposed(
+        "codex",
+        ".codex/skills/.system/.bak-test/hidden/SKILL.md"
+    ));
     assert_eq!(
         scan_json["placements"]
             .as_array()
