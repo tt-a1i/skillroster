@@ -114,6 +114,26 @@ const MIGRATIONS: [(i64, Migration); SCHEMA_VERSION as usize] = [
     (10, migration_v10),
 ];
 
+fn validate_migrations(migrations: &[(i64, Migration)], schema_version: i64) -> StorageResult<()> {
+    if i64::try_from(migrations.len()) != Ok(schema_version) {
+        return Err(StorageError::InvalidData(format!(
+            "migration registry has {} entries for schema {schema_version}",
+            migrations.len()
+        )));
+    }
+    for (index, (target, _)) in migrations.iter().enumerate() {
+        let expected = i64::try_from(index)
+            .map_err(|_| StorageError::InvalidData("migration index is too large".into()))?
+            + 1;
+        if *target != expected {
+            return Err(StorageError::InvalidData(format!(
+                "migration registry expected target {expected}, found {target}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct StateStore {
     connection: Connection,
 }
@@ -174,12 +194,23 @@ impl StateStore {
                 "database schema {current} is newer than supported schema {SCHEMA_VERSION}"
             )));
         }
+        if current < 0 {
+            return Err(StorageError::InvalidData(format!(
+                "database schema {current} cannot be negative"
+            )));
+        }
+        validate_migrations(&MIGRATIONS, SCHEMA_VERSION)?;
         for (target, migration) in MIGRATIONS {
             if current + 1 != target {
                 continue;
             }
             self.run_migration(target, migration)?;
             current = target;
+        }
+        if current != SCHEMA_VERSION {
+            return Err(StorageError::InvalidData(format!(
+                "migration stopped at schema {current}, expected {SCHEMA_VERSION}"
+            )));
         }
         Ok(())
     }
@@ -2255,6 +2286,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained_table, 0);
+    }
+
+    #[test]
+    fn migration_registry_must_be_complete_and_strictly_ordered() {
+        let incomplete: [(i64, Migration); 1] = [(1, migration_v1)];
+        assert_eq!(
+            validate_migrations(&incomplete, 2).unwrap_err().to_string(),
+            "migration registry has 1 entries for schema 2"
+        );
+
+        let skipped: [(i64, Migration); 2] = [(1, migration_v1), (3, migration_v2)];
+        assert_eq!(
+            validate_migrations(&skipped, 2).unwrap_err().to_string(),
+            "migration registry expected target 2, found 3"
+        );
     }
 
     #[test]
