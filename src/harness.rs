@@ -16,6 +16,20 @@ pub enum AgentKind {
     GitHubCopilot,
 }
 
+/// The first-party Skill discovery behavior verified for an Agent adapter.
+///
+/// This is deliberately a small policy vocabulary: adapters whose loader has
+/// not been verified retain the historical conservative recursive scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillDiscoverySemantics {
+    Codex,
+    ClaudeCode,
+    Pi,
+    Hermes,
+    Conservative,
+}
+
 impl AgentKind {
     pub const ALL: [Self; 8] = [
         Self::Codex,
@@ -51,6 +65,18 @@ impl AgentKind {
             Self::Cursor => "Cursor",
             Self::GeminiCli => "Gemini CLI",
             Self::GitHubCopilot => "GitHub Copilot",
+        }
+    }
+
+    pub const fn skill_discovery_semantics(self) -> SkillDiscoverySemantics {
+        match self {
+            Self::Codex => SkillDiscoverySemantics::Codex,
+            Self::ClaudeCode => SkillDiscoverySemantics::ClaudeCode,
+            Self::Pi => SkillDiscoverySemantics::Pi,
+            Self::Hermes => SkillDiscoverySemantics::Hermes,
+            Self::OpenCode | Self::Cursor | Self::GeminiCli | Self::GitHubCopilot => {
+                SkillDiscoverySemantics::Conservative
+            }
         }
     }
 }
@@ -421,6 +447,37 @@ mod tests {
         assert_eq!(AgentKind::ALL.len(), 8);
         assert!(roots.iter().all(|roots| !roots.skill_roots.is_empty()));
         assert!(roots.iter().all(|roots| !roots.session_roots.is_empty()));
+    }
+
+    #[test]
+    fn verified_adapters_have_explicit_discovery_semantics() {
+        assert_eq!(
+            AgentKind::Codex.skill_discovery_semantics(),
+            SkillDiscoverySemantics::Codex
+        );
+        assert_eq!(
+            AgentKind::ClaudeCode.skill_discovery_semantics(),
+            SkillDiscoverySemantics::ClaudeCode
+        );
+        assert_eq!(
+            AgentKind::Pi.skill_discovery_semantics(),
+            SkillDiscoverySemantics::Pi
+        );
+        assert_eq!(
+            AgentKind::Hermes.skill_discovery_semantics(),
+            SkillDiscoverySemantics::Hermes
+        );
+        for agent in [
+            AgentKind::OpenCode,
+            AgentKind::Cursor,
+            AgentKind::GeminiCli,
+            AgentKind::GitHubCopilot,
+        ] {
+            assert_eq!(
+                agent.skill_discovery_semantics(),
+                SkillDiscoverySemantics::Conservative
+            );
+        }
     }
 
     #[test]
