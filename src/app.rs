@@ -2092,7 +2092,7 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
         "imported_receipt_ids": imported,
         "import_errors": import_errors,
         "automatic_resolution_available": false,
-        "resolution_note": "Orphan journals with an existing immutable Plan are imported as recovery_required, never guessed successful. Inspect exact paths before repair.",
+        "resolution_note": "Orphan journals with an existing immutable Plan are imported as recovery_required, never guessed successful. Apply recovery transitions an applying Plan; Undo recovery preserves its terminal Plan. Inspect exact paths before repair.",
         "state_changed": state_changed,
         "files_changed": false,
     }))

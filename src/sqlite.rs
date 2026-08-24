@@ -1360,9 +1360,10 @@ impl StateStore {
         Ok(())
     }
 
-    /// Imports a filesystem recovery Receipt and transitions its Applying Plan
-    /// in one transaction. An already-imported recovery Receipt is accepted so
-    /// older split states can converge on retry.
+    /// Imports a filesystem recovery Receipt in one transaction. Apply recovery
+    /// transitions its Applying Plan; a verified reverse Undo keeps the terminal
+    /// Plan unchanged. An already-imported recovery Receipt is accepted so older
+    /// split states can converge on retry.
     pub fn save_recovery_receipt(
         &self,
         plan: &PlanId,
