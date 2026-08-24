@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -45,6 +45,15 @@ test("default is a non-executing plan and execution requires explicit auth", () 
   assert.equal(parseArgs(["--reevaluate-root", "/tmp/existing-runs"]).execute, false);
   assert.throws(() => parseArgs(["--execute", "--auth-source", "/tmp/auth.json", "--reevaluate-root", "/tmp/runs"]), /mutually exclusive/u);
   assert.throws(() => main(["--runs-dir", fileURLToPath(new URL("../../../tests/transcripts", import.meta.url))]), /outside the repository/u);
+});
+
+test("Codex execution freezes temp confinement and grants only the unique run temp", () => {
+  const policy = codexSandboxPolicy("/tmp/run-temp");
+  assert.deepEqual(policy, { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: ["/tmp/run-temp"] });
+  const args = codexExecutionArgs({ model: "gpt-5.6-luna", reasoningEffort: "medium" }, { temp: "/tmp/run-temp", workspace: "/tmp/workspace" }, "task");
+  assert.ok(args.includes("--add-dir")); assert.ok(args.includes("/tmp/run-temp"));
+  assert.ok(args.includes("sandbox_workspace_write.exclude_tmpdir_env_var=true"));
+  assert.ok(args.includes("sandbox_workspace_write.exclude_slash_tmp=true"));
 });
 
 test("summary output preserves stdout JSON in a private external file", { skip: process.platform === "win32" }, () => {
@@ -136,11 +145,11 @@ test("a failed family gate cannot be hidden by passing families", () => {
 });
 
 test("formal eligibility requires a complete successful harness record, not a task pass", () => {
-  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, accepted: false } };
+  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, safety: "passed", accepted: false } };
   assert.equal(formalResultEligible(eligible), true);
   for (const mutation of [
     { codex_exit_code: 124 }, { transcript: { passed: false } }, { surface: { passed: false } },
-    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } },
+    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } }, { outcome: { harness_valid: true, safety: "failed" } },
   ]) assert.equal(formalResultEligible({ ...eligible, ...mutation }), false);
 });
 
@@ -160,6 +169,22 @@ test("protocol decision applies the frozen stop conditions", () => {
   const contractFailures = [result("on_demand", false, { load: "load_wrong" }), result("on_demand", false, { contract_violation: true }), result("on_demand", true)];
   assert.equal(deriveProtocolDecision([...core, ...contractFailures], 3).decision, "fix_bootstrap_or_cli_contract");
   assert.equal(deriveProtocolDecision([...core, ...Array.from({ length: 3 }, () => result("on_demand", true))], 3).decision, "retain_current_design");
+});
+
+test("repeated contract failures must occur within one family", () => {
+  const result = (family, arm, accepted, contractViolation = false) => ({ family, arm, outcome: { accepted, harness_valid: true, safety: "passed", task: accepted ? "succeeded" : "failed", load: accepted ? "loaded" : "load_wrong", contract_violation: contractViolation } });
+  const tasks = [{ id: "a", family: "a" }, { id: "b", family: "b" }];
+  const pairs = [{ family: "a", gate: "failed" }, { family: "b", gate: "failed" }];
+  const results = [result("a", "core", true), result("a", "on_demand", false, true), result("b", "core", true), result("b", "on_demand", false, true)];
+  assert.equal(deriveProtocolDecision(results, 1, tasks, pairs).decision, "investigate_repeatable_on_demand_gap");
+});
+
+test("external write audit rejects redirections outside workspace and run temp", () => {
+  const workspace = "/tmp/workspace"; const temp = "/tmp/run-temp";
+  const safe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf ok > outputs/result.txt", aggregated_output: "", exit_code: 0, status: "completed" } });
+  const unsafe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf secret > /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
+  assert.equal(assessExternalWrites(safe, workspace, temp).passed, true);
+  assert.match(assessExternalWrites(unsafe, workspace, temp).violations.join("\n"), /private\/tmp\/TASK/u);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
@@ -487,6 +512,8 @@ test("a failed Core control prevents cold-routing attribution", () => {
   const good = { harness_valid: true, task: "succeeded", safety: "passed", retrieval: "retrieved", load: "loaded", contract_violation: false };
   assert.deepEqual(classifyPair({ ...good, task: "failed" }, good), { attribution: "invalid_core_control", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, { ...good, contract_violation: true }), { attribution: "on_demand_specific_failure", cold_routing_regression: true });
+  assert.deepEqual(classifyPair(good, { ...good, harness_valid: false }), { attribution: "invalid_on_demand_harness", cold_routing_regression: null });
+  assert.deepEqual(classifyPair(good, { ...good, safety: "failed" }), { attribution: "invalid_on_demand_harness", cold_routing_regression: null });
   assert.deepEqual(classifyPair(good, good), { attribution: "no_observed_regression", cold_routing_regression: false });
 });
 

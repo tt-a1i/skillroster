@@ -326,6 +326,27 @@ export function assessTranscriptIntegrity(jsonl) {
   return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands, unsuccessful_command_count: unsuccessfulCommands };
 }
 
+function writeTargetAllowed(path, workspace, tempRoot) {
+  const candidate = isAbsolute(path) ? resolve(path) : resolve(workspace, path);
+  return inside(candidate, workspace) || inside(candidate, tempRoot);
+}
+
+export function assessExternalWrites(jsonl, workspace, tempRoot) {
+  const targets = []; const violations = [];
+  const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
+  const redirection = /(?:^|\s)(?:\d*>>?|\d*<>)[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gu;
+  for (const [eventIndex, event] of commands.entries()) {
+    for (const match of event.command.matchAll(redirection)) {
+      const raw = match[1] ?? match[2] ?? match[3];
+      if (["/dev/null", "NUL", "nul"].includes(raw)) continue;
+      const target = { raw, canonical: canonicalPath(isAbsolute(raw) ? raw : join(workspace, raw)), event_index: eventIndex, command: event.command };
+      const allowed = writeTargetAllowed(raw, workspace, tempRoot); targets.push({ ...target, allowed });
+      if (!allowed) violations.push(`external_write_target:${target.canonical}`);
+    }
+  }
+  return { passed: violations.length === 0, violations: [...new Set(violations)], targets, audit_scope: "command-visible explicit redirection targets; OS sandbox is the actual write boundary" };
+}
+
 export function extractCommandTexts(jsonl) { return extractCommandEvents(jsonl).filter((event) => event.kind === "command").map((event) => event.command); }
 
 function unwrapSimpleShell(command) {
@@ -584,8 +605,8 @@ export function assessCoreOrder(transcript, targetPath) {
   return { passed: violations.length === 0, violations, audit_scope: "Core first-action full-load gate over Codex command event state machine" };
 }
 
-export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder = { passed: true }, coreOrder = { passed: true }, transcript = { passed: true }, protectedScopes = { passed: true } }) {
-  const safety = workspace.passed && protectedScopes.passed ? "passed" : "failed";
+export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder = { passed: true }, coreOrder = { passed: true }, transcript = { passed: true }, protectedScopes = { passed: true }, externalWrites = { passed: true } }) {
+  const safety = workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed";
   const harnessValid = surface.passed && transcript.passed && (arm !== "core" || coreOrder.passed);
   const retrievalStage = arm === "core" ? "core_control" : retrieval.count === 0 ? "no_retrieval" : retrieval.top1_correct ? "retrieved" : "retrieval_wrong";
   const loadStage = arm === "core" ? load.passed ? "loaded" : "load_wrong" : load.passed && retrieval.returned_path_exact ? "loaded" : "load_wrong";
@@ -602,6 +623,7 @@ export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, worksp
 
 export function classifyPair(core, onDemand) {
   if (!core.harness_valid || core.task !== "succeeded" || core.load !== "loaded" || core.safety !== "passed") return { attribution: "invalid_core_control", cold_routing_regression: null };
+  if (!onDemand.harness_valid || onDemand.safety !== "passed") return { attribution: "invalid_on_demand_harness", cold_routing_regression: null };
   const regression = onDemand.task !== "succeeded" || onDemand.retrieval !== "retrieved" || onDemand.load !== "loaded" || onDemand.safety !== "passed" || onDemand.contract_violation;
   return { attribution: regression ? "on_demand_specific_failure" : "no_observed_regression", cold_routing_regression: regression };
 }
@@ -642,7 +664,7 @@ export function deriveProtocolDecision(results, trialsPerArm, tasks = null, pair
   });
   let decision = "investigate_repeatable_on_demand_gap";
   if (coreAccepted < familyIds.length * trialsPerArm) decision = "fix_control_task_or_oracle";
-  else if (onDemandContractFailures >= 2) decision = "fix_bootstrap_or_cli_contract";
+  else if (family_gates.some((gate) => gate.on_demand_contract_failures >= 2)) decision = "fix_bootstrap_or_cli_contract";
   else if (family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed")) decision = "retain_current_design";
   return { decision, required_trials_per_arm: trialsPerArm, expected_runs: familyIds.length * trialsPerArm * 2, family_count: familyIds.length, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures, family_gates, overall_gate: family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed") };
 }
@@ -850,6 +872,7 @@ function freezeSuite(manifest, options) {
       isolated_non_repository_workspace: true,
       execution_only_flags_unsupported_by_debug: ["ignore_user_config", "sandbox", "ephemeral"],
     },
+    sandbox_policy: { workspace_write: { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dir: "unique_run_temp" } },
     arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm,
     family_schedule: manifest.tasks.map((task) => ({ family: task.family, task: task.id })),
   };
@@ -863,6 +886,15 @@ function freezeSuite(manifest, options) {
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
+}
+
+export function codexSandboxPolicy(tempRoot) {
+  return { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dirs: [canonicalPath(tempRoot)] };
+}
+
+export function codexExecutionArgs(options, paths, prompt) {
+  const policy = codexSandboxPolicy(paths.temp);
+  return ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--add-dir", policy.add_dirs[0], "--skip-git-repo-check", "--json", "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true", "-c", "sandbox_workspace_write.exclude_slash_tmp=true", ...codexModelConfig(options), "-C", paths.workspace, prompt];
 }
 
 function codexModelConfig(options) { return ["-c", `model=${JSON.stringify(options.model)}`, "-c", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`]; }
@@ -916,7 +948,8 @@ export function formalResultEligible(result) {
     && result.transcript?.passed === true
     && result.workspace?.passed === true
     && result.protected_scopes?.passed === true
-    && result.outcome?.harness_valid === true);
+    && result.outcome?.harness_valid === true
+    && result.outcome?.safety === "passed");
 }
 
 function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
@@ -931,14 +964,15 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const surface = preflightSurface(paths, task, arm, options, env);
     if (!surface.passed) {
       const workspace = assessWorkspaceChanges(initialWorkspace, walk(paths.workspace), Object.keys(task.workspace_files), task.allowed_changed_paths); const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
-      return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed ? "passed" : "failed", accepted: false }, root };
+      const externalWrites = assessExternalWrites("", paths.workspace, paths.temp);
+      return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, external_writes: externalWrites, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed", accepted: false }, root };
     }
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
     const runEnv = { ...env };
     if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.runtimeAudit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
-    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", ...codexModelConfig(options), "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const result = run(options.codex, codexExecutionArgs(options, paths, task.prompt), { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     if (existsSync(paths.runtimeAudit)) copyFileSync(paths.runtimeAudit, paths.audit);
@@ -950,8 +984,9 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
-    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
-    return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    const externalWrites = assessExternalWrites(result.stdout, paths.workspace, paths.temp);
+    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes, externalWrites });
+    return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, external_writes: externalWrites, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
     cleanupRuntime(paths.temp);

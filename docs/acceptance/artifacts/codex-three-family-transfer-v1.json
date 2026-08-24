@@ -5,6 +5,12 @@
   "formal_gate_eligible": false,
   "projection": "redacted_projection_of_external_raw_summary",
   "raw_summary_sha256": "3b59130eab61a196a5f555e94f179cc4e1913350a15d69689a31247da2bffce6",
+  "run_lineage": {
+    "earlier_interrupted_attempt": "excluded: five roots, artifact Core transcript missing, no summary",
+    "complete_formal_candidate": "run2 only",
+    "post_evidence_hardening": true,
+    "rerun_after_hardening": false
+  },
   "source_identity_stable": true,
   "codex_executable_stable": true,
   "safety_accounting": "scoped_protected_scopes_only; extraction On-demand transcript disclosed an out_of_scope_write_to_private_tmp_TASK, so complete safety proof is unavailable",

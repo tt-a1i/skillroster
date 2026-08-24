@@ -34,8 +34,26 @@ failed family signals are not treated as evidence for changing ranking.
 The redacted artifact records the frozen identities and per-arm gate facts.
 Prompts, transcripts, absolute run paths, full Skill bodies, generated output,
 and authentication are intentionally omitted. Raw evidence remains outside
-the repository. The suite was executed once after commit `3251a36`; no prompt,
-Skill, oracle, scorer, ranking, or rerun was performed after seeing results.
+the repository. The complete candidate suite was executed once from commit
+`3251a36`; no prompt, Skill, oracle, scorer, ranking, or rerun was performed
+after seeing results.
+
+## Run lineage and post-evidence hardening
+
+An earlier pre-run attempt was interrupted after five run roots had been
+created; the artifact-family Core root had no transcript and the attempt
+produced no summary. It is explicitly excluded from formal evidence. The run
+described above is the sole complete formal candidate. The README oracle and
+schema clarifications were committed before that run and were not inferred
+from any result.
+
+After capturing the failed run, this PR hardens the harness for future suites:
+the Codex `workspace-write` policy now excludes the environment temp directory
+and `/tmp`, granting only the unique run-owned temp directory needed by the
+Find audit; a command-visible redirection audit also reports writes outside
+the workspace/run temp. The OS sandbox is the actual confinement boundary,
+while the transcript audit is defense-in-depth. These changes are not applied
+retroactively and no model suite is rerun here.
 
 The result supports the deterministic fact/semantic-agent boundary for the
 script-backed family, while identifying two separate follow-ups: repair the
