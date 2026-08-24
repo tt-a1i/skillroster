@@ -625,9 +625,13 @@ test("fresh rewrite oracle accepts harmless date spacing but rejects invented cl
     writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
     assert.equal(evaluateOracle(root, task.oracle).passed, true);
     writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日关闭测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。\n");
-    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:开放\\s\*测试/u);
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台拟于11月14日开放测试，首轮未包含语音速记和离线搜索。试用共有36人，其中24人并未表示离线搜索缩短了查找时间。\n");
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
     writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间，开放测试后另外 12 人加入。\n");
-    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /开放测试后/u);
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
+    writeFileSync(join(root, task.oracle.path), "移动端工作台将于 11月14日开放测试，首轮包含语音速记和离线搜索。试用共有 36 人，其中 24 人表示离线搜索缩短了查找时间。预计12月再新增50人。\n");
+    assert.match(evaluateOracle(root, task.oracle).failures.join(","), /missing_regex:\^/u);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
