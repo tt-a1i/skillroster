@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -23,7 +24,7 @@ test("symlink retargeting changes identity but never hashes its target", { skip:
   const root = tempRoot(); const inside = join(root, "inside.txt"); const outside = join(dirname(root), "outside-secret.txt"); writeFileSync(inside, "inside"); writeFileSync(outside, "secret"); symlinkSync("inside.txt", join(root, "link"));
   const before = await collectLedger(scope(root)); rmSync(join(root, "link")); symlinkSync(outside, join(root, "link")); const after = await collectLedger(scope(root));
   const linkBefore = before.records.find((record) => record.kind === "symlink"); const linkAfter = after.records.find((record) => record.kind === "symlink");
-  assert.equal(linkBefore.target_scope, "approved_root_0"); assert.equal(linkAfter.target_scope, "external_target_not_hashed"); assert.equal(compareLedgers(before, after).changed, 1); assert.equal(after.records.some((record) => record.sha256 === "secret"), false); rmSync(outside, { force: true }); rmSync(root, { recursive: true, force: true });
+  const outsideDigest = createHash("sha256").update("secret").digest("hex"); assert.equal(linkBefore.target_scope, "approved_root_0"); assert.equal(linkAfter.target_scope, "external_target_not_hashed"); assert.equal(compareLedgers(before, after).changed, 1); assert.equal(after.records.some((record) => record.sha256 === outsideDigest), false); rmSync(outside, { force: true }); rmSync(root, { recursive: true, force: true });
 });
 
 test("external symlink targets are explicitly out of scope even when unreadable", { skip: process.platform === "win32" }, async () => {
