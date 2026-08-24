@@ -367,7 +367,11 @@ pub fn run(cli: Cli) -> Result<Output> {
                 ReportRequest::Finding {
                     id,
                     full: args.full,
-                    limit: usize::from(args.limit),
+                    limit: args.limit.map(usize::from).unwrap_or(if args.full {
+                        DEFAULT_REPORT_PAGE_LIMIT
+                    } else {
+                        DEFAULT_FINDING_DETAIL_LIMIT
+                    }),
                     offset: usize::try_from(args.offset)?,
                 }
             } else if args.full {
@@ -378,7 +382,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 ReportRequest::Findings {
                     category: args.category,
                     severity: args.severity,
-                    limit: usize::from(args.limit),
+                    limit: args.limit.map_or(DEFAULT_REPORT_PAGE_LIMIT, usize::from),
                     offset: usize::try_from(args.offset)?,
                 }
             } else {
@@ -2352,6 +2356,9 @@ enum ReportRequest<'a> {
     },
     Exhaustive,
 }
+
+const DEFAULT_FINDING_DETAIL_LIMIT: usize = 5;
+const DEFAULT_REPORT_PAGE_LIMIT: usize = 20;
 
 fn report_command(
     store: &StateStore,

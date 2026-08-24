@@ -29,7 +29,7 @@ skillroster --source-root /absolute/confirmed/source scan --json
 skillroster report --json
 skillroster report --findings --limit 20 --json
 skillroster report --findings --category usage --json
-skillroster report --finding <finding-id> --limit 20 --json
+skillroster report --finding <finding-id> --json       # 5-row compact first view
 skillroster report --finding <finding-id> --full --json
 skillroster report --full --json
 skillroster find "database migration" --json
