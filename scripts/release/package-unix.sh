@@ -33,6 +33,10 @@ if [[ -e "$stage" || -L "$stage" || -e "$archive" || -L "$archive" || -e "$check
   exit 1
 fi
 
+cleanup_stage() {
+  if [[ -e "$stage" || -L "$stage" ]]; then rm -rf -- "$stage"; fi
+}
+trap cleanup_stage EXIT
 mkdir -p "$stage"
 install -m 0755 "target/${target}/release/skillroster" "$stage/skillroster"
 cp README.md "$stage/README.md"
@@ -40,6 +44,7 @@ cp LICENSE "$stage/LICENSE"
 scripts/release/smoke.sh "$stage/skillroster"
 tar -C "$dist_root" -czf "$archive" "$name"
 rm -rf "$stage"
+trap - EXIT
 
 if ! tar -xOf "$archive" "$name/LICENSE" | cmp - LICENSE; then
   echo "release archive does not contain the repository LICENSE" >&2
