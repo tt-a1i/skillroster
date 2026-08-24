@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, cpSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -513,19 +513,50 @@ function copyAuth(authSource, codexHome) {
 function cleanupAuth(path) { rmSync(path, { force: true }); ACTIVE_AUTH_COPIES.delete(path); }
 
 function validateSummaryOutput(path, runsDir) {
-  if (!path) return;
-  try { lstatSync(path); fail("summary output already exists"); } catch (error) { if (error.code !== "ENOENT") throw error; }
-  const parent = dirname(path); let stat;
+  if (!path) return null;
+  const absolute = resolve(path);
+  try { lstatSync(absolute); fail("summary output already exists"); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const parent = dirname(absolute); let stat;
   try { stat = lstatSync(parent); } catch { fail("summary output parent must already exist"); }
   if (!stat.isDirectory() || stat.isSymbolicLink()) fail("summary output parent must be a real directory");
-  if (inside(path, REPO) || existingAncestorResolvesInside(path, REPO)) fail("summary output must stay outside the repository");
-  if (inside(path, runsDir) || existingAncestorResolvesInside(path, runsDir)) fail("summary output must stay outside the run root");
+  let current = parse(parent).root;
+  for (const part of relative(current, parent).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    if (lstatSync(current).isSymbolicLink()) fail("summary output path must not contain linked ancestors");
+  }
+  if (inside(absolute, REPO) || existingAncestorResolvesInside(absolute, REPO)) fail("summary output must stay outside the repository");
+  if (inside(absolute, runsDir) || existingAncestorResolvesInside(absolute, runsDir)) fail("summary output must stay outside the run root");
+  return { path: absolute, parent, parentDevice: stat.dev, parentInode: stat.ino, canonicalParent: realpathSync(parent) };
+}
+
+function assertSummaryBoundary(boundary, descriptor = null) {
+  const parent = lstatSync(boundary.parent);
+  if (!parent.isDirectory() || parent.isSymbolicLink() || parent.dev !== boundary.parentDevice || parent.ino !== boundary.parentInode || realpathSync(boundary.parent) !== boundary.canonicalParent) fail("summary output parent changed during persistence");
+  if (descriptor !== null) {
+    const opened = fstatSync(descriptor); const named = lstatSync(boundary.path);
+    if (!opened.isFile() || named.isSymbolicLink() || opened.dev !== named.dev || opened.ino !== named.ino || opened.nlink !== 1) fail("summary output changed during persistence");
+  }
+}
+
+function persistSummary(encoded, options) {
+  const boundary = validateSummaryOutput(options.summaryOutput, options.runsDir); let descriptor = null;
+  try {
+    descriptor = openSync(boundary.path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    assertSummaryBoundary(boundary, descriptor); writeFileSync(descriptor, encoded); fchmodSync(descriptor, 0o600); assertSummaryBoundary(boundary, descriptor);
+  } catch (error) {
+    if (descriptor !== null) {
+      try { const opened = fstatSync(descriptor); const named = lstatSync(boundary.path); if (opened.dev === named.dev && opened.ino === named.ino) rmSync(boundary.path, { force: true }); } catch {}
+    }
+    fail(`summary output persistence failed: ${error.message}`);
+  } finally { if (descriptor !== null) closeSync(descriptor); }
 }
 
 function emitSummary(summary, options) {
   const encoded = `${JSON.stringify(summary, null, 2)}\n`;
-  if (options.summaryOutput) writeFileSync(options.summaryOutput, encoded, { flag: "wx", mode: 0o600 });
+  let persistenceError = null;
+  if (options.summaryOutput) try { persistSummary(encoded, options); } catch (error) { persistenceError = error; }
   process.stdout.write(encoded);
+  if (persistenceError) throw persistenceError;
 }
 
 function run(command, args, options) {
