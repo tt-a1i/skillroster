@@ -603,6 +603,38 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if error
+        .downcast_ref::<ContentIdentityRescanRequired>()
+        .is_some()
+    {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "content_identity_rescan_required".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids: Vec::new(),
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "legacy_snapshot_requires_rescan",
+                    "required_algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![action(
+            "refresh_snapshot_content_identity",
+            &["scan", "--json"],
+            false,
+            false,
+            "content_identity_rescan_required",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -1045,6 +1077,22 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "path": conflict.path,
                 "files_changed": false,
                 "next_action": "resolve_same_name_variant_or_shared_ownership"
+            })),
+        };
+    }
+    if let Some(blocker) =
+        error.downcast_ref::<crate::roster_plan::RosterPackageFingerprintVariants>()
+    {
+        return ClassifiedError {
+            code: "roster_package_fingerprint_variants",
+            retryable: false,
+            details: Some(json!({
+                "reason": "multiple_package_fingerprints_require_explicit_preservation",
+                "skill_id": blocker.skill_id,
+                "placement_ids": blocker.placement_ids,
+                "fingerprint_count": blocker.fingerprint_count,
+                "files_changed": false,
+                "next_action": "review_each_package_before_roster_mutation"
             })),
         };
     }
@@ -2318,6 +2366,7 @@ fn report_command(
             let scan: ScanResult = store
                 .scan_payload(&report.scan_id)?
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
+            require_content_identity(&scan)?;
             let coverage_basis = stored_finding_coverage_basis(&stored, object)?;
             let evidence_quality = object
                 .get("evidence_quality")
@@ -2503,6 +2552,7 @@ fn report_command(
         });
     }
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id {
             return Ok(select_report_view(&existing.summary, request));
@@ -4273,6 +4323,7 @@ fn find_command(
         .into());
     }
     let (scan_id, scan) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
         std::iter::once(task).chain(retrieval_hints.iter().map(String::as_str)),
@@ -4837,6 +4888,23 @@ fn current_readable_skill_paths(
     approved_roots.sort();
     approved_roots.dedup();
 
+    let mut fingerprints_by_resolved_path =
+        std::collections::BTreeMap::<PathBuf, std::collections::BTreeSet<&str>>::new();
+    let mut known_fingerprints = std::collections::BTreeSet::new();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+    {
+        known_fingerprints.insert(placement.content_digest.as_str());
+        if let Ok(resolved) = std::fs::canonicalize(&placement.entrypoint) {
+            fingerprints_by_resolved_path
+                .entry(resolved)
+                .or_default()
+                .insert(placement.content_digest.as_str());
+        }
+    }
+
     let mut paths = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for path in candidates {
@@ -4852,7 +4920,10 @@ fn current_readable_skill_paths(
         let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
             continue;
         };
-        if actual_id != skill.id || actual_fingerprint != skill.content_digest {
+        let expected_fingerprints = fingerprints_by_resolved_path
+            .get(&resolved)
+            .unwrap_or(&known_fingerprints);
+        if actual_id != skill.id || !expected_fingerprints.contains(actual_fingerprint.as_str()) {
             continue;
         }
         paths.push(path.display().to_string());
@@ -5868,6 +5939,29 @@ fn expand_finding_roster_changes(
         if let Some(blocker) = finding_roster_safety_blocker(&supported.exclusions) {
             return Err(blocker.into());
         }
+        if let Some(exclusion) = supported.exclusions.iter().find(|exclusion| {
+            exclusion.reason == "multiple_package_fingerprints_require_explicit_preservation"
+        }) {
+            let placements = scan
+                .placements
+                .iter()
+                .filter(|placement| placement.skill_id == exclusion.skill_id)
+                .collect::<Vec<_>>();
+            let fingerprint_count = placements
+                .iter()
+                .map(|placement| placement.content_digest.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            return Err(crate::roster_plan::RosterPackageFingerprintVariants {
+                skill_id: exclusion.skill_id.clone(),
+                placement_ids: placements
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                fingerprint_count,
+            }
+            .into());
+        }
         return Err(crate::roster_plan::source_confirmation_block(
             finding_id.as_str(),
             request.core_budget,
@@ -6721,6 +6815,7 @@ fn prepare_plan(
         bail!("recovery is required before another Plan can be prepared");
     }
     let (scan_id, scan) = latest_scan(store)?;
+    require_content_identity(&scan)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
         let (input, roster_provenance) = expand_finding_roster_changes(
             store,
@@ -7759,10 +7854,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             .version
             .clone()
             .or_else(|| skill.metadata.revision.clone());
-        let identity_key = match (&skill.metadata.source, &declared_revision) {
-            (Some(source), Some(revision)) => format!("source:{source}@{revision}"),
-            _ => format!("content:{}", skill.content_digest),
-        };
+        let identity_key = persistence_identity_key(skill, declared_revision.as_deref());
         let stored_id = store.save_skill(&SkillRecord {
             id,
             identity_key,
@@ -7817,6 +7909,25 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             json!({"algorithm": skill.digest_algorithm, "name": skill.name}),
             observed_at,
         )?;
+        if let Some(content_identity_digest) = skill.content_identity_digest.as_deref() {
+            save_reference_evidence(
+                store,
+                scan_id,
+                &format!("routing_content_digest:{content_identity_digest}"),
+                EvidenceKind::Digest,
+                EvidenceQuality::Observed,
+                "skill",
+                stored_id.as_str(),
+                None,
+                Some(content_identity_digest.to_owned()),
+                json!({
+                    "algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
+                    "name": skill.name,
+                    "scope": "routing_content_identity"
+                }),
+                observed_at,
+            )?;
+        }
     }
 
     for placement in &scan.placements {
@@ -7969,6 +8080,18 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
         })?;
     }
     Ok(())
+}
+
+fn persistence_identity_key(skill: &scan::ScannedSkill, declared_revision: Option<&str>) -> String {
+    match (
+        skill.metadata.source.as_deref(),
+        declared_revision,
+        skill.content_identity_digest.as_deref(),
+    ) {
+        (Some(source), Some(revision), _) => format!("source:{source}@{revision}"),
+        (_, _, Some(content_identity)) => format!("content:{content_identity}"),
+        _ => format!("incomplete-snapshot-skill:{}", skill.id),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8385,6 +8508,28 @@ fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
     store
         .latest_scan_payload()?
         .ok_or_else(|| anyhow!("no completed Snapshot; run skillroster scan first"))
+}
+
+#[derive(Debug)]
+struct ContentIdentityRescanRequired;
+
+impl std::fmt::Display for ContentIdentityRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "latest Snapshot has no {} content identity; run skillroster scan",
+            scan::CONTENT_IDENTITY_ALGORITHM
+        )
+    }
+}
+
+impl std::error::Error for ContentIdentityRescanRequired {}
+
+fn require_content_identity(scan: &ScanResult) -> Result<()> {
+    if scan.content_identity_algorithm.as_deref() != Some(scan::CONTENT_IDENTITY_ALGORITHM) {
+        return Err(ContentIdentityRescanRequired.into());
+    }
+    Ok(())
 }
 
 fn harness_agent(value: &str) -> Result<AgentKind> {
@@ -9478,19 +9623,29 @@ mod recovery_tests {
         assert_eq!(planning["mutation_scopes"], json!(["provider_read_only"]));
         assert_eq!(planning["protected_placement_count"], 1);
 
-        let blocker = finding_roster_safety_blocker(&[crate::roster_plan::RosterChangeExclusion {
-            agent: "codex".into(),
-            skill_id: "skill_shared".into(),
-            name: "shared".into(),
-            reason: "provider_managed_placement_is_read_only",
-            observed_source_target: None,
-            safety_blocker: Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+        let blocker = finding_roster_safety_blocker(&[
+            crate::roster_plan::RosterChangeExclusion {
+                agent: "claude-code".into(),
+                skill_id: "skill_package_variants".into(),
+                name: "package-variants".into(),
+                reason: "multiple_package_fingerprints_require_explicit_preservation",
+                observed_source_target: None,
+                safety_blocker: None,
+            },
+            crate::roster_plan::RosterChangeExclusion {
+                agent: "codex".into(),
                 skill_id: "skill_shared".into(),
-                placement_ids: vec!["placement_plugin".into()],
-                paths: vec![PathBuf::from("/fixture/placement_plugin")],
-                providers: vec!["plugin@market".into()],
-            }),
-        }])
+                name: "shared".into(),
+                reason: "provider_managed_placement_is_read_only",
+                observed_source_target: None,
+                safety_blocker: Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged {
+                    skill_id: "skill_shared".into(),
+                    placement_ids: vec!["placement_plugin".into()],
+                    paths: vec![PathBuf::from("/fixture/placement_plugin")],
+                    providers: vec!["plugin@market".into()],
+                }),
+            },
+        ])
         .unwrap();
         let blocked: Value = serde_json::from_str(&error_json("plan", &blocker)).unwrap();
         assert_eq!(
@@ -9541,6 +9696,7 @@ mod recovery_tests {
                 name: "bounded".into(),
                 metadata: scan::SkillMetadata::default(),
                 content_digest: "same-fallback-digest".into(),
+                content_identity_digest: None,
                 digest_algorithm: "sha256-v1".into(),
                 summary: String::new(),
                 normalized_text: String::new(),
@@ -9552,6 +9708,14 @@ mod recovery_tests {
             ],
             ..ScanResult::default()
         };
+        assert_eq!(
+            persistence_identity_key(&scan.skills[0], None),
+            "incomplete-snapshot-skill:skill_bounded"
+        );
+        assert_ne!(
+            persistence_identity_key(&scan.skills[0], None),
+            "content:same-fallback-digest"
+        );
         let request = LibraryChangeRequest {
             skill_id: "skill_bounded".into(),
             canonical_placement_id: "placement_b".into(),
@@ -10593,6 +10757,32 @@ mod recovery_tests {
         assert_eq!(output["error"]["details"]["identity_role"], "target");
         assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
         assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn roster_package_variants_expose_a_typed_no_change_blocker() {
+        let error = crate::roster_plan::RosterPackageFingerprintVariants {
+            skill_id: "skill_fixture".into(),
+            placement_ids: vec!["placement_a".into(), "placement_b".into()],
+            fingerprint_count: 2,
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_package_fingerprint_variants"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "multiple_package_fingerprints_require_explicit_preservation"
+        );
+        assert_eq!(output["error"]["details"]["fingerprint_count"], 2);
+        assert_eq!(output["error"]["details"]["files_changed"], false);
+        assert_eq!(
+            output["error"]["details"]["next_action"],
+            "review_each_package_before_roster_mutation"
+        );
     }
 
     #[test]

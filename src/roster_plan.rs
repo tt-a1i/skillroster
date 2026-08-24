@@ -81,6 +81,25 @@ impl std::fmt::Display for RosterOperationConflict {
 
 impl std::error::Error for RosterOperationConflict {}
 
+#[derive(Debug)]
+pub struct RosterPackageFingerprintVariants {
+    pub skill_id: String,
+    pub placement_ids: Vec<String>,
+    pub fingerprint_count: usize,
+}
+
+impl std::fmt::Display for RosterPackageFingerprintVariants {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Skill {} has {} complete package fingerprints; Roster mutation cannot choose canonical package content",
+            self.skill_id, self.fingerprint_count
+        )
+    }
+}
+
+impl std::error::Error for RosterPackageFingerprintVariants {}
+
 #[derive(Clone, Debug)]
 pub enum RosterSafetyBlocker {
     ProviderManaged {
@@ -524,7 +543,14 @@ pub fn exclude_unpreservable_demotions(
             .iter()
             .find(|skill| skill.id == skill_id)
             .ok_or_else(|| anyhow!("Skill {skill_id} is not in the latest Snapshot"))?;
-        let exact_digest = skill.content_digest.as_str();
+        let package_fingerprints = placements
+            .iter()
+            .map(|placement| placement.content_digest.as_str())
+            .collect::<BTreeSet<_>>();
+        let exact_digest = package_fingerprints
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("Skill {skill_id} has no package fingerprint"))?;
         let name = skill.name.as_str();
         let retained_owned = placements
             .iter()
@@ -577,6 +603,11 @@ pub fn exclude_unpreservable_demotions(
                         .map(|placement| placement.directory.clone())
                         .collect(),
                 }),
+            )
+        } else if package_fingerprints.len() > 1 {
+            (
+                "multiple_package_fingerprints_require_explicit_preservation",
+                None,
             )
         } else if retained_owned || migratable_owned {
             continue;
@@ -662,15 +693,48 @@ pub fn derive(
             .iter()
             .map(|request| Ok((agent(&request.agent)?, roster_state(&request.state)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let package_fingerprints = placements
+            .iter()
+            .map(|placement| placement.content_digest.as_str())
+            .collect::<BTreeSet<_>>();
+        let exact_digest = package_fingerprints
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow!("Skill {skill_id} has no package fingerprint"))?;
+        let allow_integrity_variants =
+            skill.metadata.source.is_none() && skill.content_identity_digest.is_some();
         let read_only_placements_remain_unchanged = requests.iter().all(|request| {
             matches!(roster_state(&request.state), Ok(RosterState::Core))
                 && agent(&request.agent).is_ok_and(|requested_agent| {
                     placements.iter().any(|placement| {
                         placement.agent == Some(requested_agent)
-                            && unchanged_core_exposure(placement, &skill.content_digest)
+                            && unchanged_core_exposure(
+                                placement,
+                                exact_digest,
+                                allow_integrity_variants,
+                            )
                     })
                 })
         });
+        let invalid_read_only_core = requests
+            .iter()
+            .filter(|request| matches!(roster_state(&request.state), Ok(RosterState::Core)))
+            .filter_map(|request| agent(&request.agent).ok())
+            .flat_map(|requested_agent| {
+                placements.iter().copied().filter(move |placement| {
+                    placement.agent == Some(requested_agent)
+                        && !placement.is_mutable()
+                        && !unchanged_core_exposure(
+                            placement,
+                            exact_digest,
+                            allow_integrity_variants,
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !invalid_read_only_core.is_empty() {
+            return Err(read_only_blocker(skill_id, &invalid_read_only_core).into());
+        }
         if !placements.iter().any(|placement| placement.is_mutable())
             && !read_only_placements_remain_unchanged
         {
@@ -708,7 +772,38 @@ pub fn derive(
                 .collect::<Vec<_>>();
             return Err(read_only_blocker(skill_id, &blocked).into());
         }
-        let mut source = verified_real_source(&placements, &removal, &skill.content_digest);
+        let non_agent_source_dependencies = placements
+            .iter()
+            .copied()
+            .filter(|placement| placement.agent.is_none())
+            .filter(|placement| depends_on_physical_removal(placement, &removal))
+            .collect::<Vec<_>>();
+        if !non_agent_source_dependencies.is_empty() {
+            return Err(RosterSafetyBlocker::DependentSource {
+                skill_id: skill_id.to_owned(),
+                placement_ids: non_agent_source_dependencies
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                paths: non_agent_source_dependencies
+                    .iter()
+                    .map(|placement| placement.directory.clone())
+                    .collect(),
+            }
+            .into());
+        }
+        if package_fingerprints.len() > 1 && !read_only_placements_remain_unchanged {
+            return Err(RosterPackageFingerprintVariants {
+                skill_id: skill_id.to_owned(),
+                placement_ids: placements
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                fingerprint_count: package_fingerprints.len(),
+            }
+            .into());
+        }
+        let mut source = verified_real_source(&placements, &removal, exact_digest);
         let mut source_fingerprint = source
             .as_ref()
             .map(|path| change::fingerprint(path))
@@ -719,7 +814,7 @@ pub fn derive(
             let canonical = removal
                 .iter()
                 .copied()
-                .find(|placement| is_real_exact(placement, &skill.content_digest))
+                .find(|placement| is_real_exact(placement, exact_digest))
                 .ok_or_else(|| {
                     anyhow!(
                         "Skill {skill_id} has no owned exact-digest content to preserve before exposure removal"
@@ -874,7 +969,7 @@ pub fn derive(
                 continue;
             }
             if existing.iter().any(|placement| {
-                unchanged_core_exposure(placement, &skill.content_digest)
+                unchanged_core_exposure(placement, exact_digest, allow_integrity_variants)
                     && !placement.link_target.as_ref().is_some_and(|target| {
                         removal.iter().any(|removed| target == &removed.directory)
                     })
@@ -897,7 +992,7 @@ pub fn derive(
             }
             let source = source
                 .clone()
-                .or_else(|| verified_real_source(&placements, &[], &skill.content_digest))
+                .or_else(|| verified_real_source(&placements, &[], exact_digest))
                 .ok_or_else(|| anyhow!("Skill {skill_id} has no verified canonical source"))?;
             let source_fingerprint = source_fingerprint
                 .clone()
@@ -1160,10 +1255,17 @@ fn is_real_exact(placement: &SkillPlacement, digest: &str) -> bool {
             .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
-fn unchanged_core_exposure(placement: &SkillPlacement, digest: &str) -> bool {
+fn unchanged_core_exposure(
+    placement: &SkillPlacement,
+    exact_digest: &str,
+    allow_integrity_variants: bool,
+) -> bool {
     placement.default_exposed
         && placement.link_status != LinkStatus::Broken
-        && placement.content_digest == digest
+        && (placement.content_digest == exact_digest
+            || (allow_integrity_variants
+                && placement.is_mutable()
+                && placement.fingerprint_completeness == FingerprintCompleteness::Complete))
 }
 
 fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
@@ -1286,6 +1388,113 @@ mod tests {
             3
         );
         (temp, snapshot, shared_skill)
+    }
+
+    #[test]
+    fn roster_mutation_refuses_one_routing_identity_with_multiple_package_fingerprints() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let codex = home.join(".codex/skills/shared");
+        let claude = home.join(".claude/skills/shared");
+        for directory in [&codex, &claude] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                "---\nname: shared\n---\nsame Agent Skills payload\n",
+            )
+            .unwrap();
+        }
+        fs::write(claude.join(".gitignore"), "local-only\n").unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        assert_eq!(snapshot.skills.len(), 1);
+        assert_eq!(snapshot.placements.len(), 2);
+        assert_eq!(
+            snapshot
+                .placements
+                .iter()
+                .map(|placement| placement.content_digest.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let skill_id = snapshot.skills[0].id.clone();
+        let requested_demotion = RosterChange {
+            agent: "claude-code".into(),
+            skill_id: skill_id.clone(),
+            state: "on_demand".into(),
+        };
+        let supported =
+            exclude_unpreservable_demotions(&snapshot, vec![requested_demotion.clone()]).unwrap();
+        assert!(supported.changes.is_empty());
+        assert_eq!(
+            supported.exclusions[0].reason,
+            "multiple_package_fingerprints_require_explicit_preservation"
+        );
+        let blocked = derive(&snapshot, &state, &[requested_demotion]).unwrap_err();
+        let blocker = blocked
+            .downcast_ref::<RosterPackageFingerprintVariants>()
+            .unwrap();
+        assert_eq!(blocker.skill_id, skill_id);
+        assert_eq!(blocker.fingerprint_count, 2);
+        assert!(codex.join("SKILL.md").is_file());
+        assert!(claude.join(".gitignore").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+
+        let no_change = derive(
+            &snapshot,
+            &state,
+            &[
+                RosterChange {
+                    agent: "codex".into(),
+                    skill_id: skill_id.clone(),
+                    state: "core".into(),
+                },
+                RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id: skill_id.clone(),
+                    state: "core".into(),
+                },
+            ],
+        )
+        .unwrap();
+        assert!(no_change.operations.is_empty());
+
+        let mut read_only_snapshot = snapshot.clone();
+        let read_only = read_only_snapshot
+            .placements
+            .iter_mut()
+            .find(|placement| placement.agent == Some(AgentKind::ClaudeCode))
+            .unwrap();
+        read_only.mutation_scope = Some(crate::scan::MutationScope::DurableReadOnly);
+        read_only.governable = false;
+        let read_only_demotion = RosterChange {
+            agent: "claude-code".into(),
+            skill_id: skill_id.clone(),
+            state: "on_demand".into(),
+        };
+        let supported =
+            exclude_unpreservable_demotions(&read_only_snapshot, vec![read_only_demotion.clone()])
+                .unwrap();
+        assert_eq!(
+            supported.exclusions[0].reason,
+            "durable_read_only_placement_blocks_mutation"
+        );
+        assert!(matches!(
+            supported.exclusions[0].safety_blocker,
+            Some(RosterSafetyBlocker::MutationScopeReadOnly { .. })
+        ));
+        let blocked = derive(&read_only_snapshot, &state, &[read_only_demotion]).unwrap_err();
+        assert!(matches!(
+            blocked.downcast_ref::<RosterSafetyBlocker>(),
+            Some(RosterSafetyBlocker::MutationScopeReadOnly { .. })
+        ));
+        assert!(claude.join(".gitignore").is_file());
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
     }
 
     #[cfg(unix)]

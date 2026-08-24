@@ -58,10 +58,14 @@ A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata
 
 Skill-root discovery and package fingerprints carry explicit completeness facts. A configured root whose depth limit was reached remains Included but is marked discovery-incomplete, making structural coverage unreliable. Each placement fingerprint is `complete`, `bounded`, `unreadable`, or `unknown`; payloads created before this contract default to `unknown`. Only a complete package fingerprint may support an exact-duplicate Finding or any Library/Roster Plan that relies on exact content. Bounded or unreadable packages remain inventory facts and require a new complete Scan before governance. Apply repeats this check so a Ready Plan created by an older binary cannot bypass the boundary.
 
+Scan records two deliberately separate hashes in one bounded traversal. The complete package fingerprint covers every retained package file, including `.gitignore`, and remains the only hash used for drift checks, exact load, Plan, Apply, Receipt, Undo, and recovery. The versioned routing content identity excludes only the package-root `.gitignore`; it is used for unsourced logical identity and same-name variant grouping because source-control metadata is not Agent Skills payload. `SKILL.md`, scripts, references, assets, and symlink targets remain identity-bearing. A legacy Snapshot without the current content-identity algorithm must be rescanned; the CLI never backfills or infers equality from old package fingerprints.
+
+One routing identity may therefore have multiple complete package fingerprints. Existing Core placements may remain unchanged, but any Roster mutation, migration, retarget, or new exposure that would require choosing one package as canonical fails closed with the affected placement IDs and fingerprint count. Routing equivalence never authorizes package consolidation or metadata loss.
+
 Skill identity uses this precedence:
 
 1. declared source plus version or revision;
-2. normalized content hash;
+2. versioned routing content identity;
 3. name and semantic similarity as candidate evidence only.
 
 Ambiguous Skills remain separate. SkillRoster never merges based only on a matching name or Agent interpretation.
