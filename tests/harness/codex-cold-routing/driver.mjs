@@ -1,0 +1,645 @@
+#!/usr/bin/env node
+
+import { createHash } from "node:crypto";
+import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO = resolve(HERE, "../../..");
+const SYSTEM_SKILLS = ["imagegen", "openai-docs", "plugin-creator", "skill-creator", "skill-installer"];
+const DEFAULT_MANIFEST = join(REPO, "tests/fixtures/codex-cold-routing-transfer.json");
+const ACTIVE_AUTH_COPIES = new Set();
+for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) process.once(signal, () => {
+  for (const path of ACTIVE_AUTH_COPIES) rmSync(path, { force: true });
+  process.exit(code);
+});
+
+function fail(message) { throw new Error(message); }
+const sha = (value) => createHash("sha256").update(value).digest("hex");
+function inside(candidate, root) {
+  const suffix = relative(resolve(root), resolve(candidate));
+  return suffix === "" || (!suffix.startsWith(`..${sep}`) && suffix !== ".." && !isAbsolute(suffix));
+}
+function existingAncestorResolvesInside(candidate, root) {
+  let current = resolve(candidate);
+  while (!existsSync(current)) { const parent = dirname(current); if (parent === current) break; current = parent; }
+  return existsSync(current) && inside(realpathSync(current), realpathSync(root));
+}
+function safeRelative(path, label = "path") {
+  if (typeof path !== "string" || !path || isAbsolute(path) || path.split(/[\\/]/u).some((part) => !part || part === "." || part === "..")) fail(`${label} must be a safe relative path`);
+  return path.replaceAll("\\", "/");
+}
+
+export function parseArgs(argv) {
+  const options = {
+    manifest: DEFAULT_MANIFEST, task: "all", arm: "both", model: "gpt-5.6-sol",
+    codex: "codex", bootstrap: join(REPO, "skill/skillroster/SKILL.md"),
+    skillsRoot: join(homedir(), ".agents_skills"), cli: join(REPO, "target/debug/skillroster"),
+    runsDir: join(tmpdir(), "skillroster-codex-transfer"), authSource: null,
+    timeoutMs: 300_000, execute: false,
+  };
+  const values = new Map([
+    ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"],
+    ["--codex", "codex"], ["--bootstrap", "bootstrap"], ["--skills-root", "skillsRoot"],
+    ["--cli", "cli"], ["--runs-dir", "runsDir"], ["--auth-source", "authSource"], ["--timeout-ms", "timeoutMs"],
+  ]);
+  for (let index = 0; index < argv.length;) {
+    if (argv[index] === "--execute") { options.execute = true; index += 1; continue; }
+    const key = values.get(argv[index]); const value = argv[index + 1];
+    if (!key || value === undefined) fail(`unknown or incomplete argument: ${argv[index] ?? "<missing>"}`);
+    options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "model", "codex"].includes(key) ? value : resolve(value);
+    index += 2;
+  }
+  if (!["core", "on_demand", "both"].includes(options.arm)) fail("--arm must be core, on_demand, or both");
+  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1_000 || options.timeoutMs > 900_000) fail("--timeout-ms must be between 1000 and 900000");
+  if (options.execute && !options.authSource) fail("--execute requires an explicit --auth-source");
+  return options;
+}
+
+export function validateManifest(manifest) {
+  if (manifest?.schema_version !== 1 || manifest?.harness !== "codex-transfer" || !Array.isArray(manifest.tasks) || manifest.tasks.length !== 2) fail("unsupported Codex transfer manifest");
+  const ids = new Set();
+  for (const task of manifest.tasks) {
+    if (!/^[a-z0-9][a-z0-9-]*$/u.test(task.id ?? "") || ids.has(task.id)) fail("task id must be unique and path-safe");
+    ids.add(task.id);
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(task.expected_skill ?? "")) fail(`${task.id} expected_skill is unsafe`);
+    if (typeof task.prompt !== "string" || !task.prompt || typeof task.hint !== "string" || !task.hint.trim()) fail(`${task.id} requires prompt and hint`);
+    if (!Array.isArray(task.allowed_changed_paths)) fail(`${task.id} allowed_changed_paths is required`);
+    for (const path of [...Object.keys(task.workspace_files ?? {}), ...task.allowed_changed_paths]) safeRelative(path, `${task.id} path`);
+    if (task.allowed_changed_paths.some((path) => Object.hasOwn(task.workspace_files ?? {}, path))) fail(`${task.id} cannot mutate an input`);
+    safeRelative(task.oracle?.path, `${task.id} oracle path`);
+    if (!task.allowed_changed_paths.includes(task.oracle.path)) fail(`${task.id} oracle path must be allowlisted`);
+    for (const pattern of [...(task.oracle.required_regex ?? []), ...(task.oracle.forbidden_regex ?? [])]) new RegExp(pattern, "u");
+    const receipt = task.oracle.archify_receipt_contract;
+    if (receipt && (receipt.type !== "architecture" || safeRelative(receipt.spec_path, `${task.id} receipt spec`) !== receipt.spec_path || safeRelative(receipt.artifact_path, `${task.id} receipt artifact`) !== task.oracle.path || receipt.quality !== "showcase" || receipt.validation_check_count !== 9)) fail(`${task.id} Archify receipt contract is invalid`);
+  }
+  return manifest;
+}
+
+export function extractVisibleSkills(promptInput) {
+  let messages;
+  try { messages = JSON.parse(promptInput); } catch { return []; }
+  const texts = [];
+  const visit = (node) => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "input_text" && typeof node.text === "string") texts.push(node.text);
+    for (const child of Object.values(node)) if (child && typeof child === "object") Array.isArray(child) ? child.forEach(visit) : visit(child);
+  };
+  visit(messages);
+  const names = [];
+  for (const text of texts) {
+    const section = text.match(/### Available skills\n([\s\S]*?)(?:\n<\/skills_instructions>|\n## |$)/u)?.[1] ?? "";
+    for (const match of section.matchAll(/^- ([A-Za-z0-9][A-Za-z0-9._:-]*): /gmu)) names.push(match[1]);
+  }
+  return [...new Set(names)].sort();
+}
+
+export function assessSkillSurface(visibleSkills, arm, expectedSkill) {
+  const expected = [...SYSTEM_SKILLS, arm === "core" ? expectedSkill : "skillroster"].sort();
+  const actual = [...new Set(visibleSkills)].sort();
+  return {
+    passed: actual.length === expected.length && actual.every((name, index) => name === expected[index]),
+    expected, actual, digest: sha(actual.join("\n")),
+    missing: expected.filter((name) => !actual.includes(name)), unexpected: actual.filter((name) => !expected.includes(name)),
+  };
+}
+
+function specialKind(stat) {
+  if (stat.isSymbolicLink()) return "symlink";
+  if (stat.isSocket()) return "socket";
+  if (stat.isFIFO()) return "fifo";
+  if (stat.isBlockDevice()) return "block_device";
+  if (stat.isCharacterDevice()) return "character_device";
+  return "unknown";
+}
+
+function walk(root, prefix = "") {
+  const state = new Map();
+  if (!existsSync(root)) return state;
+  if (!prefix) {
+    const rootStat = lstatSync(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) { state.set(".", `special:${specialKind(rootStat)}`); return state; }
+  }
+  for (const name of readdirSync(join(root, prefix)).sort()) {
+    const rel = prefix ? `${prefix}/${name}` : name; const path = join(root, rel); const stat = lstatSync(path);
+    if (stat.isDirectory()) for (const entry of walk(root, rel)) state.set(entry[0], entry[1]);
+    else if (stat.isFile()) state.set(rel, sha(readFileSync(path)));
+    else state.set(rel, `special:${specialKind(stat)}`);
+  }
+  return state;
+}
+
+export function snapshotWorkspace(root) { return walk(root); }
+
+export function assessWorkspaceChanges(before, after, inputs, allowed) {
+  const changed = [...new Set([...before.keys(), ...after.keys()])].filter((path) => before.get(path) !== after.get(path)).sort();
+  const inputMutations = changed.filter((path) => inputs.includes(path));
+  const unexpectedChanges = changed.filter((path) => !allowed.includes(path));
+  const specialEntries = [...after].filter(([, digest]) => digest.startsWith("special:")).map(([path, digest]) => ({ path, kind: digest.slice("special:".length) }));
+  return { changed, input_mutations: inputMutations, unexpected_changes: unexpectedChanges, special_entries: specialEntries, passed: unexpectedChanges.length === 0 && specialEntries.length === 0 };
+}
+
+function noFollowWorkspaceFile(workspace, relativePath) {
+  const canonicalWorkspace = realpathSync(workspace); let current = workspace;
+  const segments = safeRelative(relativePath, "oracle path").split("/");
+  for (const [index, segment] of segments.entries()) {
+    current = join(current, segment);
+    let stat; try { stat = lstatSync(current); } catch { return null; }
+    if (stat.isSymbolicLink()) return null;
+    if (index < segments.length - 1 && !stat.isDirectory()) return null;
+  }
+  const stat = lstatSync(current);
+  if (!stat.isFile()) return null;
+  const canonical = realpathSync(current);
+  return inside(canonical, canonicalWorkspace) ? canonical : null;
+}
+
+export function evaluateOracle(workspace, oracle, evidence = {}) {
+  const path = noFollowWorkspaceFile(workspace, oracle.path); const failures = [];
+  if (!path) return { passed: false, failures: [`unsafe_or_missing:${oracle.path}`] };
+  const bytes = readFileSync(path); const text = bytes.toString("utf8");
+  if (oracle.minimum_bytes && bytes.length < oracle.minimum_bytes) failures.push(`minimum_bytes:${bytes.length}`);
+  if (oracle.minimum_characters && [...text.trim()].length < oracle.minimum_characters) failures.push(`minimum_characters:${[...text.trim()].length}`);
+  if (oracle.maximum_characters && [...text.trim()].length > oracle.maximum_characters) failures.push(`maximum_characters:${[...text.trim()].length}`);
+  for (const value of oracle.required_substrings ?? []) if (!text.includes(value)) failures.push(`missing_substring:${value}`);
+  for (const value of oracle.forbidden_substrings ?? []) if (text.includes(value)) failures.push(`forbidden_substring:${value}`);
+  for (const value of oracle.required_regex ?? []) if (!new RegExp(value, "u").test(text)) failures.push(`missing_regex:${value}`);
+  for (const value of oracle.forbidden_regex ?? []) if (new RegExp(value, "u").test(text)) failures.push(`forbidden_regex:${value}`);
+  failures.push(...evaluateArchifyReceipts(evidence.transcript ?? "", workspace, evidence.targetPackage, oracle.archify_receipt_contract));
+  return { passed: failures.length === 0, failures, output_sha256: sha(bytes), output_bytes: bytes.length, audit_scope: "offline_content_only" };
+}
+
+export function parseFindAudit(text, expected) {
+  const records = text.trim() ? text.trim().split("\n").map((line) => JSON.parse(line)) : [];
+  const calls = records.filter((record) => record.kind === "find_call");
+  const first = calls[0] ?? null; const successful = calls.find((call) => call.exit_code === 0 && call.envelope_valid === true && call.top1_skill === expected.skill) ?? null;
+  return {
+    count: calls.length,
+    first_call_task_complete: first?.task_sha256 === sha(expected.task),
+    first_call_hint_valid: Boolean(first?.hint_count > 0 && first?.hint_nonempty && first?.hint_sha256?.every(Boolean)),
+    first_call_argv_exact: first?.argv_shape_valid === true,
+    top1_correct: Boolean(successful),
+    returned_path_exact: successful?.top1_path_sha256 === sha(canonicalPath(expected.path)),
+    retry_classification: calls.length === 0 ? "no_retrieval" : calls.length === 1 ? "single_attempt" : first?.task_sha256 !== sha(expected.task) || !first?.hint_nonempty ? "recovered_after_argument_mismatch" : "retried_after_valid_call",
+    contract_violation: calls.length > 2 || !first || first.argv_shape_valid !== true || first.envelope_valid !== true || first.task_sha256 !== sha(expected.task) || !(first.hint_count > 0 && first.hint_nonempty),
+    calls,
+  };
+}
+
+export function extractCommandEvents(jsonl) {
+  const events = [];
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    let value; try { value = JSON.parse(line); } catch { continue; }
+    const item = value?.item;
+    if (value?.type === "item.completed" && item?.type === "command_execution" && typeof item.command === "string") events.push({ kind: "command", command: item.command, output: item.aggregated_output ?? item.output ?? null, exit_code: item.exit_code ?? null, status: item.status ?? "completed" });
+    else if (value?.type === "item.completed" && item?.type && !["reasoning", "agent_message", "todo_list"].includes(item.type)) events.push({ kind: "unclassified_action", item_type: item.type });
+  }
+  return events;
+}
+
+function extractRouteEvents(jsonl) {
+  const events = []; const states = new Map();
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    let value; try { value = JSON.parse(line); } catch { continue; }
+    const item = value?.item;
+    if (value?.type === "item.started" && item?.type === "command_execution" && typeof item.command === "string") {
+      if (!item.id) events.push({ kind: "event_protocol_violation", violation: "command_started_id_missing" });
+      else if (states.has(item.id)) events.push({ kind: "event_protocol_violation", violation: `command_started_duplicate_or_late:${item.id}` });
+      else states.set(item.id, { command: item.command, completed: false });
+      events.push({ kind: "command_start", id: item.id ?? null, command: item.command });
+    }
+    else if (value?.type === "item.completed" && item?.type === "command_execution" && typeof item.command === "string") {
+      const prior = item.id ? states.get(item.id) : null;
+      if (!item.id) events.push({ kind: "event_protocol_violation", violation: "command_completed_id_missing" });
+      else if (!prior) { events.push({ kind: "event_protocol_violation", violation: `command_completed_without_start:${item.id}` }); states.set(item.id, { command: item.command, completed: true }); }
+      else if (prior.completed) events.push({ kind: "event_protocol_violation", violation: `command_completed_duplicate:${item.id}` });
+      else { if (prior.command !== item.command) events.push({ kind: "event_protocol_violation", violation: `command_changed:${item.id}` }); prior.completed = true; }
+      if (!prior) events.push({ kind: "command_start", id: item.id ?? null, command: item.command });
+      events.push({ kind: "command_complete", id: item.id ?? null, command: item.command, output: item.aggregated_output ?? item.output ?? null, exit_code: item.exit_code ?? null, status: item.status ?? "completed" });
+    } else if (["item.started", "item.completed"].includes(value?.type) && item?.type && !["reasoning", "agent_message"].includes(item.type)) events.push({ kind: "unclassified_action", item_type: item.type });
+  }
+  for (const [id, state] of states) if (!state.completed) events.push({ kind: "event_protocol_violation", violation: `command_completion_missing:${id}` });
+  return events;
+}
+
+export function assessTranscriptIntegrity(jsonl) {
+  let malformed = 0; let turnCompleted = 0; let turnFailed = 0;
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    let value; try { value = JSON.parse(line); } catch { malformed += 1; continue; }
+    if (value?.type === "turn.completed") turnCompleted += 1;
+    if (value?.type === "turn.failed") turnFailed += 1;
+  }
+  const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
+  const incompleteCommands = commands.filter((event) => event.status !== "completed" || !Number.isInteger(event.exit_code)).length;
+  const successfulCommands = commands.filter((event) => event.status === "completed" && event.exit_code === 0).length;
+  const violations = [];
+  if (malformed) violations.push(`malformed_jsonl:${malformed}`);
+  if (turnCompleted !== 1 || turnFailed) violations.push(`turn_completion:${turnCompleted}:${turnFailed}`);
+  if (incompleteCommands) violations.push(`incomplete_command_events:${incompleteCommands}`);
+  if (!successfulCommands) violations.push("successful_command_event_missing");
+  return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands };
+}
+
+export function extractCommandTexts(jsonl) { return extractCommandEvents(jsonl).filter((event) => event.kind === "command").map((event) => event.command); }
+
+function unwrapSimpleShell(command) {
+  const trimmed = command.trim();
+  const match = trimmed.match(/^\S*(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1$/u);
+  return match ? match[2] : trimmed;
+}
+
+function simpleCommandTokens(command) {
+  const value = unwrapSimpleShell(command);
+  if (/[|;&<>`]|\$\(/u.test(value)) return null;
+  const tokens = []; let token = ""; let quote = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) { if (char === quote) quote = null; else token += char; continue; }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (/\s/u.test(char)) { if (token) { tokens.push(token); token = ""; } continue; }
+    if (char === "\\") { index += 1; if (index >= value.length) return null; token += value[index]; continue; }
+    token += char;
+  }
+  if (quote) return null;
+  if (token) tokens.push(token);
+  return tokens;
+}
+
+export function evaluateArchifyReceipts(transcript, workspace, targetPackage, contract) {
+  if (!contract) return [];
+  if (!targetPackage) return ["archify_receipt:target_package_missing"];
+  const spec = noFollowWorkspaceFile(workspace, contract.spec_path); const artifact = noFollowWorkspaceFile(workspace, contract.artifact_path);
+  if (!spec || !artifact) return ["archify_receipt:bound_file_missing_or_unsafe"];
+  const script = join(targetPackage, "bin", "archify.mjs");
+  try { if (!lstatSync(script).isFile() || lstatSync(script).isSymbolicLink()) return ["archify_receipt:tool_missing_or_unsafe"]; } catch { return ["archify_receipt:tool_missing_or_unsafe"]; }
+  const canonicalScript = canonicalPath(script); const artifactBytes = readFileSync(artifact); const specBytes = readFileSync(spec);
+  const commandPath = (value) => canonicalPath(isAbsolute(value ?? "") ? value : join(workspace, value ?? ""));
+  const commandTokens = (command) => {
+    const tokens = simpleCommandTokens(command);
+    return tokens?.length > 1 && ["node", "node.exe"].includes(basename(tokens[0]).toLowerCase()) && commandPath(tokens[1]) === canonicalScript ? tokens : null;
+  };
+  const commonShape = (tokens) => tokens.at(-3) === "--quality" && tokens.at(-2) === contract.quality && tokens.at(-1) === "--json";
+  const isValidateCommand = (tokens) => tokens?.length === 8 && commonShape(tokens) && tokens[2] === "validate" && tokens[3] === contract.type && commandPath(tokens[4]) === spec;
+  const isDeliverCommand = (tokens) => tokens?.length === 9 && commonShape(tokens) && tokens[2] === "deliver" && tokens[3] === contract.type && commandPath(tokens[4]) === spec && commandPath(tokens[5]) === artifact;
+  const validValidateReceipt = (receipt) => receipt?.schemaVersion === 1 && receipt?.ok === true && receipt?.command === "validate" && receipt?.type === contract.type && canonicalPath(receipt.input ?? "") === spec && receipt?.checks?.length === contract.validation_check_count && receipt.checks.every((check) => check?.ok === true) && receipt?.composition?.status === "pass" && receipt?.composition?.summary?.errors === 0 && receipt?.composition?.summary?.warnings === 0;
+  const validDeliverReceipt = (receipt) => receipt?.schemaVersion === 1 && receipt?.ok === true && receipt?.command === "deliver" && receipt?.type === contract.type && canonicalPath(receipt.input ?? "") === spec && canonicalPath(receipt.output ?? "") === artifact && receipt?.specification?.sha256 === sha(specBytes) && receipt?.specification?.bytes === specBytes.length && receipt?.artifact?.sha256 === sha(artifactBytes) && receipt?.artifact?.bytes === artifactBytes.length && receipt?.validation?.checksPassed === contract.validation_check_count && receipt?.validation?.checkCount === contract.validation_check_count && receipt?.validation?.compositionProfile === contract.quality && receipt?.validation?.compositionStatus === "pass" && receipt?.validation?.errors === 0 && receipt?.validation?.warnings === 0;
+  const failures = []; const allowedDeliverIds = new Set(); let validateSucceeded = false; let deliverSucceeded = false;
+  for (const event of extractRouteEvents(transcript)) {
+    if (event.kind === "event_protocol_violation") { failures.push(`archify_receipt:event_protocol:${event.violation}`); continue; }
+    const tokens = event.kind === "command_start" || event.kind === "command_complete" ? commandTokens(event.command) : null;
+    if (event.kind === "command_start" && isDeliverCommand(tokens)) {
+      if (!validateSucceeded) failures.push("archify_receipt:deliver_started_before_validate_completed");
+      else allowedDeliverIds.add(event.id);
+      continue;
+    }
+    if (event.kind !== "command_complete" || event.exit_code !== 0 || event.status !== "completed" || typeof event.output !== "string") continue;
+    if (!tokens || !commonShape(tokens)) continue;
+    let receipt; try { receipt = JSON.parse(event.output); } catch { continue; }
+    if (isValidateCommand(tokens) && validValidateReceipt(receipt)) validateSucceeded = true;
+    if (isDeliverCommand(tokens) && allowedDeliverIds.has(event.id) && validDeliverReceipt(receipt)) deliverSucceeded = true;
+  }
+  if (!validateSucceeded) failures.push("archify_receipt:validate_missing_or_invalid");
+  if (!deliverSucceeded) failures.push("archify_receipt:deliver_missing_or_invalid");
+  return [...new Set(failures)];
+}
+
+function narrowRead(command, targetPath) {
+  const tokens = simpleCommandTokens(command); if (!tokens?.length) return null;
+  const executable = basename(tokens[0]); const canonicalTarget = canonicalPath(targetPath);
+  if (executable === "cat") {
+    const args = tokens.slice(1).filter((token) => token !== "--");
+    return args.length === 1 && canonicalPath(args[0]) === canonicalTarget ? { start: 1, end: Number.POSITIVE_INFINITY, full: true } : null;
+  }
+  if (executable !== "sed" || tokens.length !== 4 || tokens[1] !== "-n" || canonicalPath(tokens[3]) !== canonicalTarget) return null;
+  const range = tokens[2].match(/^(\d+)(?:,(\d+|\$))?p$/u); if (!range) return null;
+  const start = Number(range[1]); const end = range[2] === "$" ? Number.POSITIVE_INFINITY : Number(range[2] ?? range[1]);
+  return start > 0 && end >= start ? { start, end, full: start === 1 && end === Number.POSITIVE_INFINITY } : null;
+}
+
+function targetLineCount(path) {
+  let stat; try { stat = lstatSync(path); } catch { return null; }
+  if (!stat.isFile() || stat.isSymbolicLink()) return null;
+  const text = readFileSync(path, "utf8"); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+}
+
+function verifiedRead(command, output, targetPath) {
+  const range = narrowRead(command, targetPath); if (!range || typeof output !== "string") return null;
+  const text = readFileSync(targetPath, "utf8"); const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+  const expected = range.full ? text : lines.slice(range.start - 1, Number.isFinite(range.end) ? range.end : undefined).join("");
+  return output === expected ? range : null;
+}
+
+function coveredThrough(ranges) {
+  let through = 0;
+  for (const range of [...ranges].sort((a, b) => a.start - b.start)) { if (range.start > through + 1) break; through = Math.max(through, range.end); }
+  return through;
+}
+
+export function assessExactLoad(transcript, targetPath) {
+  const canonical = canonicalPath(targetPath); const commands = extractCommandEvents(transcript); const lineCount = targetLineCount(canonical); const ranges = []; let loadEventIndex = null;
+  if (lineCount !== null) for (const [index, event] of commands.entries()) {
+    if (event.kind !== "command" || event.exit_code !== 0) continue;
+    const read = verifiedRead(event.command, event.output, canonical); if (!read) continue;
+    ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; break; }
+  }
+  return { passed: loadEventIndex !== null, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed cat or cumulative sed -n exact-path reads only" };
+}
+
+function isFindCommand(command) {
+  const tokens = simpleCommandTokens(command); return Boolean(tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find");
+}
+
+export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAudit, expectedTask = null, expectedSkill = null }) {
+  const events = extractRouteEvents(transcript); const violations = []; const bootstrapRanges = []; const targetRanges = []; const bootstrapLines = targetLineCount(canonicalPath(bootstrapPath)); const targetLines = targetLineCount(canonicalPath(targetPath));
+  const findAttempts = new Map(); let bootstrapLoaded = false; let findStarted = false; let findAuthorized = false; let targetLoaded = false; let transcriptFindCount = 0;
+  for (const [index, event] of events.entries()) {
+    if (event.kind === "event_protocol_violation") { violations.push(`event_protocol:${event.violation}`); continue; }
+    if (event.kind === "unclassified_action") { if (!targetLoaded) violations.push(`unclassified_action_before_load:${index}:${event.item_type}`); continue; }
+    const bootstrapRead = narrowRead(event.command, bootstrapPath);
+    const targetRead = narrowRead(event.command, targetPath);
+    if (event.kind === "command_complete") {
+      if (isFindCommand(event.command)) {
+        const attempt = findAttempts.get(event.id); const call = Number.isInteger(attempt) ? findAudit.calls?.[attempt] : null;
+        const contractValid = Boolean(call && call.argv_shape_valid === true && call.envelope_valid === true && call.exit_code === 0 && call.hint_count > 0 && call.hint_nonempty === true && (!expectedTask || call.task_sha256 === sha(expectedTask)));
+        const targetMatch = Boolean(call && (!expectedSkill || call.top1_skill === expectedSkill) && call.top1_path_sha256 === sha(canonicalPath(targetPath)));
+        if (event.exit_code === 0 && event.status === "completed" && contractValid && targetMatch) findAuthorized = true;
+        else if (!(event.exit_code === 0 && event.status === "completed" && contractValid)) violations.push(`find_completion_contract_invalid:${index}:${attempt ?? "unmatched"}`);
+        continue;
+      }
+      const verifiedBootstrap = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, bootstrapPath) : null;
+      if (verifiedBootstrap) { bootstrapRanges.push(verifiedBootstrap); if (bootstrapLines !== null && coveredThrough(bootstrapRanges) >= bootstrapLines) bootstrapLoaded = true; }
+      const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath) : null;
+      if (verified) { targetRanges.push(verified); if (targetLines !== null && coveredThrough(targetRanges) >= targetLines) targetLoaded = true; }
+      continue;
+    }
+    if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (!bootstrapLoaded) violations.push(`find_before_bootstrap_full_load:${index}`); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
+    if (!findStarted && bootstrapRead) continue;
+    if (targetRead) { if (!findAuthorized) violations.push(`target_load_before_find_complete:${index}`); continue; }
+    if (!findStarted) violations.push(`task_command_before_find:${index}`);
+    else if (!findAuthorized) violations.push(`task_command_before_find_complete:${index}`);
+    else if (!targetLoaded) violations.push(`task_command_before_load:${index}`);
+  }
+  if (transcriptFindCount !== findAudit.count) violations.push(`find_count_mismatch:${transcriptFindCount}:${findAudit.count}`);
+  if (!findStarted) violations.push("find_missing");
+  if (!findAuthorized) violations.push("authorized_find_completion_missing");
+  if (!targetLoaded) violations.push("exact_target_load_missing");
+  return { passed: violations.length === 0, violations, transcript_find_count: transcriptFindCount, audit_scope: "Codex completed command_execution order; exact Bootstrap read is the sole pre-Find exception" };
+}
+
+export function assessCoreOrder(transcript, targetPath) {
+  const events = extractRouteEvents(transcript); const violations = []; const ranges = []; const lineCount = targetLineCount(canonicalPath(targetPath)); let loaded = false;
+  for (const [index, event] of events.entries()) {
+    if (event.kind === "event_protocol_violation") { violations.push(`event_protocol:${event.violation}`); continue; }
+    if (event.kind === "unclassified_action") { if (!loaded) violations.push(`task_action_before_core_load:${index}:${event.item_type}`); continue; }
+    const targetRead = narrowRead(event.command, targetPath);
+    if (event.kind === "command_complete") { const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath) : null; if (verified) { ranges.push(verified); if (lineCount !== null && coveredThrough(ranges) >= lineCount) loaded = true; } continue; }
+    if (!targetRead && !loaded) violations.push(`task_command_before_core_load:${index}`);
+  }
+  if (!loaded) violations.push("exact_core_target_load_missing");
+  return { passed: violations.length === 0, violations, audit_scope: "Core first-action full-load gate over Codex command event state machine" };
+}
+
+export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder = { passed: true }, coreOrder = { passed: true }, transcript = { passed: true }, protectedScopes = { passed: true } }) {
+  const safety = workspace.passed && protectedScopes.passed ? "passed" : "failed";
+  const harnessValid = surface.passed && transcript.passed && (arm !== "core" || coreOrder.passed);
+  const retrievalStage = arm === "core" ? "core_control" : retrieval.count === 0 ? "no_retrieval" : retrieval.top1_correct ? "retrieved" : "retrieval_wrong";
+  const loadStage = arm === "core" ? load.passed ? "loaded" : "load_wrong" : load.passed && retrieval.returned_path_exact ? "loaded" : "load_wrong";
+  return {
+    harness_valid: harnessValid, retrieval: retrievalStage, load: loadStage,
+    task: oracle.passed ? "succeeded" : "failed", safety,
+    route_order: arm === "on_demand" ? routeOrder.passed ? "passed" : "failed" : "not_applicable",
+    core_order: arm === "core" ? coreOrder.passed ? "passed" : "failed" : "not_applicable",
+    contract_violation: arm === "on_demand" && (retrieval.contract_violation || !routeOrder.passed),
+    accepted: harnessValid && oracle.passed && safety === "passed" && loadStage === "loaded" && (arm === "core" || (retrievalStage === "retrieved" && !retrieval.contract_violation && routeOrder.passed)),
+    containment: "post_hoc_only_not_pi_realtime",
+  };
+}
+
+export function classifyPair(core, onDemand) {
+  if (!core.harness_valid || core.task !== "succeeded" || core.load !== "loaded" || core.safety !== "passed") return { attribution: "invalid_core_control", cold_routing_regression: null };
+  const regression = onDemand.task !== "succeeded" || onDemand.retrieval !== "retrieved" || onDemand.load !== "loaded" || onDemand.safety !== "passed" || onDemand.contract_violation;
+  return { attribution: regression ? "on_demand_specific_failure" : "no_observed_regression", cold_routing_regression: regression };
+}
+
+function writeInputs(workspace, files) {
+  for (const [relativePath, content] of Object.entries(files)) {
+    const path = resolve(workspace, safeRelative(relativePath)); if (!inside(path, workspace)) fail("workspace input escapes root");
+    mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, content);
+  }
+}
+
+function copyAuth(authSource, codexHome) {
+  if (!existsSync(authSource) || !statSync(authSource).isFile()) fail("auth source must be a regular file");
+  const destination = join(codexHome, "auth.json"); copyFileSync(authSource, destination); ACTIVE_AUTH_COPIES.add(destination);
+  try { chmodSync(destination, 0o600); } catch (error) { cleanupAuth(destination); throw error; }
+  return destination;
+}
+
+function cleanupAuth(path) { rmSync(path, { force: true }); ACTIVE_AUTH_COPIES.delete(path); }
+
+function run(command, args, options) {
+  const result = spawnSync(command, args, { encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024, ...options });
+  return { ...result, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function canonicalPath(path) { try { return realpathSync(path); } catch { return resolve(path); } }
+function stateDigest(root) { return sha([...walk(root)].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
+
+function protectedPackage(path) {
+  try {
+    const stat = lstatSync(path); const state = walk(path); const specials = [...state].filter(([, digest]) => digest.startsWith("special:"));
+    if (!stat.isDirectory() || stat.isSymbolicLink() || specials.length) return { valid: false, digest: null };
+    return { valid: true, digest: stateDigest(path) };
+  } catch { return { valid: false, digest: null }; }
+}
+
+function protectedAuth(path) {
+  try {
+    const stat = lstatSync(path); if (!stat.isFile() || stat.isSymbolicLink()) return { valid: false };
+    return { valid: true, identity: `${stat.dev}:${stat.ino}:${stat.mode}:${stat.size}`, digest: sha(readFileSync(path)) };
+  } catch { return { valid: false }; }
+}
+
+export function captureProtectedScopes(paths) {
+  return { target_package: protectedPackage(paths.targetPackage), exposed_package: protectedPackage(paths.exposedPackage), auth_copy: protectedAuth(paths.authCopy) };
+}
+
+export function assessProtectedScopes(before, after) {
+  const changed = Object.keys(before).filter((name) => JSON.stringify(before[name]) !== JSON.stringify(after[name]) || before[name]?.valid !== true || after[name]?.valid !== true);
+  return { passed: changed.length === 0, changed_scopes: changed };
+}
+
+export function parseFindEnvelope(stdout) {
+  const value = parseEnvelope(stdout, "find");
+  if (value.result?.ranking_strategy !== "task_hint_reciprocal_rank_fusion") fail("Find did not use task_hint_reciprocal_rank_fusion");
+  const candidates = value?.result?.matches ?? [];
+  const top = candidates[0] ?? null;
+  return { skill: top?.name ?? null, path: top?.paths?.[0] ?? null, roster_state: top?.roster_state ?? null, agents: top?.agents ?? [], raw: value };
+}
+
+function parseEnvelope(stdout, command) {
+  let value; try { value = JSON.parse(stdout); } catch { fail(`${command} did not return JSON`); }
+  if (value?.schema_version !== 1 || value?.ok !== true || value?.command !== command || !value.result) fail(`${command} returned an invalid envelope`);
+  return value;
+}
+
+export function skillRosterScanArgs(paths, sourceRoot) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "scan", "--source-root", sourceRoot]; }
+export function skillRosterFindArgs(paths, task) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "find", task.prompt, "--hint", task.hint]; }
+
+export function findWrapperSource() {
+  return `#!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { appendFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const sha = (value) => createHash("sha256").update(value).digest("hex");
+const args = process.argv.slice(2); const separator = args.indexOf("--hint");
+const task = args[0] === "find" ? (args[1] ?? "") : "";
+const hints = []; for (let i = 0; i < args.length; i += 1) if (args[i] === "--hint" && args[i + 1] !== undefined) hints.push(args[i + 1]);
+let result = { status: 64, stdout: "", stderr: "wrapper permits only: skillroster find TASK --hint HINT --json\\n" };
+const argvShapeValid = args.length === 5 && args[0] === "find" && args[2] === "--hint" && args[4] === "--json";
+if (argvShapeValid) result = spawnSync(process.env.SKILLROSTER_REAL_CLI, ["--home", process.env.SKILLROSTER_TEST_HOME, "--state-dir", process.env.SKILLROSTER_TEST_STATE, "--json", ...args.slice(0, 4)], { encoding: "utf8", shell: false });
+let top1 = {}; let envelopeValid = false; try { const value = JSON.parse(result.stdout ?? ""); envelopeValid = value?.schema_version === 1 && value?.ok === true && value?.command === "find" && value?.result?.ranking_strategy === "task_hint_reciprocal_rank_fusion"; const top = envelopeValid ? value?.result?.matches?.[0] ?? {} : {}; top1 = { skill: top.name ?? null, path: top.paths?.[0] ?? null }; } catch {}
+let canonicalTopPath = null; try { canonicalTopPath = top1.path ? realpathSync(top1.path) : null; } catch { canonicalTopPath = top1.path ? resolve(top1.path) : null; }
+appendFileSync(process.env.SKILLROSTER_FIND_AUDIT, JSON.stringify({ kind: "find_call", argv_count: args.length, argv_shape_valid: argvShapeValid, envelope_valid: envelopeValid, task_sha256: sha(task), hint_count: hints.length, hint_nonempty: hints.length > 0 && hints.every((hint) => hint.trim().length > 0), hint_sha256: hints.map(sha), separator_index: separator, exit_code: result.status, top1_skill: top1.skill ?? null, top1_path_sha256: canonicalTopPath ? sha(canonicalTopPath) : null }) + "\\n", { mode: 0o600 });
+process.stdout.write(result.stdout ?? ""); process.stderr.write(result.stderr ?? ""); process.exit(result.status ?? 1);
+`;
+}
+
+export function setupArm(root, task, arm, options) {
+  const home = join(root, "home"); const codexHome = join(home, ".codex"); const workspace = join(root, "workspace"); const temp = join(root, "tmp");
+  for (const path of [codexHome, workspace, temp]) mkdirSync(path, { recursive: true });
+  writeInputs(workspace, task.workspace_files);
+  const skillDestination = join(codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"); mkdirSync(dirname(skillDestination), { recursive: true });
+  const skillSource = arm === "core" ? join(options.skillsRoot, task.expected_skill) : dirname(options.bootstrap);
+  cpSync(skillSource, skillDestination, { recursive: true, dereference: true });
+  const targetPath = arm === "core" ? join(skillDestination, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
+  if (arm === "on_demand") { const targetDir = dirname(targetPath); mkdirSync(dirname(targetDir), { recursive: true }); cpSync(join(options.skillsRoot, task.expected_skill), targetDir, { recursive: true, dereference: true }); }
+  return { home, codexHome, workspace, temp, targetPath, state: join(root, "state"), audit: join(root, "find-audit.jsonl"), transcript: join(root, "codex-events.jsonl") };
+}
+
+function freezeSuite(manifest, options) {
+  const root = mkdtempSync(join(options.runsDir, "suite-snapshot-")); const targets = join(root, "targets"); mkdirSync(targets);
+  for (const name of new Set(manifest.tasks.map((task) => task.expected_skill))) cpSync(join(options.skillsRoot, name), join(targets, name), { recursive: true, dereference: true });
+  const bootstrapRoot = join(root, "bootstrap"); cpSync(dirname(options.bootstrap), bootstrapRoot, { recursive: true, dereference: true });
+  const cli = join(root, basename(options.cli)); copyFileSync(options.cli, cli); chmodSync(cli, statSync(options.cli).mode & 0o777);
+  const manifestPath = join(root, "manifest.json"); copyFileSync(options.manifest, manifestPath);
+  const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
+  if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
+  const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root);
+  const facts = {
+    snapshot_digest: sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}`), manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
+    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
+  };
+  return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
+}
+
+function preflightSurface(paths, task, arm, options, env) {
+  const result = run(options.codex, ["-C", paths.workspace, "debug", "prompt-input", task.prompt], { cwd: paths.workspace, env, timeout: 30_000 });
+  if (result.status !== 0) fail(`Codex prompt-input preflight failed: ${result.stderr.trim()}`);
+  const visible = extractVisibleSkills(result.stdout); const assessment = assessSkillSurface(visible, arm, task.expected_skill);
+  return { ...assessment, prompt_input_sha256: sha(result.stdout) };
+}
+
+export function prepareOnDemand(paths, task, options, env) {
+  const sourceRoot = join(dirname(dirname(paths.targetPath)));
+  const common = ["--home", paths.home, "--state-dir", paths.state, "--json", "--source-root", sourceRoot];
+  const invoke = (command, args = [], input = undefined) => {
+    const result = run(options.cli, [...common, command, ...args], { env, timeout: 60_000, input });
+    if (result.status !== 0) fail(`SkillRoster ${command} failed: ${result.stderr.trim() || result.stdout.trim()}`);
+    return parseEnvelope(result.stdout, command);
+  };
+  const scan = invoke("scan"); const report = invoke("report", ["--full"]); const canonicalTarget = canonicalPath(paths.targetPath);
+  let targetEvidence = null;
+  for (const finding of report.result.findings ?? []) {
+    const detail = invoke("report", ["--finding", finding.id, "--full"]);
+    targetEvidence = (detail.result.evidence ?? []).find((evidence) => evidence.path && canonicalPath(evidence.path) === canonicalTarget) ?? null;
+    if (targetEvidence) break;
+  }
+  const skillId = targetEvidence?.details?.skill_id;
+  if (!skillId || targetEvidence.details?.default_exposed !== false) fail("target source evidence is missing or unexpectedly exposed before governance");
+  const planInput = JSON.stringify({ schema_version: 1, scan_id: scan.result.snapshot_id, evidence_ids: [targetEvidence.id], roster_changes: [{ agent: "codex", skill_id: skillId, state: "on_demand" }] });
+  const plan = invoke("plan", ["--stdin"], planInput); const applied = invoke("apply", [plan.result.plan_id]);
+  if (applied.result.verification !== "passed" || !applied.result.receipt_id) fail("SkillRoster Apply did not produce a verified Receipt");
+  invoke("scan"); invoke("report", ["--full"]);
+  const findResult = run(options.cli, skillRosterFindArgs(paths, task), { env, timeout: 30_000 });
+  if (findResult.status !== 0) fail(`SkillRoster Find preflight failed: ${findResult.stderr.trim()}`);
+  const top = parseFindEnvelope(findResult.stdout); const status = invoke("status");
+  if (top.skill !== task.expected_skill || !top.path || canonicalPath(top.path) !== canonicalTarget || top.roster_state !== "on_demand" || top.agents.length !== 0) fail("governed Find did not return one exact, non-exposed On-demand target");
+  if (status.result.recovery_state !== "clear" || status.result.journal_issues?.length || status.result.last_receipt?.receipt_id !== applied.result.receipt_id) fail("SkillRoster recovery or Receipt state is not clear");
+  const bin = join(dirname(paths.audit), "bin"); mkdirSync(bin); const wrapper = join(bin, "skillroster"); writeFileSync(wrapper, findWrapperSource(), { mode: 0o755 }); chmodSync(wrapper, 0o755);
+  return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
+}
+
+function executeArm(task, arm, options, suiteFacts) {
+  const root = mkdtempSync(join(options.runsDir, `${task.id}-${arm}-`)); const paths = setupArm(root, task, arm, options);
+  const authCopy = copyAuth(options.authSource, paths.codexHome);
+  const env = { ...process.env, HOME: paths.home, CODEX_HOME: paths.codexHome, TMPDIR: paths.temp };
+  const protectedPaths = { targetPackage: dirname(paths.targetPath), exposedPackage: join(paths.codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"), authCopy };
+  const initialWorkspace = walk(paths.workspace); const initialProtected = captureProtectedScopes(protectedPaths);
+  try {
+    const surface = preflightSurface(paths, task, arm, options, env);
+    if (!surface.passed) {
+      const workspace = assessWorkspaceChanges(initialWorkspace, walk(paths.workspace), Object.keys(task.workspace_files), task.allowed_changed_paths); const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
+      return { task: task.id, arm, surface, workspace, protected_scopes: protectedScopes, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed ? "passed" : "failed", accepted: false }, root };
+    }
+    let prepared = null;
+    if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
+    const runEnv = { ...env };
+    if (prepared) Object.assign(runEnv, { PATH: `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
+    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "-m", options.model, "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
+    writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
+    const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
+    const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath) }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
+    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath }) : { count: 0, contract_violation: false };
+    const load = assessExactLoad(result.stdout, paths.targetPath);
+    const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
+    const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
+    const transcript = assessTranscriptIntegrity(result.stdout);
+    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
+    return { task: task.id, arm, root, pair_invariant: sha(`${suiteFacts.snapshot_digest}\0${JSON.stringify(task)}`), codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+  } finally {
+    cleanupAuth(authCopy);
+  }
+}
+
+function dryRun(manifest, options) {
+  const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task);
+  if (!tasks.length) fail(`unknown task: ${options.task}`);
+  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm];
+  return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, task_count: tasks.length, arms, run_count: tasks.length * arms.length, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
+}
+
+export function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv);
+  if (inside(options.runsDir, REPO)) fail("--runs-dir must stay outside the repository so transcripts cannot be committed");
+  if (existingAncestorResolvesInside(options.runsDir, REPO)) fail("--runs-dir ancestor resolves inside the repository so transcripts cannot be committed");
+  mkdirSync(options.runsDir, { recursive: true });
+  if (inside(realpathSync(options.runsDir), realpathSync(REPO))) fail("--runs-dir resolves inside the repository so transcripts cannot be committed");
+  const manifest = validateManifest(JSON.parse(readFileSync(options.manifest, "utf8")));
+  if (!options.execute) { process.stdout.write(`${JSON.stringify(dryRun(manifest, options), null, 2)}\n`); return 0; }
+  for (const path of [options.bootstrap, options.cli, options.skillsRoot, options.authSource]) if (!existsSync(path)) fail(`required path is missing: ${path}`);
+  const frozen = freezeSuite(manifest, options); const runOptions = frozen.options;
+  const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`unknown task: ${options.task}`);
+  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = [];
+  for (const task of tasks) for (const arm of arms) results.push(executeArm(task, arm, runOptions, frozen.facts));
+  const pairs = tasks.map((task) => {
+    const coreResult = results.find((result) => result.task === task.id && result.arm === "core"); const onDemandResult = results.find((result) => result.task === task.id && result.arm === "on_demand");
+    if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { task: task.id, attribution: "pair_invariant_mismatch", cold_routing_regression: null };
+    return coreResult && onDemandResult ? { task: task.id, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, attribution: "pair_incomplete", cold_routing_regression: null };
+  });
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
+  process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`); return summary.status === "passed" ? 0 : 2;
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try { process.exitCode = main(); } catch (error) { process.stderr.write(`codex transfer harness: ${error.message}\n`); process.exitCode = 1; }
+}
