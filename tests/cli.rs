@@ -2044,6 +2044,15 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     FileExt::unlock(&shared_lock).unwrap();
     drop(shared_lock);
 
+    let clean_recovery = json_output(&run(
+        &[&common[..], &["lifecycle", "recovery"]].concat(),
+        None,
+    ));
+    assert_eq!(clean_recovery["result"]["recovery_state"], "clear");
+    assert_eq!(clean_recovery["result"]["imported_receipt_ids"], json!([]));
+    assert_eq!(clean_recovery["result"]["import_errors"], json!([]));
+    assert_eq!(clean_recovery["result"]["state_changed"], false);
+
     let write_lock = OpenOptions::new()
         .read(true)
         .write(true)

@@ -1991,8 +1991,15 @@ fn remove_recovery_artifacts(state_dir: &Path) -> Result<u64> {
 fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Value> {
     let mut imported = Vec::new();
     let mut import_errors = Vec::new();
+    let mut state_changed = false;
     for mut journal in change::journals(state_dir)? {
         let receipt_id = ReceiptId::parse(journal.id.clone())?;
+        if store
+            .get_receipt(&receipt_id)?
+            .is_some_and(|receipt| receipt.status != ReceiptStatus::RecoveryRequired)
+        {
+            continue;
+        }
         let plan_id = match PlanId::parse(journal.plan_id.clone()) {
             Ok(id) => id,
             Err(error) => {
@@ -2049,8 +2056,9 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
             }),
         )?;
         match store.save_recovery_receipt(&plan_id, &imported_receipt) {
-            Ok(inserted) => {
-                if inserted {
+            Ok(outcome) => {
+                state_changed |= outcome.inserted || outcome.plan_transitioned;
+                if outcome.inserted {
                     imported.push(receipt_id);
                 }
             }
@@ -2085,7 +2093,7 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
         "import_errors": import_errors,
         "automatic_resolution_available": false,
         "resolution_note": "Orphan journals with an existing immutable Plan are imported as recovery_required, never guessed successful. Inspect exact paths before repair.",
-        "state_changed": !imported.is_empty(),
+        "state_changed": state_changed,
         "files_changed": false,
     }))
 }
@@ -10416,6 +10424,7 @@ mod recovery_tests {
 
         let result = lifecycle_recovery_command(&store, &state_dir).unwrap();
         assert_eq!(result["imported_receipt_ids"][0], receipt.id);
+        assert_eq!(result["state_changed"], true);
         let imported = store
             .get_receipt(&ReceiptId::parse(receipt.id).unwrap())
             .unwrap()
@@ -10425,6 +10434,103 @@ mod recovery_tests {
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::RecoveryRequired
         );
+
+        let repeated = lifecycle_recovery_command(&store, &state_dir).unwrap();
+        assert_eq!(repeated["imported_receipt_ids"], json!([]));
+        assert_eq!(repeated["import_errors"], json!([]));
+        assert_eq!(repeated["state_changed"], false);
+    }
+
+    #[test]
+    fn lifecycle_recovery_imports_a_reverse_journal_without_changing_the_plan() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        std::fs::create_dir_all(state_dir.join("receipts")).unwrap();
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = ScanRun {
+            id: ScanId::new(),
+            started_at: 1,
+            completed_at: Some(2),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        store.save_scan(&scan).unwrap();
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: scan.id.to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".to_owned(),
+            operations: vec![],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![],
+            approved_roots: vec![temp.path().to_path_buf()],
+            state_dir: state_dir.clone(),
+        };
+        let plan = PlanRecord {
+            id: PlanId::parse(prepared.id.clone()).unwrap(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 3,
+            status: PlanStatus::Ready,
+            input: json!({
+                "prepared": prepared,
+                "roster_before": [],
+                "library_before": [],
+            }),
+            fingerprint: "sha256:test".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 4,
+            completed_at: Some(5),
+            status: ReceiptStatus::Applied,
+            verification: json!({}),
+            operation_results: vec![],
+        };
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
+            .unwrap();
+        let reverse = ChangeReceipt {
+            id: ReceiptId::new().to_string(),
+            plan_id: plan.id.to_string(),
+            status: change::ReceiptStatus::Undone,
+            changed_paths: vec![temp.path().join("agent-skill")],
+            compensations: vec![],
+            approved_roots: vec![temp.path().to_path_buf()],
+            state_dir: state_dir.clone(),
+            error: None,
+            reverses_receipt_id: Some(original.id.to_string()),
+            operation_results: vec![],
+        };
+        std::fs::write(
+            state_dir
+                .join("receipts")
+                .join(format!("{}.json", reverse.id)),
+            serde_json::to_vec(&reverse).unwrap(),
+        )
+        .unwrap();
+
+        let result = lifecycle_recovery_command(&store, &state_dir).unwrap();
+        assert_eq!(result["imported_receipt_ids"][0], reverse.id);
+        assert_eq!(result["import_errors"], json!([]));
+        assert_eq!(result["state_changed"], true);
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::Applied
+        );
+
+        let repeated = lifecycle_recovery_command(&store, &state_dir).unwrap();
+        assert_eq!(repeated["imported_receipt_ids"], json!([]));
+        assert_eq!(repeated["import_errors"], json!([]));
+        assert_eq!(repeated["state_changed"], false);
     }
 
     #[test]

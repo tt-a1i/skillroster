@@ -39,6 +39,12 @@ pub struct PlanReceiptPurgeCounts {
     pub receipts: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryReceiptSaveOutcome {
+    pub inserted: bool,
+    pub plan_transitioned: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceBaseline {
     pub source: String,
@@ -1361,7 +1367,7 @@ impl StateStore {
         &self,
         plan: &PlanId,
         receipt: &ReceiptRecord,
-    ) -> StorageResult<bool> {
+    ) -> StorageResult<RecoveryReceiptSaveOutcome> {
         if receipt.plan_id != *plan || receipt.status != ReceiptStatus::RecoveryRequired {
             return Err(StorageError::InvalidData(
                 "Recovery receipt does not match the recovery Plan".to_owned(),
@@ -1390,11 +1396,34 @@ impl StateStore {
                 true
             }
         };
-        transaction.execute(
-            "UPDATE plans SET status = 'recovery_required'
-             WHERE id = ?1 AND status = 'applying'",
-            [plan.as_str()],
-        )?;
+        let is_reverse = receipt.reverses_receipt_id.is_some();
+        if let Some(original_id) = &receipt.reverses_receipt_id {
+            let original = transaction
+                .query_row(
+                    "SELECT plan_id, status FROM receipts WHERE id = ?1",
+                    [original_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if original.as_ref().map(|(original_plan, original_status)| {
+                (original_plan.as_str(), original_status.as_str())
+            }) != Some((plan.as_str(), "applied"))
+            {
+                return Err(StorageError::InvalidData(format!(
+                    "recovery receipt {} does not reverse an applied Receipt from Plan {plan}",
+                    receipt.id
+                )));
+            }
+        }
+        let plan_transitioned = if is_reverse {
+            false
+        } else {
+            transaction.execute(
+                "UPDATE plans SET status = 'recovery_required'
+                 WHERE id = ?1 AND status = 'applying'",
+                [plan.as_str()],
+            )? == 1
+        };
         let plan_status = transaction
             .query_row(
                 "SELECT status FROM plans WHERE id = ?1",
@@ -1402,13 +1431,24 @@ impl StateStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        if plan_status.as_deref() != Some("recovery_required") {
+        let valid_plan_status = if is_reverse {
+            matches!(
+                plan_status.as_deref(),
+                Some("applied" | "failed_rolled_back")
+            )
+        } else {
+            plan_status.as_deref() == Some("recovery_required")
+        };
+        if !valid_plan_status {
             return Err(StorageError::InvalidData(format!(
                 "plan {plan} is not recoverable from its current state"
             )));
         }
         transaction.commit()?;
-        Ok(inserted)
+        Ok(RecoveryReceiptSaveOutcome {
+            inserted,
+            plan_transitioned,
+        })
     }
 
     pub fn receipt_exists(&self, id: &ReceiptId) -> StorageResult<bool> {
@@ -2867,7 +2907,13 @@ mod tests {
         };
 
         store.save_receipt(&receipt).unwrap();
-        assert!(!store.save_recovery_receipt(&plan.id, &receipt).unwrap());
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &receipt).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: false,
+                plan_transitioned: true,
+            }
+        );
         assert_eq!(
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::RecoveryRequired
@@ -2917,6 +2963,69 @@ mod tests {
         assert_eq!(
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::Applying
+        );
+    }
+
+    #[test]
+    fn reverse_recovery_receipt_preserves_applied_plan_and_is_idempotent() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
+            .unwrap();
+        let recovery = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: Some(original.id.clone()),
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &recovery).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: true,
+                plan_transitioned: false,
+            }
+        );
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::Applied
+        );
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &recovery).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: false,
+                plan_transitioned: false,
+            }
         );
     }
 
