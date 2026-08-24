@@ -395,6 +395,12 @@ test("on-demand route order permits metadata-authorized Find followed by exact t
     const unsafeExpansion = [event("skillroster find '完整任务' --hint " + unsafeHint + " --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
     assert.match(assessRouteOrder(unsafeExpansion, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
   }
+  const quotedNewline = [event("skillroster find '完整任务' --hint 'agent\nnewline' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.equal(assessRouteOrder(quotedNewline, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
+  for (const unsafeNewline of ["skillroster find '完整任务' --hint 'agent' --json\ntouch /private/tmp/TASK", "/bin/zsh -lc \"skillroster find '完整任务' --hint 'agent' --json\nrm -rf /\"", "skillroster find '完整任务' --hint agent\\\ntouch --json"]) {
+    const transcript = [event(unsafeNewline), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+    assert.match(assessRouteOrder(transcript, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
+  }
   const unsafePrefix = [event(`printf task > /tmp/TASK && skillroster find '完整任务' --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
   assert.match(assessRouteOrder(unsafePrefix, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
   const assignment = [event(`TASK='完整任务'; skillroster find "$TASK" --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");

@@ -373,14 +373,15 @@ function simpleCommandTokens(command) {
     if (char === "`" || (char === "$" && value[index + 1] === "(")) return null;
     if (quote) {
       if (char === quote) quote = null;
-      else if (quote === '"' && char === "\\") { index += 1; if (index >= value.length) return null; token += value[index]; }
+      else if (quote === '"' && char === "\\") { index += 1; if (index >= value.length || /[\r\n]/u.test(value[index])) return null; token += value[index]; }
       else token += char;
       continue;
     }
     if (char === "'" || char === '"') { quote = char; continue; }
     if (/[|;&<>]/u.test(char)) return null;
+    if (/[\r\n]/u.test(char)) return null;
     if (/\s/u.test(char)) { if (token) { tokens.push(token); token = ""; } continue; }
-    if (char === "\\") { index += 1; if (index >= value.length) return null; token += value[index]; continue; }
+    if (char === "\\") { index += 1; if (index >= value.length || /[\r\n]/u.test(value[index])) return null; token += value[index]; continue; }
     token += char;
   }
   if (quote) return null;
