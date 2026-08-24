@@ -99,6 +99,20 @@ impl From<serde_json::Error> for StorageError {
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;
+type Migration = for<'a> fn(&Transaction<'a>) -> StorageResult<()>;
+
+const MIGRATIONS: [(i64, Migration); SCHEMA_VERSION as usize] = [
+    (1, migration_v1),
+    (2, migration_v2),
+    (3, migration_v3),
+    (4, migration_v4),
+    (5, migration_v5),
+    (6, migration_v6),
+    (7, migration_v7),
+    (8, migration_v8),
+    (9, migration_v9),
+    (10, migration_v10),
+];
 
 pub struct StateStore {
     connection: Connection,
@@ -160,75 +174,21 @@ impl StateStore {
                 "database schema {current} is newer than supported schema {SCHEMA_VERSION}"
             )));
         }
-        if current == 0 {
-            let transaction = self.connection.transaction()?;
-            migration_v1(&transaction)?;
-            transaction.pragma_update(None, "user_version", 1_i64)?;
-            transaction.commit()?;
-            current = 1;
+        for (target, migration) in MIGRATIONS {
+            if current + 1 != target {
+                continue;
+            }
+            self.run_migration(target, migration)?;
+            current = target;
         }
-        if current == 1 {
-            let transaction = self.connection.transaction()?;
-            migration_v2(&transaction)?;
-            transaction.pragma_update(None, "user_version", 2_i64)?;
-            transaction.commit()?;
-            current = 2;
-        }
-        if current == 2 {
-            let transaction = self.connection.transaction()?;
-            migration_v3(&transaction)?;
-            transaction.pragma_update(None, "user_version", 3_i64)?;
-            transaction.commit()?;
-            current = 3;
-        }
-        if current == 3 {
-            let transaction = self.connection.transaction()?;
-            migration_v4(&transaction)?;
-            transaction.pragma_update(None, "user_version", 4_i64)?;
-            transaction.commit()?;
-            current = 4;
-        }
-        if current == 4 {
-            let transaction = self.connection.transaction()?;
-            migration_v5(&transaction)?;
-            transaction.pragma_update(None, "user_version", 5_i64)?;
-            transaction.commit()?;
-            current = 5;
-        }
-        if current == 5 {
-            let transaction = self.connection.transaction()?;
-            migration_v6(&transaction)?;
-            transaction.pragma_update(None, "user_version", 6_i64)?;
-            transaction.commit()?;
-            current = 6;
-        }
-        if current == 6 {
-            let transaction = self.connection.transaction()?;
-            migration_v7(&transaction)?;
-            transaction.pragma_update(None, "user_version", 7_i64)?;
-            transaction.commit()?;
-            current = 7;
-        }
-        if current == 7 {
-            let transaction = self.connection.transaction()?;
-            migration_v8(&transaction)?;
-            transaction.pragma_update(None, "user_version", 8_i64)?;
-            transaction.commit()?;
-            current = 8;
-        }
-        if current == 8 {
-            let transaction = self.connection.transaction()?;
-            migration_v9(&transaction)?;
-            transaction.pragma_update(None, "user_version", 9_i64)?;
-            transaction.commit()?;
-            current = 9;
-        }
-        if current == 9 {
-            let transaction = self.connection.transaction()?;
-            migration_v10(&transaction)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            transaction.commit()?;
-        }
+        Ok(())
+    }
+
+    fn run_migration(&mut self, target: i64, migration: Migration) -> StorageResult<()> {
+        let transaction = self.connection.transaction()?;
+        migration(&transaction)?;
+        transaction.pragma_update(None, "user_version", target)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2264,6 +2224,37 @@ mod tests {
     fn migration_creates_current_schema() {
         let store = StateStore::open_in_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn failed_migration_rolls_back_schema_and_version() {
+        fn fail_after_schema_write(transaction: &Transaction<'_>) -> StorageResult<()> {
+            transaction.execute_batch("CREATE TABLE partial_migration (id INTEGER)")?;
+            Err(StorageError::InvalidData("injected failure".into()))
+        }
+
+        let mut store = StateStore {
+            connection: Connection::open_in_memory().unwrap(),
+        };
+        let error = store.run_migration(1, fail_after_schema_write).unwrap_err();
+
+        assert_eq!(error.to_string(), "injected failure");
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let retained_table: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'partial_migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_table, 0);
     }
 
     #[test]
