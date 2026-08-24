@@ -424,6 +424,16 @@ test("JSON oracle compares structure without depending on object key order", () 
   assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:invalid_json"]);
 });
 
+test("JSON oracle can require a bounded companion file", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-required-file-oracle-")); mkdirSync(join(root, "outputs"));
+  writeFileSync(join(root, "outputs/report.json"), JSON.stringify({ ok: true }));
+  writeFileSync(join(root, "outputs/README.md"), "# Report\nItems: 2\n");
+  const oracle = { path: "outputs/report.json", json_equals: { ok: true }, required_files: [{ path: "outputs/README.md", required_substrings: ["# Report", "Items: 2"] }] };
+  assert.equal(evaluateOracle(root, oracle).passed, true);
+  writeFileSync(join(root, "outputs/README.md"), "# Report\n");
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["required_file:missing_substring:outputs/README.md:Items: 2"]);
+});
+
 test("Archify transcript attempts require exact shape and lifecycle order", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-archify-receipts-")); const workspace = join(root, "workspace"); const target = join(root, "archify"); const spec = join(workspace, "scratch", "order.spec.json"); const artifact = join(workspace, "outputs", "order.html"); const script = join(target, "bin", "archify.mjs");
   mkdirSync(join(workspace, "scratch"), { recursive: true }); mkdirSync(join(workspace, "outputs"), { recursive: true }); mkdirSync(join(target, "bin"), { recursive: true }); writeFileSync(spec, "{\"type\":\"architecture\"}\n"); writeFileSync(artifact, "<html>static token stuffing</html>\n"); writeFileSync(script, "// frozen tool");

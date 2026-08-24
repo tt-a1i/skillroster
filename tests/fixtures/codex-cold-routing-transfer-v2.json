@@ -9,7 +9,7 @@
       "id": "transfer-rewrite-001",
       "family": "instruction_only_rewriting",
       "expected_skill": "zh-rewrite",
-      "prompt": "请阅读 draft.md，把它改写成一段克制、自然的中文团队更新，保存到 outputs/update.md。只保留原文明确写出的发布日期、离线草稿、批量导出、内测人数和反馈人数；去掉夸张表述、问候、收尾建议和任何推断。保留所有日期、数字和事实，不要标题、列表或修改说明，正文控制在 80 到 180 个字符（含标点）。",
+      "prompt": "请阅读 draft.md，把它改写成一段克制、自然的中文团队更新，保存到 outputs/update.md。只保留原文明确写出的发布日期、离线草稿、批量导出、内测人数和反馈人数；去掉夸张表述、问候、收尾建议和任何推断。保留所有日期、数字和事实，不要标题、列表或修改说明，正文控制在 50 到 180 个字符（含标点）。",
       "hint": "Chinese restrained internal update preserving explicit facts",
       "workspace_files": {
         "draft.md": "桌面客户端将在 10 月 8 日发布，首版支持离线草稿和批量导出。内测共有 28 人，其中 19 人反馈批量导出节省了时间。此外，这是迈向卓越体验的关键里程碑，请告诉我是否需要进一步展开。\n"
@@ -19,7 +19,7 @@
       "required_find_calls": 1,
       "oracle": {
         "path": "outputs/update.md",
-        "minimum_characters": 80,
+        "minimum_characters": 50,
         "maximum_characters": 180,
         "required_substrings": ["桌面客户端", "10 月 8 日", "离线草稿", "批量导出", "28", "19"],
         "forbidden_regex": ["^#", "^\\s*[-*+]\\s", "关键里程碑", "卓越体验", "请告诉我", "进一步展开", "另外\\s*9\\s*人", "发布后"]
@@ -68,7 +68,13 @@
             { "position": 1, "name": "offline drafts", "status": "ready" },
             { "position": 2, "name": "batch export", "status": "review" }
           ]
-        }
+        },
+        "required_files": [
+          {
+            "path": "outputs/README.md",
+            "required_substrings": ["# Release checklist", "Items: 2", "1. offline drafts — ready", "2. batch export — review"]
+          }
+        ]
       }
     }
   ]

@@ -90,6 +90,12 @@ export function validateManifest(manifest) {
     if (task.allowed_changed_paths.some((path) => Object.hasOwn(task.workspace_files ?? {}, path))) fail(`${task.id} cannot mutate an input`);
     safeRelative(task.oracle?.path, `${task.id} oracle path`);
     if (!task.allowed_changed_paths.includes(task.oracle.path)) fail(`${task.id} oracle path must be allowlisted`);
+    for (const requiredFile of task.oracle.required_files ?? []) {
+      safeRelative(requiredFile?.path, `${task.id} required file path`);
+      if (!task.allowed_changed_paths.includes(requiredFile.path)) fail(`${task.id} required file path must be allowlisted`);
+      for (const value of requiredFile.required_substrings ?? []) if (typeof value !== "string" || !value) fail(`${task.id} required file substring must be non-empty`);
+      for (const value of requiredFile.required_regex ?? []) new RegExp(value, "u");
+    }
     for (const pattern of [...(task.oracle.required_regex ?? []), ...(task.oracle.forbidden_regex ?? [])]) new RegExp(pattern, "u");
     if (task.oracle?.json_equals !== undefined && (task.oracle.json_equals === null || typeof task.oracle.json_equals !== "object")) fail(`${task.id} json_equals must be an object or array`);
     const receipt = task.oracle.archify_receipt_contract;
@@ -190,6 +196,13 @@ export function evaluateOracle(workspace, oracle, evidence = {}) {
   for (const value of oracle.forbidden_substrings ?? []) if (text.includes(value)) failures.push(`forbidden_substring:${value}`);
   for (const value of oracle.required_regex ?? []) if (!new RegExp(value, "u").test(text)) failures.push(`missing_regex:${value}`);
   for (const value of oracle.forbidden_regex ?? []) if (new RegExp(value, "u").test(text)) failures.push(`forbidden_regex:${value}`);
+  for (const requiredFile of oracle.required_files ?? []) {
+    const requiredPath = noFollowWorkspaceFile(workspace, requiredFile.path);
+    if (!requiredPath) { failures.push(`required_file:unsafe_or_missing:${requiredFile.path}`); continue; }
+    const requiredText = readFileSync(requiredPath, "utf8");
+    for (const value of requiredFile.required_substrings ?? []) if (!requiredText.includes(value)) failures.push(`required_file:missing_substring:${requiredFile.path}:${value}`);
+    for (const value of requiredFile.required_regex ?? []) if (!new RegExp(value, "u").test(requiredText)) failures.push(`required_file:missing_regex:${requiredFile.path}:${value}`);
+  }
   if (oracle.json_equals !== undefined) {
     let actual; try { actual = JSON.parse(text); } catch { failures.push("json_equals:invalid_json"); }
     if (actual !== undefined && JSON.stringify(canonicalJson(actual)) !== JSON.stringify(canonicalJson(oracle.json_equals))) failures.push("json_equals:mismatch");
