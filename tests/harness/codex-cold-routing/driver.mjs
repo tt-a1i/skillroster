@@ -415,10 +415,21 @@ function readTokens(tokens, targetPath) {
   return read?.path === canonicalPath(targetPath) ? read : null;
 }
 
+function readOnlyShellSegment(segment) {
+  const tokens = simpleCommandTokens(segment); if (!tokens?.length) return false;
+  const executable = basename(tokens[0]);
+  if (parseReadTokens(tokens)) return true;
+  if (executable === "printf") return true;
+  return ["rg", "rg.exe"].includes(executable.toLowerCase()) && tokens.includes("--files");
+}
+
 function narrowRead(command, targetPath, allowLeading = false) {
   const direct = readTokens(simpleCommandTokens(command), targetPath); if (direct || !allowLeading) return direct;
-  const inner = unwrapSimpleShell(command); const separator = inner.indexOf(" && ");
-  if (separator >= 0) return null;
+  const inner = unwrapSimpleShell(command); const compound = inner.split(/\s+&&\s+/u);
+  if (compound.length > 1) {
+    const leading = readTokens(simpleCommandTokens(compound[0]), targetPath);
+    return leading && compound.slice(1).every(readOnlyShellSegment) ? { ...leading, read_only_compound: true } : null;
+  }
   const parts = inner.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean);
   if (parts.length < 2) return null;
   const reads = parts.map((part) => parseReadTokens(simpleCommandTokens(part)));
@@ -438,6 +449,7 @@ function verifiedRead(command, output, targetPath, allowLeading = false) {
   const readOutput = (read) => { const text = readFileSync(read.path, "utf8"); const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? []; return read.full ? text : lines.slice(read.start - 1, Number.isFinite(read.end) ? read.end : undefined).join(""); };
   const expected = readOutput(range);
   if (range.read_sequence) return output === range.read_sequence.map(readOutput).join("") ? { ...range, evidence_mode: "content_echo_sequence" } : null;
+  if (range.read_only_compound) return output.startsWith(expected) ? { ...range, evidence_mode: "content_echo_read_only_compound" } : null;
   return output === expected ? { ...range, evidence_mode: "content_echo" } : null;
 }
 
@@ -454,7 +466,7 @@ export function assessExactLoad(transcript, targetPath) {
     const read = verifiedRead(event.command, event.output, canonical, true); if (!read) continue;
     ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; evidenceMode = read.evidence_mode; break; }
   }
-  return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed standalone exact-path reads with verified content echo, or read-only newline sequences" };
+  return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed exact-path reads with verified content echo; compound suffixes must be fully classified as read-only" };
 }
 
 function findCommandShape(command) {

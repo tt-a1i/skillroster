@@ -238,13 +238,15 @@ test("cumulative sed reads prove full load only after all lines are covered", ()
   assert.equal(full.passed, true); assert.equal(full.load_event_index, 1);
 });
 
-test("exact target load rejects compound reads with unaudited suffixes", () => {
+test("exact target load classifies every compound suffix and rejects writes", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-leading-load-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\n"); const canonical = realpathSync(target);
   const command = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && printf '\\nDONE\\n'"`;
-  const event = (type, output = null) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
+  const event = (type, output = null, value = command) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command: value, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
   const transcript = `${event("started")}\n${event("completed", "one\ntwo\n\nDONE\n")}`;
-  assert.equal(assessExactLoad(transcript, target).passed, false);
-  assert.equal(assessCoreOrder(transcript, target).passed, false);
+  assert.equal(assessExactLoad(transcript, target).passed, true);
+  assert.equal(assessCoreOrder(transcript, target).passed, true);
+  const mutatingCommand = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && touch /tmp/unaudited"`;
+  const mutating = `${event("started", null, mutatingCommand)}\n${event("completed", "one\ntwo\n", mutatingCommand)}`; assert.equal(assessExactLoad(mutating, target).passed, false);
   const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
 });
 
