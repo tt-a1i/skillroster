@@ -497,24 +497,13 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
         "---\nname: humanizer-zh\ndescription: 把中文文章改得更自然，更像人类写的。\n---\n保留原意并去掉机器表达。\n",
     )
     .unwrap();
-    for name in [
-        "ai-tone-editor",
-        "content-polisher",
-        "english-humanizer",
-        "writing-assistant",
-        "x-post-writer",
-        "zh-copy-editor",
-    ] {
-        let directory = skill_root.join(name);
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("SKILL.md"),
-            format!(
-                "---\nname: {name}\ndescription: Humanize Chinese writing, remove AI tone, and polish English posts.\n---\n"
-            ),
-        )
-        .unwrap();
-    }
+    let session_miner = skill_root.join("agent-session-miner");
+    fs::create_dir_all(&session_miner).unwrap();
+    fs::write(
+        session_miner.join("SKILL.md"),
+        "---\nname: agent-session-miner\ndescription: Mine local AI coding-agent session history into redacted reusable content seeds. Humanization and writing patterns may be analyzed.\n---\n",
+    )
+    .unwrap();
     let common = [
         "--home",
         home.to_str().unwrap(),
@@ -552,14 +541,10 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
         .concat(),
         None,
     ));
-    let native = hinted["result"]["matches"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|matched| matched["name"] == "humanizer-zh")
-        .expect("the task-only native match must survive hint fusion");
-    assert!(native["rank"].as_u64().unwrap() <= 3);
-    assert!(native["task_channel_rank"].as_u64().unwrap() <= 3);
+    let native = &hinted["result"]["matches"][0];
+    assert_eq!(native["name"], "humanizer-zh");
+    assert_eq!(native["rank"], 1);
+    assert_eq!(native["task_channel_rank"], 1);
     assert!(native["augmented_channel_rank"].is_number());
     assert_eq!(
         hinted["result"]["ranking_strategy"],

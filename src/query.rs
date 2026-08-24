@@ -1990,12 +1990,14 @@ pub(crate) fn fuse_retrieval_channels(
         task_rank: Option<usize>,
         augmented_rank: Option<usize>,
         fused_score: f64,
+        has_protectable_task_evidence: bool,
     }
 
     let mut fused = BTreeMap::<String, FusedMatch>::new();
     for matched in task_matches {
         let capability = matched.name.trim().to_lowercase();
         let rank = matched.rank;
+        let has_protectable_task_evidence = has_protectable_task_evidence(&matched);
         fused.insert(
             capability,
             FusedMatch {
@@ -2003,6 +2005,7 @@ pub(crate) fn fuse_retrieval_channels(
                 task_rank: Some(rank),
                 augmented_rank: None,
                 fused_score: 1.0 / (RECIPROCAL_RANK_OFFSET + rank as f64),
+                has_protectable_task_evidence,
             },
         );
     }
@@ -2027,6 +2030,7 @@ pub(crate) fn fuse_retrieval_channels(
                     task_rank: None,
                     augmented_rank: Some(rank),
                     fused_score: AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64),
+                    has_protectable_task_evidence: false,
                 },
             );
         }
@@ -2051,6 +2055,14 @@ pub(crate) fn fuse_retrieval_channels(
             .then_with(|| left.matched.name.cmp(&right.matched.name))
             .then_with(|| left.matched.skill_id.cmp(&right.matched.skill_id))
     });
+    let leading_match_is_weak_augmented_only = fused.first().is_some_and(|matched| {
+        matched.task_rank.is_none() && !has_direct_hint_evidence(&matched.matched)
+    });
+    let protected_task_capabilities = fused
+        .iter()
+        .filter(|fused| fused.task_rank == Some(1) && fused.has_protectable_task_evidence)
+        .map(|fused| fused.matched.name.trim().to_lowercase())
+        .collect::<BTreeSet<_>>();
     let mut fused = fused
         .into_iter()
         .map(|mut fused| {
@@ -2062,13 +2074,6 @@ pub(crate) fn fuse_retrieval_channels(
             fused.matched
         })
         .collect::<Vec<_>>();
-    let protected_task_capabilities = fused
-        .iter()
-        .filter(|matched| {
-            matched.task_channel_rank == Some(1) && has_protectable_task_evidence(matched)
-        })
-        .map(|matched| matched.name.trim().to_lowercase())
-        .collect::<BTreeSet<_>>();
     let protected_task_matches = fused
         .iter()
         .filter(|matched| protected_task_capabilities.contains(&matched.name.trim().to_lowercase()))
@@ -2092,9 +2097,14 @@ pub(crate) fn fuse_retrieval_channels(
         else {
             continue;
         };
-        if index >= PROTECTED_TASK_MAX_RANK {
+        let protected_rank_index = if leading_match_is_weak_augmented_only {
+            0
+        } else {
+            PROTECTED_TASK_MAX_RANK - 1
+        };
+        if index > protected_rank_index {
             let matched = fused.remove(index);
-            fused.insert(PROTECTED_TASK_MAX_RANK - 1, matched);
+            fused.insert(protected_rank_index, matched);
         }
     }
     fused.truncate(limit);
@@ -2297,18 +2307,37 @@ fn has_strong_lexical_evidence(matched: &FindMatch) -> bool {
 }
 
 fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
+    let has_direct_metadata_evidence = has_direct_metadata_reason(matched)
+        || ["name_tokens:", "trigger_tokens:", "description_tokens:"]
+            .iter()
+            .any(|prefix| match_reason_count(matched, prefix).is_some_and(|count| count >= 2));
+    let has_correlated_cjk_evidence = match_reason_count(matched, "cjk_description_bigrams:")
+        .is_some_and(|count| count >= 1)
+        && match_reason_count(matched, "cjk_all_text_bigrams:").is_some_and(|count| count >= 3);
+    has_direct_metadata_evidence || has_correlated_cjk_evidence
+}
+
+fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
+    has_direct_metadata_reason(matched)
+        || ["name_tokens:", "trigger_tokens:"]
+            .iter()
+            .any(|prefix| match_reason_count(matched, prefix).is_some_and(|count| count >= 2))
+}
+
+fn has_direct_metadata_reason(matched: &FindMatch) -> bool {
     matched.match_reasons.iter().any(|reason| {
         matches!(
             reason.as_str(),
             "exact_name" | "name_phrase" | "declared_trigger" | "description_phrase"
-        ) || ["name_tokens:", "trigger_tokens:", "description_tokens:"]
-            .iter()
-            .any(|prefix| {
-                reason
-                    .strip_prefix(prefix)
-                    .and_then(|count| count.parse::<usize>().ok())
-                    .is_some_and(|count| count >= 2)
-            })
+        )
+    })
+}
+
+fn match_reason_count(matched: &FindMatch, prefix: &str) -> Option<usize> {
+    matched.match_reasons.iter().find_map(|reason| {
+        reason
+            .strip_prefix(prefix)
+            .and_then(|count| count.parse::<usize>().ok())
     })
 }
 
@@ -2324,6 +2353,32 @@ fn fnv1a64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn matched(name: &str, rank: usize, reasons: &[&str]) -> FindMatch {
+        FindMatch {
+            rank,
+            skill_id: format!("skill_{name}"),
+            name: name.into(),
+            score: 1.0,
+            paths: Vec::new(),
+            agents: Vec::new(),
+            roster_state: "unknown".into(),
+            source: None,
+            providers: Vec::new(),
+            governable: true,
+            owned_by_agent: Some(true),
+            mutation_scopes: vec![crate::scan::MutationScope::Mutable],
+            match_reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
+            task_channel_rank: None,
+            augmented_channel_rank: None,
+            evidence_quality: EvidenceQuality::Inferred,
+            variant_skill_ids: Vec::new(),
+            variants: Vec::new(),
+            variant_count: 1,
+            variants_truncated: false,
+            variant_finding: None,
+        }
+    }
 
     #[test]
     fn inventory_coverage_ignores_session_root_availability() {
@@ -3079,40 +3134,15 @@ mod tests {
     }
 
     #[test]
-    fn hint_fusion_prefers_a_high_rank_hint_match_over_weak_channel_overlap() {
-        fn matched(name: &str, rank: usize, reasons: &[&str]) -> FindMatch {
-            FindMatch {
-                rank,
-                skill_id: format!("skill_{name}"),
-                name: name.into(),
-                score: 1.0,
-                paths: Vec::new(),
-                agents: Vec::new(),
-                roster_state: "unknown".into(),
-                source: None,
-                providers: Vec::new(),
-                governable: true,
-                owned_by_agent: Some(true),
-                mutation_scopes: vec![crate::scan::MutationScope::Mutable],
-                match_reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
-                task_channel_rank: None,
-                augmented_channel_rank: None,
-                evidence_quality: EvidenceQuality::Inferred,
-                variant_skill_ids: Vec::new(),
-                variants: Vec::new(),
-                variant_count: 1,
-                variants_truncated: false,
-                variant_finding: None,
-            }
-        }
-
+    fn hint_fusion_keeps_a_strong_native_top_match_ahead_of_hint_only_matches() {
         let task_matches = vec![
             matched("native-task", 1, &["description_tokens:2"]),
             matched("weak-overlap", 2, &["description_tokens:1"]),
         ];
         let augmented_matches = vec![
-            matched("direct-hint", 1, &["declared_trigger"]),
-            matched("weak-overlap", 3, &["all_text_tokens:5"]),
+            matched("hint-only-overlap", 1, &["description_tokens:3"]),
+            matched("weak-overlap", 2, &["all_text_tokens:5"]),
+            matched("native-task", 3, &["all_text_tokens:5"]),
         ];
         let task_query = RetrievalQuery::from_parts(["原始任务"]);
 
@@ -3125,8 +3155,46 @@ mod tests {
                 .expect("expected bounded capability")
         };
 
-        assert!(rank("direct-hint") < rank("weak-overlap"));
-        assert!(rank("native-task") <= 3);
+        assert_eq!(rank("native-task"), 1);
+        assert!(rank("hint-only-overlap") < rank("weak-overlap"));
+    }
+
+    #[test]
+    fn hint_fusion_does_not_promote_weak_task_evidence_using_hint_reasons() {
+        let task_matches = vec![matched("weak-task", 1, &["all_text_tokens:1"])];
+        let augmented_matches = vec![
+            matched("direct-hint", 1, &["declared_trigger"]),
+            matched("weak-task", 2, &["description_phrase"]),
+        ];
+        let task_query = RetrievalQuery::from_parts(["incidental"]);
+
+        let fused = fuse_retrieval_channels(task_matches, augmented_matches, &task_query, 2);
+
+        assert_eq!(fused[0].name, "direct-hint");
+        assert_eq!(fused[1].name, "weak-task");
+        assert_eq!(fused[1].task_channel_rank, Some(1));
+        assert_eq!(fused[1].augmented_channel_rank, Some(2));
+    }
+
+    #[test]
+    fn hint_fusion_treats_correlated_cjk_description_and_body_evidence_as_strong() {
+        let task_matches = vec![matched(
+            "native-task",
+            1,
+            &["cjk_description_bigrams:1", "cjk_all_text_bigrams:3"],
+        )];
+        let augmented_matches = vec![
+            matched("hint-only", 1, &["description_tokens:3"]),
+            matched("other", 2, &["description_tokens:2"]),
+            matched("native-task", 3, &["all_text_tokens:3"]),
+        ];
+        let task_query = RetrievalQuery::from_parts(["把中文改得自然克制一些"]);
+
+        let fused = fuse_retrieval_channels(task_matches, augmented_matches, &task_query, 3);
+
+        assert_eq!(fused[0].name, "native-task");
+        assert_eq!(fused[0].task_channel_rank, Some(1));
+        assert_eq!(fused[0].augmented_channel_rank, Some(3));
     }
 
     #[test]
