@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -91,8 +91,8 @@ test("offline reevaluation writes only outside the immutable source run tree", (
 
 test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   const manifest = { schema_version: 1, harness: "codex-transfer", tasks: [
-    { id: "a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
-    { id: "b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+    { id: "a", family: "family-a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
+    { id: "b", family: "family-b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
   ] };
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
@@ -100,9 +100,39 @@ test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   assert.throws(() => validateManifest({ ...manifest, tasks: [], trials_per_arm: 3 }), /unsupported/u);
   assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 0 }), /trials_per_arm/u);
   assert.throws(() => validateManifest({ ...manifest, formal_protocol_gate: "yes" }), /formal_protocol_gate/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], family: "family-b" }, manifest.tasks[1]] }), /family must be unique/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], family: "Family A" }, manifest.tasks[1]] }), /family must be unique/u);
   for (const prompt of ["use SkillRoster", "run capability search", "please Find it", "做能力检索", "load one"]) {
     assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], prompt }] }), /must not disclose/u);
   }
+});
+
+test("multi-family protocol aggregation counts every task pair and emits one gate per family", () => {
+  const tasks = [{ id: "a", family: "rewrite" }, { id: "b", family: "extract" }, { id: "c", family: "artifact" }];
+  const results = tasks.flatMap((task) => [
+    { family: task.family, task: task.id, trial: 1, arm: "core", pair_invariant: `${task.id}-pair`, outcome: { accepted: true, harness_valid: true, task: "succeeded", load: "loaded", safety: "passed" } },
+    { family: task.family, task: task.id, trial: 1, arm: "on_demand", pair_invariant: `${task.id}-pair`, outcome: { accepted: true, harness_valid: true, task: "succeeded", load: "loaded", safety: "passed", retrieval: "retrieved", contract_violation: false } },
+  ]);
+  const pairs = groupPairedResults(tasks, results, 1);
+  assert.deepEqual(pairs.map((pair) => [pair.family, pair.gate]), [["rewrite", "passed"], ["extract", "passed"], ["artifact", "passed"]]);
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.expected_runs, 6);
+  assert.equal(decision.core_accepted, 3);
+  assert.equal(decision.on_demand_accepted, 3);
+  assert.equal(decision.overall_gate, true);
+  assert.deepEqual(decision.family_gates.map((gate) => gate.family), ["rewrite", "extract", "artifact"]);
+  assert.ok(decision.family_gates.every((gate) => gate.gate === "passed"));
+});
+
+test("a failed family gate cannot be hidden by passing families", () => {
+  const tasks = [{ id: "rewrite", family: "rewrite" }, { id: "extract", family: "extract" }];
+  const result = (task, family, arm, accepted) => ({ family, task, trial: 1, arm, pair_invariant: `${task}-pair`, outcome: { accepted, harness_valid: true, task: accepted ? "succeeded" : "failed", load: accepted ? "loaded" : "load_wrong", safety: "passed", retrieval: accepted ? "retrieved" : "retrieval_wrong", contract_violation: !accepted } });
+  const results = [result("rewrite", "rewrite", "core", true), result("rewrite", "rewrite", "on_demand", true), result("extract", "extract", "core", true), result("extract", "extract", "on_demand", false)];
+  const pairs = groupPairedResults(tasks, results, 1);
+  const decision = deriveProtocolDecision(results, 1, tasks, pairs);
+  assert.equal(decision.overall_gate, false);
+  assert.equal(decision.family_gates.find((gate) => gate.family === "rewrite").gate, "passed");
+  assert.equal(decision.family_gates.find((gate) => gate.family === "extract").gate, "failed");
 });
 
 test("formal eligibility requires a complete successful harness record, not a task pass", () => {
@@ -454,4 +484,13 @@ test("fixture remains readable and contains only the two previously passing fami
   const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer.json", import.meta.url)));
   validateManifest(fixture);
   assert.deepEqual(fixture.tasks.map((task) => task.expected_skill).sort(), ["archify", "humanizer-zh"]);
+});
+
+test("sealed transfer fixture keeps three distinct capability families and six scheduled runs", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../../fixtures/codex-cold-routing-transfer-v2.json", import.meta.url)));
+  validateManifest(fixture);
+  assert.equal(fixture.formal_protocol_gate, true);
+  assert.deepEqual(fixture.tasks.map((task) => task.family), ["instruction_only_rewriting", "reference_backed_extraction", "script_backed_artifact"]);
+  assert.equal(fixture.tasks.length * 2 * fixture.trials_per_arm, 6);
+  assert.equal(new Set(fixture.tasks.map((task) => task.family)).size, 3);
 });
