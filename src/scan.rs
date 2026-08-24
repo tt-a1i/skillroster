@@ -157,6 +157,14 @@ pub struct SkillPlacement {
     pub link_target: Option<PathBuf>,
     pub link_status: LinkStatus,
     pub default_exposed: bool,
+    /// Stable structural ownership of the placement path. This does not claim
+    /// ownership or endorsement of content reached through a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by_agent: Option<bool>,
+    /// The bounded mutation authority observed for this placement. Missing on
+    /// legacy Snapshots means unknown and must never authorize mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_scope: Option<MutationScope>,
     /// Whether SkillRoster may include this placement in a mutating governance Plan.
     /// External provider caches are observed and searchable, but never governable.
     #[serde(default = "default_true")]
@@ -168,6 +176,32 @@ pub struct SkillPlacement {
     pub executable_files: Vec<PathBuf>,
     #[serde(default)]
     pub declared_name_matches_directory: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationScope {
+    Mutable,
+    ProviderReadOnly,
+    DurableReadOnly,
+    UntrustedExternal,
+}
+
+impl MutationScope {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Mutable => "mutable",
+            Self::ProviderReadOnly => "provider_read_only",
+            Self::DurableReadOnly => "durable_read_only",
+            Self::UntrustedExternal => "untrusted_external",
+        }
+    }
+}
+
+impl SkillPlacement {
+    pub fn is_mutable(&self) -> bool {
+        self.governable && self.mutation_scope == Some(MutationScope::Mutable)
+    }
 }
 
 #[derive(Debug)]
@@ -1390,6 +1424,18 @@ fn materialize_candidates_with_hook(
             candidate.root.display(),
             candidate.entrypoint.display()
         );
+        let mutation_scope = if candidate.provider.is_some() {
+            MutationScope::ProviderReadOnly
+        } else if durable_anchor.is_some() {
+            MutationScope::DurableReadOnly
+        } else if !candidate.governable
+            || candidate.link_status == LinkStatus::EscapesRoot
+            || !safe_to_read
+        {
+            MutationScope::UntrustedExternal
+        } else {
+            MutationScope::Mutable
+        };
         result.placements.push(SkillPlacement {
             id: format!("placement_{}", stable_digest(placement_basis.as_bytes())),
             skill_id,
@@ -1404,7 +1450,9 @@ fn materialize_candidates_with_hook(
             link_target: candidate.link_target,
             link_status: candidate.link_status,
             default_exposed: candidate.agent.is_some(),
-            governable: candidate.governable && durable_anchor.is_none(),
+            owned_by_agent: Some(candidate.agent.is_some()),
+            mutation_scope: Some(mutation_scope),
+            governable: mutation_scope == MutationScope::Mutable,
             provider: candidate.provider,
             executable_files,
             declared_name_matches_directory,
@@ -2479,6 +2527,11 @@ enabled = true
         assert_eq!(result.skills[0].name, "design-kpis");
         assert_eq!(result.placements.len(), 1);
         assert!(!result.placements[0].governable);
+        assert_eq!(result.placements[0].owned_by_agent, Some(false));
+        assert_eq!(
+            result.placements[0].mutation_scope,
+            Some(MutationScope::ProviderReadOnly)
+        );
         assert_eq!(
             result.placements[0].provider.as_deref(),
             Some("data-analytics@openai-curated-remote")
@@ -2808,6 +2861,11 @@ enabled = true
         let result = scan(&options).unwrap();
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.placements.len(), 2);
+        assert!(result.placements.iter().all(|placement| {
+            placement.owned_by_agent == Some(true)
+                && placement.mutation_scope == Some(MutationScope::Mutable)
+                && placement.governable
+        }));
         assert!(result.roots.iter().any(|seen| seen.explicit));
         fs::remove_dir_all(root).unwrap();
     }
@@ -3068,6 +3126,11 @@ enabled = true
             FingerprintCompleteness::Unreadable
         );
         assert!(!result.placements[0].governable);
+        assert_eq!(result.placements[0].owned_by_agent, Some(true));
+        assert_eq!(
+            result.placements[0].mutation_scope,
+            Some(MutationScope::DurableReadOnly)
+        );
         assert!(result.placements[0].physical_directory.is_none());
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("replacement-secret"));
@@ -4040,6 +4103,12 @@ enabled = true
         let result = scan(&options).unwrap();
         assert_eq!(result.placements.len(), 1);
         assert_eq!(result.placements[0].link_status, LinkStatus::EscapesRoot);
+        assert_eq!(result.placements[0].owned_by_agent, Some(true));
+        assert_eq!(
+            result.placements[0].mutation_scope,
+            Some(MutationScope::UntrustedExternal)
+        );
+        assert!(!result.placements[0].governable);
         assert!(result.skills[0].summary.is_empty());
         assert!(
             result
@@ -4049,6 +4118,30 @@ enabled = true
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn legacy_placement_authority_is_unknown_and_cannot_authorize_mutation() {
+        let value = serde_json::json!({
+            "id": "placement_legacy",
+            "skill_id": "skill_legacy",
+            "agent": "codex",
+            "root": "/tmp/skills",
+            "directory": "/tmp/skills/example",
+            "entrypoint": "/tmp/skills/example/SKILL.md",
+            "content_digest": "sha256:legacy",
+            "link_target": null,
+            "link_status": "not_link",
+            "default_exposed": true,
+            "governable": true,
+            "executable_files": [],
+            "declared_name_matches_directory": true
+        });
+        let placement: SkillPlacement = serde_json::from_value(value).unwrap();
+
+        assert_eq!(placement.owned_by_agent, None);
+        assert_eq!(placement.mutation_scope, None);
+        assert!(!placement.is_mutable());
     }
 
     #[cfg(unix)]

@@ -23,5 +23,10 @@ selected result's exact `SKILL.md` path directly. Finding a Skill does not
 activate, install, or authorize it, and SkillRoster has no load or activate
 step.
 
-Provider-managed results with `governable: false` are valid read-only matches.
-Do not move, update, consolidate, or add them to a governance Plan.
+Read `owned_by_agent` as placement-path structure only, never as ownership or
+endorsement of linked source content. Read `mutation_scopes` before governance:
+only `mutable` may participate in a mutating Plan. `provider_read_only`,
+`durable_read_only`, and `untrusted_external` remain valid routing results but
+must not be moved, updated, consolidated, or added to a governance Plan. Missing
+scope facts mean a legacy Snapshot is unknown; rescan instead of inferring
+authority. `governable` remains a compatibility projection of `mutable`.
