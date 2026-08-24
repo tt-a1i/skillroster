@@ -13,8 +13,11 @@ The frozen six-run suite **failed** its protocol gate. Its driver reported
 the snapshot omitted the configured timeout and repository source identity.
 The run remains diagnostic evidence and is not a formal gate. Core controls
 passed 3/3 and On-demand passed 1/3. All six runs produced the exact
-expected JSON, changed only the allowlisted workspace output, preserved the
-protected Skill/auth scopes, and exited normally.
+expected JSON; their workspace diffs contained only the allowlisted output,
+their protected Skill/auth scopes were preserved, and they exited normally.
+That workspace statement is deliberately narrower than a claim about every
+filesystem write: manual review found the trial-1 `/tmp/TASK` side effect
+described below.
 
 | Trial | Core | On-demand retrieval | Target load | Task / safety | Protocol |
 |---|---|---|---|---|---|

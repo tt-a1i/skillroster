@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, constants as fsConstants, copyFileSync, cpSync, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -75,6 +75,9 @@ export function validateManifest(manifest) {
     ids.add(task.id);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(task.expected_skill ?? "")) fail(`${task.id} expected_skill is unsafe`);
     if (typeof task.prompt !== "string" || !task.prompt || typeof task.hint !== "string" || !task.hint.trim()) fail(`${task.id} requires prompt and hint`);
+    const escapedSkill = task.expected_skill.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const protocolTerms = new RegExp(`skillroster|${escapedSkill}|capability\\s+search|能力检索|技能检索|\\bfind\\b`, "iu");
+    if (protocolTerms.test(task.prompt)) fail(`${task.id} prompt must not disclose the routing protocol or target Skill`);
     if (task.required_find_calls !== undefined && (!Number.isSafeInteger(task.required_find_calls) || task.required_find_calls < 1 || task.required_find_calls > 2)) fail(`${task.id} required_find_calls must be 1 or 2`);
     if (!Array.isArray(task.allowed_changed_paths)) fail(`${task.id} allowed_changed_paths is required`);
     for (const path of [...Object.keys(task.workspace_files ?? {}), ...task.allowed_changed_paths]) safeRelative(path, `${task.id} path`);
@@ -415,10 +418,7 @@ function readTokens(tokens, targetPath) {
 function narrowRead(command, targetPath, allowLeading = false) {
   const direct = readTokens(simpleCommandTokens(command), targetPath); if (direct || !allowLeading) return direct;
   const inner = unwrapSimpleShell(command); const separator = inner.indexOf(" && ");
-  if (separator >= 0) {
-    const leading = readTokens(simpleCommandTokens(inner.slice(0, separator)), targetPath);
-    if (leading) return { ...leading, leading_compound: true };
-  }
+  if (separator >= 0) return null;
   const parts = inner.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean);
   if (parts.length < 2) return null;
   const reads = parts.map((part) => parseReadTokens(simpleCommandTokens(part)));
@@ -438,7 +438,6 @@ function verifiedRead(command, output, targetPath, allowLeading = false) {
   const readOutput = (read) => { const text = readFileSync(read.path, "utf8"); const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? []; return read.full ? text : lines.slice(read.start - 1, Number.isFinite(read.end) ? read.end : undefined).join(""); };
   const expected = readOutput(range);
   if (range.read_sequence) return output === range.read_sequence.map(readOutput).join("") ? { ...range, evidence_mode: "content_echo_sequence" } : null;
-  if (range.leading_compound) return { ...range, evidence_mode: output.startsWith(expected) ? "content_echo" : "successful_leading_read" };
   return output === expected ? { ...range, evidence_mode: "content_echo" } : null;
 }
 
@@ -455,15 +454,17 @@ export function assessExactLoad(transcript, targetPath) {
     const read = verifiedRead(event.command, event.output, canonical, true); if (!read) continue;
     ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; evidenceMode = read.evidence_mode; break; }
   }
-  return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed exact-path reads; verified content echo, ordered read sequences, or a successful leading read before &&" };
+  return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed standalone exact-path reads with verified content echo, or read-only newline sequences" };
 }
 
 function findCommandShape(command) {
   const tokens = simpleCommandTokens(command);
   if (tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find") return "standalone";
   const inner = unwrapSimpleShell(command); const match = inner.match(/skillroster\s+find(?:\s|$)/u); if (!match) return null;
-  const prefix = inner.slice(0, match.index).trim().replace(/;$/u, "").trim();
-  return /^TASK='[^']*'$/u.test(prefix) ? "quoted_task_assignment" : "unsafe_compound";
+  const prefix = inner.slice(0, match.index).trim().replace(/;$/u, "").trim().replaceAll('\\"', '"');
+  const directAssignment = /^TASK='[^']*'$/u.test(prefix);
+  const shellAssignment = /^\S*(?:ba|z)?sh\s+-l?c\s+["']TASK='[^']*'$/u.test(prefix);
+  return directAssignment || shellAssignment ? "quoted_task_assignment" : "unsafe_compound";
 }
 
 function isFindCommand(command) { return findCommandShape(command) !== null; }
@@ -623,6 +624,24 @@ function run(command, args, options) {
 function canonicalPath(path) { try { return realpathSync(path); } catch { return resolve(path); } }
 function stateDigest(root) { return sha([...walk(root)].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
 
+function executableIdentity(command, env = process.env) {
+  const pathEntries = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  const explicit = isAbsolute(command) || command.includes("/") || command.includes("\\");
+  const extensions = process.platform === "win32" && !parse(command).ext
+    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  const candidates = explicit
+    ? extensions.map((extension) => `${resolve(command)}${extension}`)
+    : pathEntries.flatMap((directory) => extensions.map((extension) => join(directory, `${command}${extension}`)));
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const canonical = canonicalPath(candidate); const stat = lstatSync(canonical);
+    if (!stat.isFile() || stat.isSymbolicLink()) continue;
+    return { path_sha256: sha(canonical), content_sha256: sha(readFileSync(canonical)) };
+  }
+  fail("unable to freeze Codex executable identity");
+}
+
 function repositoryIdentity() {
   const head = run("git", ["-C", REPO, "rev-parse", "HEAD"], { timeout: 30_000 });
   const tree = run("git", ["-C", REPO, "rev-parse", "HEAD^{tree}"], { timeout: 30_000 });
@@ -715,15 +734,16 @@ function freezeSuite(manifest, options) {
   const manifestPath = join(root, "manifest.json"); copyFileSync(options.manifest, manifestPath);
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
+  const codexExecutable = executableIdentity(options.codex);
   const trialsPerArm = manifest.trials_per_arm ?? 1;
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
-  const executionContract = { model: options.model, reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs, sandbox: "workspace-write", ephemeral: true, ignore_user_config: true, arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm };
-  const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${driverSha256}\0${parentVerifierIdentity}`);
+  const executionContract = { model: options.model, reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs, sandbox: "workspace-write", ephemeral: true, ignore_user_config: true, preflight_fresh_codex_home: true, preflight_model_config_frozen: true, arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm };
+  const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${JSON.stringify(codexExecutable)}\0${driverSha256}\0${parentVerifierIdentity}`);
   const pairInvariants = {};
   for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) pairInvariants[trialKey(task.id, trial, trialsPerArm)] = pairInvariant(snapshotDigest, task, trial);
   const facts = {
     snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
-    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version: version.stdout.trim(), codex_version_sha256: sha(version.stdout.trim()), source_identity: sourceIdentity, execution_contract: executionContract, model: options.model, reasoning_effort: options.reasoningEffort, driver_sha256: driverSha256,
+    bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version: version.stdout.trim(), codex_version_sha256: sha(version.stdout.trim()), codex_executable: codexExecutable, source_identity: sourceIdentity, execution_contract: executionContract, model: options.model, reasoning_effort: options.reasoningEffort, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
@@ -731,7 +751,7 @@ function freezeSuite(manifest, options) {
 }
 
 function preflightSurface(paths, task, arm, options, env) {
-  const result = run(options.codex, ["-C", paths.workspace, "debug", "prompt-input", task.prompt], { cwd: paths.workspace, env, timeout: 30_000 });
+  const result = run(options.codex, ["-C", paths.workspace, "debug", "prompt-input", "-c", `model=${JSON.stringify(options.model)}`, "-c", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`, task.prompt], { cwd: paths.workspace, env, timeout: 30_000 });
   if (result.status !== 0) fail(`Codex prompt-input preflight failed: ${result.stderr.trim()}`);
   const visible = extractVisibleSkills(result.stdout); const assessment = assessSkillSurface(visible, arm, task.expected_skill);
   return { ...assessment, prompt_input_sha256: sha(result.stdout) };
@@ -770,6 +790,16 @@ export function prepareOnDemand(paths, task, options, env) {
 function trialKey(taskId, trial, trialsPerArm) { return trialsPerArm === 1 ? taskId : `${taskId}#${trial}`; }
 
 export function pairInvariant(snapshotDigest, task, trial = 1) { return sha(`${snapshotDigest}\0${JSON.stringify(task)}\0trial:${trial}`); }
+
+export function formalResultEligible(result) {
+  return Boolean(result.pair_invariant
+    && result.codex_exit_code === 0
+    && result.surface?.passed === true
+    && result.transcript?.passed === true
+    && result.workspace?.passed === true
+    && result.protected_scopes?.passed === true
+    && result.outcome?.harness_valid === true);
+}
 
 function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
   const key = trialKey(task.id, trial, trialsPerArm); const frozenPairInvariant = suiteFacts.pair_invariants?.[key]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${key}`);
@@ -867,8 +897,9 @@ export function main(argv = process.argv.slice(2)) {
   }));
   const completeSchedule = tasks.length === manifest.tasks.length && arms.length === 2 && results.length === manifest.tasks.length * trialsPerArm * 2;
   const sourceIdentityAfter = repositoryIdentity(); const sourceIdentityStable = JSON.stringify(sourceIdentityAfter) === JSON.stringify(frozen.facts.source_identity);
-  const formalGateEligible = completeSchedule && sourceIdentityStable && results.every((result) => result.pair_invariant && result.surface && result.workspace && result.protected_scopes && result.outcome) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
+  const codexExecutableAfter = executableIdentity(options.codex); const codexExecutableStable = JSON.stringify(codexExecutableAfter) === JSON.stringify(frozen.facts.codex_executable);
+  const formalGateEligible = completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(formalResultEligible) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 

@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -79,6 +79,18 @@ test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   assert.throws(() => validateManifest({ ...manifest, tasks: [], trials_per_arm: 3 }), /unsupported/u);
   assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 0 }), /trials_per_arm/u);
   assert.throws(() => validateManifest({ ...manifest, formal_protocol_gate: "yes" }), /formal_protocol_gate/u);
+  for (const prompt of ["use SkillRoster", "run capability search", "please Find it", "做能力检索", "load one"]) {
+    assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], prompt }] }), /must not disclose/u);
+  }
+});
+
+test("formal eligibility requires a complete successful harness record, not a task pass", () => {
+  const eligible = { pair_invariant: "frozen", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, accepted: false } };
+  assert.equal(formalResultEligible(eligible), true);
+  for (const mutation of [
+    { codex_exit_code: 124 }, { transcript: { passed: false } }, { surface: { passed: false } },
+    { workspace: { passed: false } }, { protected_scopes: { passed: false } }, { outcome: { harness_valid: false } },
+  ]) assert.equal(formalResultEligible({ ...eligible, ...mutation }), false);
 });
 
 test("pair invariant is frozen from the suite snapshot and complete task input", () => {
@@ -226,13 +238,13 @@ test("cumulative sed reads prove full load only after all lines are covered", ()
   assert.equal(full.passed, true); assert.equal(full.load_event_index, 1);
 });
 
-test("a leading exact read followed by successful && work preserves within-command order", () => {
+test("exact target load rejects compound reads with unaudited suffixes", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-leading-load-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\n"); const canonical = realpathSync(target);
   const command = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && printf '\\nDONE\\n'"`;
   const event = (type, output = null) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
   const transcript = `${event("started")}\n${event("completed", "one\ntwo\n\nDONE\n")}`;
-  assert.equal(assessExactLoad(transcript, target).passed, true);
-  assert.equal(assessCoreOrder(transcript, target).passed, true);
+  assert.equal(assessExactLoad(transcript, target).passed, false);
+  assert.equal(assessCoreOrder(transcript, target).passed, false);
   const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
 });
 
@@ -266,6 +278,9 @@ test("on-demand route order permits metadata-authorized Find followed by exact t
   assert.match(assessRouteOrder(unsafePrefix, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
   const assignment = [event(`TASK='完整任务'; skillroster find "$TASK" --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
   assert.equal(assessRouteOrder(assignment, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
+  const codexAssignmentCommand = `/bin/zsh -lc \\"TASK='完整任务'\nskillroster find \\\\\\"\\"'$TASK\\" --hint \\"agent hint\\" --json'`;
+  const codexAssignment = [event(codexAssignmentCommand), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.equal(assessRouteOrder(codexAssignment, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
 });
 
 test("target read cannot start until the matching Find completion is ledger-authorized", async () => {
