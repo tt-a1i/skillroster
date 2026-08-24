@@ -444,6 +444,61 @@ SkillRoster 应加入 embedding 或 reranker；但它支持一个更窄的产品
 canonical package 的 Roster 变更必须 typed fail-closed，不能用代表性 Skill digest 覆盖
 某个 placement 独有的本地元数据。
 
+## 动态 Skill 生命周期研究带来的校准
+
+2026 年中出现的动态 Skill 研究把问题从“一次性安装和调用”扩展到了长期变化的
+Skill 库。它们与 SkillRoster 的治理方向高度相关，但研究对象同时包含自动写 Skill、
+在线演化、模型路由和共享平台，不能把整套架构直接搬进本地 CLI。
+
+### 三项直接相关工作
+
+| 来源与证据级别 | 实际评测 | 可支持的产品判断 | 不能授权的实现 |
+|---|---|---|---|
+| [Dynamic Agent Skills（TMLR 2026）](https://arxiv.org/abs/2607.10113) · 论文综述 | 审计 124 篇论文，提出八阶段生命周期、十类变更操作、七项 evidence-graded patterns、八类安全面和报告清单；明确指出现有 benchmark 常漏报库轨迹、usage–utility 差距和安全面 | 把 present/usage、变更、验证、维护、来源和回滚分开记录；不要只报告最终成功或库大小 | 综述不是 SkillRoster 的端到端实验；不能据此加入自动演化、图路由、RL、扫描模型或统一数量阈值 |
+| [SkillsVote（2026 预印本）](https://arxiv.org/abs/2605.18401) · 论文结论 | 在 Terminal-Bench 2.0 与 SWE-Bench Pro 上测试任务前推荐、任务后归因和 evidence-gated 更新；另在 SkillRouter public evaluation set 的 79,141-Skill hard pool（75 个 expert-verified queries、780 个 distractors）上测试 Agentic search | 大库选择依赖任务、模型和候选呈现；执行结果必须区分 Skill 指导、Agent 自主探索、环境和 verifier 信号 | 推荐阶段调用模型；路由 ground truth 用于评测，offline attribution 才可选用 benchmark oracle；不证明本地确定性 CLI 应内置模型或自动改写 Skill |
+| [SkillWiki（2026 demo paper）](https://arxiv.org/abs/2606.16523) · 论文结论 | 125 个异构 artifact 中 99 个转成 governed candidates；用一个 API 文档 case 展示 S0–S7 生命周期 | provenance、版本、验证、release、deprecation、archive 可以作为不同事实，而不是一个模糊状态 | 作者明确未系统验证数万级库、广泛下游 Agent 收益或长期演化稳定性；不能把流程可运行写成产品价值已证明 |
+
+SkillsVote 还给出一个重要反例：冻结的 10K curated Skill 库在不同 benchmark 和
+backbone 上既有提升也有下降；任务前推荐能减少一部分负迁移，但收益仍是重尾且依赖
+模型能力。它支持“由 Agent 结合任务做语义选择”，同时反对把“安装更多”“调用更多”
+或“进入 Top-K”直接当作 utility。
+
+生命周期综述的报告清单尤其适合转化为 SkillRoster 的证据纪律：
+
+1. 说明实际实现了哪些生命周期阶段，哪些只是外部假设；
+2. 记录 library trajectory 和 operator velocity（单位时间内 Add、Refine、Merge、
+   Split、Prune 等操作次数及证据状态），而不只给最终任务分数；
+3. 如果声称 admission、repair 或 maintenance 有效，必须提供关闭该机制的对照；
+4. 把 Skill usage 与 Skill utility 分开；
+5. 说明 Add、Refine、Merge、Split、Prune 等操作哪些便宜、昂贵、被阻止或可审计。
+
+### 与当前 SkillRoster 的差距映射
+
+| 生命周期问题 | 当前已有的确定性事实 | 仍缺的证据 | 当前决策 |
+|---|---|---|---|
+| Evidence acquisition | 8 个 Agent 适配、Session coverage、五阶段 usage evidence、缺失/截断/跳过计数 | 日志不可见时没有完整 denominator；没有可靠 task utility | 继续显示 coverage 和 unknown；不得把未观察到写成未使用 |
+| Admission / verification | source trust、路径边界、包与入口 digest、版本/漂移、显式确认 | 没有证明某个 Skill 在真实任务上有益的通用 verifier | CLI 只报告可验证安全事实；质量与任务判断交给 Agent/测试/人审 |
+| Storage / organization | Core / On-demand / Explicit-only / Archived、Roster、Library、软链接身份 | 跨机器共享配置仍是明确延期项 | 保持本地和可逆，不扩云或 registry |
+| Retrieval / composition | 有界 Find、证据路径、完整 verified load、同名 exact variant | 没有证明自动多 Skill 组合是当前瓶颈 | Agent 负责 intent、比较与组合；不加内置模型、图或分解器 |
+| Maintenance / repair | Finding、不可变 Plan、Receipt、Undo、purge 与 recovery | 尚未证明 Agent 能从现有 JSON 快速重建长期 library trajectory 和变更速率 | 先做决策完备性 dogfood；只有缺少确定性字段时才补最小事实 |
+| Safety boundary | source trust、路径 containment、digest/漂移、可执行文件事实、确认门槛 | 不做恶意内容/凭证扫描、依赖/权限/网络 endpoint manifest、request-conditioned invocation safety、runtime sandbox/stdout containment、组合安全或领域 release gate | 按[产品规格](../product-spec.md)只报告结构与来源风险，不声称 malware detection 或 runtime safety |
+| Governance / provenance | first-observed baseline、source policy、fingerprint、Plan/Receipt/Undo；Setup 已区分 CLI 与 Bootstrap 内容版本 | 跨长期、多用户的 operator-level attribution 是未来研究缺口，不是单机 1.0 承诺 | 单机 1.0 不扩共享平台；明确限制，不伪装完成 |
+
+### 下一项实证门槛：Agent 决策完备性审计
+
+下一步不直接实现“生命周期仪表盘”或自动维护。先冻结一份含多个 Snapshot、usage、
+Plan、Receipt 和 Undo 的本地 fixture，以及 Agent 实际可获得的 opaque ID 和调用轨迹。
+在执行前固定 5–7 个问题、允许的公开命令序列、必需字段、证据等级和客观评分；问题至少
+覆盖库如何变化、哪些操作发生、哪些 usage 只是观察到、哪些 utility 无法判断、什么可以
+安全回滚。
+
+`report`、`status`、`lifecycle export` 和按 ID 查询当前并不承诺暴露完整历史。因此
+“无法从公开 JSON 重建”首先记为 `unknown/not_exposed`，不自动判为产品缺陷。若 Agent
+已能完成当前承诺的治理决策，停止增加摘要层；只有同一确定性事实缺口在多个独立问题中
+重复出现，并实际阻碍已承诺的治理决策，才开最小字段 Issue。若缺口属于任务价值、意图
+或因果归因，则保留为 Agent/eval 输入，不把它塞进 CLI。这个 gate 能检验生命周期研究
+真正指出的 reporting gap，同时保持 Agent-first 和不过度设计。
+
 ## 产品边界
 
 ### SkillRoster 应该负责
@@ -519,6 +574,7 @@ PR #148 的 v6 suite 已按该设计形成正式冻结证据：`formal_gate_elig
 | 增加 embedding/reranker | 否 | 控制有效、correct-listed 高、词法 Find 的 correct-in-K 稳定不足，且语义方法提升端到端 |
 | 设置统一 Core 数量上限 | 否 | 多宿主因子实验给出稳定阈值并能跨任务复现 |
 | 自动归档“未使用”Skill | 否 | 有覆盖足够时间和宿主的高置信 invocation 证据，并仍需用户确认 |
+| 新增长期 library trajectory 摘要 | 暂不实现 | Agent 决策完备性审计反复证明公开 JSON 缺少同一项确定性事实 |
 | 做云端同步/MCP/daemon/TUI | 否 | 出现本地 CLI 无法解决且被多用户重复验证的需求 |
 | 扩大目录规模 benchmark | 暂不进入产品实现；可作为独立研究轮 | 先冻结任务分布、宿主目录事实和可归因协议，并先证明对当前决策有影响 |
 
@@ -539,4 +595,6 @@ PR #148 的 v6 suite 已按该设计形成正式冻结证据：`formal_gate_elig
 Issue #163/Issue #165 的真实只读 dogfood 则把产品价值从“路由胜出”拉回到可审计的事实、
 coverage 不确定性、fallback/variant blocker 和字节级安全边界。后续若要研究
 “目录规模 × 描述重叠 × shortlist K”，必须另立冻结实验，先证明它会改变当前
-决策；在此之前不实现 embedding、图、重排器或内置模型。
+决策；动态生命周期研究则先经过本文定义的 Agent 决策完备性审计，只有公开 JSON
+反复缺少同一确定性事实时才增加最小字段。在此之前不实现 embedding、图、重排器、
+内置模型或自动演化平台。
