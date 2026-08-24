@@ -98,6 +98,8 @@
           "skill_5dc20339363defdb0a534aa5c5e327569ecefe05b1d9ac69ff84050067b4643f",
           "skill_641ea724b4a47d839a27556c81bbcc13afebcbb2762bed5a9b128b682c3c545a"
         ],
+        "blocked_skill_ids_projection": "representative_subset",
+        "total_blocked_changes": 27,
         "plan_error_code": "roster_package_fingerprint_variants"
       },
       "interpretation": "Core/On-demand summary is review-required; Explicit-only/Archived is not inferred from missing usage."
