@@ -651,11 +651,12 @@ function freezeSuite(manifest, options) {
   const version = run(options.codex, ["--version"], { encoding: "utf8", timeout: 30_000 });
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
+  const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`);
   const facts = {
-    snapshot_digest: sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`), manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
+    snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
     bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
-    target_packages: targetPackages,
+    target_packages: targetPackages, pair_invariants: Object.fromEntries(manifest.tasks.map((task) => [task.id, pairInvariant(snapshotDigest, task)])),
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
@@ -697,7 +698,10 @@ export function prepareOnDemand(paths, task, options, env) {
   return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
 }
 
+export function pairInvariant(snapshotDigest, task) { return sha(`${snapshotDigest}\0${JSON.stringify(task)}`); }
+
 function executeArm(task, arm, options, suiteFacts) {
+  const frozenPairInvariant = suiteFacts.pair_invariants?.[task.id]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${task.id}`);
   const root = mkdtempSync(join(options.runsDir, `${task.id}-${arm}-`)); const paths = setupArm(root, task, arm, options);
   const authCopy = copyAuth(options.authSource, paths.codexHome);
   const env = { ...process.env, HOME: paths.home, CODEX_HOME: paths.codexHome, TMPDIR: paths.temp };
@@ -725,7 +729,7 @@ function executeArm(task, arm, options, suiteFacts) {
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
     const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
-    return { task: task.id, arm, root, pair_invariant: sha(`${suiteFacts.snapshot_digest}\0${JSON.stringify(task)}`), codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    return { task: task.id, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
   }

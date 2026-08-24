@@ -4,6 +4,10 @@
   "scope": "codex_luna_cold_routing_transfer_gate",
   "issues": [129, 145],
   "status": "failed",
+  "formal_gate_eligible": false,
+  "eligibility_limitations": [
+    "Pair invariant values matched across each pair but were calculated and emitted after model invocation rather than frozen in the pre-invocation suite snapshot."
+  ],
   "execution": {
     "agent": "codex",
     "codex_version": "0.147.0",
@@ -19,6 +23,14 @@
     "private_run_tree_sha256": "a6365dbe5a5438816a3eb91ebe990c880308939fd7474c5b8b0e07b627acea44",
     "auth_copies_remaining": 0
   },
+  "preflight": {
+    "driver_syntax": "passed",
+    "harness_tests": {"passed": 32, "failed": 0},
+    "cargo_build_locked": "passed",
+    "dry_run": {"status": "planned", "model": "gpt-5.6-luna", "run_count": 4},
+    "pre_run_spec_review": "passed",
+    "pre_run_standards_review": "passed"
+  },
   "frozen_inputs": {
     "snapshot_sha256": "17b524c365f87cea88c9f902802813c332bd3b6bea1323e0ba6869aaee6192ef",
     "manifest_sha256": "61fad881f9191c4f568d3ca5028c85bc149568bb68057d952e9b2353c59034c0",
@@ -26,7 +38,23 @@
     "bootstrap_sha256": "3e28f02ed580180b8543be8ea23507c8c1b9f22a01adec696ee7d455c0676c57",
     "targets_sha256": "71e3d2e90d77dc5dcef356559f1364363ba88dc166cea7aef891eb9f38f3e8b9",
     "codex_version_sha256": "7aa31f8b0864fa0a787657d21167487f49ed01497802a4e5955ef02db3e94272",
-    "driver_sha256": "627b93134794c79ce4384642f86325a2c233dd403e1b84d949e62cf6349efa93"
+    "driver_sha256": "627b93134794c79ce4384642f86325a2c233dd403e1b84d949e62cf6349efa93",
+    "real_node_sha256": "595af80a2a1276b139d20ef9d8ae4d2c0d358f1895c446b0d8717f2b82943adf",
+    "parent_verifier_identity_sha256": "71166db3c986b3ee6ad52ae77bc7e2786fb5e1e23ce3ce3740c0a9bf240fa291",
+    "target_packages": {
+      "humanizer-zh": {
+        "package_tree_sha256": "8c4d15f60d1debb58e88a2a83a56fdf06b9a20a8c6eec78dfe6137a40948cc2d",
+        "script_content_sha256": null
+      },
+      "archify": {
+        "package_tree_sha256": "5601eb1ed6d8c65806e010c376c7aebd8fb41e7de44e438f822e6894081770c0",
+        "script_content_sha256": "4ce95433141a503c569235e7dfbe6964da626d230cab31960b676af862b3397d"
+      }
+    },
+    "observed_post_invocation_pair_invariants": {
+      "transfer-humanize-001": "d883b5a5c40e89330cc8c8b076cdc03b522c4ba7cfff872402a96465fa2500b2",
+      "transfer-architecture-001": "f709314fd16c1ac0f6d15c8f1e788e96eb3623f160d4cab2fcb608a6d98ed506"
+    }
   },
   "results": [
     {
@@ -121,6 +149,7 @@
     "One frozen two-task run with one Codex model is not a general task-success claim.",
     "Raw prompts, transcripts, absolute run paths, receipts, and credentials are not committed.",
     "The private run root is retained locally and referenced only by its aggregate digest.",
+    "SIGINT and SIGTERM cleanup is best effort; SIGKILL cannot guarantee isolated auth cleanup.",
     "The historical driver containment enum has a legacy name; this execution invoked Codex only."
   ]
 }

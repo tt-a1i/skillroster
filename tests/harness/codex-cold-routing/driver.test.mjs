@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -73,6 +73,14 @@ test("manifest is restricted to the two-family Codex transfer contract", () => {
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
   assert.throws(() => validateManifest({ ...manifest, tasks: [manifest.tasks[0]] }), /unsupported/u);
+});
+
+test("pair invariant is frozen from the suite snapshot and complete task input", () => {
+  const task = { id: "transfer-a", prompt: "fixed", workspace_files: { "input.txt": "one" } };
+  const frozen = pairInvariant("suite-snapshot", task);
+  assert.equal(pairInvariant("suite-snapshot", task), frozen);
+  assert.notEqual(pairInvariant("other-snapshot", task), frozen);
+  assert.notEqual(pairInvariant("suite-snapshot", { ...task, prompt: "changed" }), frozen);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {

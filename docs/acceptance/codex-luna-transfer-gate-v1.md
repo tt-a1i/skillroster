@@ -7,7 +7,8 @@ This is not completion of the broader cross-harness recovery goal.
 
 ## Outcome
 
-The single frozen four-arm run **failed**. All four Codex processes exited
+The single frozen four-arm run **failed** and is **not eligible as a formal
+transfer-gate result**. All four Codex processes exited
 normally, prompt surfaces were correct, protected scopes stayed unchanged, and
 workspace safety passed. No arm was retried.
 
@@ -30,6 +31,12 @@ minimum-length oracle. Architecture Core loaded its Skill in order but, like
 On-demand, failed the self-contained HTML, topology, and Archify receipt gates.
 These facts do not support blaming cold routing for either task failure.
 
+The driver emitted identical pair invariant values for each task's two arms,
+but calculated them after invocation instead of recording them in the frozen
+pre-run suite snapshot. That procedural miss invalidates formal eligibility
+without invalidating the observed run facts. It was discovered during final
+Spec review; the experiment was not rerun.
+
 ## Frozen evidence
 
 The run used Codex CLI `0.147.0`, model `gpt-5.6-luna`, revision `2623693`, and
@@ -43,6 +50,12 @@ The retained private run tree has aggregate SHA-256
 `a6365dbe5a5438816a3eb91ebe990c880308939fd7474c5b8b0e07b627acea44`.
 No isolated authentication copy remained after completion.
 
+Before invocation, driver syntax, 32 harness tests, `cargo build --locked`, the
+four-arm Luna dry-run, and pre-run Spec/Standards review passed. The frozen
+summary also records the real Node verifier identity and both target package
+identities. Signal cleanup is best effort for SIGINT/SIGTERM; SIGKILL cannot
+guarantee removal of an isolated auth copy.
+
 The committed [redacted artifact](artifacts/codex-luna-transfer-gate-v1.json)
 contains the reviewable facts and frozen digests. Raw prompts, transcripts,
 absolute temporary paths, receipts, and credentials remain uncommitted.
@@ -55,3 +68,6 @@ but only one Agent run followed the complete route cleanly. The next
 investigation should focus on making Bootstrap, Find arguments, and exact Skill
 loading easier for an Agent to execute, while keeping semantic intent and task
 judgment in the model. More ranking heuristics are not justified by this run.
+The driver now freezes pair invariants before invocation for a future experiment;
+this ledger remains bound to the original revision and is not upgraded
+retroactively.
