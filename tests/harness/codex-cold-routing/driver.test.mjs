@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -65,14 +65,17 @@ test("offline reevaluation writes only outside the immutable source run tree", (
   const before = snapshotWorkspace(source); const output = join(parent, "post-hoc.json"); assert.equal(main(["--reevaluate-root", source, "--reevaluate-output", output]), 0); assert.deepEqual(snapshotWorkspace(source), before); const summary = JSON.parse(readFileSync(output)); assert.equal(summary.raw_runs_modified, false); assert.equal(summary.formal_gate_eligible, false); assert.equal(summary.source_tree_sha256_before, summary.source_tree_sha256_after); assert.ok(summary.results.every((result) => result.formal_evidence_accepted === null && result.post_hoc_only === true));
 });
 
-test("manifest is restricted to the two-family Codex transfer contract", () => {
+test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   const manifest = { schema_version: 1, harness: "codex-transfer", tasks: [
     { id: "a", expected_skill: "one", prompt: "p", hint: "h", workspace_files: { "in.txt": "x" }, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
     { id: "b", expected_skill: "two", prompt: "p", hint: "h", workspace_files: {}, allowed_changed_paths: ["out.md"], oracle: { path: "out.md" } },
   ] };
   assert.equal(validateManifest(manifest), manifest);
   assert.throws(() => validateManifest({ ...manifest, harness: "pi" }), /unsupported/u);
-  assert.throws(() => validateManifest({ ...manifest, tasks: [manifest.tasks[0]] }), /unsupported/u);
+  assert.equal(validateManifest({ ...manifest, tasks: [manifest.tasks[0]], trials_per_arm: 3 }).tasks.length, 1);
+  assert.throws(() => validateManifest({ ...manifest, tasks: [], trials_per_arm: 3 }), /unsupported/u);
+  assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 0 }), /trials_per_arm/u);
+  assert.throws(() => validateManifest({ ...manifest, formal_protocol_gate: "yes" }), /formal_protocol_gate/u);
 });
 
 test("pair invariant is frozen from the suite snapshot and complete task input", () => {
@@ -81,6 +84,16 @@ test("pair invariant is frozen from the suite snapshot and complete task input",
   assert.equal(pairInvariant("suite-snapshot", task), frozen);
   assert.notEqual(pairInvariant("other-snapshot", task), frozen);
   assert.notEqual(pairInvariant("suite-snapshot", { ...task, prompt: "changed" }), frozen);
+  assert.notEqual(pairInvariant("suite-snapshot", task, 2), frozen);
+});
+
+test("protocol decision applies the frozen stop conditions", () => {
+  const result = (arm, accepted, overrides = {}) => ({ arm, outcome: { accepted, load: "loaded", contract_violation: false, ...overrides } });
+  assert.equal(deriveProtocolDecision([result("core", true), result("core", false), result("core", true)], 3).decision, "fix_control_task_or_oracle");
+  const core = Array.from({ length: 3 }, () => result("core", true));
+  const contractFailures = [result("on_demand", false, { load: "load_wrong" }), result("on_demand", false, { contract_violation: true }), result("on_demand", true)];
+  assert.equal(deriveProtocolDecision([...core, ...contractFailures], 3).decision, "fix_bootstrap_or_cli_contract");
+  assert.equal(deriveProtocolDecision([...core, ...Array.from({ length: 3 }, () => result("on_demand", true))], 3).decision, "retain_current_design");
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
@@ -288,6 +301,17 @@ test("oracle and safety remain independent outcome dimensions", () => {
   assert.equal(unsafe.task, "succeeded"); assert.equal(unsafe.safety, "failed"); assert.equal(unsafe.accepted, false);
   const coreWithoutLoad = deriveArmOutcome({ arm: "core", surface, retrieval: { count: 0, contract_violation: false }, load: { passed: false }, oracle, workspace: { passed: true } });
   assert.equal(coreWithoutLoad.load, "load_wrong"); assert.equal(coreWithoutLoad.accepted, false);
+});
+
+test("JSON oracle compares structure without depending on object key order", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-json-oracle-")); mkdirSync(join(root, "outputs"));
+  writeFileSync(join(root, "outputs/events.json"), JSON.stringify({ records: [{ state: "open", id: "evt-01" }], schema_version: 1 }));
+  const oracle = { path: "outputs/events.json", json_equals: { schema_version: 1, records: [{ id: "evt-01", state: "open" }] } };
+  assert.equal(evaluateOracle(root, oracle).passed, true);
+  writeFileSync(join(root, "outputs/events.json"), JSON.stringify({ schema_version: 1, records: [{ id: "evt-01", state: "closed" }] }));
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:mismatch"]);
+  writeFileSync(join(root, "outputs/events.json"), "not json");
+  assert.deepEqual(evaluateOracle(root, oracle).failures, ["json_equals:invalid_json"]);
 });
 
 test("Archify transcript attempts require exact shape and lifecycle order", () => {

@@ -64,19 +64,24 @@ export function parseArgs(argv) {
 }
 
 export function validateManifest(manifest) {
-  if (manifest?.schema_version !== 1 || manifest?.harness !== "codex-transfer" || !Array.isArray(manifest.tasks) || manifest.tasks.length !== 2) fail("unsupported Codex transfer manifest");
+  if (manifest?.schema_version !== 1 || manifest?.harness !== "codex-transfer" || !Array.isArray(manifest.tasks) || manifest.tasks.length < 1) fail("unsupported Codex transfer manifest");
+  const trialsPerArm = manifest.trials_per_arm ?? 1;
+  if (!Number.isSafeInteger(trialsPerArm) || trialsPerArm < 1 || trialsPerArm > 10) fail("trials_per_arm must be between 1 and 10");
+  if (manifest.formal_protocol_gate !== undefined && typeof manifest.formal_protocol_gate !== "boolean") fail("formal_protocol_gate must be boolean");
   const ids = new Set();
   for (const task of manifest.tasks) {
     if (!/^[a-z0-9][a-z0-9-]*$/u.test(task.id ?? "") || ids.has(task.id)) fail("task id must be unique and path-safe");
     ids.add(task.id);
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(task.expected_skill ?? "")) fail(`${task.id} expected_skill is unsafe`);
     if (typeof task.prompt !== "string" || !task.prompt || typeof task.hint !== "string" || !task.hint.trim()) fail(`${task.id} requires prompt and hint`);
+    if (task.required_find_calls !== undefined && (!Number.isSafeInteger(task.required_find_calls) || task.required_find_calls < 1 || task.required_find_calls > 2)) fail(`${task.id} required_find_calls must be 1 or 2`);
     if (!Array.isArray(task.allowed_changed_paths)) fail(`${task.id} allowed_changed_paths is required`);
     for (const path of [...Object.keys(task.workspace_files ?? {}), ...task.allowed_changed_paths]) safeRelative(path, `${task.id} path`);
     if (task.allowed_changed_paths.some((path) => Object.hasOwn(task.workspace_files ?? {}, path))) fail(`${task.id} cannot mutate an input`);
     safeRelative(task.oracle?.path, `${task.id} oracle path`);
     if (!task.allowed_changed_paths.includes(task.oracle.path)) fail(`${task.id} oracle path must be allowlisted`);
     for (const pattern of [...(task.oracle.required_regex ?? []), ...(task.oracle.forbidden_regex ?? [])]) new RegExp(pattern, "u");
+    if (task.oracle?.json_equals !== undefined && (task.oracle.json_equals === null || typeof task.oracle.json_equals !== "object")) fail(`${task.id} json_equals must be an object or array`);
     const receipt = task.oracle.archify_receipt_contract;
     if (receipt && (receipt.type !== "architecture" || safeRelative(receipt.spec_path, `${task.id} receipt spec`) !== receipt.spec_path || safeRelative(receipt.artifact_path, `${task.id} receipt artifact`) !== task.oracle.path || receipt.quality !== "showcase" || receipt.validation_check_count !== 9)) fail(`${task.id} Archify receipt contract is invalid`);
     const spec = task.oracle.architecture_spec_contract;
@@ -175,10 +180,20 @@ export function evaluateOracle(workspace, oracle, evidence = {}) {
   for (const value of oracle.forbidden_substrings ?? []) if (text.includes(value)) failures.push(`forbidden_substring:${value}`);
   for (const value of oracle.required_regex ?? []) if (!new RegExp(value, "u").test(text)) failures.push(`missing_regex:${value}`);
   for (const value of oracle.forbidden_regex ?? []) if (new RegExp(value, "u").test(text)) failures.push(`forbidden_regex:${value}`);
+  if (oracle.json_equals !== undefined) {
+    let actual; try { actual = JSON.parse(text); } catch { failures.push("json_equals:invalid_json"); }
+    if (actual !== undefined && JSON.stringify(canonicalJson(actual)) !== JSON.stringify(canonicalJson(oracle.json_equals))) failures.push("json_equals:mismatch");
+  }
   failures.push(...evaluateArchitectureSpec(workspace, oracle.architecture_spec_contract));
   const archifyAttempts = evaluateArchifyReceipts(evidence.transcript ?? "", workspace, oracle.archify_receipt_contract); failures.push(...archifyAttempts);
   const parentVerification = verifyArchifyParent(workspace, evidence.targetPackage, oracle.archify_receipt_contract, evidence.parentVerificationAuthority); if (parentVerification.passed === false) failures.push(...parentVerification.failures);
   return { passed: failures.length === 0, failures, output_sha256: sha(bytes), output_bytes: bytes.length, audit_scope: "independent transcript-attempt and parent-owned frozen correctness evidence", archify_agent_attempts: { passed: archifyAttempts.length === 0, failures: archifyAttempts }, archify_parent_verification: parentVerification };
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+  return value;
 }
 
 export function evaluateArchitectureSpec(workspace, contract) {
@@ -496,6 +511,18 @@ export function classifyPair(core, onDemand) {
   return { attribution: regression ? "on_demand_specific_failure" : "no_observed_regression", cold_routing_regression: regression };
 }
 
+export function deriveProtocolDecision(results, trialsPerArm) {
+  const core = results.filter((result) => result.arm === "core"); const onDemand = results.filter((result) => result.arm === "on_demand");
+  const coreAccepted = core.filter((result) => result.outcome?.accepted === true).length;
+  const onDemandAccepted = onDemand.filter((result) => result.outcome?.accepted === true).length;
+  const onDemandContractFailures = onDemand.filter((result) => result.outcome?.contract_violation === true || result.outcome?.load !== "loaded").length;
+  let decision = "investigate_repeatable_on_demand_gap";
+  if (coreAccepted < trialsPerArm) decision = "fix_control_task_or_oracle";
+  else if (onDemandContractFailures >= 2) decision = "fix_bootstrap_or_cli_contract";
+  else if (onDemandAccepted === trialsPerArm) decision = "retain_current_design";
+  return { decision, required_trials_per_arm: trialsPerArm, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures };
+}
+
 function writeInputs(workspace, files) {
   for (const [relativePath, content] of Object.entries(files)) {
     const path = resolve(workspace, safeRelative(relativePath)); if (!inside(path, workspace)) fail("workspace input escapes root");
@@ -652,11 +679,14 @@ function freezeSuite(manifest, options) {
   if (version.status !== 0 || !version.stdout.trim()) fail("unable to freeze Codex version identity");
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
   const snapshotDigest = sha(`${frozenTreeDigest}\0${options.model}\0${driverSha256}\0${parentVerifierIdentity}`);
+  const trialsPerArm = manifest.trials_per_arm ?? 1;
+  const pairInvariants = {};
+  for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) pairInvariants[trialKey(task.id, trial, trialsPerArm)] = pairInvariant(snapshotDigest, task, trial);
   const facts = {
     snapshot_digest: snapshotDigest, manifest_sha256: sha(readFileSync(manifestPath)), cli_sha256: sha(readFileSync(cli)),
     bootstrap_sha256: stateDigest(bootstrapRoot), targets_sha256: stateDigest(targets), codex_version_sha256: sha(version.stdout.trim()), model: options.model, driver_sha256: driverSha256,
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
-    target_packages: targetPackages, pair_invariants: Object.fromEntries(manifest.tasks.map((task) => [task.id, pairInvariant(snapshotDigest, task)])),
+    target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
@@ -698,11 +728,14 @@ export function prepareOnDemand(paths, task, options, env) {
   return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
 }
 
-export function pairInvariant(snapshotDigest, task) { return sha(`${snapshotDigest}\0${JSON.stringify(task)}`); }
+function trialKey(taskId, trial, trialsPerArm) { return trialsPerArm === 1 ? taskId : `${taskId}#${trial}`; }
 
-function executeArm(task, arm, options, suiteFacts) {
-  const frozenPairInvariant = suiteFacts.pair_invariants?.[task.id]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${task.id}`);
-  const root = mkdtempSync(join(options.runsDir, `${task.id}-${arm}-`)); const paths = setupArm(root, task, arm, options);
+export function pairInvariant(snapshotDigest, task, trial = 1) { return sha(`${snapshotDigest}\0${JSON.stringify(task)}\0trial:${trial}`); }
+
+function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
+  const key = trialKey(task.id, trial, trialsPerArm); const frozenPairInvariant = suiteFacts.pair_invariants?.[key]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${key}`);
+  const runPrefix = trialsPerArm === 1 ? `${task.id}-${arm}-` : `${task.id}-trial-${trial}-${arm}-`;
+  const root = mkdtempSync(join(options.runsDir, runPrefix)); const paths = setupArm(root, task, arm, options);
   const authCopy = copyAuth(options.authSource, paths.codexHome);
   const env = { ...process.env, HOME: paths.home, CODEX_HOME: paths.codexHome, TMPDIR: paths.temp };
   const protectedPaths = { targetPackage: dirname(paths.targetPath), exposedPackage: join(paths.codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"), authCopy };
@@ -711,7 +744,7 @@ function executeArm(task, arm, options, suiteFacts) {
     const surface = preflightSurface(paths, task, arm, options, env);
     if (!surface.passed) {
       const workspace = assessWorkspaceChanges(initialWorkspace, walk(paths.workspace), Object.keys(task.workspace_files), task.allowed_changed_paths); const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
-      return { task: task.id, arm, surface, workspace, protected_scopes: protectedScopes, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed ? "passed" : "failed", accepted: false }, root };
+      return { task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed ? "passed" : "failed", accepted: false }, root };
     }
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
@@ -724,12 +757,13 @@ function executeArm(task, arm, options, suiteFacts) {
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
     const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath), parentVerificationAuthority: { protected_scopes_passed: protectedScopes.passed, expected: suiteFacts.target_packages?.[task.expected_skill] } }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
     const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath }) : { count: 0, contract_violation: false };
+    if (arm === "on_demand" && task.required_find_calls !== undefined && retrieval.count !== task.required_find_calls) retrieval.contract_violation = true;
     const load = assessExactLoad(result.stdout, paths.targetPath);
     const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
     const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
-    return { task: task.id, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    return { task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
   }
@@ -739,24 +773,27 @@ function dryRun(manifest, options) {
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task);
   if (!tasks.length) fail(`unknown task: ${options.task}`);
   const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm];
-  return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, task_count: tasks.length, arms, run_count: tasks.length * arms.length, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
+  const trialsPerArm = manifest.trials_per_arm ?? 1;
+  return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, task_count: tasks.length, trials_per_arm: trialsPerArm, arms, run_count: tasks.length * arms.length * trialsPerArm, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
 }
 
 export function reevaluateExistingRuns(suiteRoot, manifest) {
-  const sourceDigestBefore = stateDigest(suiteRoot); const results = [];
-  for (const task of manifest.tasks) for (const arm of ["core", "on_demand"]) {
-    const matches = readdirSync(suiteRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith(`${task.id}-${arm}-`));
-    if (matches.length !== 1) { results.push({ task: task.id, arm, root: null, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: [`run_root_count:${matches.length}`] }); continue; }
+  const sourceDigestBefore = stateDigest(suiteRoot); const results = []; const trialsPerArm = manifest.trials_per_arm ?? 1;
+  for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of ["core", "on_demand"]) {
+    const prefix = trialsPerArm === 1 ? `${task.id}-${arm}-` : `${task.id}-trial-${trial}-${arm}-`;
+    const matches = readdirSync(suiteRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory() && entry.name.startsWith(prefix));
+    if (matches.length !== 1) { results.push({ task: task.id, trial, arm, root: null, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: [`run_root_count:${matches.length}`] }); continue; }
     const root = join(suiteRoot, matches[0].name); const workspacePath = join(root, "workspace"); const transcriptPath = join(root, "codex-events.jsonl");
-    if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ task: task.id, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
+    if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ task: task.id, trial, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
     const transcriptText = readFileSync(transcriptPath, "utf8"); const targetPath = arm === "core" ? join(root, "home", ".codex", "skills", task.expected_skill, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
     const initial = new Map(Object.entries(task.workspace_files).map(([path, content]) => [path, sha(content)])); const workspace = assessWorkspaceChanges(initial, walk(workspacePath), Object.keys(task.workspace_files), task.allowed_changed_paths);
     const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(join(root, "find-audit.jsonl")) ? readFileSync(join(root, "find-audit.jsonl"), "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: targetPath }) : { count: 0, contract_violation: false };
+    if (arm === "on_demand" && task.required_find_calls !== undefined && retrieval.count !== task.required_find_calls) retrieval.contract_violation = true;
     const load = assessExactLoad(transcriptText, targetPath); const transcript = assessTranscriptIntegrity(transcriptText);
     const routeOrder = arm === "on_demand" ? assessRouteOrder(transcriptText, { bootstrapPath: join(root, "home", ".codex", "skills", "skillroster", "SKILL.md"), targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(transcriptText, targetPath) : { passed: true, audit_scope: "not_applicable" };
     const oracle = evaluateOracle(workspacePath, task.oracle, { transcript: transcriptText, targetPackage: dirname(targetPath), parentVerificationAuthority: { mode: "historical_untrusted" } });
-    results.push({ task: task.id, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not an Issue #129 formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });
+    results.push({ task: task.id, trial, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not a formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });
   }
   const sourceDigestAfter = stateDigest(suiteRoot); if (sourceDigestAfter !== sourceDigestBefore) fail("reevaluation changed the source run tree");
   return { status: "reevaluated", source_root: canonicalPath(suiteRoot), source_tree_sha256_before: sourceDigestBefore, source_tree_sha256_after: sourceDigestAfter, raw_runs_modified: false, formal_gate_eligible: false, results };
@@ -778,17 +815,20 @@ export function main(argv = process.argv.slice(2)) {
   if (inside(realpathSync(options.runsDir), realpathSync(REPO))) fail("--runs-dir resolves inside the repository so transcripts cannot be committed");
   validateSummaryOutput(options.summaryOutput, options.runsDir);
   if (!options.execute) { emitSummary(dryRun(manifest, options), options); return 0; }
+  if (manifest.formal_protocol_gate === true && (options.task !== "all" || options.arm !== "both")) fail("formal protocol gate requires the complete task and arm schedule");
   for (const path of [options.bootstrap, options.cli, options.skillsRoot, options.authSource]) if (!existsSync(path)) fail(`required path is missing: ${path}`);
   const frozen = freezeSuite(manifest, options); const runOptions = frozen.options;
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`unknown task: ${options.task}`);
-  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = [];
-  for (const task of tasks) for (const arm of arms) results.push(executeArm(task, arm, runOptions, frozen.facts));
-  const pairs = tasks.map((task) => {
-    const coreResult = results.find((result) => result.task === task.id && result.arm === "core"); const onDemandResult = results.find((result) => result.task === task.id && result.arm === "on_demand");
-    if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { task: task.id, attribution: "pair_invariant_mismatch", cold_routing_regression: null };
-    return coreResult && onDemandResult ? { task: task.id, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, attribution: "pair_incomplete", cold_routing_regression: null };
-  });
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
+  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = []; const trialsPerArm = manifest.trials_per_arm ?? 1;
+  for (const task of tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of arms) results.push(executeArm(task, arm, trial, trialsPerArm, runOptions, frozen.facts));
+  const pairs = tasks.flatMap((task) => Array.from({ length: trialsPerArm }, (_, index) => {
+    const trial = index + 1; const coreResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "core"); const onDemandResult = results.find((result) => result.task === task.id && result.trial === trial && result.arm === "on_demand");
+    if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { task: task.id, trial, attribution: "pair_invariant_mismatch", cold_routing_regression: null };
+    return coreResult && onDemandResult ? { task: task.id, trial, ...classifyPair(coreResult.outcome, onDemandResult.outcome) } : { task: task.id, trial, attribution: "pair_incomplete", cold_routing_regression: null };
+  }));
+  const completeSchedule = tasks.length === manifest.tasks.length && arms.length === 2 && results.length === manifest.tasks.length * trialsPerArm * 2;
+  const formalGateEligible = completeSchedule && results.every((result) => result.pair_invariant && result.surface && result.workspace && result.protected_scopes && result.outcome) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
+  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, protocol_decision: manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm) : null, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM best effort; SIGKILL cannot guarantee auth cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 
