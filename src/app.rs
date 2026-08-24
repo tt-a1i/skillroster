@@ -3266,10 +3266,11 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
             }
             if result["planning"]["reason"].as_str() == Some("trusted_canonical_sources_required") {
                 let prerequisite = &result["planning"]["source_confirmation_finding"];
-                let prerequisite_id = prerequisite["finding_id"].as_str();
-                if prerequisite["state"].as_str() == Some("available")
-                    && let Some(prerequisite_id) = prerequisite_id
-                    && prerequisite_id != id
+                let prerequisite_id = prerequisite["finding_id"]
+                    .as_str()
+                    .filter(|prerequisite_id| *prerequisite_id != id);
+                if let (Some("available"), Some(prerequisite_id)) =
+                    (prerequisite["state"].as_str(), prerequisite_id)
                 {
                     actions.push(action(
                         "view_source_confirmation_finding",
