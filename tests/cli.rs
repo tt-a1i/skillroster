@@ -2022,11 +2022,25 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     FileExt::try_lock_shared(&shared_lock).unwrap();
     let concurrent_status = run(&[&common[..], &["status"]].concat(), None);
     assert!(concurrent_status.status.success());
-    let blocked_purge = run(
-        &[&common[..], &["lifecycle", "purge", "--raw-days", "180"]].concat(),
-        None,
-    );
-    assert!(!blocked_purge.status.success());
+    let concurrent_plan_detail = run(&[&common[..], &["plan", "--show", plan_id]].concat(), None);
+    assert!(concurrent_plan_detail.status.success());
+    for (args, input) in [
+        (&["scan"][..], None),
+        (&["report"][..], None),
+        (&["plan"][..], Some("{}")),
+        (&["lifecycle", "exclude", "codex"][..], None),
+        (&["lifecycle", "purge", "--raw-days", "180"][..], None),
+        (&["lifecycle", "recovery"][..], None),
+    ] {
+        let blocked = run(&[&common[..], args].concat(), input);
+        assert!(
+            !blocked.status.success(),
+            "command was not locked: {args:?}"
+        );
+        let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert_eq!(blocked["error"]["code"], "write_locked");
+        assert_eq!(blocked["error"]["retryable"], true);
+    }
     FileExt::unlock(&shared_lock).unwrap();
     drop(shared_lock);
 

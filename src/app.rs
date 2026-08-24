@@ -582,16 +582,23 @@ pub fn run(cli: Cli) -> Result<Output> {
 }
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
-    matches!(
-        command,
-        Some(Command::Apply(_) | Command::Undo(_) | Command::Setup(_))
-            | Some(Command::SourceRoot(crate::cli::SourceRootArgs {
-                command: SourceRootCommand::Confirm(_) | SourceRootCommand::Revoke(_),
-            }))
-            | Some(Command::Lifecycle(crate::cli::LifecycleArgs {
-                command: LifecycleCommand::Purge(_),
-            }))
-    )
+    match command {
+        Some(Command::Scan | Command::Apply(_) | Command::Undo(_) | Command::Setup(_)) => true,
+        Some(Command::Report(args)) => args.finding.is_none(),
+        Some(Command::Plan(args)) => args.show.is_none(),
+        Some(Command::SourceRoot(args)) => matches!(
+            &args.command,
+            SourceRootCommand::Confirm(_) | SourceRootCommand::Revoke(_)
+        ),
+        Some(Command::Lifecycle(args)) => matches!(
+            &args.command,
+            LifecycleCommand::Exclude(_)
+                | LifecycleCommand::Purge(_)
+                | LifecycleCommand::Recovery
+                | LifecycleCommand::Delete(_)
+        ),
+        Some(Command::Find(_) | Command::Status) | None => false,
+    }
 }
 
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
@@ -1986,9 +1993,6 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
     let mut import_errors = Vec::new();
     for mut journal in change::journals(state_dir)? {
         let receipt_id = ReceiptId::parse(journal.id.clone())?;
-        if store.receipt_exists(&receipt_id)? {
-            continue;
-        }
         let plan_id = match PlanId::parse(journal.plan_id.clone()) {
             Ok(id) => id,
             Err(error) => {
@@ -2044,10 +2048,11 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
                 "after": prepared.library_changes,
             }),
         )?;
-        match store.save_receipt(&imported_receipt) {
-            Ok(()) => {
-                store.mark_plan_recovery_if_applying(&plan_id)?;
-                imported.push(receipt_id);
+        match store.save_recovery_receipt(&plan_id, &imported_receipt) {
+            Ok(inserted) => {
+                if inserted {
+                    imported.push(receipt_id);
+                }
             }
             Err(error) => import_errors.push(json!({
                 "receipt_id": journal.id,
@@ -8869,7 +8874,54 @@ fn action(
 #[allow(clippy::items_after_test_module)]
 mod recovery_tests {
     use super::*;
+    use clap::Parser;
     use tempfile::TempDir;
+
+    #[test]
+    fn command_lock_mode_matches_state_production_boundary() {
+        fn exclusive(args: &[&str]) -> bool {
+            let cli =
+                Cli::try_parse_from(std::iter::once("skillroster").chain(args.iter().copied()))
+                    .unwrap();
+            command_requires_exclusive_state_lock(cli.command.as_ref())
+        }
+
+        for args in [
+            &["scan"][..],
+            &["report"][..],
+            &["plan"][..],
+            &["apply", "plan_1"][..],
+            &["undo", "receipt_1"][..],
+            &["setup"][..],
+            &[
+                "source-root",
+                "confirm",
+                "--finding",
+                "finding_1",
+                "--path",
+                "/tmp",
+            ][..],
+            &["source-root", "revoke", "permission_1"][..],
+            &["lifecycle", "exclude", "codex"][..],
+            &["lifecycle", "purge", "--raw-days", "180"][..],
+            &["lifecycle", "recovery"][..],
+            &["lifecycle", "delete", "--confirm", "DELETE-LOCAL-STATE"][..],
+        ] {
+            assert!(exclusive(args), "expected exclusive lock for {args:?}");
+        }
+        for args in [
+            &[][..],
+            &["status"][..],
+            &["find", "review a pull request"][..],
+            &["report", "--finding", "finding_1"][..],
+            &["plan", "--show", "plan_1"][..],
+            &["source-root", "inspect"][..],
+            &["lifecycle", "inspect"][..],
+            &["lifecycle", "export", "--output", "/tmp/export.json"][..],
+        ] {
+            assert!(!exclusive(args), "expected shared lock for {args:?}");
+        }
+    }
 
     fn placement_with_scope(
         id: &str,
