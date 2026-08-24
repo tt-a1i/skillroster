@@ -262,6 +262,10 @@ test("on-demand route order permits metadata-authorized Find followed by exact t
   const directFind = [event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
   const directAssessment = assessRouteOrder(directFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" });
   assert.equal(directAssessment.passed, true); assert.equal(directAssessment.bootstrap_loaded, false);
+  const unsafePrefix = [event(`printf task > /tmp/TASK && skillroster find '完整任务' --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.match(assessRouteOrder(unsafePrefix, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_shell_shape_invalid/u);
+  const assignment = [event(`TASK='完整任务'; skillroster find "$TASK" --hint 'agent hint' --json`), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  assert.equal(assessRouteOrder(assignment, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).passed, true);
 });
 
 test("target read cannot start until the matching Find completion is ledger-authorized", async () => {

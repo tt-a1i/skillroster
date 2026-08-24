@@ -458,11 +458,15 @@ export function assessExactLoad(transcript, targetPath) {
   return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed exact-path reads; verified content echo, ordered read sequences, or a successful leading read before &&" };
 }
 
-function isFindCommand(command) {
+function findCommandShape(command) {
   const tokens = simpleCommandTokens(command);
-  if (tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find") return true;
-  return /(?:^|[;\n]\s*)skillroster\s+find(?:\s|$)/u.test(unwrapSimpleShell(command));
+  if (tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find") return "standalone";
+  const inner = unwrapSimpleShell(command); const match = inner.match(/skillroster\s+find(?:\s|$)/u); if (!match) return null;
+  const prefix = inner.slice(0, match.index).trim().replace(/;$/u, "").trim();
+  return /^TASK='[^']*'$/u.test(prefix) ? "quoted_task_assignment" : "unsafe_compound";
 }
+
+function isFindCommand(command) { return findCommandShape(command) !== null; }
 
 export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAudit, expectedTask = null, expectedSkill = null }) {
   const events = extractRouteEvents(transcript); const violations = []; const bootstrapRanges = []; const targetRanges = []; const bootstrapLines = targetLineCount(canonicalPath(bootstrapPath)); const targetLines = targetLineCount(canonicalPath(targetPath));
@@ -487,7 +491,7 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
       if (verified) { targetRanges.push(verified); if (targetLines !== null && coveredThrough(targetRanges) >= targetLines) targetLoaded = true; }
       continue;
     }
-    if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
+    if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (findCommandShape(event.command) === "unsafe_compound") violations.push(`find_shell_shape_invalid:${index}`); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
     if (!findStarted && bootstrapRead) continue;
     if (targetRead) { if (!findAuthorized) violations.push(`target_load_before_find_complete:${index}`); continue; }
     if (!findStarted) violations.push(`task_command_before_find:${index}`);
