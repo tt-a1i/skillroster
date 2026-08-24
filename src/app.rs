@@ -4519,6 +4519,13 @@ fn find_command(
             ),
             None if matches!(
                 next.map(|reference| reference.state),
+                Some(crate::query::VariantFindingState::SourceConfirmationRequired)
+            ) => format!(
+                "{} represents {} same-name Skill variants behind unconfirmed source links; inspect the linked source-root Finding before choosing content",
+                found.name, found.variant_count
+            ),
+            None if matches!(
+                next.map(|reference| reference.state),
                 Some(crate::query::VariantFindingState::ReportRequired)
             ) => format!(
                 "{} represents {} same-name Skill variants; materialize the current Report before choosing content",
@@ -4546,6 +4553,7 @@ fn find_command(
                         .as_ref()
                         .map(|reference| reference.state),
                     Some(crate::query::VariantFindingState::RescanRequired)
+                        | Some(crate::query::VariantFindingState::SourceConfirmationRequired)
                 )
         }) {
             actions.extend(explicit_variant_load_actions(task, &retrieval_hints, found));
@@ -4689,8 +4697,13 @@ fn bind_variant_findings(
             .map(|skill| skill.id.clone())
             .collect::<BTreeSet<_>>();
         let mut variant_drifted = false;
+        let mut source_confirmation_variant_ids = BTreeSet::new();
         for skill_id in &variant_ids {
-            variant_drifted |= current_readable_skill_paths(scan, state_dir, skill_id)?.drifted;
+            let current = current_readable_skill_paths(scan, state_dir, skill_id)?;
+            variant_drifted |= current.drifted;
+            if current.source_confirmation_required {
+                source_confirmation_variant_ids.insert(skill_id.clone());
+            }
         }
         rescan_required |= variant_drifted;
         let (reference, suggested) = if variant_drifted {
@@ -4714,7 +4727,55 @@ fn bind_variant_findings(
                 suggested,
             )
         } else if let Some(report) = report.as_ref() {
-            if let Some(finding_id) = matching_variant_finding_id(store, report, &variant_ids)? {
+            if !source_confirmation_variant_ids.is_empty() {
+                if let Some(finding_id) = matching_escaping_link_finding_id(
+                    store,
+                    report,
+                    &source_confirmation_variant_ids,
+                )? {
+                    let suggested = action(
+                        "inspect_source_confirmation_finding",
+                        &["report", "--finding", &finding_id, "--json"],
+                        false,
+                        false,
+                        "untrusted_same_name_variants_require_source_confirmation",
+                    );
+                    (
+                        crate::query::VariantFindingReference {
+                            state: crate::query::VariantFindingState::SourceConfirmationRequired,
+                            reason_code: crate::query::VariantFindingReason::UntrustedVariantsRequireSourceConfirmation,
+                            snapshot_id: scan_id.to_string(),
+                            report_id: Some(report.id.to_string()),
+                            finding_id: Some(finding_id),
+                            resolution: Some("confirm_trusted_source_roots".into()),
+                            argv: suggested.argv.clone(),
+                        },
+                        suggested,
+                    )
+                } else {
+                    let suggested = action(
+                        "inspect_layout_findings",
+                        &["report", "--findings", "--category", "layout", "--json"],
+                        false,
+                        false,
+                        "matching_escaping_link_finding_missing",
+                    );
+                    (
+                        crate::query::VariantFindingReference {
+                            state: crate::query::VariantFindingState::FindingUnavailable,
+                            reason_code: crate::query::VariantFindingReason::MatchingEscapingLinkFindingMissing,
+                            snapshot_id: scan_id.to_string(),
+                            report_id: Some(report.id.to_string()),
+                            finding_id: None,
+                            resolution: None,
+                            argv: suggested.argv.clone(),
+                        },
+                        suggested,
+                    )
+                }
+            } else if let Some(finding_id) =
+                matching_variant_finding_id(store, report, &variant_ids)?
+            {
                 let suggested = action(
                     "inspect_variant_finding",
                     &["report", "--finding", &finding_id, "--json"],
@@ -4827,6 +4888,51 @@ fn matching_variant_finding_id(
         && stored.details["kind"] == crate::query::SAME_NAME_DIVERGENT_FINDING_KIND
         && stored_variant_ids == *variant_ids)
         .then(|| id.to_string()))
+}
+
+fn matching_escaping_link_finding_id(
+    store: &StateStore,
+    report: &ReportRecord,
+    untrusted_variant_ids: &BTreeSet<String>,
+) -> Result<Option<String>> {
+    let Some(candidate) = report.summary["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|finding| {
+            if finding["title"] != "Skill links escape an approved root" {
+                return None;
+            }
+            let affected = finding["affected_skill_ids"]
+                .as_array()?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            untrusted_variant_ids
+                .is_subset(&affected)
+                .then(|| finding["id"].as_str())
+                .flatten()
+        })
+    else {
+        return Ok(None);
+    };
+    let id = FindingId::parse(candidate.to_owned())?;
+    let Some(stored) = store.get_finding(&id)? else {
+        return Ok(None);
+    };
+    let stored_skill_ids = stored.details["affected_skill_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    Ok((stored.report_id == report.id
+        && stored.category == FindingCategory::Layout
+        && stored.title == "Skill links escape an approved root"
+        && untrusted_variant_ids.is_subset(&stored_skill_ids))
+    .then(|| id.to_string()))
 }
 
 fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {
@@ -4949,8 +5055,34 @@ fn current_readable_skill_paths(
     }
     paths.sort();
     paths.dedup();
+    let placements = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    let source_confirmation_required = paths.is_empty()
+        && !placements.is_empty()
+        && placements.iter().all(|placement| {
+            if placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+                || placement.link_status != scan::LinkStatus::EscapesRoot
+            {
+                return false;
+            }
+            let Some(expected_directory) = placement.link_target.as_deref() else {
+                return false;
+            };
+            let Ok(expected_directory) = std::fs::canonicalize(expected_directory) else {
+                return false;
+            };
+            std::fs::canonicalize(&placement.entrypoint)
+                .ok()
+                .filter(|entrypoint| entrypoint.is_file())
+                .and_then(|entrypoint| entrypoint.parent().map(Path::to_path_buf))
+                .is_some_and(|directory| directory == expected_directory)
+        });
     Ok(CurrentSkillPaths {
-        drifted: paths.is_empty(),
+        drifted: paths.is_empty() && !source_confirmation_required,
+        source_confirmation_required,
         paths,
     })
 }
@@ -4958,6 +5090,7 @@ fn current_readable_skill_paths(
 struct CurrentSkillPaths {
     paths: Vec<String>,
     drifted: bool,
+    source_confirmation_required: bool,
 }
 
 #[derive(Debug)]

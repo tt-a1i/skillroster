@@ -985,6 +985,9 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                             .and_then(Value::as_str)
                         {
                             Some("rescan_required") => Some("refresh Snapshot first".into()),
+                            Some("source_confirmation_required") => {
+                                Some("confirm exact source root first".into())
+                            }
                             Some("report_required") => Some("current Report required".into()),
                             _ => None,
                         }
@@ -1071,14 +1074,33 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
         }
     }
     let loaded = value.get("loaded_skill").is_some_and(Value::is_object);
-    lines.extend(summary(
-        "Read-only · no Skill was activated",
-        if loaded {
-            "Top match verified and fully loaded in Agent JSON"
-        } else {
-            "Use --load for one-call verified instructions"
-        },
-    ));
+    let variant_state = value
+        .pointer("/matches/0/variant_finding/state")
+        .and_then(Value::as_str);
+    let next = if loaded {
+        "Top match verified and fully loaded in Agent JSON"
+    } else {
+        match variant_state {
+            Some("source_confirmation_required") => {
+                "Inspect the linked Finding before confirming exact source roots"
+            }
+            Some("rescan_required") => "Refresh the Snapshot before loading a variant",
+            Some("report_required") => "Materialize the current Report before choosing a variant",
+            Some("available") => "Inspect the linked Finding before loading an exact variant",
+            Some("finding_unavailable") => {
+                "Inspect current layout Findings before choosing a variant"
+            }
+            _ if value
+                .get("matches")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty) =>
+            {
+                "Refine the task or add one concrete capability hint"
+            }
+            _ => "Use --load for one-call verified instructions",
+        }
+    };
+    lines.extend(summary("Read-only · no Skill was activated", next));
 }
 
 fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
@@ -2643,6 +2665,33 @@ mod tests {
         assert!(found.contains("variants 2 · Finding finding_variants"));
         assert!(found.contains("declared_trigger"));
         assert!(found.contains("Retrieval notes"));
+        assert!(found.contains("Inspect the linked Finding before loading an exact variant"));
+
+        let source_confirmation = render(
+            "find",
+            &json!({"matches": [{
+                "name": "shared-external",
+                "roster_state": "unassigned",
+                "source": null,
+                "variant_count": 2,
+                "variant_finding": {
+                    "state": "source_confirmation_required",
+                    "finding_id": "finding_source"
+                },
+                "match_reasons": ["exact_name"],
+                "paths": []
+            }]}),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(source_confirmation.contains("variants 2 · Finding finding_source"));
+        assert!(
+            source_confirmation
+                .contains("Inspect the linked Finding before confirming exact source roots")
+        );
+        assert!(!source_confirmation.contains("Use --load"));
 
         let provider = render(
             "find",

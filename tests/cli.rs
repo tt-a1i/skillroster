@@ -1536,6 +1536,207 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert_eq!(full["result"]["placements"].as_array().unwrap().len(), 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_loop() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let sources = temp.path().join("sources");
+    let first_source = sources.join("first");
+    let second_source = sources.join("second");
+    for (source, body) in [(&first_source, "alpha"), (&second_source, "beta")] {
+        fs::create_dir_all(source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            format!(
+                "---\nname: shared-external\ndescription: External comparison route\n---\n{body}\n"
+            ),
+        )
+        .unwrap();
+    }
+    let codex_root = home.join(".codex/skills");
+    let claude_root = home.join(".claude/skills");
+    fs::create_dir_all(&codex_root).unwrap();
+    fs::create_dir_all(&claude_root).unwrap();
+    let codex_link = codex_root.join("shared-external");
+    let claude_link = claude_root.join("shared-external");
+    std::os::unix::fs::symlink(&first_source, &codex_link).unwrap();
+    std::os::unix::fs::symlink(&second_source, &claude_link).unwrap();
+
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let trusted_scan = [
+        &common[..],
+        &["--source-root", sources.to_str().unwrap(), "scan"],
+    ]
+    .concat();
+    let seeded = json_output(&run(&trusted_scan, None));
+    assert_eq!(seeded["result"]["skill_count"], 2);
+
+    let untrusted_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(untrusted_scan["result"]["skill_count"], 2);
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let escaping_finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap();
+    let finding_id = escaping_finding["id"].as_str().unwrap();
+
+    let found = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    let reference = &found["result"]["matches"][0]["variant_finding"];
+    assert_eq!(found["result"]["rescan_required"], false);
+    assert_eq!(reference["state"], "source_confirmation_required");
+    assert_eq!(
+        reference["reason_code"],
+        "untrusted_variants_require_source_confirmation"
+    );
+    assert_eq!(reference["finding_id"], finding_id);
+    assert_eq!(reference["report_id"], report["result"]["report_id"]);
+    assert_eq!(reference["resolution"], "confirm_trusted_source_roots");
+    assert_eq!(
+        reference["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--json"],
+        )
+    );
+    assert!(
+        found["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| {
+                action["action"] != "load_exact_variant_for_comparison"
+                    && action["action"] != "plan"
+                    && action["action"] != "scan"
+                    && action["mutates"] == false
+                    && action["requires_confirmation"] == false
+            })
+    );
+    let blocked_load = run(
+        &[
+            &common[..],
+            &["find", "shared-external", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!blocked_load.status.success());
+    let blocked_load: Value = serde_json::from_slice(&blocked_load.stdout).unwrap();
+    assert_eq!(
+        blocked_load["error"]["details"]["reason"],
+        "same_name_variants_ambiguous"
+    );
+    assert!(blocked_load["error"]["details"].get("content").is_none());
+
+    let repeated_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(
+        repeated_report["result"]["snapshot_id"],
+        repeated_scan["result"]["snapshot_id"]
+    );
+    let repeated_finding_id = repeated_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let repeated = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(repeated["result"]["rescan_required"], false);
+    assert_eq!(
+        repeated["result"]["matches"][0]["variant_finding"]["state"],
+        "source_confirmation_required"
+    );
+    assert_eq!(
+        repeated["result"]["matches"][0]["variant_finding"]["finding_id"],
+        repeated_finding_id
+    );
+
+    let replacement = temp.path().join("replacement");
+    fs::create_dir(&replacement).unwrap();
+    fs::write(
+        replacement.join("SKILL.md"),
+        "---\nname: shared-external\ndescription: External comparison route\n---\nreplacement\n",
+    )
+    .unwrap();
+    fs::remove_file(&codex_link).unwrap();
+    std::os::unix::fs::symlink(&replacement, &codex_link).unwrap();
+    let drifted = json_output(&run(
+        &[&common[..], &["find", "shared-external"]].concat(),
+        None,
+    ));
+    assert_eq!(drifted["result"]["rescan_required"], true);
+    assert_eq!(
+        drifted["result"]["matches"][0]["variant_finding"]["state"],
+        "rescan_required"
+    );
+    fs::remove_file(&codex_link).unwrap();
+    std::os::unix::fs::symlink(&first_source, &codex_link).unwrap();
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let recovered_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let recovered_finding_id = recovered_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    for source in [&first_source, &second_source] {
+        let confirmed = json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "source-root",
+                    "confirm",
+                    "--finding",
+                    recovered_finding_id,
+                    "--path",
+                    source.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+            None,
+        ));
+        assert_eq!(
+            confirmed["result"]["permission_scope"],
+            "exact_local_read_only"
+        );
+        assert_eq!(confirmed["result"]["content_endorsed"], false);
+        assert_eq!(confirmed["result"]["plan_apply_authorized"], false);
+        assert_eq!(confirmed["result"]["files_changed"], false);
+    }
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let readable = json_output(&run(
+        &[&common[..], &["find", "external comparison route"]].concat(),
+        None,
+    ));
+    assert_eq!(readable["result"]["matches"][0]["variant_count"], 2);
+    assert_eq!(
+        readable["result"]["matches"][0]["variant_finding"]["state"],
+        "available"
+    );
+}
+
 #[test]
 fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
     let temp = TempDir::new().unwrap();
