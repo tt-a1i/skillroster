@@ -2440,6 +2440,43 @@ mod tests {
     }
 
     #[test]
+    fn rebuilding_fts_with_current_empty_semantics_removes_historical_terms() {
+        let store = StateStore::open_in_memory().unwrap();
+        let skill = SkillId::parse("skill_historical_body").unwrap();
+        store
+            .index_skill(
+                &skill,
+                "helper",
+                "historical generic metadata",
+                "",
+                "instructions include phosphorescent telemetry reconciliation",
+            )
+            .unwrap();
+        assert_eq!(
+            store.search_skill_ids("phosphorescent", 5).unwrap(),
+            vec![skill.clone()]
+        );
+
+        store.index_skill(&skill, "helper", "", "", "").unwrap();
+
+        assert!(
+            store
+                .search_skill_ids("phosphorescent", 5)
+                .unwrap()
+                .is_empty()
+        );
+        let current: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT description, body FROM skills_fts WHERE skill_id = ?1",
+                [skill.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, (String::new(), String::new()));
+    }
+
+    #[test]
     fn search_falls_back_to_unicode_phrase_matching() {
         let store = StateStore::open_in_memory().unwrap();
         let skill = SkillId::parse("skill_database").unwrap();
