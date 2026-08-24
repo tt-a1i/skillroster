@@ -1,8 +1,8 @@
 # Issue #185：保留语义证据但当前 Skill 不可读时的诊断性 `unavailable_matches`
 
-> Issue：[Investigate typed unavailable Find matches from retained semantic evidence](https://github.com/tt-a1i/skillroster/issues/185)  
-> 日期：2026-08-25  
-> 状态：研究结论；未修改生产实现，仅增加安全回归测试  
+> Issue：[Investigate typed unavailable Find matches from retained semantic evidence](https://github.com/tt-a1i/skillroster/issues/185)
+> 日期：2026-08-25
+> 状态：研究结论；未修改生产实现，仅增加安全回归测试
 > 研究范围：Agent Skills/Codex 官方规范与实现、原始工具检索/工具使用论文、W3C provenance 规范。没有使用二手综述或营销文章作为证据。
 
 ## 结论先行
