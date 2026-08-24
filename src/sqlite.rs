@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +37,12 @@ pub struct PurgeCounts {
 pub struct PlanReceiptPurgeCounts {
     pub plans: u64,
     pub receipts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoveryReceiptSaveOutcome {
+    pub inserted: bool,
+    pub plan_transitioned: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -139,6 +145,15 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    pub fn requires_migration(path: impl AsRef<Path>) -> StorageResult<bool> {
+        if !path.as_ref().exists() {
+            return Ok(true);
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        Ok(version != SCHEMA_VERSION)
+    }
+
     /// Opens a SQLite savepoint around normalized Snapshot persistence. The
     /// initial `running` row is intentionally written before this boundary so
     /// a failed attempt can be retained as `failed` after rollback.
@@ -1354,6 +1369,105 @@ impl StateStore {
         Ok(())
     }
 
+    /// Imports a filesystem recovery Receipt in one transaction. Apply recovery
+    /// transitions its Applying Plan; a verified reverse Undo keeps the terminal
+    /// Plan unchanged. An already-imported recovery Receipt is accepted so older
+    /// split states can converge on retry.
+    pub fn save_recovery_receipt(
+        &self,
+        plan: &PlanId,
+        receipt: &ReceiptRecord,
+    ) -> StorageResult<RecoveryReceiptSaveOutcome> {
+        if receipt.plan_id != *plan || receipt.status != ReceiptStatus::RecoveryRequired {
+            return Err(StorageError::InvalidData(
+                "Recovery receipt does not match the recovery Plan".to_owned(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT plan_id, status, reverses_receipt_id FROM receipts WHERE id = ?1",
+                [receipt.id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let inserted = match existing {
+            Some((existing_plan, existing_status, existing_reverse)) => {
+                let expected_reverse = receipt.reverses_receipt_id.as_ref().map(ReceiptId::as_str);
+                if existing_plan != plan.as_str()
+                    || existing_status != "recovery_required"
+                    || existing_reverse.as_deref() != expected_reverse
+                {
+                    return Err(StorageError::InvalidData(format!(
+                        "recovery receipt {} conflicts with retained state",
+                        receipt.id
+                    )));
+                }
+                false
+            }
+            None => {
+                save_receipt_transaction(&transaction, receipt)?;
+                true
+            }
+        };
+        let is_reverse = receipt.reverses_receipt_id.is_some();
+        if let Some(original_id) = &receipt.reverses_receipt_id {
+            let original = transaction
+                .query_row(
+                    "SELECT plan_id, status FROM receipts WHERE id = ?1",
+                    [original_id.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if original.as_ref().map(|(original_plan, original_status)| {
+                (original_plan.as_str(), original_status.as_str())
+            }) != Some((plan.as_str(), "applied"))
+            {
+                return Err(StorageError::InvalidData(format!(
+                    "recovery receipt {} does not reverse an applied Receipt from Plan {plan}",
+                    receipt.id
+                )));
+            }
+        }
+        let plan_transitioned = if is_reverse {
+            false
+        } else {
+            transaction.execute(
+                "UPDATE plans SET status = 'recovery_required'
+                 WHERE id = ?1 AND status = 'applying'",
+                [plan.as_str()],
+            )? == 1
+        };
+        let plan_status = transaction
+            .query_row(
+                "SELECT status FROM plans WHERE id = ?1",
+                [plan.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let valid_plan_status = if is_reverse {
+            plan_status.as_deref() == Some("applied")
+        } else {
+            plan_status.as_deref() == Some("recovery_required")
+        };
+        if !valid_plan_status {
+            return Err(StorageError::InvalidData(format!(
+                "plan {plan} is not recoverable from its current state"
+            )));
+        }
+        transaction.commit()?;
+        Ok(RecoveryReceiptSaveOutcome {
+            inserted,
+            plan_transitioned,
+        })
+    }
+
     pub fn receipt_exists(&self, id: &ReceiptId) -> StorageResult<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM receipts WHERE id = ?1)",
@@ -2422,6 +2536,21 @@ mod tests {
     }
 
     #[test]
+    fn migration_requirement_detects_missing_old_and_current_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("skillroster.db");
+        assert!(StateStore::requires_migration(&path).unwrap());
+
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 9).unwrap();
+        drop(connection);
+        assert!(StateStore::requires_migration(&path).unwrap());
+
+        drop(StateStore::open(&path).unwrap());
+        assert!(!StateStore::requires_migration(&path).unwrap());
+    }
+
+    #[test]
     fn migration_preserves_distinct_v8_observations_without_combining_legacy_totals() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
@@ -2773,6 +2902,272 @@ mod tests {
                 .is_err()
         );
         assert!(!store.receipt_exists(&receipt.id).unwrap());
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::Applying
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_atomically_converges_new_and_legacy_split_state() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        let receipt = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        store.save_receipt(&receipt).unwrap();
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &receipt).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: false,
+                plan_transitioned: true,
+            }
+        );
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn failed_recovery_finalization_retains_neither_receipt_nor_plan_transition() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_recovery_transition BEFORE UPDATE OF status ON plans
+                 WHEN NEW.status = 'recovery_required'
+                 BEGIN SELECT RAISE(FAIL, 'injected recovery failure'); END;",
+            )
+            .unwrap();
+        let receipt = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        assert!(store.save_recovery_receipt(&plan.id, &receipt).is_err());
+        assert!(!store.receipt_exists(&receipt.id).unwrap());
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::Applying
+        );
+    }
+
+    #[test]
+    fn reverse_recovery_receipt_preserves_applied_plan_and_is_idempotent() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
+            .unwrap();
+        let recovery = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: Some(original.id.clone()),
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &recovery).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: true,
+                plan_transitioned: false,
+            }
+        );
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::Applied
+        );
+        assert_eq!(
+            store.save_recovery_receipt(&plan.id, &recovery).unwrap(),
+            RecoveryReceiptSaveOutcome {
+                inserted: false,
+                plan_transitioned: false,
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_recovery_receipt_rejects_a_rolled_back_plan() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::FailedRolledBack)
+            .unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store.save_receipt(&original).unwrap();
+        let recovery = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: Some(original.id),
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        assert!(store.save_recovery_receipt(&plan.id, &recovery).is_err());
+        assert!(!store.receipt_exists(&recovery.id).unwrap());
+        assert_eq!(
+            store.get_plan(&plan.id).unwrap().unwrap().status,
+            PlanStatus::FailedRolledBack
+        );
+    }
+
+    #[test]
+    fn recovery_receipt_rejects_a_changed_reverse_identity() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: scan.id,
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store.save_receipt(&original).unwrap();
+        let retained = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::RecoveryRequired,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store.save_receipt(&retained).unwrap();
+        let conflicting = ReceiptRecord {
+            reverses_receipt_id: Some(original.id),
+            ..retained
+        };
+
+        assert!(store.save_recovery_receipt(&plan.id, &conflicting).is_err());
+        assert_eq!(
+            store
+                .get_receipt(&conflicting.id)
+                .unwrap()
+                .unwrap()
+                .reverses_receipt_id,
+            None
+        );
         assert_eq!(
             store.get_plan(&plan.id).unwrap().unwrap().status,
             PlanStatus::Applying

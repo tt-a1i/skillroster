@@ -24,7 +24,7 @@ tests/
   fixtures/         synthetic Agent homes and session samples
 ```
 
-Adapters discover and normalize Agent-specific facts. They do not implement eight separate mutation systems. All writes pass through `change`, and only one Apply or Undo may hold the process-level write lock at a time. Do not add an ORM, repository trait, Tokio runtime, generic plugin interface, vector database, virtual filesystem, or TUI. A private filesystem seam inside `change` is allowed for fault-injection tests.
+Adapters discover and normalize Agent-specific facts. They do not implement eight separate mutation systems. All Agent and Library filesystem writes pass through `change`. Commands that create or reconcile persisted state hold the exclusive process-level state lock; true read and detail commands share the read lock once the current SQLite schema exists. First initialization and migration also require the exclusive lock. A typed, retryable `write_locked` response means another local command must finish before a bounded retry. Do not add an ORM, repository trait, Tokio runtime, generic plugin interface, vector database, virtual filesystem, or TUI. A private filesystem seam inside `change` is allowed for fault-injection tests.
 
 ## Persistence model
 
