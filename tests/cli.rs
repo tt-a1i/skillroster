@@ -5268,6 +5268,49 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
         detail["result"]["planning"]["observed_link_targets"],
         json!([outside])
     );
+    let prerequisite = &detail["result"]["planning"]["source_confirmation_finding"];
+    assert_eq!(prerequisite["state"], "available");
+    assert_eq!(prerequisite["kind"], "escaping_link_source_confirmation");
+    assert_eq!(prerequisite["snapshot_id"], report["result"]["snapshot_id"]);
+    let source_finding_id = prerequisite["finding_id"].as_str().unwrap();
+    assert_ne!(source_finding_id, finding_id);
+    let source_action = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "view_source_confirmation_finding")
+        .expect("blocked Roster exposes its source Finding continuation");
+    let source_argv = source_action["argv"].as_array().unwrap();
+    assert_eq!(source_argv[0], "skillroster");
+    assert_eq!(source_argv[1], "--state-dir");
+    assert_eq!(source_argv[2], state.to_str().unwrap());
+    assert_eq!(source_argv[3], "--home");
+    assert_eq!(source_argv[4], home.to_str().unwrap());
+    assert_eq!(
+        &source_argv[5..],
+        &json!(["report", "--finding", source_finding_id, "--json"])
+            .as_array()
+            .unwrap()[..]
+    );
+    assert_eq!(source_action["mutates"], false);
+    assert_eq!(source_action["requires_confirmation"], false);
+    let source_detail = json_output(&run_suggested_action(source_action));
+    assert_eq!(
+        source_detail["result"]["kind"],
+        "escaping_link_source_confirmation"
+    );
+    let confirm_actions = source_detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "confirm_source_root_read_permission")
+        .collect::<Vec<_>>();
+    assert!(!confirm_actions.is_empty());
+    assert!(
+        confirm_actions
+            .iter()
+            .all(|action| { action["mutates"] == true && action["requires_confirmation"] == true })
+    );
     assert!(
         detail["suggested_actions"]
             .as_array()
@@ -5295,6 +5338,59 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
             .as_str()
             .unwrap()
             .contains("confirm the reported source roots")
+    );
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let report_id = prerequisite["report_id"].as_str().unwrap();
+    let duplicate_finding_id = "finding_197_cli_duplicate";
+    database
+        .execute(
+            "INSERT INTO findings (id, report_id, category, severity, title, summary, details_json) SELECT ?1, report_id, category, severity, title, summary, details_json FROM findings WHERE id = ?2",
+            rusqlite::params![duplicate_finding_id, source_finding_id],
+        )
+        .unwrap();
+    let raw_summary: String = database
+        .query_row(
+            "SELECT summary_json FROM reports WHERE id = ?1",
+            [report_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut summary: Value = serde_json::from_str(&raw_summary).unwrap();
+    let mut duplicate = summary["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["id"] == source_finding_id)
+        .unwrap()
+        .clone();
+    duplicate["id"] = json!(duplicate_finding_id);
+    summary["findings"].as_array_mut().unwrap().push(duplicate);
+    database
+        .execute(
+            "UPDATE reports SET summary_json = ?1 WHERE id = ?2",
+            rusqlite::params![summary.to_string(), report_id],
+        )
+        .unwrap();
+
+    let ambiguous = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        ambiguous["result"]["planning"]["source_confirmation_finding"]["reason_code"],
+        "matching_escaping_link_finding_ambiguous"
+    );
+    assert_eq!(
+        ambiguous["result"]["planning"]["source_confirmation_finding"]["candidate_count"],
+        2
+    );
+    assert!(
+        ambiguous["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "view_source_confirmation_finding")
     );
 }
 
@@ -5742,6 +5838,13 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
             .unwrap()
             .iter()
             .all(|action| action["action"] != "plan")
+    );
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "view_source_confirmation_finding")
     );
 
     let request = json!({

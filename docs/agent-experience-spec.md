@@ -93,8 +93,12 @@ semantic conclusion and may read a returned `SKILL.md` path when those facts
 are insufficient; candidate evidence never authorizes a Plan.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
-Never execute a confirmation-gated Core-protection template or source-link
-change on the user's behalf.
+When `planning.reason` is `trusted_canonical_sources_required`, follow its
+same-Report/Snapshot `source_confirmation_finding` reference through the
+read-only `view_source_confirmation_finding` action when available. The
+opened escaping-link Finding remains the only surface that offers exact
+confirmation-gated source-root actions. Never execute a confirmation-gated
+Core-protection template or source-link change on the user's behalf.
 
 ## 5. Ready Plan response
 
