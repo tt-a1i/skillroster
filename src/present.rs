@@ -2005,7 +2005,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "cli_version": "1.8.26",
+                "cli_version": "1.8.27",
                 "bootstrap_content_version": "1.8.23",
                 "bootstrap_version": "1.8.23",
                 "detected_agents": [{"agent": "codex"}],
@@ -2029,7 +2029,7 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "cli_version": "1.8.26",
+                "cli_version": "1.8.27",
                 "bootstrap_content_version": "1.8.23",
                 "bootstrap_version": "1.8.23",
                 "detected_agents": [{"agent": "codex"}],

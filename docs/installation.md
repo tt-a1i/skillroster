@@ -27,7 +27,7 @@ On macOS or Linux, the archive contains a versioned directory. Extract it and
 install the binary from that directory (not from the current directory):
 
 ```sh
-SKILLROSTER_VERSION=1.8.26
+SKILLROSTER_VERSION=1.8.27
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -51,7 +51,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v1.8.26 skillroster
+  --tag v1.8.27 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the
@@ -82,7 +82,7 @@ skillroster scan --json
 skillroster setup --json
 ```
 
-CLI v1.8.26 bundles Bootstrap content version 1.8.23. These versions differ
+CLI v1.8.27 bundles Bootstrap content version 1.8.23. These versions differ
 intentionally: the CLI changed after the Bootstrap instructions last changed.
 In Setup JSON, `cli_version` identifies the executable and
 `bootstrap_content_version` identifies the bundled Skill package.
