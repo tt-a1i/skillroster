@@ -5268,6 +5268,48 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
         detail["result"]["planning"]["observed_link_targets"],
         json!([outside])
     );
+    let prerequisite = &detail["result"]["planning"]["source_confirmation_finding"];
+    assert_eq!(prerequisite["state"], "available");
+    assert_eq!(prerequisite["kind"], "escaping_link_source_confirmation");
+    assert_eq!(prerequisite["snapshot_id"], report["result"]["snapshot_id"]);
+    let source_finding_id = prerequisite["finding_id"].as_str().unwrap();
+    assert_ne!(source_finding_id, finding_id);
+    let source_action = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "view_source_confirmation_finding")
+        .expect("blocked Roster exposes its source Finding continuation");
+    let source_argv = source_action["argv"].as_array().unwrap();
+    assert_eq!(source_argv[0], "skillroster");
+    assert_eq!(source_argv[1], "--state-dir");
+    assert_eq!(source_argv[2], state.to_str().unwrap());
+    assert_eq!(source_argv[3], "--home");
+    assert_eq!(source_argv[4], home.to_str().unwrap());
+    assert_eq!(
+        &source_argv[5..],
+        &json!(["report", "--finding", source_finding_id, "--json"])
+            .as_array()
+            .unwrap()[..]
+    );
+    assert_eq!(source_action["mutates"], false);
+    assert_eq!(source_action["requires_confirmation"], false);
+    let source_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", source_finding_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        source_detail["result"]["kind"],
+        "escaping_link_source_confirmation"
+    );
+    assert!(
+        source_detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "confirm_source_root_read_permission")
+            .all(|action| { action["mutates"] == true && action["requires_confirmation"] == true })
+    );
     assert!(
         detail["suggested_actions"]
             .as_array()
@@ -5742,6 +5784,13 @@ fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
             .unwrap()
             .iter()
             .all(|action| action["action"] != "plan")
+    );
+    assert!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "view_source_confirmation_finding")
     );
 
     let request = json!({

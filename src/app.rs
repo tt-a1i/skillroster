@@ -3264,6 +3264,22 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                     "finding_action_available",
                 ));
             }
+            if result["planning"]["reason"].as_str() == Some("trusted_canonical_sources_required") {
+                let prerequisite = &result["planning"]["source_confirmation_finding"];
+                let prerequisite_id = prerequisite["finding_id"].as_str();
+                if prerequisite["state"].as_str() == Some("available")
+                    && let Some(prerequisite_id) = prerequisite_id
+                    && prerequisite_id != id
+                {
+                    actions.push(action(
+                        "view_source_confirmation_finding",
+                        &["report", "--finding", prerequisite_id, "--json"],
+                        false,
+                        false,
+                        "trusted_canonical_sources_required",
+                    ));
+                }
+            }
             if requires_trust_decision {
                 for path in result["resolution"]["observed_link_targets"]
                     .as_array()
@@ -3548,6 +3564,65 @@ fn blocked_skill_planning(
     }
 }
 
+fn is_untrusted_external_blocker(exclusion: &crate::roster_plan::RosterChangeExclusion) -> bool {
+    matches!(
+        exclusion.safety_blocker.as_ref(),
+        Some(crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
+            mutation_scopes,
+            ..
+        }) if mutation_scopes == &["untrusted_external"]
+    )
+}
+
+/// Resolve the source-confirmation prerequisite only inside the immutable
+/// Report that owns the Roster Finding. A source Finding from another Report,
+/// a partial match, or more than one match is not safe to expose as an
+/// executable continuation.
+fn source_confirmation_finding_reference(
+    store: &StateStore,
+    roster_finding: &FindingRecord,
+    scan_id: &ScanId,
+    required_skill_ids: &BTreeSet<String>,
+) -> Result<Value> {
+    let mut reference = json!({
+        "kind": crate::source_policy::ESCAPING_LINK_FINDING_KIND,
+        "state": "finding_unavailable",
+        "reason_code": "matching_escaping_link_finding_missing",
+        "snapshot_id": scan_id,
+        "report_id": roster_finding.report_id,
+        "finding_id": Value::Null,
+        "resolution": "confirm_trusted_source_roots",
+        "candidate_count": 0,
+    });
+    let Some(report) = store.get_report(&roster_finding.report_id)? else {
+        return Ok(reference);
+    };
+    if report.scan_id != *scan_id {
+        reference["reason_code"] = json!("source_confirmation_finding_snapshot_mismatch");
+        return Ok(reference);
+    }
+
+    if required_skill_ids.is_empty() {
+        reference["reason_code"] = json!("no_untrusted_external_blockers");
+        return Ok(reference);
+    }
+    let candidates = matching_escaping_link_finding_ids(store, &report, required_skill_ids)?;
+
+    reference["candidate_count"] = json!(candidates.len());
+    match candidates.len() {
+        1 => {
+            reference["state"] = json!("available");
+            reference["reason_code"] = json!("matching_escaping_link_finding_available");
+            reference["finding_id"] = json!(candidates.into_iter().next());
+        }
+        _ if candidates.len() > 1 => {
+            reference["reason_code"] = json!("matching_escaping_link_finding_ambiguous");
+        }
+        _ => {}
+    }
+    Ok(reference)
+}
+
 fn finding_roster_planning(
     store: &StateStore,
     finding: &FindingRecord,
@@ -3777,6 +3852,18 @@ fn finding_roster_planning(
                 "next": "Provider and durable read permissions authorize inspection only; keep these placements unchanged or choose current mutable placements. Rescan when scope facts are missing."
             })));
         }
+        let untrusted_external_skill_ids = supported
+            .exclusions
+            .iter()
+            .filter(|exclusion| is_untrusted_external_blocker(exclusion))
+            .map(|exclusion| exclusion.skill_id.clone())
+            .collect::<BTreeSet<_>>();
+        let source_confirmation_finding = source_confirmation_finding_reference(
+            store,
+            finding,
+            scan_id,
+            &untrusted_external_skill_ids,
+        )?;
         return Ok(Some(json!({
             "supported": false,
             "reason": "trusted_canonical_sources_required",
@@ -3802,6 +3889,7 @@ fn finding_roster_planning(
             "blocked_skills": blocked_skills.items,
             "blocked_skills_truncated": blocked_skills.truncated,
             "observed_link_targets": observed_link_targets,
+            "source_confirmation_finding": source_confirmation_finding,
             "after_confirmation": {
                 "repeatable_option": "--source-root",
                 "value": "absolute canonical source directory",
@@ -4887,7 +4975,19 @@ fn matching_escaping_link_finding_id(
     report: &ReportRecord,
     untrusted_variant_ids: &BTreeSet<String>,
 ) -> Result<Option<String>> {
-    matching_report_finding_id(
+    let matches = matching_escaping_link_finding_ids(store, report, untrusted_variant_ids)?;
+    Ok((matches.len() == 1).then(|| matches[0].clone()))
+}
+
+fn matching_escaping_link_finding_ids(
+    store: &StateStore,
+    report: &ReportRecord,
+    untrusted_variant_ids: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    if untrusted_variant_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    matching_report_finding_ids(
         store,
         report,
         crate::source_policy::ESCAPING_LINK_FINDING_KIND,
@@ -4901,34 +5001,48 @@ fn matching_report_finding_id(
     kind: &str,
     affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
 ) -> Result<Option<String>> {
-    let Some(candidate) = report.summary["findings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find_map(|finding| {
-            if finding["kind"] != kind {
-                return None;
-            }
-            let affected = finding_skill_ids(finding)?;
-            affected_ids_match(&affected)
-                .then(|| finding["id"].as_str())
-                .flatten()
-        })
-    else {
-        return Ok(None);
-    };
-    let id = FindingId::parse(candidate.to_owned())?;
-    let Some(stored) = store.get_finding(&id)? else {
-        return Ok(None);
-    };
-    let Some(stored_skill_ids) = finding_skill_ids(&stored.details) else {
-        return Ok(None);
-    };
-    Ok((stored.report_id == report.id
-        && stored.category == FindingCategory::Layout
-        && stored.details["kind"] == kind
-        && affected_ids_match(&stored_skill_ids))
-    .then(|| id.to_string()))
+    let matches = matching_report_finding_ids(store, report, kind, affected_ids_match)?;
+    Ok((matches.len() == 1).then(|| matches[0].clone()))
+}
+
+fn matching_report_finding_ids(
+    store: &StateStore,
+    report: &ReportRecord,
+    kind: &str,
+    affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
+) -> Result<Vec<String>> {
+    let mut matches = BTreeSet::new();
+    for finding in report.summary["findings"].as_array().into_iter().flatten() {
+        if finding["kind"] != kind {
+            continue;
+        }
+        let Some(affected) = finding_skill_ids(finding) else {
+            continue;
+        };
+        if !affected_ids_match(&affected) {
+            continue;
+        }
+        let Some(raw_id) = finding["id"].as_str() else {
+            continue;
+        };
+        let Ok(id) = FindingId::parse(raw_id.to_owned()) else {
+            continue;
+        };
+        let Some(stored) = store.get_finding(&id)? else {
+            continue;
+        };
+        let Some(stored_skill_ids) = finding_skill_ids(&stored.details) else {
+            continue;
+        };
+        if stored.report_id == report.id
+            && stored.category == FindingCategory::Layout
+            && stored.details["kind"] == kind
+            && affected_ids_match(&stored_skill_ids)
+        {
+            matches.insert(id.to_string());
+        }
+    }
+    Ok(matches.into_iter().collect())
 }
 
 fn finding_skill_ids(finding: &Value) -> Option<BTreeSet<String>> {
@@ -9437,6 +9551,171 @@ mod recovery_tests {
             ReportRequest::Summary,
         );
         assert!(empty.is_empty());
+    }
+
+    fn source_reference_fixture_finding(
+        id: &str,
+        report_id: &ReportId,
+        affected_skill_ids: &[&str],
+    ) -> FindingRecord {
+        FindingRecord {
+            id: FindingId::parse(id).unwrap(),
+            report_id: report_id.clone(),
+            category: FindingCategory::Layout,
+            severity: Severity::Warning,
+            title: crate::source_policy::ESCAPING_LINK_FINDING_TITLE.into(),
+            summary: String::new(),
+            details: json!({
+                "kind": crate::source_policy::ESCAPING_LINK_FINDING_KIND,
+                "affected_skill_ids": affected_skill_ids
+            }),
+            evidence_ids: Vec::new(),
+        }
+    }
+
+    fn source_reference_fixture_roster(report_id: &ReportId) -> FindingRecord {
+        FindingRecord {
+            id: FindingId::parse("finding_197_roster").unwrap(),
+            report_id: report_id.clone(),
+            category: FindingCategory::Usage,
+            severity: Severity::Warning,
+            title: "Large default Rosters need review".into(),
+            summary: String::new(),
+            details: json!({"kind": "large_default_roster"}),
+            evidence_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn roster_source_prerequisite_requires_one_same_report_finding() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan_id = ScanId::parse("scan_197_fixture").unwrap();
+        let report_id = ReportId::parse("report_197_fixture").unwrap();
+        store
+            .save_scan(&ScanRun {
+                id: scan_id.clone(),
+                started_at: 1,
+                completed_at: Some(2),
+                status: ScanStatus::Completed,
+                coverage_notes: Vec::new(),
+            })
+            .unwrap();
+        let roster = source_reference_fixture_roster(&report_id);
+        let escaping = source_reference_fixture_finding(
+            "finding_197_source",
+            &report_id,
+            &["skill_external", "skill_extra"],
+        );
+        let report = ReportRecord {
+            id: report_id.clone(),
+            scan_id: scan_id.clone(),
+            created_at: 2,
+            summary: json!({
+                "findings": [{
+                    "id": escaping.id,
+                    "kind": crate::source_policy::ESCAPING_LINK_FINDING_KIND,
+                    "affected_skill_ids": ["skill_external", "skill_extra"]
+                }]
+            }),
+        };
+        store
+            .save_report(&report, &[roster.clone(), escaping])
+            .unwrap();
+
+        let reference = source_confirmation_finding_reference(
+            &store,
+            &roster,
+            &scan_id,
+            &BTreeSet::from(["skill_external".into()]),
+        )
+        .unwrap();
+        assert_eq!(reference["state"], "available");
+        assert_eq!(reference["finding_id"], "finding_197_source");
+        assert_eq!(reference["candidate_count"], 1);
+    }
+
+    #[test]
+    fn roster_source_prerequisite_is_unavailable_for_missing_ambiguous_or_stale_facts() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan_id = ScanId::parse("scan_197_fixture").unwrap();
+        let stale_scan_id = ScanId::parse("scan_197_stale").unwrap();
+        let report_id = ReportId::parse("report_197_fixture").unwrap();
+        for (id, completed_at) in [(scan_id.clone(), 2), (stale_scan_id.clone(), 3)] {
+            store
+                .save_scan(&ScanRun {
+                    id,
+                    started_at: completed_at - 1,
+                    completed_at: Some(completed_at),
+                    status: ScanStatus::Completed,
+                    coverage_notes: Vec::new(),
+                })
+                .unwrap();
+        }
+        let roster = source_reference_fixture_roster(&report_id);
+        let first = source_reference_fixture_finding(
+            "finding_197_source_a",
+            &report_id,
+            &["skill_external"],
+        );
+        let second = source_reference_fixture_finding(
+            "finding_197_source_b",
+            &report_id,
+            &["skill_external"],
+        );
+        let report = ReportRecord {
+            id: report_id.clone(),
+            scan_id: scan_id.clone(),
+            created_at: 2,
+            summary: json!({
+                "findings": [
+                    {"id": first.id, "kind": crate::source_policy::ESCAPING_LINK_FINDING_KIND, "affected_skill_ids": ["skill_external"]},
+                    {"id": second.id, "kind": crate::source_policy::ESCAPING_LINK_FINDING_KIND, "affected_skill_ids": ["skill_external"]}
+                ]
+            }),
+        };
+        store
+            .save_report(&report, &[roster.clone(), first, second])
+            .unwrap();
+
+        let ambiguous = source_confirmation_finding_reference(
+            &store,
+            &roster,
+            &scan_id,
+            &BTreeSet::from(["skill_external".into()]),
+        )
+        .unwrap();
+        assert_eq!(ambiguous["state"], "finding_unavailable");
+        assert_eq!(
+            ambiguous["reason_code"],
+            "matching_escaping_link_finding_ambiguous"
+        );
+        assert_eq!(ambiguous["candidate_count"], 2);
+
+        let missing = source_confirmation_finding_reference(
+            &store,
+            &roster,
+            &scan_id,
+            &BTreeSet::from(["skill_missing".into()]),
+        )
+        .unwrap();
+        assert_eq!(missing["state"], "finding_unavailable");
+        assert_eq!(
+            missing["reason_code"],
+            "matching_escaping_link_finding_missing"
+        );
+
+        let stale = source_confirmation_finding_reference(
+            &store,
+            &roster,
+            &stale_scan_id,
+            &BTreeSet::from(["skill_external".into()]),
+        )
+        .unwrap();
+        assert_eq!(stale["state"], "finding_unavailable");
+        assert_eq!(
+            stale["reason_code"],
+            "source_confirmation_finding_snapshot_mismatch"
+        );
     }
 
     #[test]
