@@ -415,12 +415,17 @@ function readTokens(tokens, targetPath) {
   return read?.path === canonicalPath(targetPath) ? read : null;
 }
 
-function readOnlyShellSegment(segment) {
+function readOnlyShellSegment(segment, targetPath) {
   const tokens = simpleCommandTokens(segment); if (!tokens?.length) return false;
   const executable = basename(tokens[0]);
-  if (parseReadTokens(tokens)) return true;
+  if (readTokens(tokens, targetPath)) return true;
   if (executable === "printf") return true;
-  return ["rg", "rg.exe"].includes(executable.toLowerCase()) && tokens.includes("--files");
+  if (!["rg", "rg.exe"].includes(executable.toLowerCase()) || tokens[1] !== "--files") return false;
+  for (let index = 2; index < tokens.length; index += 1) {
+    if (tokens[index] === "-g" && tokens[index + 1]) { index += 1; continue; }
+    if (tokens[index] !== ".") return false;
+  }
+  return true;
 }
 
 function narrowRead(command, targetPath, allowLeading = false) {
@@ -428,7 +433,7 @@ function narrowRead(command, targetPath, allowLeading = false) {
   const inner = unwrapSimpleShell(command); const compound = inner.split(/\s+&&\s+/u);
   if (compound.length > 1) {
     const leading = readTokens(simpleCommandTokens(compound[0]), targetPath);
-    return leading && compound.slice(1).every(readOnlyShellSegment) ? { ...leading, read_only_compound: true } : null;
+    return leading && compound.slice(1).every((segment) => readOnlyShellSegment(segment, targetPath)) ? { ...leading, read_only_compound: true } : null;
   }
   const parts = inner.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean);
   if (parts.length < 2) return null;

@@ -247,6 +247,8 @@ test("exact target load classifies every compound suffix and rejects writes", ()
   assert.equal(assessCoreOrder(transcript, target).passed, true);
   const mutatingCommand = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && touch /tmp/unaudited"`;
   const mutating = `${event("started", null, mutatingCommand)}\n${event("completed", "one\ntwo\n", mutatingCommand)}`; assert.equal(assessExactLoad(mutating, target).passed, false);
+  const outsideRead = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && cat /etc/hosts"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", outsideRead), target).passed, false);
+  const unsafeListing = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && rg --files /tmp"`; assert.equal(assessExactLoad(event("completed", "one\ntwo\n", unsafeListing), target).passed, false);
   const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
 });
 
