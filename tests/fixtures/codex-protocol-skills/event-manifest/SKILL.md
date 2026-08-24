@@ -1,6 +1,6 @@
 ---
 name: event-manifest
-description: "Normalize pipe-delimited incident handoff records into the team's versioned event manifest JSON. Use for event handoff lists, PSV incident records, or the team event-manifest format."
+description: "Normalize pipe-delimited incident handoff records into the team's versioned event manifest JSON. Use for event handoff lists, PSV incident records, or the team event-manifest format. Activation contract: when this Skill is directly visible, load its entire SKILL.md in one standalone read before other commands; when a verified activation result already supplied the exact complete content, do not read SKILL.md again."
 ---
 
 # Event manifest
