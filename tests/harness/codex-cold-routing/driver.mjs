@@ -438,7 +438,8 @@ function narrowRead(command, targetPath, allowLeading = false) {
   const parts = inner.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean);
   if (parts.length < 2) return null;
   const reads = parts.map((part) => parseReadTokens(simpleCommandTokens(part)));
-  if (reads.some((read) => !read)) return null;
+  const canonicalTarget = canonicalPath(targetPath);
+  if (reads.some((read) => !read || read.path !== canonicalTarget)) return null;
   const index = reads.findIndex((read) => read.path === canonicalPath(targetPath));
   return index >= 0 ? { ...reads[index], read_sequence: reads } : null;
 }
@@ -754,7 +755,16 @@ function freezeSuite(manifest, options) {
   const codexExecutable = executableIdentity(options.codex);
   const trialsPerArm = manifest.trials_per_arm ?? 1;
   const driverSha256 = sha(readFileSync(fileURLToPath(import.meta.url))); const frozenTreeDigest = stateDigest(root); const realNode = canonicalPath(process.execPath); const parentVerifierIdentity = sha(`${realNode}\0${driverSha256}`);
-  const executionContract = { model: options.model, reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs, sandbox: "workspace-write", ephemeral: true, ignore_user_config: true, preflight_fresh_codex_home: true, preflight_model_config_frozen: true, arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm };
+  const executionContract = {
+    model: options.model, reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs,
+    sandbox: "workspace-write", ephemeral: true, ignore_user_config: true,
+    preflight_contract: {
+      command: "debug prompt-input", shared_model_config: true, fresh_codex_home_without_config: true,
+      isolated_non_repository_workspace: true,
+      execution_only_flags_unsupported_by_debug: ["ignore_user_config", "sandbox", "ephemeral"],
+    },
+    arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm,
+  };
   const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${JSON.stringify(codexExecutable)}\0${driverSha256}\0${parentVerifierIdentity}`);
   const pairInvariants = {};
   for (const task of manifest.tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) pairInvariants[trialKey(task.id, trial, trialsPerArm)] = pairInvariant(snapshotDigest, task, trial);
@@ -767,8 +777,10 @@ function freezeSuite(manifest, options) {
   return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
 
+function codexModelConfig(options) { return ["-c", `model=${JSON.stringify(options.model)}`, "-c", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`]; }
+
 function preflightSurface(paths, task, arm, options, env) {
-  const result = run(options.codex, ["-C", paths.workspace, "debug", "prompt-input", "-c", `model=${JSON.stringify(options.model)}`, "-c", `model_reasoning_effort=${JSON.stringify(options.reasoningEffort)}`, task.prompt], { cwd: paths.workspace, env, timeout: 30_000 });
+  const result = run(options.codex, ["-C", paths.workspace, "debug", "prompt-input", ...codexModelConfig(options), task.prompt], { cwd: paths.workspace, env, timeout: 30_000 });
   if (result.status !== 0) fail(`Codex prompt-input preflight failed: ${result.stderr.trim()}`);
   const visible = extractVisibleSkills(result.stdout); const assessment = assessSkillSurface(visible, arm, task.expected_skill);
   return { ...assessment, prompt_input_sha256: sha(result.stdout) };
@@ -837,7 +849,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const runEnv = { ...env };
     if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
-    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", "-m", options.model, "-c", `model_reasoning_effort=${options.reasoningEffort}`, "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", ...codexModelConfig(options), "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
