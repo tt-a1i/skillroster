@@ -1504,7 +1504,12 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
 
 fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "State", text(value, "state"));
-    fact(lines, "Bootstrap version", text(value, "bootstrap_version"));
+    fact(lines, "CLI version", text(value, "cli_version"));
+    fact(
+        lines,
+        "Bootstrap content",
+        text(value, "bootstrap_content_version"),
+    );
     fact(
         lines,
         "Detected Agents",
@@ -1978,7 +1983,9 @@ mod tests {
             "setup",
             &json!({
                 "state": "modified_choice_required",
-                "bootstrap_version": "1.5.0",
+                "cli_version": "1.8.25",
+                "bootstrap_content_version": "1.8.23",
+                "bootstrap_version": "1.8.23",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,
@@ -2000,7 +2007,9 @@ mod tests {
             "setup",
             &json!({
                 "state": "unsupported_targets",
-                "bootstrap_version": "1.5.0",
+                "cli_version": "1.8.25",
+                "bootstrap_content_version": "1.8.23",
+                "bootstrap_version": "1.8.23",
                 "detected_agents": [{"agent": "codex"}],
                 "current_count": 0,
                 "missing_count": 0,

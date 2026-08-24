@@ -42,6 +42,12 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn assert_setup_versions(output: &Value) {
+    assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.23");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.23");
+}
+
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
     let mut argv = vec![
         "skillroster".to_owned(),
@@ -2309,6 +2315,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
 
     let blocked = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(blocked["result"]["state"], "modified_choice_required");
+    assert_setup_versions(&blocked);
     assert_eq!(blocked["result"]["modified_count"], 1);
     assert!(blocked["result"]["plan_id"].is_null());
     assert_eq!(blocked["result"]["targets"][0]["status"], "modified");
@@ -2354,6 +2361,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
         None,
     ));
     assert_eq!(upgrade["result"]["state"], "preview_ready");
+    assert_setup_versions(&upgrade);
     assert_eq!(upgrade["result"]["replace_count"], 1);
     assert_eq!(upgrade["result"]["modified_count"], 1);
     assert_eq!(upgrade["suggested_actions"].as_array().unwrap().len(), 1);
@@ -2395,9 +2403,10 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
     assert!(current["result"]["plan_id"].is_null());
+    assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        env!("CARGO_PKG_VERSION")
+        "1.8.23"
     );
 
     let undone = json_output(&run(
@@ -2735,6 +2744,7 @@ fn setup_rejects_a_symlinked_managed_reference() {
         None,
     ));
     assert_eq!(result["result"]["state"], "unsupported_targets");
+    assert_setup_versions(&result);
     assert_eq!(result["result"]["unsupported_count"], 1);
     assert!(result["result"]["plan_id"].is_null());
     assert!(
@@ -2996,10 +3006,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     ));
 
     assert_eq!(output["result"]["state"], "scan_required");
-    assert_eq!(
-        output["result"]["bootstrap_version"],
-        env!("CARGO_PKG_VERSION")
-    );
+    assert_setup_versions(&output);
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
