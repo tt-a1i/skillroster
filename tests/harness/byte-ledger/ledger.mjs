@@ -31,6 +31,22 @@ const canonical = (path) => {
   try { return realpathSync.native(absolute); } catch { return absolute; }
 };
 
+const canonicalSafePath = (path, label) => {
+  let current = resolve(path); const missing = [];
+  while (true) {
+    let mode;
+    try { mode = lstatSync(current); }
+    catch (error) {
+      if (error.code !== "ENOENT") fail("unreadable_scope", `${label} cannot be inspected`);
+      const parent = dirname(current); if (parent === current) fail("unreadable_scope", `${label} cannot be inspected`);
+      missing.unshift(current.slice(parent.length + (parent.endsWith(sep) ? 0 : 1))); current = parent; continue;
+    }
+    if (mode.isSymbolicLink()) fail("unsafe_scope", `${label} has a symlink ancestor`);
+    let real; try { real = realpathSync.native(current); } catch { fail("unreadable_scope", `${label} cannot be resolved`); }
+    return resolve(real, ...missing);
+  }
+};
+
 const isWithin = (child, parent) => {
   const relation = relative(parent, child);
   return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !isAbsolute(relation));
@@ -112,9 +128,9 @@ export const validateScope = ({ approvedRoots, configPaths = [], evidenceDir, re
   for (const [input, label] of [[evidenceInput, "evidence directory"], [repositoryInput, "repository directory"], [stateInput, "state directory"]]) {
     try { if (lstatSync(input).isSymbolicLink()) fail("unsafe_scope", `${label} must not be a symlink`); } catch (error) { if (error instanceof LedgerError) throw error; }
   }
-  const evidence = canonical(evidenceInput);
-  const repository = canonical(repositoryInput);
-  const state = canonical(stateInput);
+  const evidence = canonicalSafePath(evidenceInput, "evidence directory");
+  const repository = canonicalSafePath(repositoryInput, "repository directory");
+  const state = canonicalSafePath(stateInput, "state directory");
   if (overlapsForbidden(evidence, [home, repository, state]) || overlapsForbidden(repository, [state])) fail("unsafe_scope", "evidence, repository, and state directories overlap");
   const forbidden = [evidence, repository, state]
     .filter((entry) => entry !== undefined && entry !== null)
@@ -310,13 +326,18 @@ export const redactedComparison = (before, after) => {
   };
 };
 
-export const writeRawLedger = (ledger, outputPath, evidenceDir) => {
+export const writeRawLedger = (ledger, outputPath, evidenceDir, boundaries = {}) => {
   validateLedger(ledger);
   const output = requireAbsolute(outputPath, "ledger output");
   const lexicalEvidence = requireAbsolute(evidenceDir, "evidence directory");
+  const boundaryPaths = [boundaries.homeDir, boundaries.repositoryDir, boundaries.stateDir].filter(Boolean).map((path) => canonicalSafePath(requireAbsolute(path, "boundary directory"), "boundary directory"));
+  if (boundaryPaths.length !== 3) fail("invalid_scope", "raw ledger boundaries are required");
+  const initialEvidence = canonicalSafePath(lexicalEvidence, "evidence directory");
+  if (overlapsForbidden(initialEvidence, boundaryPaths)) fail("unsafe_output", "evidence directory overlaps a forbidden boundary");
   if (!isWithin(output, lexicalEvidence) || output === lexicalEvidence) fail("unsafe_output", "raw ledger must be written inside evidence directory");
   try { mkdirSync(lexicalEvidence, { recursive: true }); } catch { fail("write_failed", "evidence directory could not be created"); }
-  const evidence = canonical(lexicalEvidence);
+  const evidence = canonicalSafePath(lexicalEvidence, "evidence directory");
+  if (evidence !== initialEvidence || overlapsForbidden(evidence, boundaryPaths)) fail("unsafe_output", "evidence directory drifted into a forbidden boundary");
   const safeOutput = resolve(evidence, relative(lexicalEvidence, output));
   if (dirname(safeOutput) !== evidence || !isWithin(canonical(dirname(safeOutput)), evidence)) fail("unsafe_output", "raw ledger must be directly inside evidence directory");
   let descriptor;
@@ -338,6 +359,13 @@ const readListArg = (path, label) => {
   finally { if (opened !== undefined) closeSync(opened.descriptor); }
   return parsePathList(text, label);
 };
+const readJsonArg = (path, label) => {
+  const absolute = requireAbsolute(path, `${label} file`); let opened; let text;
+  try { opened = openNoFollow(absolute); text = readFileSync(opened.descriptor, "utf8"); const current = lstatSync(absolute); if (!sameIdentity(opened.opened, current) || current.isSymbolicLink()) fail("input_drift", `${label} file changed while it was read`); }
+  catch (error) { if (error instanceof LedgerError) throw error; fail("unreadable_input", `${label} file cannot be read`); }
+  finally { if (opened !== undefined) closeSync(opened.descriptor); }
+  try { return JSON.parse(text); } catch { fail("invalid_ledger", `${label} JSON is invalid`); }
+};
 const argValue = (args, flag) => {
   const index = args.indexOf(flag);
   if (index < 0) return undefined;
@@ -353,11 +381,11 @@ const cli = async (args) => {
     const repositoryDir = argValue(args, "--repository-dir"); const stateDir = argValue(args, "--state-dir"); const homeDir = argValue(args, "--home-dir");
     if (!rootsFile || !evidenceDir || !output || !repositoryDir || !stateDir || !homeDir) fail("invalid_args", "capture requires explicit roots, evidence, output, repository, state, and home paths");
     const ledger = await collectLedger({ approvedRoots: readListArg(rootsFile, "approved root list"), configPaths: configFile ? readListArg(configFile, "config path list") : [], evidenceDir, repositoryDir, stateDir, homeDir });
-    writeRawLedger(ledger, output, evidenceDir);
+    writeRawLedger(ledger, output, evidenceDir, { repositoryDir, stateDir, homeDir });
     process.stdout.write(`${JSON.stringify({ format: ledger.format, aggregate: ledger.aggregate, ledger_sha256: ledgerDigest(ledger) })}\n`);
   } else if (mode === "compare") {
-    const before = JSON.parse(readFileSync(requireAbsolute(argValue(args, "--before"), "before ledger"), "utf8"));
-    const after = JSON.parse(readFileSync(requireAbsolute(argValue(args, "--after"), "after ledger"), "utf8"));
+    const before = readJsonArg(argValue(args, "--before"), "before ledger");
+    const after = readJsonArg(argValue(args, "--after"), "after ledger");
     process.stdout.write(`${JSON.stringify(redactedComparison(before, after))}\n`);
   } else fail("invalid_args", "command must be capture or compare");
 };

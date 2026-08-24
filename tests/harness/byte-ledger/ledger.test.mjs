@@ -38,7 +38,15 @@ test("external symlink targets are explicitly out of scope even when unreadable"
 });
 
 test("unsafe scopes fail closed", () => {
-  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); const filesystemRoot = process.platform === "win32" ? parse(root).root : "/"; assert.throws(() => validateScope({ ...common, approvedRoots: [] }), (error) => error instanceof LedgerError && error.code === "empty_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [filesystemRoot] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root, root] }), (error) => error instanceof LedgerError && error.code === "conflicting_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], repositoryDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], homeDir: join(root, "subhome") }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: join(dirname(root), "evidence"), homeDir: dirname(root) }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true });
+  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); const filesystemRoot = process.platform === "win32" ? parse(root).root : "/"; const expectError = (name, options, code) => assert.throws(() => validateScope(options), (error) => error instanceof LedgerError && error.code === code, name);
+  expectError("empty approved roots", { ...common, approvedRoots: [] }, "empty_scope");
+  expectError("filesystem root", { ...common, approvedRoots: [filesystemRoot] }, "unsafe_scope");
+  expectError("duplicate approved root", { ...common, approvedRoots: [root, root] }, "conflicting_scope");
+  expectError("evidence overlaps root", { ...common, approvedRoots: [root], evidenceDir: root }, "unsafe_scope");
+  expectError("repository overlaps root", { ...common, approvedRoots: [root], repositoryDir: root }, "unsafe_scope");
+  expectError("root contains home", { ...common, approvedRoots: [root], homeDir: join(root, "subhome") }, "unsafe_scope");
+  expectError("evidence is inside home", { ...common, approvedRoots: [root], evidenceDir: join(dirname(root), "evidence"), homeDir: dirname(root) }, "unsafe_scope");
+  rmSync(root, { recursive: true, force: true });
 });
 
 test("special files fail closed", { skip: process.platform === "win32" }, async () => {
@@ -51,7 +59,7 @@ test("config files are explicit and privacy-safe redaction contains no path, nam
 });
 
 test("raw output is exclusive and confined to the isolated evidence directory", async () => {
-  const root = tempRoot(); const evidence = `${root}-evidence`; const ledger = await collectLedger(scope(root, { evidenceDir: evidence })); const output = join(evidence, "before.json"); const written = writeRawLedger(ledger, output, evidence); assert.equal(JSON.parse(readFileSync(written)).format, "skillroster-byte-ledger"); assert.throws(() => writeRawLedger(ledger, output, evidence), (error) => error instanceof LedgerError && error.code === "write_failed"); assert.throws(() => writeRawLedger(ledger, join(root, "escape.json"), evidence), (error) => error instanceof LedgerError && error.code === "unsafe_output"); rmSync(root, { recursive: true, force: true }); rmSync(evidence, { recursive: true, force: true });
+  const root = tempRoot(); const evidence = `${root}-evidence`; const boundaries = scope(root, { evidenceDir: evidence }); const ledger = await collectLedger(boundaries); const output = join(evidence, "before.json"); const written = writeRawLedger(ledger, output, evidence, boundaries); assert.equal(JSON.parse(readFileSync(written)).format, "skillroster-byte-ledger"); assert.throws(() => writeRawLedger(ledger, output, evidence, boundaries), (error) => error instanceof LedgerError && error.code === "write_failed"); assert.throws(() => writeRawLedger(ledger, join(root, "escape.json"), evidence, boundaries), (error) => error instanceof LedgerError && error.code === "unsafe_output"); if (process.platform !== "win32") { const after = join(evidence, "after.json"); writeRawLedger(ledger, after, evidence, boundaries); const beforeLink = join(evidence, "before-link.json"); symlinkSync(written, beforeLink); const script = fileURLToPath(new URL("../../../scripts/byte-ledger.mjs", import.meta.url)); const comparison = spawnSync(process.execPath, [script, "compare", "--before", beforeLink, "--after", after], { encoding: "utf8" }); assert.notEqual(comparison.status, 0); rmSync(beforeLink, { force: true }); } rmSync(root, { recursive: true, force: true }); rmSync(evidence, { recursive: true, force: true });
 });
 
 test("config identity and symlink inputs are validated before canonicalization", { skip: process.platform === "win32" }, async () => {
@@ -60,6 +68,11 @@ test("config identity and symlink inputs are validated before canonicalization",
   const rootAlias = `${root}-alias`; symlinkSync(root, rootAlias, "dir"); assert.throws(() => validateScope({ ...common, approvedRoots: [rootAlias] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope");
   const configAlias = `${config}-alias`; symlinkSync(config, configAlias); assert.throws(() => validateScope({ ...common, configPaths: [configAlias] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope");
   rmSync(root, { recursive: true, force: true }); rmSync(rootAlias, { force: true }); rmSync(dirname(config), { recursive: true, force: true });
+});
+
+test("missing evidence under a symlinked ancestor fails before mkdir", { skip: process.platform === "win32" }, () => {
+  const root = tempRoot(); const repository = `${root}-repository`; mkdirSync(repository); const alias = `${root}-repository-alias`; symlinkSync(repository, alias, "dir"); const evidence = join(alias, "evidence");
+  assert.throws(() => validateScope({ ...scope(root), evidenceDir: evidence, repositoryDir: repository }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true }); rmSync(repository, { recursive: true, force: true }); rmSync(alias, { force: true });
 });
 
 test("CLI fails closed for unsafe list inputs and missing flag values", () => {
