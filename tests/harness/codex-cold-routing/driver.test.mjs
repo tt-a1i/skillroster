@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessFrozenInputIdentities, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveOnDemandTransferDecision, deriveOnDemandTransferOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalOnDemandTransferGateEligible, formalOnDemandTransferResultEligible, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -115,6 +115,107 @@ test("manifest supports bounded one-or-more-task Codex protocol suites", () => {
   for (const prompt of ["use SkillRoster", "run capability search", "please Find it", "做能力检索", "load one"]) {
     assert.throws(() => validateManifest({ ...manifest, tasks: [{ ...manifest.tasks[0], prompt }] }), /must not disclose/u);
   }
+});
+
+test("legacy paired evaluation remains the default", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-legacy-plan-"));
+  const manifest = fileURLToPath(new URL("../../fixtures/codex-cold-routing-transfer-v2.json", import.meta.url));
+  const result = spawnSync(process.execPath, [DRIVER, "--manifest", manifest, "--runs-dir", join(root, "runs")], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.deepEqual(plan.arms, ["core", "on_demand"]);
+  assert.equal(plan.run_count, 6);
+});
+
+test("frozen On-demand transfer manifest rejects every partial or mixed schedule", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-on-demand-plan-"));
+  const manifestPath = fileURLToPath(new URL("../../fixtures/codex-cold-routing-on-demand-transfer-v1.json", import.meta.url));
+  const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
+  assert.equal(manifest.tasks.length, 3); assert.equal(manifest.trials_per_arm, 3);
+  const frozenArgs = ["--model", manifest.formal_schedule.model, "--reasoning-effort", manifest.formal_schedule.reasoning_effort, "--timeout-ms", String(manifest.formal_schedule.timeout_ms)];
+  const planned = spawnSync(process.execPath, [DRIVER, "--manifest", manifestPath, "--runs-dir", join(root, "complete"), ...frozenArgs], { encoding: "utf8" });
+  assert.equal(planned.status, 0, planned.stderr); assert.deepEqual(JSON.parse(planned.stdout).arms, ["on_demand"]); assert.equal(JSON.parse(planned.stdout).run_count, 9);
+  assert.equal(JSON.parse(planned.stdout).model, "gpt-5.6-luna"); assert.equal(JSON.parse(planned.stdout).reasoning_effort, "medium");
+  assert.deepEqual(manifest.tasks.map((task) => task.expected_skill), ["event-manifest", "domain-extractor", "artifact-builder"]);
+  assert.deepEqual(manifest.tasks.map((task) => task.family), ["deterministic_json_artifact", "reference_backed_structured_extraction", "script_backed_multi_file_artifact"]);
+  for (const args of [["--task", manifest.tasks[0].id], ["--arm", "core"], ["--arm", "both"]]) {
+    const partial = spawnSync(process.execPath, [DRIVER, "--manifest", manifestPath, "--runs-dir", join(root, `partial-${args.at(-1)}`), ...frozenArgs, ...args], { encoding: "utf8" });
+    assert.notEqual(partial.status, 0); assert.match(partial.stderr, /complete On-demand schedule/u);
+  }
+  assert.throws(() => validateManifest({ ...manifest, trials_per_arm: 2 }), /formal_schedule/u);
+  assert.throws(() => validateManifest({ ...manifest, tasks: manifest.tasks.slice(0, 2) }), /formal_schedule/u);
+  assert.throws(() => validateManifest({ ...manifest, stop_decision: { ...manifest.stop_decision, any_run_fails: "" } }), /stop_decision/u);
+  const wrongModel = spawnSync(process.execPath, [DRIVER, "--manifest", manifestPath, "--runs-dir", join(root, "wrong-model")], { encoding: "utf8" });
+  assert.notEqual(wrongModel.status, 0); assert.match(wrongModel.stderr, /execution parameters must match/u);
+});
+
+test("On-demand transfer emits one exclusive deepest stage and never accepts task success without load", () => {
+  const base = {
+    surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protectedScopes: { passed: true }, externalWrites: { passed: true }, routeOrder: { passed: true },
+  };
+  const cases = [
+    [{ count: 0 }, { passed: false }, { passed: false }, "no_retrieval_call"],
+    [{ count: 1, top1_correct: false, returned_path_exact: false }, { passed: false }, { passed: false }, "retrieval_wrong"],
+    [{ count: 1, top1_correct: true, returned_path_exact: true }, { passed: false }, { passed: false }, "load_wrong"],
+    [{ count: 1, top1_correct: true, returned_path_exact: true }, { passed: true }, { passed: false }, "task_execution_failed"],
+    [{ count: 1, top1_correct: true, returned_path_exact: true }, { passed: true }, { passed: true }, "task_succeeded"],
+  ];
+  for (const [retrieval, load, oracle, expected] of cases) {
+    const outcome = deriveOnDemandTransferOutcome({ ...base, retrieval: { contract_violation: false, ...retrieval }, load, oracle });
+    assert.equal(outcome.deepest_stage, expected);
+    assert.equal(["no_retrieval_call", "retrieval_wrong", "load_wrong", "task_execution_failed", "task_succeeded"].filter((stage) => outcome.deepest_stage === stage).length, 1);
+  }
+  const bypass = deriveOnDemandTransferOutcome({ ...base, retrieval: { count: 1, top1_correct: true, returned_path_exact: true, contract_violation: false }, load: { passed: false }, oracle: { passed: true } });
+  assert.equal(bypass.deepest_stage, "load_wrong"); assert.equal(bypass.task_succeeded_without_loaded_skill, true); assert.equal(bypass.accepted, false);
+});
+
+test("On-demand transfer aggregation requires all three complete 3-of-3 families", () => {
+  const tasks = [
+    { id: "json", family: "deterministic_json_artifact" },
+    { id: "extract", family: "reference_backed_structured_extraction" },
+    { id: "artifact", family: "script_backed_multi_file_artifact" },
+  ];
+  const passing = tasks.flatMap((task) => Array.from({ length: 3 }, (_, index) => ({ family: task.family, task: task.id, trial: index + 1, arm: "on_demand", outcome: { accepted: true, deepest_stage: "task_succeeded", safety: "passed" } })));
+  const decision = deriveOnDemandTransferDecision(passing, 3, tasks);
+  assert.equal(decision.expected_runs, 9); assert.equal(decision.complete_schedule, true); assert.equal(decision.overall_gate, true);
+  assert.ok(decision.family_gates.every((family) => family.accepted === 3 && family.stage_counts.task_succeeded === 3));
+  const partial = deriveOnDemandTransferDecision(passing.slice(0, -1), 3, tasks);
+  assert.equal(partial.complete_schedule, false); assert.equal(partial.overall_gate, false);
+  const duplicate = deriveOnDemandTransferDecision([...passing.slice(0, -1), passing[0]], 3, tasks);
+  assert.equal(duplicate.complete_schedule, false); assert.equal(duplicate.overall_gate, false);
+});
+
+test("On-demand formal evidence separates invalid safety or identity from a valid negative load result", () => {
+  const result = { arm: "on_demand", pair_invariant: "frozen-run", codex_exit_code: 0, surface: { passed: true }, transcript: { passed: true }, workspace: { passed: true }, protected_scopes: { passed: true }, outcome: { harness_valid: true, safety: "passed", accepted: true, deepest_stage: "task_succeeded", task_succeeded_without_loaded_skill: false } };
+  assert.equal(formalOnDemandTransferResultEligible(result), true);
+  const gate = (overrides = {}) => formalOnDemandTransferGateEligible({ completeSchedule: true, sourceIdentityStable: true, codexExecutableStable: true, frozenInputsStable: true, results: [result], ...overrides });
+  assert.equal(gate(), true);
+  assert.equal(gate({ completeSchedule: false }), false);
+  assert.equal(gate({ sourceIdentityStable: false }), false);
+  assert.equal(gate({ codexExecutableStable: false }), false);
+  assert.equal(gate({ frozenInputsStable: false }), false);
+  assert.equal(gate({ results: [{ ...result, outcome: { ...result.outcome, safety: "failed", accepted: false } }] }), false);
+  const validNegative = { ...result, outcome: { ...result.outcome, task: "succeeded", deepest_stage: "load_wrong", task_succeeded_without_loaded_skill: true, accepted: false } };
+  assert.equal(formalOnDemandTransferResultEligible(validNegative), true);
+  assert.equal(gate({ results: [validNegative] }), true);
+  const decision = deriveOnDemandTransferDecision([{ family: "one", task: "one", trial: 1, arm: "on_demand", outcome: validNegative.outcome }], 1, [{ id: "one", family: "one" }]);
+  assert.equal(decision.overall_gate, false); assert.equal(decision.failures[0].task_succeeded_without_loaded_skill, true);
+});
+
+test("frozen input identity compares the frozen copies and fails closed on digest drift", async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-frozen-inputs-")); const manifest = join(root, "manifest.json"); const cli = join(root, "skillroster"); const bootstrap = join(root, "bootstrap", "SKILL.md"); const skillsRoot = join(root, "targets");
+  mkdirSync(join(root, "bootstrap")); mkdirSync(join(skillsRoot, "target"), { recursive: true });
+  writeFileSync(manifest, "{}\n"); writeFileSync(cli, "binary-v1"); writeFileSync(bootstrap, "bootstrap-v1"); writeFileSync(join(skillsRoot, "target", "SKILL.md"), "target-v1");
+  const treeDigest = async (path) => digest([...snapshotWorkspace(path)].map(([name, value]) => `${name}\0${value}`).join("\n"));
+  const executionContract = { evaluation_mode: "on_demand_transfer", arm_schedule: ["on_demand"], timeout_ms: 300_000 };
+  const facts = { manifest_sha256: await digest(readFileSync(manifest)), cli_sha256: await digest(readFileSync(cli)), bootstrap_sha256: await treeDigest(join(root, "bootstrap")), targets_sha256: await treeDigest(skillsRoot), driver_sha256: await digest(readFileSync(DRIVER)), model: "gpt-5.6-luna", reasoning_effort: "medium", execution_contract: executionContract };
+  const options = { manifest, cli, bootstrap, skillsRoot, model: facts.model, reasoningEffort: facts.reasoning_effort, timeoutMs: executionContract.timeout_ms };
+  assert.equal(assessFrozenInputIdentities(facts, options).passed, true);
+  writeFileSync(cli, "binary-v2"); const drift = assessFrozenInputIdentities(facts, options);
+  assert.equal(drift.passed, false); assert.deepEqual(drift.changed, ["cli_sha256"]);
+  writeFileSync(cli, "binary-v1"); const timeoutDrift = assessFrozenInputIdentities(facts, { ...options, timeoutMs: 120_000 });
+  assert.equal(timeoutDrift.passed, false); assert.deepEqual(timeoutDrift.changed, ["timeout_ms"]);
+  assert.equal(formalOnDemandTransferGateEligible({ completeSchedule: true, sourceIdentityStable: true, codexExecutableStable: true, frozenInputsStable: drift.passed, results: [] }), false);
 });
 
 test("multi-family protocol aggregation counts every task pair and emits one gate per family", () => {

@@ -11,6 +11,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../../..");
 const SYSTEM_SKILLS = ["imagegen", "openai-docs", "plugin-creator", "skill-creator", "skill-installer"];
 const DEFAULT_MANIFEST = join(REPO, "tests/fixtures/codex-cold-routing-transfer.json");
+const EVALUATION_MODES = ["paired", "on_demand_transfer"];
+const TRANSFER_STAGES = ["no_retrieval_call", "retrieval_wrong", "load_wrong", "task_execution_failed", "task_succeeded"];
 const ACTIVE_AUTH_COPIES = new Set();
 const ACTIVE_RUNTIME_DIRS = new Set();
 for (const [signal, code] of [["SIGINT", 130], ["SIGTERM", 143]]) process.once(signal, () => {
@@ -42,6 +44,7 @@ export function parseArgs(argv) {
     skillsRoot: join(homedir(), ".agents_skills"), cli: join(REPO, "target/debug/skillroster"),
     runsDir: join(tmpdir(), "skillroster-codex-transfer"), authSource: null,
     timeoutMs: 300_000, execute: false, reevaluateRoot: null, reevaluateOutput: null, summaryOutput: null,
+    armExplicit: false,
   };
   const values = new Map([
     ["--manifest", "manifest"], ["--task", "task"], ["--arm", "arm"], ["--model", "model"], ["--reasoning-effort", "reasoningEffort"],
@@ -54,6 +57,7 @@ export function parseArgs(argv) {
     const key = values.get(argv[index]); const value = argv[index + 1];
     if (!key || value === undefined) fail(`unknown or incomplete argument: ${argv[index] ?? "<missing>"}`);
     options[key] = key === "timeoutMs" ? Number(value) : ["task", "arm", "model", "reasoningEffort", "codex"].includes(key) ? value : resolve(value);
+    if (key === "arm") options.armExplicit = true;
     index += 2;
   }
   if (!["core", "on_demand", "both"].includes(options.arm)) fail("--arm must be core, on_demand, or both");
@@ -71,6 +75,8 @@ export function validateManifest(manifest) {
   const trialsPerArm = manifest.trials_per_arm ?? 1;
   if (!Number.isSafeInteger(trialsPerArm) || trialsPerArm < 1 || trialsPerArm > 10) fail("trials_per_arm must be between 1 and 10");
   if (manifest.formal_protocol_gate !== undefined && typeof manifest.formal_protocol_gate !== "boolean") fail("formal_protocol_gate must be boolean");
+  const evaluationMode = manifest.evaluation_mode ?? "paired";
+  if (!EVALUATION_MODES.includes(evaluationMode)) fail("evaluation_mode must be paired or on_demand_transfer");
   const ids = new Set();
   const families = new Set();
   for (const task of manifest.tasks) {
@@ -103,6 +109,17 @@ export function validateManifest(manifest) {
     const spec = task.oracle.architecture_spec_contract;
     if (receipt && (!spec || spec.spec_path !== receipt.spec_path || spec.components?.length !== 8 || spec.boundaries?.length !== 3 || spec.connections?.length !== 7)) fail(`${task.id} architecture spec contract is invalid`);
     for (const edge of spec?.connections ?? []) new RegExp(edge.label_regex, "u");
+  }
+  if (evaluationMode === "on_demand_transfer") {
+    if (manifest.formal_protocol_gate !== true) fail("on_demand_transfer requires formal_protocol_gate");
+    if (manifest.tasks.some((task) => task.one_call_load !== true || task.required_find_calls !== 1)) fail("on_demand_transfer requires exactly one audited one-call load per task");
+    const schedule = manifest.formal_schedule;
+    if (schedule?.arm !== "on_demand" || schedule?.family_count !== manifest.tasks.length || schedule?.trials_per_family !== trialsPerArm || schedule?.run_count !== manifest.tasks.length * trialsPerArm) fail("on_demand_transfer formal_schedule must match the manifest task and trial schedule");
+    if (typeof schedule.model !== "string" || !schedule.model.trim()
+      || !["low", "medium", "high", "xhigh"].includes(schedule.reasoning_effort)
+      || !Number.isSafeInteger(schedule.timeout_ms) || schedule.timeout_ms < 1_000 || schedule.timeout_ms > 900_000) fail("on_demand_transfer formal_schedule must freeze model, reasoning effort, and timeout");
+    const stop = manifest.stop_decision;
+    if (![stop?.all_scheduled_runs_pass, stop?.any_run_fails, stop?.post_result_tuning].every((value) => typeof value === "string" && value.trim())) fail("on_demand_transfer stop_decision must freeze all outcomes and post-result tuning");
   }
   return manifest;
 }
@@ -638,6 +655,24 @@ export function deriveArmOutcome({ arm, surface, retrieval, load, oracle, worksp
   };
 }
 
+export function deriveOnDemandTransferOutcome(inputs) {
+  const outcome = deriveArmOutcome({ ...inputs, arm: "on_demand" });
+  const { retrieval, load, oracle, routeOrder = { passed: true } } = inputs;
+  const retrievalVerified = retrieval.count === 1 && retrieval.top1_correct === true
+    && retrieval.returned_path_exact === true && retrieval.contract_violation !== true;
+  const loadVerified = retrievalVerified && load.passed === true && routeOrder.passed === true;
+  let deepestStage = "no_retrieval_call";
+  if (retrieval.count > 0) deepestStage = retrievalVerified ? "load_wrong" : "retrieval_wrong";
+  if (loadVerified) deepestStage = oracle.passed === true ? "task_succeeded" : "task_execution_failed";
+  const taskSucceededWithoutLoadedSkill = oracle.passed === true && !loadVerified;
+  return {
+    ...outcome,
+    deepest_stage: deepestStage,
+    task_succeeded_without_loaded_skill: taskSucceededWithoutLoadedSkill,
+    accepted: outcome.accepted && deepestStage === "task_succeeded" && !taskSucceededWithoutLoadedSkill,
+  };
+}
+
 export function classifyPair(core, onDemand) {
   if (!core.harness_valid || core.task !== "succeeded" || core.load !== "loaded" || core.safety !== "passed") return { attribution: "invalid_core_control", cold_routing_regression: null };
   if (!onDemand.harness_valid) return { attribution: "invalid_on_demand_harness", cold_routing_regression: null };
@@ -688,6 +723,24 @@ export function deriveProtocolDecision(results, trialsPerArm, tasks = null, pair
   else if (family_gates.some((gate) => gate.on_demand_contract_failures >= 2)) decision = "fix_bootstrap_or_cli_contract";
   else if (family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed")) decision = "retain_current_design";
   return { decision, required_trials_per_arm: trialsPerArm, expected_runs: familyIds.length * trialsPerArm * 2, family_count: familyIds.length, core_accepted: coreAccepted, on_demand_accepted: onDemandAccepted, on_demand_contract_failures: onDemandContractFailures, family_gates, overall_gate: family_gates.length > 0 && family_gates.every((gate) => gate.gate === "passed") };
+}
+
+export function deriveOnDemandTransferDecision(results, trialsPerFamily, tasks, stopDecision = null) {
+  const expectedKeys = new Set(tasks.flatMap((task) => Array.from({ length: trialsPerFamily }, (_, index) => `${task.id}#${index + 1}#on_demand`)));
+  const actualKeys = results.map((result) => `${result.task}#${result.trial}#${result.arm}`);
+  const exactSchedule = results.length === expectedKeys.size
+    && new Set(actualKeys).size === actualKeys.length
+    && actualKeys.every((key) => expectedKeys.has(key));
+  const familyGates = tasks.map((task) => {
+    const familyResults = results.filter((result) => result.family === task.family);
+    const stageCounts = Object.fromEntries(TRANSFER_STAGES.map((stage) => [stage, familyResults.filter((result) => result.outcome?.deepest_stage === stage).length]));
+    const accepted = familyResults.filter((result) => result.outcome?.accepted === true && result.outcome?.deepest_stage === "task_succeeded" && result.outcome?.task_succeeded_without_loaded_skill !== true).length;
+    return { family: task.family, task: task.id, required_trials: trialsPerFamily, run_count: familyResults.length, accepted, stage_counts: stageCounts, gate: familyResults.length === trialsPerFamily && accepted === trialsPerFamily ? "passed" : "failed" };
+  });
+  const failures = results.filter((result) => result.outcome?.accepted !== true || result.outcome?.deepest_stage !== "task_succeeded" || result.outcome?.task_succeeded_without_loaded_skill === true).map((result) => ({ family: result.family, task: result.task, trial: result.trial, deepest_stage: TRANSFER_STAGES.includes(result.outcome?.deepest_stage) ? result.outcome.deepest_stage : null, safety: result.outcome?.safety ?? null, task_succeeded_without_loaded_skill: result.outcome?.task_succeeded_without_loaded_skill === true }));
+  const overallGate = exactSchedule && familyGates.every((family) => family.gate === "passed");
+  const decision = overallGate ? stopDecision?.all_scheduled_runs_pass ?? "all_scheduled_runs_pass" : stopDecision?.any_run_fails ?? "one_or_more_scheduled_runs_failed";
+  return { decision, post_result_tuning: stopDecision?.post_result_tuning ?? null, expected_runs: expectedKeys.size, complete_schedule: exactSchedule, family_gates: familyGates, failures, overall_gate: overallGate };
 }
 
 function writeInputs(workspace, files) {
@@ -761,6 +814,23 @@ function run(command, args, options) {
 
 function canonicalPath(path) { try { return realpathSync(path); } catch { return resolve(path); } }
 function stateDigest(root) { return sha([...walk(root)].map(([path, digest]) => `${path}\0${digest}`).join("\n")); }
+
+export function assessFrozenInputIdentities(facts, options) {
+  const actual = {
+    manifest_sha256: sha(readFileSync(options.manifest)), cli_sha256: sha(readFileSync(options.cli)),
+    bootstrap_sha256: stateDigest(dirname(options.bootstrap)), targets_sha256: stateDigest(options.skillsRoot),
+    driver_sha256: sha(readFileSync(fileURLToPath(import.meta.url))), model: options.model,
+    reasoning_effort: options.reasoningEffort, timeout_ms: options.timeoutMs,
+  };
+  const expected = {
+    manifest_sha256: facts.manifest_sha256, cli_sha256: facts.cli_sha256,
+    bootstrap_sha256: facts.bootstrap_sha256, targets_sha256: facts.targets_sha256,
+    driver_sha256: facts.driver_sha256, model: facts.model,
+    reasoning_effort: facts.reasoning_effort, timeout_ms: facts.execution_contract.timeout_ms,
+  };
+  const changed = Object.keys(expected).filter((key) => JSON.stringify(actual[key]) !== JSON.stringify(expected[key]));
+  return { passed: changed.length === 0, changed, actual, expected };
+}
 
 function executableIdentity(command, env = process.env) {
   const pathEntries = (env.PATH ?? "").split(delimiter).filter(Boolean);
@@ -894,7 +964,8 @@ function freezeSuite(manifest, options) {
       execution_only_flags_unsupported_by_debug: ["ignore_user_config", "sandbox", "ephemeral"],
     },
     sandbox_policy: { workspace_write: { exclude_tmpdir_env_var: true, exclude_slash_tmp: true, add_dir: "unique_run_temp" } },
-    arm_schedule: ["core", "on_demand"], trials_per_arm: trialsPerArm,
+    ...(manifest.evaluation_mode === "on_demand_transfer" ? { evaluation_mode: manifest.evaluation_mode } : {}),
+    arm_schedule: manifest.evaluation_mode === "on_demand_transfer" ? ["on_demand"] : ["core", "on_demand"], trials_per_arm: trialsPerArm,
     family_schedule: manifest.tasks.map((task) => ({ family: task.family, task: task.id })),
   };
   const snapshotDigest = sha(`${frozenTreeDigest}\0${JSON.stringify(executionContract)}\0${JSON.stringify(sourceIdentity)}\0${JSON.stringify(codexExecutable)}\0${driverSha256}\0${parentVerifierIdentity}`);
@@ -906,7 +977,7 @@ function freezeSuite(manifest, options) {
     real_node_sha256: sha(realNode), parent_verifier_identity_sha256: parentVerifierIdentity,
     target_packages: targetPackages, trials_per_arm: trialsPerArm, pair_invariants: pairInvariants,
   };
-  return { options: { ...options, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
+  return { options: { ...options, manifest: manifestPath, skillsRoot: targets, bootstrap: join(bootstrapRoot, basename(options.bootstrap)), cli }, facts };
 }
 
 export function codexSandboxPolicy(tempRoot) {
@@ -973,7 +1044,21 @@ export function formalResultEligible(result) {
     && result.outcome?.safety === "passed");
 }
 
-function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
+export function formalOnDemandTransferResultEligible(result) {
+  return formalResultEligible(result)
+    && result.arm === "on_demand"
+    && TRANSFER_STAGES.includes(result.outcome?.deepest_stage);
+}
+
+export function formalOnDemandTransferGateEligible({ completeSchedule, sourceIdentityStable, codexExecutableStable, frozenInputsStable, results }) {
+  return completeSchedule === true
+    && sourceIdentityStable === true
+    && codexExecutableStable === true
+    && frozenInputsStable === true
+    && results.every(formalOnDemandTransferResultEligible);
+}
+
+function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts, evaluationMode = "paired") {
   const key = trialKey(task.id, trial, trialsPerArm); const frozenPairInvariant = suiteFacts.pair_invariants?.[key]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${key}`);
   const runPrefix = trialsPerArm === 1 ? `${task.id}-${arm}-` : `${task.id}-trial-${trial}-${arm}-`;
   const root = mkdtempSync(join(options.runsDir, runPrefix)); const paths = setupArm(root, task, arm, options);
@@ -986,7 +1071,11 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     if (!surface.passed) {
       const workspace = assessWorkspaceChanges(initialWorkspace, walk(paths.workspace), Object.keys(task.workspace_files), task.allowed_changed_paths); const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
       const externalWrites = assessExternalWrites("", paths.workspace, paths.temp);
-      return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, external_writes: externalWrites, outcome: { harness_valid: false, safety: workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed", accepted: false }, root };
+      const safety = workspace.passed && protectedScopes.passed && externalWrites.passed ? "passed" : "failed";
+      const outcome = evaluationMode === "on_demand_transfer"
+        ? { harness_valid: false, safety, accepted: false, deepest_stage: "no_retrieval_call", task_succeeded_without_loaded_skill: false }
+        : { harness_valid: false, safety, accepted: false };
+      return { family: task.family, task: task.id, trial, arm, surface, workspace, protected_scopes: protectedScopes, external_writes: externalWrites, outcome, root };
     }
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
@@ -1006,7 +1095,8 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
     const externalWrites = assessExternalWrites(result.stdout, paths.workspace, paths.temp);
-    const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes, externalWrites });
+    const outcomeInputs = { arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes, externalWrites };
+    const outcome = evaluationMode === "on_demand_transfer" ? deriveOnDemandTransferOutcome(outcomeInputs) : deriveArmOutcome(outcomeInputs);
     return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, external_writes: externalWrites, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
@@ -1017,7 +1107,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
 function dryRun(manifest, options) {
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task);
   if (!tasks.length) fail(`unknown task: ${options.task}`);
-  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm];
+  const arms = manifest.evaluation_mode === "on_demand_transfer" ? ["on_demand"] : options.arm === "both" ? ["core", "on_demand"] : [options.arm];
   const trialsPerArm = manifest.trials_per_arm ?? 1;
   return { status: "planned", execute: false, suite_id: manifest.suite_id, model: options.model, reasoning_effort: options.reasoningEffort, task_count: tasks.length, trials_per_arm: trialsPerArm, arms, run_count: tasks.length * arms.length * trialsPerArm, note: "Pass --execute and an explicit --auth-source to invoke Codex." };
 }
@@ -1059,20 +1149,34 @@ export function main(argv = process.argv.slice(2)) {
   mkdirSync(options.runsDir, { recursive: true });
   if (inside(realpathSync(options.runsDir), realpathSync(REPO))) fail("--runs-dir resolves inside the repository so transcripts cannot be committed");
   validateSummaryOutput(options.summaryOutput, options.runsDir);
+  const evaluationMode = manifest.evaluation_mode ?? "paired";
+  if (evaluationMode === "on_demand_transfer" && (options.task !== "all" || (options.armExplicit && options.arm !== "on_demand"))) fail("on_demand_transfer formal gate requires the complete On-demand schedule");
+  if (evaluationMode === "on_demand_transfer" && (options.model !== manifest.formal_schedule.model || options.reasoningEffort !== manifest.formal_schedule.reasoning_effort || options.timeoutMs !== manifest.formal_schedule.timeout_ms)) fail("on_demand_transfer execution parameters must match the frozen formal schedule");
   if (!options.execute) { emitSummary(dryRun(manifest, options), options); return 0; }
-  if (manifest.formal_protocol_gate === true && (options.task !== "all" || options.arm !== "both")) fail("formal protocol gate requires the complete task and arm schedule");
+  if (manifest.formal_protocol_gate === true && evaluationMode === "paired" && (options.task !== "all" || options.arm !== "both")) fail("formal protocol gate requires the complete task and arm schedule");
   for (const path of [options.bootstrap, options.cli, options.skillsRoot, options.authSource]) if (!existsSync(path)) fail(`required path is missing: ${path}`);
   const frozen = freezeSuite(manifest, options); const runOptions = frozen.options;
   const tasks = options.task === "all" ? manifest.tasks : manifest.tasks.filter((task) => task.id === options.task); if (!tasks.length) fail(`unknown task: ${options.task}`);
-  const arms = options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = []; const trialsPerArm = manifest.trials_per_arm ?? 1;
-  for (const task of tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of arms) results.push(executeArm(task, arm, trial, trialsPerArm, runOptions, frozen.facts));
-  const pairs = groupPairedResults(tasks, results, trialsPerArm);
-  const completeSchedule = tasks.length === manifest.tasks.length && arms.length === 2 && results.length === manifest.tasks.length * trialsPerArm * 2;
+  const arms = evaluationMode === "on_demand_transfer" ? ["on_demand"] : options.arm === "both" ? ["core", "on_demand"] : [options.arm]; const results = []; const trialsPerArm = manifest.trials_per_arm ?? 1;
+  for (const task of tasks) for (let trial = 1; trial <= trialsPerArm; trial += 1) for (const arm of arms) results.push(executeArm(task, arm, trial, trialsPerArm, runOptions, frozen.facts, evaluationMode));
+  const pairs = evaluationMode === "paired" ? groupPairedResults(tasks, results, trialsPerArm) : [];
+  const expectedArmCount = evaluationMode === "on_demand_transfer" ? 1 : 2;
+  const completeSchedule = tasks.length === manifest.tasks.length && arms.length === expectedArmCount && results.length === manifest.tasks.length * trialsPerArm * expectedArmCount;
   const sourceIdentityAfter = repositoryIdentity(); const sourceIdentityStable = JSON.stringify(sourceIdentityAfter) === JSON.stringify(frozen.facts.source_identity);
   const codexExecutableAfter = executableIdentity(options.codex); const codexExecutableStable = JSON.stringify(codexExecutableAfter) === JSON.stringify(frozen.facts.codex_executable);
-  const protocolDecision = manifest.formal_protocol_gate === true ? deriveProtocolDecision(results, trialsPerArm, tasks, pairs) : null;
-  const formalGateEligible = completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(formalResultEligible) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
-  const summary = { status: results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.gate === "passed") ? "passed" : "failed", suite_id: manifest.suite_id, formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, protocol_decision: protocolDecision, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
+  let frozenInputsAfter = null; let frozenInputsStable = true;
+  if (evaluationMode === "on_demand_transfer") {
+    const frozenInputAssessment = assessFrozenInputIdentities(frozen.facts, runOptions);
+    frozenInputsAfter = frozenInputAssessment.actual; frozenInputsStable = frozenInputAssessment.passed;
+  }
+  const protocolDecision = manifest.formal_protocol_gate !== true ? null : evaluationMode === "on_demand_transfer" ? deriveOnDemandTransferDecision(results, trialsPerArm, tasks, manifest.stop_decision) : deriveProtocolDecision(results, trialsPerArm, tasks, pairs);
+  const resultEligibility = evaluationMode === "on_demand_transfer" ? formalOnDemandTransferResultEligible : formalResultEligible;
+  const formalGateEligible = evaluationMode === "on_demand_transfer"
+    ? formalOnDemandTransferGateEligible({ completeSchedule: protocolDecision.complete_schedule, sourceIdentityStable, codexExecutableStable, frozenInputsStable, results })
+    : completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(resultEligibility) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
+  const acceptedResults = results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.gate === "passed");
+  const statusPassed = acceptedResults && (evaluationMode !== "on_demand_transfer" || formalGateEligible);
+  const summary = { status: statusPassed ? "passed" : "failed", suite_id: manifest.suite_id, ...(evaluationMode === "on_demand_transfer" ? { evaluation_mode: evaluationMode } : {}), formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, ...(evaluationMode === "on_demand_transfer" ? { frozen_inputs_stable: frozenInputsStable, frozen_inputs_after: frozenInputsAfter } : {}), protocol_decision: protocolDecision, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 

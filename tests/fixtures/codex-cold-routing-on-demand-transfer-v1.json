@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "harness": "codex-transfer",
+  "suite_id": "codex-on-demand-transfer-gate-v1",
+  "evaluation_mode": "on_demand_transfer",
+  "formal_protocol_gate": true,
+  "trials_per_arm": 3,
+  "formal_schedule": {
+    "arm": "on_demand",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "timeout_ms": 300000,
+    "family_count": 3,
+    "trials_per_family": 3,
+    "run_count": 9
+  },
+  "stop_decision": {
+    "all_scheduled_runs_pass": "retain_current_design_and_close_129",
+    "any_run_fails": "classify_exclusive_stage_then_open_one_narrow_defect_or_end_research",
+    "post_result_tuning": "forbidden"
+  },
+  "tasks": [
+    {
+      "id": "on-demand-json-001",
+      "family": "deterministic_json_artifact",
+      "expected_skill": "event-manifest",
+      "prompt": "请把 handoff.psv 转成团队标准的事件交接清单，保存到 outputs/events.json。严格使用本机已有的团队规范，不要自行发明格式。完成后只告诉我输出路径和校验是否通过。",
+      "hint": "normalize PSV incident handoff records into team event manifest JSON",
+      "required_find_calls": 1,
+      "one_call_load": true,
+      "workspace_files": {
+        "handoff.psv": "evt-03|2026-08-23T09:30:00Z|billing|open\nevt-01|2026-08-22T14:05:00Z|identity|closed\nevt-02|2026-08-23T01:15:00Z|search|open\n"
+      },
+      "allowed_changed_paths": [
+        "outputs/events.json"
+      ],
+      "oracle": {
+        "path": "outputs/events.json",
+        "json_equals": {
+          "schema_version": 1,
+          "records": [
+            {
+              "id": "evt-01",
+              "occurred_at": "2026-08-22T14:05:00Z",
+              "owner": "identity",
+              "state": "closed"
+            },
+            {
+              "id": "evt-02",
+              "occurred_at": "2026-08-23T01:15:00Z",
+              "owner": "search",
+              "state": "open"
+            },
+            {
+              "id": "evt-03",
+              "occurred_at": "2026-08-23T09:30:00Z",
+              "owner": "billing",
+              "state": "open"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "on-demand-extraction-001",
+      "family": "reference_backed_structured_extraction",
+      "expected_skill": "domain-extractor",
+      "prompt": "请阅读 notes.txt，按随附的领域格式抽取其中明确出现的术语、定义和关系，保存为 outputs/glossary.json。只使用原文事实，保持首次出现顺序，输出严格 JSON，不要解释或额外字段。",
+      "hint": "extract exact domain terms and explicit relationships into JSON",
+      "required_find_calls": 1,
+      "one_call_load": true,
+      "workspace_files": {
+        "notes.txt": "Order Service 负责创建订单。Publish Queue 接收 Order Service 发布的异步事件。Order Service 发布事件到 Publish Queue。\n"
+      },
+      "allowed_changed_paths": [
+        "outputs/glossary.json"
+      ],
+      "oracle": {
+        "path": "outputs/glossary.json",
+        "json_equals": {
+          "terms": [
+            {
+              "id": "order-service",
+              "label": "Order Service",
+              "definition": "负责创建订单。",
+              "relations": [
+                {
+                  "type": "publishes-event",
+                  "target": "publish-queue"
+                }
+              ]
+            },
+            {
+              "id": "publish-queue",
+              "label": "Publish Queue",
+              "definition": "接收 Order Service 发布的异步事件。",
+              "relations": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "on-demand-multi-file-001",
+      "family": "script_backed_multi_file_artifact",
+      "expected_skill": "artifact-builder",
+      "prompt": "请根据 input.json 生成一个多文件交付物，保存到 outputs/。使用随附的程序完成转换，不要手写派生内容；完成后检查 report.json 和 README.md 都存在且内容一致，只告诉我这两个文件的路径。",
+      "hint": "build deterministic multi-file report from structured input",
+      "required_find_calls": 1,
+      "one_call_load": true,
+      "workspace_files": {
+        "input.json": "{\n  \"title\": \"Release checklist\",\n  \"items\": [\n    {\"name\": \"offline drafts\", \"status\": \"ready\"},\n    {\"name\": \"batch export\", \"status\": \"review\"}\n  ]\n}\n"
+      },
+      "allowed_changed_paths": [
+        "outputs/report.json",
+        "outputs/README.md"
+      ],
+      "oracle": {
+        "path": "outputs/report.json",
+        "json_equals": {
+          "title": "Release checklist",
+          "item_count": 2,
+          "items": [
+            {
+              "position": 1,
+              "name": "offline drafts",
+              "status": "ready"
+            },
+            {
+              "position": 2,
+              "name": "batch export",
+              "status": "review"
+            }
+          ]
+        },
+        "required_files": [
+          {
+            "path": "outputs/README.md",
+            "required_substrings": [
+              "# Release checklist",
+              "Items: 2",
+              "1. offline drafts — ready",
+              "2. batch export — review"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
