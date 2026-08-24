@@ -390,6 +390,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 &args.hints,
                 usize::from(args.limit),
                 args.load,
+                args.variant_skill_id.as_deref(),
             )?;
             ("find", result, vec![], actions)
         }
@@ -825,6 +826,16 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
         let (next_action, retry_mode) = match blocker.reason {
             "same_name_variants_ambiguous" => {
                 ("inspect_variant_finding", "read_only_command_available")
+            }
+            "variant_selector_requires_load" => (
+                "add_load_or_remove_variant_selector",
+                "agent_correction_required",
+            ),
+            "variant_selector_requires_ambiguous_top_match" => {
+                ("remove_variant_selector", "agent_correction_required")
+            }
+            "variant_not_in_top_match" => {
+                ("choose_exposed_top_match_variant", "agent_choice_required")
             }
             "no_routable_match" => (
                 "inspect_current_report_or_refine_task",
@@ -4246,7 +4257,21 @@ fn find_command(
     hints: &[String],
     limit: usize,
     load: bool,
+    variant_skill_id: Option<&str>,
 ) -> Result<(Value, Vec<SuggestedAction>)> {
+    if variant_skill_id.is_some() && !load {
+        return Err(SkillLoadBlocked {
+            reason: "variant_selector_requires_load",
+            skill_id: variant_skill_id.unwrap_or_default().to_owned(),
+            skill_name: "Top-1".into(),
+            path: None,
+            roster_state: "unknown".into(),
+            mutation_scopes: Vec::new(),
+            expected_digest: None,
+            actual_digest: None,
+        }
+        .into());
+    }
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
@@ -4350,7 +4375,7 @@ fn find_command(
             });
         }
     }
-    let (actions, variant_rescan_required) = bind_variant_findings(
+    let (mut actions, variant_rescan_required) = bind_variant_findings(
         store,
         state_dir,
         &scan_id,
@@ -4394,12 +4419,20 @@ fn find_command(
         .into());
     }
     let loaded_skill = if load && !matches.is_empty() {
-        Some(verified_top_skill_load(
-            &scan_id,
-            &scan,
-            state_dir,
-            &matches[0],
-        )?)
+        let ranked = &matches[0];
+        let selected = select_explicit_variant(ranked, variant_skill_id)?;
+        let mut loaded = verified_top_skill_load(&scan_id, &scan, state_dir, &selected)?;
+        if let Some(skill_id) = variant_skill_id {
+            loaded["selection"]["ranking_evidence_scope"] = json!("ranked_capability_group");
+            loaded["selection"]["variant_selection"] = json!({
+                "mode": "explicit_skill_id",
+                "requested_skill_id": skill_id,
+                "ranked_capability_name": ranked.name,
+                "ranked_group_representative_skill_id": ranked.skill_id,
+                "ranked_variant_count": ranked.variant_count,
+            });
+        }
+        Some(loaded)
     } else {
         None
     };
@@ -4434,6 +4467,20 @@ fn find_command(
             ),
         });
     }
+    if !load {
+        if let Some(found) = matches.first().filter(|found| {
+            found.variant_count > 1
+                && !matches!(
+                    found
+                        .variant_finding
+                        .as_ref()
+                        .map(|reference| reference.state),
+                    Some(crate::query::VariantFindingState::RescanRequired)
+                )
+        }) {
+            actions.extend(explicit_variant_load_actions(task, &retrieval_hints, found));
+        }
+    }
     let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
     if cjk_hint_required {
         warnings.push(
@@ -4463,6 +4510,84 @@ fn find_command(
         result["loaded_skill"] = loaded_skill;
     }
     Ok((result, actions))
+}
+
+fn select_explicit_variant(
+    ranked: &crate::query::FindMatch,
+    requested_skill_id: Option<&str>,
+) -> Result<crate::query::FindMatch> {
+    let Some(requested_skill_id) = requested_skill_id else {
+        return Ok(ranked.clone());
+    };
+    let blocked = |reason| SkillLoadBlocked {
+        reason,
+        skill_id: requested_skill_id.to_owned(),
+        skill_name: ranked.name.clone(),
+        path: None,
+        roster_state: "unknown".into(),
+        mutation_scopes: Vec::new(),
+        expected_digest: None,
+        actual_digest: None,
+    };
+    if ranked.variant_count <= 1 {
+        return Err(blocked("variant_selector_requires_ambiguous_top_match").into());
+    }
+    let Some(variant) = ranked
+        .variants
+        .iter()
+        .find(|variant| variant.skill_id == requested_skill_id)
+    else {
+        return Err(blocked("variant_not_in_top_match").into());
+    };
+    let mut selected = ranked.clone();
+    selected.skill_id = variant.skill_id.clone();
+    selected.paths = variant.paths.clone();
+    selected.agents = variant.agents.clone();
+    selected.roster_state = variant.roster_state.clone();
+    selected.source = variant.source.clone();
+    selected.providers = variant.providers.clone();
+    selected.governable = variant.governable;
+    selected.owned_by_agent = variant.owned_by_agent;
+    selected.mutation_scopes = variant.mutation_scopes.clone();
+    selected.variant_skill_ids.clear();
+    selected.variants.clear();
+    selected.variant_count = 1;
+    selected.variants_truncated = false;
+    selected.variant_finding = None;
+    Ok(selected)
+}
+
+fn explicit_variant_load_actions(
+    task: &str,
+    hints: &[String],
+    ranked: &crate::query::FindMatch,
+) -> Vec<SuggestedAction> {
+    ranked
+        .variants
+        .iter()
+        .map(|variant| {
+            let mut argv = vec!["skillroster".to_owned(), "find".to_owned(), task.to_owned()];
+            for hint in hints {
+                argv.extend(["--hint".to_owned(), hint.clone()]);
+            }
+            argv.extend([
+                "--load".to_owned(),
+                "--limit".to_owned(),
+                "1".to_owned(),
+                "--variant-skill-id".to_owned(),
+                variant.skill_id.clone(),
+                "--json".to_owned(),
+            ]);
+            SuggestedAction {
+                action: "load_exact_variant_for_comparison".into(),
+                description: "load_exact_variant_for_comparison".into(),
+                argv,
+                mutates: false,
+                requires_confirmation: false,
+                reason_code: "same_name_variant_explicit_read_available".into(),
+            }
+        })
+        .collect()
 }
 
 fn bind_variant_findings(
@@ -4967,6 +5092,7 @@ fn verified_top_skill_load(
             "name": matched.name,
             "snapshot_id": scan_id,
             "ranking_evidence": matched.match_reasons,
+            "ranking_evidence_scope": "loaded_identity",
         },
         "content": {
             "path": placement.entrypoint,

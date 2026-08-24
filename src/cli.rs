@@ -206,6 +206,10 @@ pub struct FindArgs {
     /// Return the complete, verified SKILL.md for the unambiguous Top-1 match.
     #[arg(long)]
     pub load: bool,
+
+    /// Load one exact identity from an ambiguous Top-1 same-name group.
+    #[arg(long, value_name = "SKILL_ID")]
+    pub variant_skill_id: Option<String>,
 }
 
 pub const MAX_FIND_RESULTS: u16 = 100;

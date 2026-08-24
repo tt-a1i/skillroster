@@ -1386,6 +1386,17 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         )
         .unwrap();
     }
+    for index in 0..2 {
+        let skill = root.join(format!("primary-{index:02}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: primary-clean\ndescription: Primary clean exact route\n---\nprimary {index}\n"
+            ),
+        )
+        .unwrap();
+    }
     let common = [
         "--home",
         home.to_str().unwrap(),
@@ -1400,7 +1411,12 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|finding| finding["kind"] == "same_name_divergent_content")
+        .find(|finding| {
+            finding["kind"] == "same_name_divergent_content"
+                && finding["summary"]
+                    .as_str()
+                    .is_some_and(|summary| summary.contains("shared-many"))
+        })
         .unwrap();
     let found = json_output(&run(
         &[&common[..], &["find", "many variant route"]].concat(),
@@ -1472,6 +1488,39 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
         "rescan_required"
     );
     assert!(drifted["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
+    assert!(
+        drifted["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "load_exact_variant_for_comparison")
+    );
+
+    let clean_top = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "primary clean exact route many variant",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(clean_top["result"]["matches"][0]["name"], "primary-clean");
+    assert_eq!(clean_top["result"]["matches"][0]["variant_count"], 2);
+    assert_eq!(clean_top["result"]["rescan_required"], true);
+    assert_eq!(
+        clean_top["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -6555,6 +6604,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         .find(|placement| placement["agent"] == "codex")
         .and_then(|placement| placement["skill_id"].as_str())
         .unwrap();
+    let codex_skill_id = codex_skill_id.to_owned();
     let evidence_id: String = database
         .query_row(
             "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
@@ -6593,6 +6643,34 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     assert!(after["result"]["matches"][0]["variants"].is_null());
     assert!(after["result"]["matches"][0]["variant_finding"].is_null());
 
+    let archived_variant = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "active search marker",
+                "--load",
+                "--limit",
+                "1",
+                "--variant-skill-id",
+                &codex_skill_id,
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!archived_variant.status.success());
+    let archived_variant: Value = serde_json::from_slice(&archived_variant.stdout).unwrap();
+    assert_eq!(
+        archived_variant["error"]["details"]["reason"],
+        "variant_selector_requires_ambiguous_top_match"
+    );
+    assert!(
+        archived_variant["error"]["details"]
+            .get("content")
+            .is_none()
+    );
+
     json_output(&run(
         &[
             &common[..],
@@ -6601,6 +6679,302 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         .concat(),
         None,
     ));
+}
+
+#[test]
+fn find_loads_only_an_exposed_exact_variant_from_the_ambiguous_top_match() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex = home.join(".codex/skills/shared-route");
+    let claude = home.join(".claude/skills/shared-route");
+    let unique = home.join(".codex/skills/unique-route");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    fs::create_dir_all(&unique).unwrap();
+    let codex_content = "---\nname: shared-route\ndescription: compare exact variants\n---\ncodex-entrypoint-marker\n";
+    let claude_content = "---\nname: shared-route\ndescription: compare exact variants\n---\nclaude-entrypoint-marker\n";
+    fs::write(codex.join("SKILL.md"), codex_content).unwrap();
+    fs::write(claude.join("SKILL.md"), claude_content).unwrap();
+    fs::write(
+        unique.join("SKILL.md"),
+        "---\nname: unique-route\ndescription: unique selector guard\n---\nunique-marker\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "compare exact variants",
+                "--hint",
+                "inspect alternative instructions",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let ranked = &found["result"]["matches"][0];
+    assert_eq!(ranked["variant_count"], 2);
+    let variants = ranked["variants"].as_array().unwrap();
+    let actions = found["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), variants.len());
+    for action in &actions {
+        assert_eq!(action["mutates"], false);
+        assert_eq!(action["requires_confirmation"], false);
+        let argv = action["argv"].as_array().unwrap();
+        assert!(
+            argv.windows(2).any(|pair| {
+                pair == [json!("--hint"), json!("inspect alternative instructions")]
+            })
+        );
+        assert!(argv.windows(2).any(|pair| {
+            pair[0] == json!("--variant-skill-id")
+                && variants
+                    .iter()
+                    .any(|variant| pair[1] == variant["skill_id"])
+        }));
+    }
+
+    for variant in variants {
+        let skill_id = variant["skill_id"].as_str().unwrap();
+        let loaded = json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "find",
+                    "compare exact variants",
+                    "--hint",
+                    "inspect alternative instructions",
+                    "--load",
+                    "--limit",
+                    "1",
+                    "--variant-skill-id",
+                    skill_id,
+                ],
+            ]
+            .concat(),
+            None,
+        ));
+        let exact = &loaded["result"]["loaded_skill"];
+        assert_eq!(exact["selection"]["skill_id"], skill_id);
+        assert_eq!(
+            exact["selection"]["variant_selection"]["requested_skill_id"],
+            skill_id
+        );
+        assert_eq!(
+            exact["selection"]["variant_selection"]["ranked_variant_count"],
+            2
+        );
+        assert_eq!(
+            exact["selection"]["ranking_evidence_scope"],
+            "ranked_capability_group"
+        );
+        let expected = if variant["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("codex"))
+        {
+            codex_content
+        } else {
+            claude_content
+        };
+        assert_eq!(exact["content"]["text"], expected);
+        assert!(
+            variant["paths"]
+                .as_array()
+                .unwrap()
+                .contains(&exact["content"]["path"])
+        );
+        assert_eq!(exact["content"]["complete"], true);
+        assert_eq!(exact["governance"]["content_endorsed"], false);
+        assert_eq!(exact["task_success"], "not_evaluated");
+        assert_eq!(loaded["result"]["files_changed"], false);
+    }
+
+    let unknown = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "compare exact variants",
+                "--load",
+                "--limit",
+                "1",
+                "--variant-skill-id",
+                "skill_not_exposed",
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!unknown.status.success());
+    let unknown: Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(
+        unknown["error"]["details"]["reason"],
+        "variant_not_in_top_match"
+    );
+    assert_eq!(
+        unknown["error"]["details"]["retry_mode"],
+        "agent_choice_required"
+    );
+    assert!(unknown["error"]["details"].get("content").is_none());
+
+    let missing_load = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "compare exact variants",
+                "--variant-skill-id",
+                variants[0]["skill_id"].as_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!missing_load.status.success());
+    let missing_load: Value = serde_json::from_slice(&missing_load.stdout).unwrap();
+    assert_eq!(
+        missing_load["error"]["details"]["reason"],
+        "variant_selector_requires_load"
+    );
+    assert_eq!(
+        missing_load["error"]["details"]["retry_mode"],
+        "agent_correction_required"
+    );
+
+    let unambiguous = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "unique selector guard",
+                "--load",
+                "--limit",
+                "1",
+                "--variant-skill-id",
+                variants[0]["skill_id"].as_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!unambiguous.status.success());
+    let unambiguous: Value = serde_json::from_slice(&unambiguous.stdout).unwrap();
+    assert_eq!(
+        unambiguous["error"]["details"]["reason"],
+        "variant_selector_requires_ambiguous_top_match"
+    );
+
+    let claude_id = variants
+        .iter()
+        .find(|variant| {
+            variant["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("claude-code"))
+        })
+        .and_then(|variant| variant["skill_id"].as_str())
+        .unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    let claude_placement = payload["placements"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|placement| placement["skill_id"] == claude_id)
+        .unwrap();
+    claude_placement["mutation_scope"] = json!("untrusted_external");
+    claude_placement["governable"] = json!(false);
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            (payload.to_string(), snapshot),
+        )
+        .unwrap();
+    let untrusted = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "compare exact variants",
+                "--load",
+                "--limit",
+                "1",
+                "--variant-skill-id",
+                claude_id,
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!untrusted.status.success());
+    let untrusted: Value = serde_json::from_slice(&untrusted.stdout).unwrap();
+    assert_eq!(
+        untrusted["error"]["details"]["reason"],
+        "untrusted_external_source"
+    );
+    assert!(untrusted["error"]["details"].get("content").is_none());
+
+    fs::write(codex.join("SKILL.md"), "changed after scan\n").unwrap();
+    let codex_id = variants
+        .iter()
+        .find(|variant| {
+            variant["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("codex"))
+        })
+        .and_then(|variant| variant["skill_id"].as_str())
+        .unwrap();
+    let drifted = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "compare exact variants",
+                "--load",
+                "--limit",
+                "1",
+                "--variant-skill-id",
+                codex_id,
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!drifted.status.success());
+    let drifted: Value = serde_json::from_slice(&drifted.stdout).unwrap();
+    assert_eq!(
+        drifted["error"]["details"]["reason"],
+        "entrypoint_content_drift"
+    );
+    assert!(drifted["error"]["details"].get("content").is_none());
 }
 
 #[test]
@@ -6740,6 +7114,10 @@ fn find_load_returns_the_complete_verified_top_match_in_one_envelope() {
     let loaded = &found["result"]["loaded_skill"];
     assert_eq!(found["result"]["matches"][0]["name"], "event-manifest");
     assert_eq!(loaded["selection"]["rank"], 1);
+    assert_eq!(
+        loaded["selection"]["ranking_evidence_scope"],
+        "loaded_identity"
+    );
     assert_eq!(loaded["content"]["text"], content);
     assert_eq!(loaded["content"]["byte_length"], content.len());
     assert_eq!(
