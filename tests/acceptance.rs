@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::Value;
 use skillroster::harness::{AgentKind, known_agent_roots};
@@ -497,6 +498,51 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
     copy_tree(&Path::new(FIXTURES).join("agents/home"), &home);
 
     cli_json(&home, &state, &["scan"], None);
+    let expected_agents = BTreeSet::from([
+        "codex",
+        "claude-code",
+        "pi",
+        "opencode",
+        "hermes",
+        "cursor",
+        "gemini-cli",
+        "github-copilot",
+    ]);
+    let connection = Connection::open(state.join("skillroster.db")).unwrap();
+    let persisted_agents = {
+        let mut statement = connection
+            .prepare(
+                "SELECT json_extract(details_json, '$.agent') FROM evidence WHERE kind = 'coverage'",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(persisted_agents.len(), 8);
+    assert_eq!(
+        persisted_agents
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        expected_agents
+    );
+    for (canonical, legacy) in [
+        ("claude-code", "claude_code"),
+        ("opencode", "open_code"),
+        ("gemini-cli", "gemini_cli"),
+        ("github-copilot", "git_hub_copilot"),
+    ] {
+        connection
+            .execute(
+                "UPDATE evidence SET details_json = replace(details_json, ?1, ?2) WHERE kind = 'coverage'",
+                [format!("\"{canonical}\""), format!("\"{legacy}\"")],
+            )
+            .unwrap();
+    }
+    drop(connection);
     let report = cli_json(
         &home,
         &state,
@@ -529,6 +575,18 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         })
         .expect("compact Claude Code Loaded evidence");
     assert_eq!(compact_claude["facts"]["skill_name"], "claude-code-fixture");
+    let compact_coverage_agents = compact["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "coverage")
+        .map(|item| item["facts"]["agent"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(compact_coverage_agents.len(), 8);
+    assert_eq!(
+        compact_coverage_agents.into_iter().collect::<BTreeSet<_>>(),
+        expected_agents
+    );
     let overview = &compact["result"]["usage_overview"];
     assert!(
         compact["suggested_actions"]
@@ -583,6 +641,16 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
         .expect("full Claude Code Loaded evidence");
     assert_eq!(full_claude["details"]["skill_name"], "claude-code-fixture");
     let full_evidence = full["result"]["evidence"].as_array().unwrap();
+    let full_coverage_agents = full_evidence
+        .iter()
+        .filter(|evidence| evidence["kind"] == "coverage")
+        .map(|evidence| evidence["details"]["agent"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(full_coverage_agents.len(), 8);
+    assert_eq!(
+        full_coverage_agents.into_iter().collect::<BTreeSet<_>>(),
+        expected_agents
+    );
     let first_observed_activity = full_evidence
         .iter()
         .position(|evidence| {
@@ -610,6 +678,34 @@ fn usage_finding_names_skills_and_uses_public_agent_ids() {
     assert_eq!(
         compact["result"]["usage_overview"],
         full["result"]["usage_overview"]
+    );
+
+    let export_path = temp.path().join("lifecycle-export.json");
+    cli_json(
+        &home,
+        &state,
+        &[
+            "lifecycle",
+            "export",
+            "--output",
+            export_path.to_str().unwrap(),
+        ],
+        None,
+    );
+    let export: Value = serde_json::from_slice(&fs::read(export_path).unwrap()).unwrap();
+    let exported_coverage_agents = export["data"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|evidence| evidence["kind"] == "coverage")
+        .map(|evidence| evidence["details"]["agent"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(exported_coverage_agents.len(), 8);
+    assert_eq!(
+        exported_coverage_agents
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        expected_agents
     );
 }
 
