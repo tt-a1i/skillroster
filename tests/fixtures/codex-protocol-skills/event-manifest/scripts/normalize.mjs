@@ -19,4 +19,3 @@ const records = readFileSync(resolve(input), "utf8").trim().split("\n").map((lin
 
 mkdirSync(dirname(resolve(output)), { recursive: true });
 writeFileSync(resolve(output), `${JSON.stringify({ schema_version: 1, records }, null, 2)}\n`);
-
