@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "suite_id": "real-agent-dogfood-issue-163",
+  "issue": 163,
+  "status": "completed_read_only",
+  "source": {
+    "commit": "209e24ab79a3603a17a9a6a8847053b1f416366f",
+    "binary_version": "skillroster 1.8.24",
+    "binary_sha256": "7ba1fe4c54420062ee54e8b0143fc742fcb2a575a5f0ccd7ca5ddcfdca7d4d57"
+  },
+  "execution": {
+    "model": "codex-caller",
+    "network": "not_used_by_cli",
+    "commands": 14,
+    "retries": 0,
+    "expected_typed_blockers": 1,
+    "raw_command_ledger_sha256": "17332a25b4026f3aa9f1213ffddd151027f0677fb85a0c836da4ac0b37d3ddcd",
+    "raw_evidence": "external_isolated_directory_not_committed"
+  },
+  "scope": {
+    "supported_agents": 8,
+    "included_skill_roots": 21,
+    "session_roots_used_for_usage": 5,
+    "session_roots_excluded_from_fingerprint": true,
+    "explicit_config_paths_fingerprinted": true,
+    "state_dir_isolated": true,
+    "real_agent_or_skill_writes_allowed": false
+  },
+  "zero_change_proof": {
+    "scope_manifest_before_sha256": "c3dfce55b0cd9eb46aa1eba3f7ae927285cdf4ffb49dede732b342afe5e06b21",
+    "scope_manifest_after_sha256": "c3dfce55b0cd9eb46aa1eba3f7ae927285cdf4ffb49dede732b342afe5e06b21",
+    "scope_manifest_equal": true,
+    "scope_manifest_lines_before": 3973,
+    "scope_manifest_lines_after": 3973,
+    "scan_files_changed": false,
+    "final_status_files_changed": false,
+    "final_recovery_state": "clear",
+    "final_pending_plan_count": 0
+  },
+  "scan": {
+    "run_id": "run_000000000000b08618cebea45fbacbe1",
+    "snapshot_id": "scan_000000000000b08618cebea1b8782be8",
+    "skill_count": 251,
+    "placement_count": 887,
+    "default_exposure": 521,
+    "files_changed": false,
+    "coverage": {
+      "skill_roots_present_agents": 5,
+      "skill_roots_missing_agents": 3,
+      "usage_observed_agents": 3,
+      "usage_complete_agents": 0,
+      "usage_limited_agents": 5,
+      "usage_missing_agents": 3
+    }
+  },
+  "intents": [
+    {
+      "id": "inventory_observed_usage",
+      "operations": ["report", "report_usage", "find"],
+      "result": "facts_returned",
+      "trace": {
+        "report_id": "report_000000000000d2eb18cebeb87d0f0d80",
+        "usage_finding_id": "finding_000000000000d2eb18cebeb87d3896ff",
+        "usage_evidence_id": "evidence_83a4c85d440a2cafe66448120f3ec309101d2675a57f287a5ed2ac90f418127e"
+      },
+      "interpretation": "Loaded=39 is observed evidence; incomplete coverage means absence is unknown, not never-used."
+    },
+    {
+      "id": "duplicate_exposure_source_layout",
+      "operations": ["report", "report_overlap", "report_exposure", "report_layout", "find"],
+      "result": "facts_returned",
+      "trace": {
+        "escaping_link_finding_id": "finding_000000000000d2eb18cebeb87d0f1551",
+        "escaping_link_evidence_id": "evidence_143918fbe2a844827017a66fd1999fc59dbd7ce7615b313bbb156e16bf15c913",
+        "large_roster_finding_id": "finding_000000000000d2eb18cebeb87d137282",
+        "large_roster_evidence_id": "evidence_36d1ffb5f5112d167e3db074e3964584341be1404a8543e127bac3f5bcce20cf",
+        "duplicate_finding_id": "finding_000000000000d2eb18cebeb87d17375b",
+        "duplicate_evidence_id": "evidence_951e897f22778467813d49eb5cfd01b55003961cc9ecfc3081ec02231f93fb5f"
+      },
+      "interpretation": "Duplicate, exposure, and path facts are distinct; no automatic mutation is implied."
+    },
+    {
+      "id": "roster_governance_summary",
+      "operations": ["find", "report_finding", "plan_stdin_read_only_surface"],
+      "result": "summary_returned_but_plan_blocked",
+      "trace": {
+        "roster_finding_id": "finding_000000000000d2eb18cebeb87d137282",
+        "variant_finding_ids": [
+          "finding_000000000000d2eb18cebeb87d17faa2",
+          "finding_000000000000d2eb18cebeb87d1de673"
+        ],
+        "blocked_skill_ids": [
+          "skill_2c6fe4bed6fb02c0c78c917af720327c53ae46a03a5c9941f1c0b36f1cf4f58d",
+          "skill_5dc20339363defdb0a534aa5c5e327569ecefe05b1d9ac69ff84067b4643f",
+          "skill_641ea724b4a47d839a27556c81bbcc13afebcbb2762bed5a9b128b682c3c545a"
+        ],
+        "plan_error_code": "roster_package_fingerprint_variants"
+      },
+      "interpretation": "Core/On-demand summary is review-required; Explicit-only/Archived is not inferred from missing usage."
+    }
+  ],
+  "observed_findings": [
+    {
+      "id": "finding_000000000000d2eb18cebeb87d0f1551",
+      "category": "layout",
+      "severity": "high",
+      "title": "Skill links escape an approved root",
+      "affected_placements": 16,
+      "evidence_quality": "observed"
+    },
+    {
+      "id": "finding_000000000000d2eb18cebeb87d137282",
+      "category": "exposure",
+      "severity": "medium",
+      "title": "Large default Rosters need review",
+      "affected_skills": 146,
+      "affected_placements": 479,
+      "agent_exposure": {"codex": 135, "claude_code": 90, "pi": 125, "hermes": 129},
+      "evidence_quality": "observed"
+    },
+    {
+      "id": "finding_000000000000d2eb18cebeb87d17375b",
+      "category": "overlap",
+      "severity": "medium",
+      "title": "Exact duplicate Skill placements",
+      "subject": "redacted_duplicate_skill",
+      "affected_placements": 9,
+      "physical_sources": 3,
+      "evidence_quality": "observed"
+    },
+    {
+      "id": "finding_000000000000d2eb18cebeb87d3896ff",
+      "category": "usage",
+      "severity": "info",
+      "title": "Five-stage usage evidence",
+      "exposed": 521,
+      "loaded": 39,
+      "applied": 0,
+      "outcome": 0,
+      "evidence_quality": "unknown",
+      "denominator_reliable": false
+    }
+  ],
+  "governance_summary": {
+    "default_core_budget": 50,
+    "automatic_change_supported": false,
+    "governance_authorized": false,
+    "explicit_only_or_archive_decision_implied": false,
+    "proposed": {
+      "codex": {"before": 135, "core": 50, "on_demand": 78, "fallback_core": 38, "blocked": 7},
+      "claude_code": {"before": 90, "core": 50, "on_demand": 34, "fallback_core": 43, "blocked": 6},
+      "pi": {"before": 125, "core": 50, "on_demand": 68, "fallback_core": 38, "blocked": 7},
+      "hermes": {"before": 129, "core": 50, "on_demand": 72, "fallback_core": 38, "blocked": 7}
+    },
+    "warning": "Fallback and cross-Agent candidates require review; they are not semantic recommendations or usage proof."
+  },
+  "plan_attempt": {
+    "exit_code": 1,
+    "error_code": "roster_package_fingerprint_variants",
+    "files_changed": false,
+    "plan_persisted": false,
+    "reason": "multiple_package_fingerprints_require_explicit_preservation",
+    "next_action": "review_each_package_before_roster_mutation"
+  },
+  "privacy": {
+    "raw_session_text_committed": false,
+    "raw_prompts_committed": false,
+    "absolute_local_paths_committed": false,
+    "credentials_committed": false,
+    "external_raw_evidence_retained": true
+  },
+  "decision": {
+    "product_boundary_sufficient_for_this_dogfood": true,
+    "narrow_seam": "Usage and roster facts are usable, but first-view presentation should make incomplete coverage, fallback dominance, and variant blockers prominent.",
+    "no_new_subsystem": true,
+    "no_core_vs_on_demand_claim": true
+  }
+}
