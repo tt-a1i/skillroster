@@ -4976,8 +4976,12 @@ fn matching_escaping_link_finding_id(
     report: &ReportRecord,
     untrusted_variant_ids: &BTreeSet<String>,
 ) -> Result<Option<String>> {
-    let matches = matching_escaping_link_finding_ids(store, report, untrusted_variant_ids)?;
-    Ok((matches.len() == 1).then(|| matches[0].clone()))
+    matching_report_finding_id(
+        store,
+        report,
+        crate::source_policy::ESCAPING_LINK_FINDING_KIND,
+        |affected| untrusted_variant_ids.is_subset(affected),
+    )
 }
 
 fn matching_escaping_link_finding_ids(
