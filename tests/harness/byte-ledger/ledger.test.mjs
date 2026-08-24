@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -38,7 +38,7 @@ test("external symlink targets are explicitly out of scope even when unreadable"
 });
 
 test("unsafe scopes fail closed", () => {
-  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); assert.throws(() => validateScope({ ...common, approvedRoots: [] }), (error) => error instanceof LedgerError && error.code === "empty_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: ["/"] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root, root] }), (error) => error instanceof LedgerError && error.code === "conflicting_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], repositoryDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], homeDir: join(root, "subhome") }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: join(dirname(root), "evidence"), homeDir: dirname(root) }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true });
+  const root = tempRoot(); const common = scope(root); mkdirSync(join(root, "subhome")); const filesystemRoot = process.platform === "win32" ? parse(root).root : "/"; assert.throws(() => validateScope({ ...common, approvedRoots: [] }), (error) => error instanceof LedgerError && error.code === "empty_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [filesystemRoot] }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root, root] }), (error) => error instanceof LedgerError && error.code === "conflicting_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], repositoryDir: root }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], homeDir: join(root, "subhome") }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); assert.throws(() => validateScope({ ...common, approvedRoots: [root], evidenceDir: join(dirname(root), "evidence"), homeDir: dirname(root) }), (error) => error instanceof LedgerError && error.code === "unsafe_scope"); rmSync(root, { recursive: true, force: true });
 });
 
 test("special files fail closed", { skip: process.platform === "win32" }, async () => {
