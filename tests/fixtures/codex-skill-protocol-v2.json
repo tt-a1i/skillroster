@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "harness": "codex-transfer",
-  "suite_id": "codex-skill-protocol-isolation-v1",
+  "suite_id": "codex-skill-protocol-isolation-v2",
   "trials_per_arm": 3,
   "formal_protocol_gate": true,
   "tasks": [

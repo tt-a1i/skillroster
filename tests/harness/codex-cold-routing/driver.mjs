@@ -394,17 +394,37 @@ export function verifyArchifyParent(workspace, targetPackage, contract, authorit
   return { passed: failures.length === 0, performed: true, failures, expected_identity: authority.expected, actual_identity: actual, real_node_sha256: sha(realNode), frozen_script_realpath_sha256: sha(canonicalScript), frozen_script_content_sha256: actual.script_content_sha256, specification_sha256: specificationSha256, agent_artifact_sha256: agentArtifactSha256, independent_artifact_sha256: independentBytes ? sha(independentBytes) : null, source_workspace_sha256_before: workspaceDigestBefore, source_workspace_sha256_after: workspaceDigestAfter, validate: { exit_code: validate.status, ok: validatePassed }, deliver: { ok: deliverReceipt?.ok === true }, audit_scope: "parent-owned frozen validate and independent deliver reproduction" };
 }
 
-function narrowRead(command, targetPath) {
-  const tokens = simpleCommandTokens(command); if (!tokens?.length) return null;
-  const executable = basename(tokens[0]); const canonicalTarget = canonicalPath(targetPath);
+function parseReadTokens(tokens) {
+  if (!tokens?.length) return null;
+  const executable = basename(tokens[0]);
   if (executable === "cat") {
     const args = tokens.slice(1).filter((token) => token !== "--");
-    return args.length === 1 && canonicalPath(args[0]) === canonicalTarget ? { start: 1, end: Number.POSITIVE_INFINITY, full: true } : null;
+    return args.length === 1 ? { path: canonicalPath(args[0]), start: 1, end: Number.POSITIVE_INFINITY, full: true } : null;
   }
-  if (executable !== "sed" || tokens.length !== 4 || tokens[1] !== "-n" || canonicalPath(tokens[3]) !== canonicalTarget) return null;
+  if (executable !== "sed" || tokens.length !== 4 || tokens[1] !== "-n") return null;
   const range = tokens[2].match(/^(\d+)(?:,(\d+|\$))?p$/u); if (!range) return null;
   const start = Number(range[1]); const end = range[2] === "$" ? Number.POSITIVE_INFINITY : Number(range[2] ?? range[1]);
-  return start > 0 && end >= start ? { start, end, full: start === 1 && end === Number.POSITIVE_INFINITY } : null;
+  return start > 0 && end >= start ? { path: canonicalPath(tokens[3]), start, end, full: start === 1 && end === Number.POSITIVE_INFINITY } : null;
+}
+
+function readTokens(tokens, targetPath) {
+  const read = parseReadTokens(tokens);
+  return read?.path === canonicalPath(targetPath) ? read : null;
+}
+
+function narrowRead(command, targetPath, allowLeading = false) {
+  const direct = readTokens(simpleCommandTokens(command), targetPath); if (direct || !allowLeading) return direct;
+  const inner = unwrapSimpleShell(command); const separator = inner.indexOf(" && ");
+  if (separator >= 0) {
+    const leading = readTokens(simpleCommandTokens(inner.slice(0, separator)), targetPath);
+    if (leading) return { ...leading, leading_compound: true };
+  }
+  const parts = inner.split(/\r?\n/u).map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const reads = parts.map((part) => parseReadTokens(simpleCommandTokens(part)));
+  if (reads.some((read) => !read)) return null;
+  const index = reads.findIndex((read) => read.path === canonicalPath(targetPath));
+  return index >= 0 ? { ...reads[index], read_sequence: reads } : null;
 }
 
 function targetLineCount(path) {
@@ -413,11 +433,13 @@ function targetLineCount(path) {
   const text = readFileSync(path, "utf8"); return text === "" ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
 }
 
-function verifiedRead(command, output, targetPath) {
-  const range = narrowRead(command, targetPath); if (!range || typeof output !== "string") return null;
-  const text = readFileSync(targetPath, "utf8"); const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
-  const expected = range.full ? text : lines.slice(range.start - 1, Number.isFinite(range.end) ? range.end : undefined).join("");
-  return output === expected ? range : null;
+function verifiedRead(command, output, targetPath, allowLeading = false) {
+  const range = narrowRead(command, targetPath, allowLeading); if (!range || typeof output !== "string") return null;
+  const readOutput = (read) => { const text = readFileSync(read.path, "utf8"); const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? []; return read.full ? text : lines.slice(read.start - 1, Number.isFinite(read.end) ? read.end : undefined).join(""); };
+  const expected = readOutput(range);
+  if (range.read_sequence) return output === range.read_sequence.map(readOutput).join("") ? { ...range, evidence_mode: "content_echo_sequence" } : null;
+  if (range.leading_compound) return { ...range, evidence_mode: output.startsWith(expected) ? "content_echo" : "successful_leading_read" };
+  return output === expected ? { ...range, evidence_mode: "content_echo" } : null;
 }
 
 function coveredThrough(ranges) {
@@ -427,17 +449,19 @@ function coveredThrough(ranges) {
 }
 
 export function assessExactLoad(transcript, targetPath) {
-  const canonical = canonicalPath(targetPath); const commands = extractCommandEvents(transcript); const lineCount = targetLineCount(canonical); const ranges = []; let loadEventIndex = null;
+  const canonical = canonicalPath(targetPath); const commands = extractCommandEvents(transcript); const lineCount = targetLineCount(canonical); const ranges = []; let loadEventIndex = null; let evidenceMode = null;
   if (lineCount !== null) for (const [index, event] of commands.entries()) {
     if (event.kind !== "command" || event.exit_code !== 0 || event.status !== "completed") continue;
-    const read = verifiedRead(event.command, event.output, canonical); if (!read) continue;
-    ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; break; }
+    const read = verifiedRead(event.command, event.output, canonical, true); if (!read) continue;
+    ranges.push(read); if (coveredThrough(ranges) >= lineCount) { loadEventIndex = index; evidenceMode = read.evidence_mode; break; }
   }
-  return { passed: loadEventIndex !== null, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed cat or cumulative sed -n exact-path reads only" };
+  return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed exact-path reads; verified content echo, ordered read sequences, or a successful leading read before &&" };
 }
 
 function isFindCommand(command) {
-  const tokens = simpleCommandTokens(command); return Boolean(tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find");
+  const tokens = simpleCommandTokens(command);
+  if (tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find") return true;
+  return /(?:^|[;\n]\s*)skillroster\s+find(?:\s|$)/u.test(unwrapSimpleShell(command));
 }
 
 export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAudit, expectedTask = null, expectedSkill = null }) {
@@ -447,7 +471,7 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
     if (event.kind === "event_protocol_violation") { violations.push(`event_protocol:${event.violation}`); continue; }
     if (event.kind === "unclassified_action") { if (!targetLoaded) violations.push(`unclassified_action_before_load:${index}:${event.item_type}`); continue; }
     const bootstrapRead = narrowRead(event.command, bootstrapPath);
-    const targetRead = narrowRead(event.command, targetPath);
+    const targetRead = narrowRead(event.command, targetPath, true);
     if (event.kind === "command_complete") {
       if (isFindCommand(event.command)) {
         const attempt = findAttempts.get(event.id); const call = Number.isInteger(attempt) ? findAudit.calls?.[attempt] : null;
@@ -459,11 +483,11 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
       }
       const verifiedBootstrap = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, bootstrapPath) : null;
       if (verifiedBootstrap) { bootstrapRanges.push(verifiedBootstrap); if (bootstrapLines !== null && coveredThrough(bootstrapRanges) >= bootstrapLines) bootstrapLoaded = true; }
-      const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath) : null;
+      const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath, true) : null;
       if (verified) { targetRanges.push(verified); if (targetLines !== null && coveredThrough(targetRanges) >= targetLines) targetLoaded = true; }
       continue;
     }
-    if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (!bootstrapLoaded) violations.push(`find_before_bootstrap_full_load:${index}`); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
+    if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
     if (!findStarted && bootstrapRead) continue;
     if (targetRead) { if (!findAuthorized) violations.push(`target_load_before_find_complete:${index}`); continue; }
     if (!findStarted) violations.push(`task_command_before_find:${index}`);
@@ -474,7 +498,7 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
   if (!findStarted) violations.push("find_missing");
   if (!findAuthorized) violations.push("authorized_find_completion_missing");
   if (!targetLoaded) violations.push("exact_target_load_missing");
-  return { passed: violations.length === 0, violations, transcript_find_count: transcriptFindCount, audit_scope: "Codex completed command_execution order; exact Bootstrap read is the sole pre-Find exception" };
+  return { passed: violations.length === 0, violations, transcript_find_count: transcriptFindCount, bootstrap_loaded: bootstrapLoaded, audit_scope: "Codex completed command_execution order; the model-visible Bootstrap description may authorize Find without loading the full Bootstrap body" };
 }
 
 export function assessCoreOrder(transcript, targetPath) {
@@ -482,8 +506,8 @@ export function assessCoreOrder(transcript, targetPath) {
   for (const [index, event] of events.entries()) {
     if (event.kind === "event_protocol_violation") { violations.push(`event_protocol:${event.violation}`); continue; }
     if (event.kind === "unclassified_action") { if (!loaded) violations.push(`task_action_before_core_load:${index}:${event.item_type}`); continue; }
-    const targetRead = narrowRead(event.command, targetPath);
-    if (event.kind === "command_complete") { const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath) : null; if (verified) { ranges.push(verified); if (lineCount !== null && coveredThrough(ranges) >= lineCount) loaded = true; } continue; }
+    const targetRead = narrowRead(event.command, targetPath, true);
+    if (event.kind === "command_complete") { const verified = event.exit_code === 0 && event.status === "completed" ? verifiedRead(event.command, event.output, targetPath, true) : null; if (verified) { ranges.push(verified); if (lineCount !== null && coveredThrough(ranges) >= lineCount) loaded = true; } continue; }
     if (!targetRead && !loaded) violations.push(`task_command_before_core_load:${index}`);
   }
   if (!loaded) violations.push("exact_core_target_load_missing");

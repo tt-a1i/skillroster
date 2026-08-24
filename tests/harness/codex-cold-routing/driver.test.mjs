@@ -226,7 +226,17 @@ test("cumulative sed reads prove full load only after all lines are covered", ()
   assert.equal(full.passed, true); assert.equal(full.load_event_index, 1);
 });
 
-test("on-demand route order permits only Bootstrap before completed, ledger-bound Find and target load", async () => {
+test("a leading exact read followed by successful && work preserves within-command order", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-leading-load-")); const target = join(root, "SKILL.md"); writeFileSync(target, "one\ntwo\n"); const canonical = realpathSync(target);
+  const command = `/bin/zsh -lc "sed -n '1,240p' ${canonical} && printf '\\nDONE\\n'"`;
+  const event = (type, output = null) => JSON.stringify({ type: `item.${type}`, item: { id: "compound", type: "command_execution", command, ...(type === "completed" ? { aggregated_output: output, exit_code: 0, status: "completed" } : {}) } });
+  const transcript = `${event("started")}\n${event("completed", "one\ntwo\n\nDONE\n")}`;
+  assert.equal(assessExactLoad(transcript, target).passed, true);
+  assert.equal(assessCoreOrder(transcript, target).passed, true);
+  const semicolon = transcript.replaceAll(" && ", "; "); assert.equal(assessExactLoad(semicolon, target).passed, false);
+});
+
+test("on-demand route order permits metadata-authorized Find followed by exact target load", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-route-order-")); const bootstrap = join(root, "bootstrap.md"); const target = join(root, "target.md"); const workspace = join(root, "input.md");
   writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "target"); writeFileSync(workspace, "input");
   const call = { argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "sample", top1_path_sha256: await digest(realpathSync(target)) }; const findAudit = { count: 1, calls: [call] };
@@ -249,8 +259,9 @@ test("on-demand route order permits only Bootstrap before completed, ledger-boun
   assert.match(assessRouteOrder(startedEarly, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /task_command_before_find/u);
   const todoBeforeFind = [JSON.stringify({ type: "item.completed", item: { type: "todo_list", items: [] } }), event(`cat '${realpathSync(bootstrap)}'`, "bootstrap"), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
   assert.match(assessRouteOrder(todoBeforeFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /todo_list/u);
-  const partialBootstrap = [event(`sed -n '2,2p' '${realpathSync(bootstrap)}'`, ""), event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
-  assert.match(assessRouteOrder(partialBootstrap, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" }).violations.join(","), /find_before_bootstrap_full_load/u);
+  const directFind = [event("skillroster find '完整任务' --hint 'agent hint' --json"), event(`cat '${realpathSync(target)}'`, "target")].join("\n");
+  const directAssessment = assessRouteOrder(directFind, { bootstrapPath: bootstrap, targetPath: target, findAudit, expectedTask: "完整任务", expectedSkill: "sample" });
+  assert.equal(directAssessment.passed, true); assert.equal(directAssessment.bootstrap_loaded, false);
 });
 
 test("target read cannot start until the matching Find completion is ledger-authorized", async () => {
