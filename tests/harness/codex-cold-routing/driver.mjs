@@ -763,15 +763,16 @@ process.stdout.write(result.stdout ?? ""); process.stderr.write(result.stderr ??
 }
 
 export function setupArm(root, task, arm, options) {
-  const home = join(root, "home"); const codexHome = join(home, ".codex"); const workspace = join(root, "workspace"); const temp = join(root, "tmp");
-  for (const path of [codexHome, workspace, temp]) mkdirSync(path, { recursive: true });
+  const home = join(root, "home"); const codexHome = join(home, ".codex"); const workspace = join(root, "workspace");
+  const temp = mkdtempSync(join(canonicalPath(tmpdir()), "skillroster-codex-"));
+  for (const path of [codexHome, workspace]) mkdirSync(path, { recursive: true });
   writeInputs(workspace, task.workspace_files);
   const skillDestination = join(codexHome, "skills", arm === "core" ? task.expected_skill : "skillroster"); mkdirSync(dirname(skillDestination), { recursive: true });
   const skillSource = arm === "core" ? join(options.skillsRoot, task.expected_skill) : dirname(options.bootstrap);
   cpSync(skillSource, skillDestination, { recursive: true, dereference: true });
   const targetPath = arm === "core" ? join(skillDestination, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
   if (arm === "on_demand") { const targetDir = dirname(targetPath); mkdirSync(dirname(targetDir), { recursive: true }); cpSync(join(options.skillsRoot, task.expected_skill), targetDir, { recursive: true, dereference: true }); }
-  return { home, codexHome, workspace, temp, targetPath, state: join(root, "state"), audit: join(root, "find-audit.jsonl"), transcript: join(root, "codex-events.jsonl") };
+  return { home, codexHome, workspace, temp, targetPath, state: join(temp, "state"), runtimeAudit: join(temp, "find-audit.jsonl"), audit: join(root, "find-audit.jsonl"), transcript: join(root, "codex-events.jsonl") };
 }
 
 function freezeSuite(manifest, options) {
@@ -880,11 +881,12 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     let prepared = null;
     if (arm === "on_demand") prepared = prepareOnDemand(paths, task, options, env);
     const runEnv = { ...env };
-    if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.audit });
+    if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.runtimeAudit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
     const result = run(options.codex, ["exec", "--ephemeral", "--ignore-user-config", "--sandbox", "workspace-write", "--skip-git-repo-check", "--json", ...codexModelConfig(options), "-C", paths.workspace, task.prompt], { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
+    if (existsSync(paths.runtimeAudit)) copyFileSync(paths.runtimeAudit, paths.audit);
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
     const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath), parentVerificationAuthority: { protected_scopes_passed: protectedScopes.passed, expected: suiteFacts.target_packages?.[task.expected_skill] } }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
     const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath, oneCall: task.one_call_load === true }) : { count: 0, contract_violation: false };
@@ -897,6 +899,7 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     return { task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
+    rmSync(paths.temp, { recursive: true, force: true });
   }
 }
 

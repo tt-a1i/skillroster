@@ -1,18 +1,39 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
 const digest = async (value) => {
   const { createHash } = await import("node:crypto"); return createHash("sha256").update(value).digest("hex");
 };
+
+test("on-demand runtime state and audit stay in the sandbox temp boundary", () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "codex-runtime-boundary-"));
+  const repo = fileURLToPath(new URL("../../../", import.meta.url));
+  const paths = setupArm(root, {
+    expected_skill: "event-manifest",
+    workspace_files: { "handoff.psv": "fixture\n" },
+  }, "on_demand", {
+    skillsRoot: join(repo, "tests/fixtures/codex-protocol-skills"),
+    bootstrap: join(repo, "skill/skillroster/SKILL.md"),
+  });
+  try {
+    assert.equal(paths.state.startsWith(`${paths.temp}/`), true);
+    assert.equal(paths.runtimeAudit.startsWith(`${paths.temp}/`), true);
+    assert.equal(paths.audit.startsWith(`${root}/`), true);
+    assert.equal(paths.audit.startsWith(`${paths.temp}/`), false);
+  } finally {
+    rmSync(paths.temp, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("default is a non-executing plan and execution requires explicit auth", () => {
   assert.equal(parseArgs([]).execute, false);
