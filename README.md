@@ -37,6 +37,7 @@ skillroster find "把中文改自然一点" --json
 skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
 skillroster find "分析本地表格" --hint "analyze standalone spreadsheet file workbook data" --json
 skillroster find "build an event manifest" --load --limit 1 --json
+skillroster find "compare exact variants" --load --limit 1 --variant-skill-id skill_... --json
 skillroster plan --stdin --json
 skillroster plan --show <plan-id> --json
 skillroster apply <plan-id> --json
@@ -56,6 +57,9 @@ skillroster lifecycle recovery --json
 Agents use JSON mode; people can omit it for concise terminal output. Read-only
 commands never change Agent files. Plan stores an immutable preview, while Apply
 and Undo use fingerprints, journals, receipts, and recovery blocking.
+When Top-1 has divergent same-name identities, ordinary Find returns exact
+read-only retry actions. Each action can load one exposed identity for the Agent
+to compare; it never selects canonical content or changes a Roster.
 See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
 Plan/Receipt history or deleting the local database.
 See [docs/installation.md](docs/installation.md) for verified Release, Cargo,

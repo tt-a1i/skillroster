@@ -11,7 +11,7 @@
 
 对已合并 PR #146 的正确解读也应保守：两个 On-demand 臂最终都找到了正确 Skill；Humanizer 臂出现 malformed `Find` 且未完成 full load，更像调用接口契约或提示遵循问题；Architecture 臂才形成干净的 Find→load 链。两个 Core 控制臂都没有通过任务 oracle，且历史 run pair 的 `formal_gate_eligible=false`，所以该实验不能证明 On-demand 优于 Core、Core 优于 On-demand，也不能证明需要新的排序或语义检索子系统。后续 PR #148 已完成正式协议隔离：Core 3/3，On-demand 1/3；但三个 On-demand trial 的 retrieval、Top-1、精确路径、完整加载、任务 oracle 和安全性均为 3/3，两个拒绝仅来自 Find→load 之间的额外动作和不安全 compound shell shape。
 
-因此当前最小动作不是继续研究目录规模或排名，而是 Issue #149：把确定性 Find、治理验证和完整 Skill 加载合成一次可观察的 Agent 调用。该调用减少模型需要正确编排的步骤，但不能替模型判断任务语义，也不能替 harness 证明原始用户文本在进入 CLI 前未被 shell 转义或改写。
+Issue #149 已通过 PR #150 落地并在冻结协议中达到 Core 3/3、On-demand 3/3。后续真实本机 dogfood 暴露了更窄的剩余缺口：同名异内容 Top-1 正确地 fail-closed，但 Agent 只能看到身份和路径，不能经同一可信接口加载它明确选择的变体。当前动作因此是 Issue #151：允许 Agent 只从已排名 Top-1 组中精确加载一个身份用于语义比较，同时继续禁止任意目录跳转、隐式 canonicalization 和治理变更。
 
 ## 证据标签与术语
 
@@ -312,6 +312,36 @@ digest 必须针对 JSON 解码后的原始 UTF-8 file bytes，而不是转义�
 - 若 On-demand 仍因 shell argv shape 失败，停止继续堆 CLI 逻辑，确认是否需要 harness-native argv/stdin 支持；这不是 embedding 或 ranking 问题。
 - 若 one-call 全通过，停止扩展 activation 机制，不新增第二个 routing Skill。
 
+## Issue #151：同名内容比较与最新研究校准
+
+**真实产品证据。** PR #150 之后的本机只读 dogfood 中，`humanizer-zh`
+与 `agent-session-miner` 都被正确检索为 Top-1，但各自存在两个异内容身份。
+普通 `find --load` 的 `same_name_variants_ambiguous` 是正确安全行为；缺口是
+Agent 无法通过 CLI 精确读取它已看到的某个身份，只能退回原始文件系统读取。
+这会打断“事实由 CLI 提供，语义由模型判断”的边界。
+
+**官方事实。** OpenAI 的 [Codex app 文章](https://openai.com/index/introducing-the-codex-app/)
+说明 Skills 可由 Agent 自动选择或由用户显式指定，并披露 OpenAI 内部已构建数百个
+Skills。这进一步否定了“数量本身就是故障”的简单结论，同时强化了可发现、可管理、
+可显式选择三种能力必须共存。Anthropic 的
+[Agent Skills 工程文章](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+把渐进式披露、从代表性失败开始评测、观察真实轨迹再增量修改列为核心实践；#151
+正是一次由真实轨迹触发的窄接口修复，而不是预设新子系统。
+
+**论文结论。** [SkillRouter（2026 预印本）](https://arxiv.org/abs/2603.22455)
+在约 8 万个 Skill、75 个专家查询上报告：同名/相近 Skill 的完整正文对重排具有关键
+作用，移除正文会显著降低其实验准确率。其查询规模较小、方法包含神经检索，不能证明
+SkillRoster 应加入 embedding 或 reranker；但它支持一个更窄的产品判断：当元数据已
+暴露真实歧义时，应让上层模型安全取得候选正文再做语义比较，而不是由确定性 CLI
+猜测 canonical content。[GoSkills（2026 预印本）](https://arxiv.org/abs/2605.06978)
+和 [SkillWeaver（2026 预印本）](https://arxiv.org/abs/2606.18051) 分别探索结构化候选组
+与多 Skill 组合。它们提示未来评测可能需要覆盖组合任务，但目前没有证据支持把图、
+分解器或规划器加入 SkillRoster。
+
+**SkillRoster 推论。** `--variant-skill-id` 只能选择当前 Top-1 组已暴露的稳定身份，
+并复用 #149 的路径、来源、digest、UTF-8、大小和 Archived 检查。成功响应同时说明
+“排名组”和“精确加载身份”；CLI 不比较语义、不推荐 canonical、不生成 Plan。
+
 ## 产品边界
 
 ### SkillRoster 应该负责
@@ -319,7 +349,7 @@ digest 必须针对 JSON 解码后的原始 UTF-8 file bytes，而不是转义�
 1. **盘点与规范化**：扫描多个宿主的 present/discovered/enabled/listed 状态，保留 provider、scope、namespace、logical/canonical path。
 2. **事实型诊断**：同名/同源/内容重复、破损软链接、版本漂移、来源不明、宿主预算与潜在省略、默认暴露面和跨 Agent 复制。
 3. **保守 usage evidence**：区分明确调用、读取、命令痕迹和仅被发现；证据不足时标 `unknown`，不能把“没看到”写成“从未使用”。
-4. **Agent-facing Find/Load**：默认 Find 输出有界、结构化、可解释候选；显式 load mode 可在同一只读调用中验证并返回完整 Top-1 `SKILL.md`。两者都让模型完成语义判断。
+4. **Agent-facing Find/Load**：默认 Find 输出有界、结构化、可解释候选；显式 load mode 可在同一只读调用中验证并返回完整 Top-1 `SKILL.md`，或从当前同名 Top-1 组精确加载一个已暴露身份用于比较。两者都让模型完成语义判断。
 5. **治理建议**：Core / On-demand / Explicit-only / Archived 分层，按宿主生成 roster；建议必须附证据和不确定性。
 6. **安全执行**：不可变 Plan、一次显式确认、Apply、Receipt、Undo、漂移检测和恢复；不读未信任目标，不静默覆盖用户来源。
 7. **评测 ledger**：分开记录 listing、retrieval、call-shape、load、oracle、safety、Core validity 和 formal eligibility。
@@ -377,13 +407,13 @@ PR #148 的 v6 suite 已按该设计形成正式 eligible 证据：Core 3/3，On
 
 | 决策 | 现在 | 触发重新评估的证据 |
 |---|---|---|
-| 保持 Agent-first CLI + 一个 Bootstrap Skill | 是；用 #149 收窄为一次 Find/Load | one-call 在冻结 suite 中仍反复因 CLI 自身契约失败 |
+| 保持 Agent-first CLI + 一个 Bootstrap Skill | 是；#149 one-call 已稳定，#151 只补同名精确比较 | exact variant load 仍迫使 Agent 绕过 CLI 或削弱安全边界 |
 | 继续 Core / On-demand / Explicit-only / Archived 分层 | 是，但建议需附证据和确认 | 真实任务显示分层导致稳定回归 |
 | 增加 embedding/reranker | 否 | 控制有效、correct-listed 高、词法 Find 的 correct-in-K 稳定不足，且语义方法提升端到端 |
 | 设置统一 Core 数量上限 | 否 | 多宿主因子实验给出稳定阈值并能跨任务复现 |
 | 自动归档“未使用”Skill | 否 | 有覆盖足够时间和宿主的高置信 invocation 证据，并仍需用户确认 |
 | 做云端同步/MCP/daemon/TUI | 否 | 出现本地 CLI 无法解决且被多用户重复验证的需求 |
-| 扩大目录规模 benchmark | 暂缓 | #149 one-call 的 3×2 协议、任务、安全与 formal eligibility 全部稳定 |
+| 扩大目录规模 benchmark | 可进入下一独立研究轮，但不阻塞 #151 | 先冻结任务分布、宿主目录事实和可归因协议 |
 
 ## 限制与反例
 
@@ -398,4 +428,11 @@ PR #148 的 v6 suite 已按该设计形成正式 eligible 证据：Core 3/3，On
 
 把当前路线概括为一句话：**SkillRoster 管理事实、暴露面和可逆变更；Agent 管理语义与意图；实验负责证明两者的接口是否稳定。**
 
-下一步不要扩展功能面。按 Issue #149 给现有 Find 增加显式 one-call load mode：同一只读进程完成确定性 Top-1、roster/path/source/drift/content-bound 验证，并只在全部通过时返回完整 `SKILL.md` 和 digest 事实。随后重跑冻结的 3×2 suite；若 Core/On-demand 都达到 3/3 且任务、安全、formal eligibility 不回归，就停止扩展 activation 机制。若仍只失败在 shell argv 形状，问题升级到 harness-native 参数传输边界，而不是排名、embedding 或更多 Skills。只有这条接口稳定后，目录规模和检索机制的实验才可能改变产品决策。
+下一步仍不扩展功能面。完成 Issue #151 的窄 exact-variant load：Agent 只能从
+当前 Top-1 同名组选择一个已暴露身份，CLI 复用现有可信完整加载边界，模型读取完整
+入口说明后自行比较。真实 `humanizer-zh` 与 `agent-session-miner` 的双方入口 digest
+实际上相同，差异仅来自包内其他文件；因此 #151 能证明入口等价，却不能解决包级
+canonical 选择。该观察应另行修复指纹噪声，而不能把两份相同说明说成语义差异。继续用这两个冲突族验证
+blocked→inspect→exact load 闭环；若任意 selector 可越过排名组、Archived、source、
+path 或 digest 边界，立即停止合并。该闭环稳定后，再把“目录规模 × 描述重叠 × K”
+作为独立研究实验，而不是把预印本结果直接实现成 embedding、图或内置模型。

@@ -138,7 +138,7 @@ The first complete command surface is:
 ```bash
 skillroster scan [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
-skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--json]
+skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--json]
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
@@ -246,6 +246,16 @@ Archived state, untrusted source, unreadable content, escape, or oversize fails
 the whole command with typed details and no partial body. The 128 KiB limit is a
 SkillRoster Agent-transport limit, not an Agent Skills format restriction.
 `task_success` remains `not_evaluated`.
+
+When Top-1 is an ambiguous same-name group, ordinary Find additionally returns
+one bounded, read-only exact-load action per displayed variant. The Agent may
+retry with `--load --variant-skill-id <skill-id>` only for an identity exposed
+inside that current ranked group. The selector cannot name an arbitrary catalog
+Skill, bypass ranking, revive Archived content, or weaken snapshot, source,
+path, digest, UTF-8, and size checks. A successful result identifies both the
+ranked group and the explicitly loaded identity. It supplies content facts for
+the model's comparison; it does not endorse, canonicalize, mutate, or establish
+task success.
 
 All JSON responses use a versioned envelope:
 

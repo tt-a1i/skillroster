@@ -15,7 +15,15 @@ result. Change only the hint; an English task may add one on its retry.
 When the blocker reason is `same_name_variants_ambiguous`, use the ordinary
 Find result and its read-only `variant_finding.argv`; keep each path and provider
 together. Materialize the current Report only when the result says
-`report_required`, then inspect that exact Finding before choosing content.
+`report_required`, then inspect that exact Finding. Use only the returned
+`load_exact_variant_for_comparison` actions to load the exact identities under
+comparison. Require the requested and loaded Skill IDs to match and retain each
+identity's content, path, provider, and governance facts together. Compare the
+complete entrypoint instructions semantically and treat any choice as
+model-owned. Identical entrypoint digests do not resolve a divergent package
+fingerprint; report the remaining package ambiguity instead of choosing a
+canonical identity. Exact loading does not canonicalize content, modify a
+Roster, or authorize a later Plan.
 
 For `no_routable_match`, retry once with a refined capability hint. For drift,
 legacy Snapshot, unreadable, oversized, escaping, or untrusted-source reasons,
