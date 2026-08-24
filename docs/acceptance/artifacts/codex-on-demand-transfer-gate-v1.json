@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "suite_id": "codex-on-demand-transfer-gate-v1",
+  "status": "failed",
+  "formal_gate_eligible": false,
+  "projection": "redacted_bounded_projection_of_external_raw_summary",
+  "raw_summary_sha256": "207367c999e22dd0c3bf140cac0921d8bd612000c5f85d9921e0af2d5178314b",
+  "source_identity": {
+    "commit": "91424a38036a6d2414c4dcbccd04f7d044327d4b",
+    "stable": true
+  },
+  "frozen": {
+    "snapshot_sha256": "b656acb64cf13057d58f530061cee26e24164ca17fbaf18a157c945da28c4516",
+    "manifest_sha256": "3ae161cfccb86e8ea5ad4cd208a4669fa41b8217cf965894651121eaaa78fbac",
+    "cli_sha256": "1e821e2aa70a4500d715806f63c274e76db89f0da1e366d6eaf091d68a6f99ea",
+    "bootstrap_sha256": "b3218d7047697e74a2c06cf77f54058aaf47d2da09d1ad8a62bd6774a54da058",
+    "targets_sha256": "7586dc518af97ae3995d2e5c2bf23d2a9ae35903300a982da1ab85e8300dab2b",
+    "driver_sha256": "3254069c9665ef8eaed9e567656d80cb75d13c149da556d943db09cb957c8638",
+    "codex_version": "codex-cli 0.147.0",
+    "model": "gpt-5.6-luna",
+    "reasoning_effort": "medium",
+    "timeout_ms": 300000,
+    "schedule": {
+      "arm": "on_demand",
+      "families": 3,
+      "trials_per_family": 3,
+      "runs": 9
+    },
+    "source_stable": true,
+    "codex_executable_stable": true,
+    "inputs_stable": true
+  },
+  "decision": {
+    "value": "classify_exclusive_stage_then_open_one_narrow_defect_or_end_research",
+    "post_result_tuning": "forbidden",
+    "complete_schedule": true,
+    "overall_gate": false,
+    "accepted_runs": 8,
+    "required_runs": 9,
+    "product_action": "retain_current_ranking_and_one_call_design",
+    "research_action": "stop_frozen_suite_without_rerun"
+  },
+  "family_gates": [
+    {
+      "family": "deterministic_json_artifact",
+      "accepted": 3,
+      "required": 3,
+      "stage_counts": {
+        "no_retrieval_call": 0,
+        "retrieval_wrong": 0,
+        "load_wrong": 0,
+        "task_execution_failed": 0,
+        "task_succeeded": 3
+      },
+      "gate": "passed"
+    },
+    {
+      "family": "reference_backed_structured_extraction",
+      "accepted": 3,
+      "required": 3,
+      "stage_counts": {
+        "no_retrieval_call": 0,
+        "retrieval_wrong": 0,
+        "load_wrong": 0,
+        "task_execution_failed": 0,
+        "task_succeeded": 3
+      },
+      "gate": "passed"
+    },
+    {
+      "family": "script_backed_multi_file_artifact",
+      "accepted": 2,
+      "required": 3,
+      "stage_counts": {
+        "no_retrieval_call": 0,
+        "retrieval_wrong": 1,
+        "load_wrong": 0,
+        "task_execution_failed": 0,
+        "task_succeeded": 2
+      },
+      "gate": "failed"
+    }
+  ],
+  "results": [
+    {
+      "family": "deterministic_json_artifact",
+      "trial": 1,
+      "pair_invariant": "0d705b8c30a3da1007b2b3759058d17ca38601f3d72d8b69bea43f42cf1c5220",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "deterministic_json_artifact",
+      "trial": 2,
+      "pair_invariant": "33b175e2c0e898b01ca8edda91e467cd985de61d50fece5515364e15060a808f",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "deterministic_json_artifact",
+      "trial": 3,
+      "pair_invariant": "b59e43086b1477667f47d3e288a8d3d4a86ab994ee460d193d355ced3052887e",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "reference_backed_structured_extraction",
+      "trial": 1,
+      "pair_invariant": "44b91c10f0bf5c0fccc2bec9ecc319360d550ed9eb7fc4a26e89675c2f6a5ee9",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "reference_backed_structured_extraction",
+      "trial": 2,
+      "pair_invariant": "4a647e8dece98eb8ef95bc9f28c3ce68c801cff2108ec4f5d8b1363b2fa40cb7",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "reference_backed_structured_extraction",
+      "trial": 3,
+      "pair_invariant": "e4a29ea344d15790fddad99703bb5ce2053e955414f8644348d97e5f40134299",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "script_backed_multi_file_artifact",
+      "trial": 1,
+      "pair_invariant": "d272e55f7ee796fc025ef7ec914940f4bb593e8c2731eefd41093986ad0fedec",
+      "find_calls": 2,
+      "first_find_shape_valid": false,
+      "recovered_find_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "workspace_and_protected_scopes": true,
+      "external_write_audit": false,
+      "external_write_failure_class": "quoted_dev_null_redirection_reported_external",
+      "deepest_stage": "retrieval_wrong",
+      "raw_task_succeeded_without_loaded_skill": true,
+      "raw_flag_interpretation": "task_succeeded_without_the_full_accepted_one_call_contract; exact content was loaded on retry",
+      "accepted": false
+    },
+    {
+      "family": "script_backed_multi_file_artifact",
+      "trial": 2,
+      "pair_invariant": "ed038e3764d635514d0f4b53ab48146bbdde0dbfe82a14530652b3400f4859a0",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    },
+    {
+      "family": "script_backed_multi_file_artifact",
+      "trial": 3,
+      "pair_invariant": "10f195c64d550352e89f7eb5481f9b65e79c1b448196563e3c84184bc776751d",
+      "find_calls": 1,
+      "retrieval_exact": true,
+      "load_exact": true,
+      "task_oracle": true,
+      "safety": true,
+      "deepest_stage": "task_succeeded",
+      "accepted": true
+    }
+  ],
+  "evidence_boundary": {
+    "raw_summary_committed": false,
+    "raw_evidence_location": "external isolated run root; omitted from repository",
+    "transcripts_committed": false,
+    "prompts_or_outputs_committed": false,
+    "absolute_paths_redacted": true,
+    "real_agent_or_skill_files_modified": false,
+    "out_of_band_operator_verification": {
+      "source": "parent process observation and read-only filesystem counts; not fields from the raw summary",
+      "preflight_rejected_before_run_root_or_model_invocation": "linked_temporary_directory_ancestor",
+      "complete_schedule_invocations": 1,
+      "post_schedule_suite_reruns": 0,
+      "failed_trial_in_trial_recovery_find_calls": 1,
+      "raw_run_roots": 9,
+      "auth_copies_remaining": 0
+    }
+  }
+}
