@@ -331,13 +331,23 @@ function writeTargetAllowed(path, workspace, tempRoot) {
   return inside(candidate, workspace) || inside(candidate, tempRoot);
 }
 
+function explicitWritePaths(command) {
+  const paths = []; const redirection = /(?:^|\s)(?:\d*>>?|\d*<>)[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gu;
+  for (const match of command.matchAll(redirection)) paths.push(match[1] ?? match[2] ?? match[3]);
+  const tokens = simpleCommandTokens(command); if (!tokens?.length) return paths;
+  const executable = basename(tokens[0]).toLowerCase(); const args = tokens.slice(1).filter((token) => token !== "--");
+  const nonOptions = args.filter((token) => !token.startsWith("-"));
+  if (["touch", "mkdir", "tee"].includes(executable)) paths.push(...nonOptions);
+  else if (["cp", "mv", "install"].includes(executable) && nonOptions.length >= 2) paths.push(nonOptions.at(-1));
+  else if (executable === "sed" && args.includes("-i") && nonOptions.length) paths.push(nonOptions.at(-1));
+  return paths;
+}
+
 export function assessExternalWrites(jsonl, workspace, tempRoot) {
   const targets = []; const violations = [];
   const commands = extractCommandEvents(jsonl).filter((event) => event.kind === "command");
-  const redirection = /(?:^|\s)(?:\d*>>?|\d*<>)[ \t]*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gu;
   for (const [eventIndex, event] of commands.entries()) {
-    for (const match of event.command.matchAll(redirection)) {
-      const raw = match[1] ?? match[2] ?? match[3];
+    for (const raw of explicitWritePaths(event.command)) {
       if (["/dev/null", "NUL", "nul"].includes(raw)) continue;
       const target = { raw, canonical: canonicalPath(isAbsolute(raw) ? raw : join(workspace, raw)), event_index: eventIndex, command: event.command };
       const allowed = writeTargetAllowed(raw, workspace, tempRoot); targets.push({ ...target, allowed });

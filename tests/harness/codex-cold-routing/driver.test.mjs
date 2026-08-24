@@ -185,6 +185,8 @@ test("external write audit rejects redirections outside workspace and run temp",
   const unsafe = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "printf secret > /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
   assert.equal(assessExternalWrites(safe, workspace, temp).passed, true);
   assert.match(assessExternalWrites(unsafe, workspace, temp).violations.join("\n"), /private\/tmp\/TASK/u);
+  const commandWrite = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "mkdir -p /private/tmp/TASK", aggregated_output: "", exit_code: 0, status: "completed" } });
+  assert.match(assessExternalWrites(commandWrite, workspace, temp).violations.join("\n"), /private\/tmp\/TASK/u);
 });
 
 test("prompt-input preflight permits only fixed Codex system skills plus the arm skill", () => {
