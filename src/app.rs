@@ -1080,6 +1080,22 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             })),
         };
     }
+    if let Some(blocker) =
+        error.downcast_ref::<crate::roster_plan::RosterPackageFingerprintVariants>()
+    {
+        return ClassifiedError {
+            code: "roster_package_fingerprint_variants",
+            retryable: false,
+            details: Some(json!({
+                "reason": "multiple_package_fingerprints_require_explicit_preservation",
+                "skill_id": blocker.skill_id,
+                "placement_ids": blocker.placement_ids,
+                "fingerprint_count": blocker.fingerprint_count,
+                "files_changed": false,
+                "next_action": "review_each_package_before_roster_mutation"
+            })),
+        };
+    }
     if let Some(blocker) = error.downcast_ref::<crate::roster_plan::RosterSafetyBlocker>() {
         let (
             code,
@@ -5920,6 +5936,29 @@ fn expand_finding_roster_changes(
     let supported =
         crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
     if !supported.exclusions.is_empty() {
+        if let Some(exclusion) = supported.exclusions.iter().find(|exclusion| {
+            exclusion.reason == "multiple_package_fingerprints_require_explicit_preservation"
+        }) {
+            let placements = scan
+                .placements
+                .iter()
+                .filter(|placement| placement.skill_id == exclusion.skill_id)
+                .collect::<Vec<_>>();
+            let fingerprint_count = placements
+                .iter()
+                .map(|placement| placement.content_digest.as_str())
+                .collect::<BTreeSet<_>>()
+                .len();
+            return Err(crate::roster_plan::RosterPackageFingerprintVariants {
+                skill_id: exclusion.skill_id.clone(),
+                placement_ids: placements
+                    .iter()
+                    .map(|placement| placement.id.clone())
+                    .collect(),
+                fingerprint_count,
+            }
+            .into());
+        }
         if let Some(blocker) = finding_roster_safety_blocker(&supported.exclusions) {
             return Err(blocker.into());
         }
@@ -10708,6 +10747,32 @@ mod recovery_tests {
         assert_eq!(output["error"]["details"]["identity_role"], "target");
         assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
         assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn roster_package_variants_expose_a_typed_no_change_blocker() {
+        let error = crate::roster_plan::RosterPackageFingerprintVariants {
+            skill_id: "skill_fixture".into(),
+            placement_ids: vec!["placement_a".into(), "placement_b".into()],
+            fingerprint_count: 2,
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_package_fingerprint_variants"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "multiple_package_fingerprints_require_explicit_preservation"
+        );
+        assert_eq!(output["error"]["details"]["fingerprint_count"], 2);
+        assert_eq!(output["error"]["details"]["files_changed"], false);
+        assert_eq!(
+            output["error"]["details"]["next_action"],
+            "review_each_package_before_roster_mutation"
+        );
     }
 
     #[test]

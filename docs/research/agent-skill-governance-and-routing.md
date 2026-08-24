@@ -357,6 +357,9 @@ SkillRoster 应加入 embedding 或 reranker；但它支持一个更窄的产品
 这与 Agent Skills 的渐进式披露边界一致：CLI 判断“是否是相同可加载 payload”这类可复现
 事实，Agent 阅读候选正文后判断语义、意图和 canonical 选择。旧 Snapshot 没有这份事实时
 返回 typed rescan，不用新规则反推历史数据，也不引入 manifest、embedding、模型或图。
+同一路由身份仍可能有多个完整包指纹；现有 Core placement 可保持不动，但任何需要选择
+canonical package 的 Roster 变更必须 typed fail-closed，不能用代表性 Skill digest 覆盖
+某个 placement 独有的本地元数据。
 
 ## 产品边界
 
