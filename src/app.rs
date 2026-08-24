@@ -168,12 +168,16 @@ pub fn run(cli: Cli) -> Result<Output> {
         .with_context(|| format!("cannot create {}", state_dir.display()))?;
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
-    let requires_exclusive_state_lock = command_requires_exclusive_state_lock(cli.command.as_ref())
-        || StateStore::requires_migration(&database_path)?;
-    let _state_lock = if requires_exclusive_state_lock {
+    let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
         change::StateLock::acquire_exclusive(&state_dir)?
     } else {
-        change::StateLock::acquire_shared(&state_dir)?
+        let shared = change::StateLock::acquire_shared(&state_dir)?;
+        if StateStore::requires_migration(&database_path)? {
+            drop(shared);
+            change::StateLock::acquire_exclusive(&state_dir)?
+        } else {
+            shared
+        }
     };
     let store = StateStore::open(&database_path)?;
 
@@ -8931,6 +8935,46 @@ mod recovery_tests {
         ] {
             assert!(!exclusive(args), "expected shared lock for {args:?}");
         }
+    }
+
+    #[test]
+    fn fresh_read_command_upgrades_to_exclusive_before_initializing_state() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let shared = change::StateLock::acquire_shared(&state).unwrap();
+        let cli = Cli::try_parse_from([
+            "skillroster",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+            "status",
+        ])
+        .unwrap();
+
+        let error = match run(cli) {
+            Ok(_) => panic!("fresh read unexpectedly initialized under a shared lock"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("write_locked"));
+        assert!(!state.join("skillroster.db").exists());
+
+        drop(shared);
+        let retry = Cli::try_parse_from([
+            "skillroster",
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+            "status",
+        ])
+        .unwrap();
+        assert!(run(retry).is_ok());
+        assert!(state.join("skillroster.db").is_file());
     }
 
     fn placement_with_scope(
