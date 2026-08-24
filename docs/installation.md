@@ -84,6 +84,11 @@ skillroster setup --json
 
 CLI v1.8.24 bundles Bootstrap content version 1.8.23. These versions differ
 intentionally: the CLI changed after the Bootstrap instructions last changed.
+In Setup JSON, `cli_version` identifies the executable and
+`bootstrap_content_version` identifies the bundled Skill package.
+`bootstrap_version` remains a compatibility alias for
+`bootstrap_content_version`; a current target's `installed_version` also
+refers to Bootstrap content, not the executable.
 
 `setup` changes no files. Apply its returned Plan only after review. Exact
 official older copies are upgraded through the same reversible Plan/Receipt

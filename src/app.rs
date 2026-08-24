@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::bootstrap::PACKAGE_FILES as BOOTSTRAP_PACKAGE_FILES;
+use crate::bootstrap::{PACKAGE_FILES as BOOTSTRAP_PACKAGE_FILES, content_version};
 use crate::change::{
     self, ChangeReceipt, Operation, OperationPolicy, PrepareContext, PreparedPlan,
 };
@@ -7532,6 +7532,8 @@ fn setup_command_with_manifests<'a>(
     modified_choice: Option<ModifiedBootstrapChoice>,
     legacy_complete_packages: &'a [BootstrapPackageManifest<'a>],
 ) -> Result<Value> {
+    let bootstrap_content_version = content_version()
+        .context("bundled Bootstrap Skill is missing metadata.bootstrap-version")?;
     let Some(snapshot) = store.latest_completed_scan()? else {
         return Ok(json!({
             "detected_agents": [],
@@ -7539,7 +7541,9 @@ fn setup_command_with_manifests<'a>(
             "plan_id": Value::Null,
             "state": "scan_required",
             "bootstrap_skill": "skillroster",
-            "bootstrap_version": env!("CARGO_PKG_VERSION"),
+            "cli_version": env!("CARGO_PKG_VERSION"),
+            "bootstrap_content_version": bootstrap_content_version,
+            "bootstrap_version": bootstrap_content_version,
             "missing_count": 0,
             "current_count": 0,
             "outdated_count": 0,
@@ -7696,7 +7700,7 @@ fn setup_command_with_manifests<'a>(
                 "physical_target": physical_entrypoint,
                 "status": package_status,
                 "installed_version": if package_status == "current" {
-                    Some(env!("CARGO_PKG_VERSION"))
+                    Some(bootstrap_content_version)
                 } else if package_status == "official_outdated" {
                     legacy_version
                 } else {
@@ -7714,7 +7718,9 @@ fn setup_command_with_manifests<'a>(
         "detected_agents": detected,
         "targets": targets,
         "bootstrap_skill": "skillroster",
-        "bootstrap_version": env!("CARGO_PKG_VERSION"),
+        "cli_version": env!("CARGO_PKG_VERSION"),
+        "bootstrap_content_version": bootstrap_content_version,
+        "bootstrap_version": bootstrap_content_version,
         "missing_count": missing_count,
         "current_count": current_count,
         "outdated_count": outdated_count,
