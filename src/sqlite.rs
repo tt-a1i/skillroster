@@ -1476,14 +1476,6 @@ impl StateStore {
         )?)
     }
 
-    pub fn mark_plan_recovery_if_applying(&self, id: &PlanId) -> StorageResult<bool> {
-        Ok(self.connection.execute(
-            "UPDATE plans SET status = 'recovery_required'
-             WHERE id = ?1 AND status = 'applying'",
-            [id.as_str()],
-        )? == 1)
-    }
-
     pub fn get_receipt(&self, id: &ReceiptId) -> StorageResult<Option<ReceiptRecord>> {
         let stored = self
             .connection
@@ -1561,26 +1553,6 @@ impl StateStore {
             .map(ReceiptId::parse)
             .transpose()
             .map_err(invalid_id)
-    }
-
-    pub fn update_receipt_status(&self, id: &ReceiptId, next: ReceiptStatus) -> StorageResult<()> {
-        if next != ReceiptStatus::Undone {
-            return Err(StorageError::InvalidData(format!(
-                "receipt {id} cannot transition to {next:?}"
-            )));
-        }
-        let next_text = enum_text(&next)?;
-        let changed = self.connection.execute(
-            "UPDATE receipts SET status = ?1, completed_at = ?2
-             WHERE id = ?3 AND status = 'applied'",
-            params![next_text, chrono::Utc::now().timestamp(), id.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(StorageError::InvalidData(format!(
-                "receipt {id} cannot transition to {next:?}"
-            )));
-        }
-        Ok(())
     }
 
     pub fn recovery_required(&self) -> StorageResult<bool> {
