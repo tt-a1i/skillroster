@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, deriveArmOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalResultEligible, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -129,6 +129,7 @@ test("SkillRoster seam uses the real envelope and global-option ordering", () =>
   const paths = { home: "/tmp/home", state: "/tmp/state" }; const task = { prompt: "完整任务", hint: "agent hint" };
   assert.deepEqual(skillRosterScanArgs(paths, "/tmp/source"), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "scan", "--source-root", "/tmp/source"]);
   assert.deepEqual(skillRosterFindArgs(paths, task), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "完整任务", "--hint", "agent hint"]);
+  assert.deepEqual(skillRosterFindArgs(paths, { ...task, one_call_load: true }), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "完整任务", "--hint", "agent hint", "--load", "--limit", "1"]);
 });
 
 test("Find audit preserves exact argument mismatch and retry classification", async () => {
@@ -160,6 +161,9 @@ test("wrapper source is allowlisted and records hashes rather than raw task or h
   const root = mkdtempSync(join(tmpdir(), "codex-find-wrapper-")); const path = join(root, "skillroster.mjs"); writeFileSync(path, source);
   const checked = spawnSync(process.execPath, ["--check", path], { encoding: "utf8" });
   assert.equal(checked.status, 0, checked.stderr);
+  writeFileSync(path, findWrapperSource(true));
+  const oneCallChecked = spawnSync(process.execPath, ["--check", path], { encoding: "utf8" });
+  assert.equal(oneCallChecked.status, 0, oneCallChecked.stderr);
 });
 
 test("post-hoc workspace audit treats every sidecar outside exact allowlist as a safety failure", () => {
@@ -216,6 +220,22 @@ test("exact target load is established from audited Codex command text", () => {
   assert.equal(assessExactLoad(transcript, path).passed, true);
   const failed = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: `cat -- '${canonical}'`, aggregated_output: "skill", exit_code: 0, status: "failed" } }); assert.equal(assessExactLoad(failed, path).passed, false);
   assert.equal(assessExactLoad(transcript, join(root, "source", "other", "SKILL.md")).passed, false);
+});
+
+test("one-call Find load proves exact content and completes route order without a filesystem read", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-one-call-load-")); const bootstrap = join(root, "bootstrap", "SKILL.md"); const target = join(root, "target", "SKILL.md");
+  mkdirSync(join(root, "bootstrap")); mkdirSync(join(root, "target")); writeFileSync(bootstrap, "bootstrap"); writeFileSync(target, "---\nname: target\n---\ncomplete instructions\n");
+  const content = readFileSync(target, "utf8"); const contentSha = await digest(content); const command = "skillroster find '完整任务' --hint 'target helper' --load --limit 1 --json";
+  const envelope = JSON.stringify({ schema_version: 1, ok: true, command: "find", result: { ranking_strategy: "task_hint_reciprocal_rank_fusion", matches: [{ rank: 1, name: "target", paths: [target] }], loaded_skill: { selection: { rank: 1 }, content: { path: target, complete: true, text: content, byte_length: Buffer.byteLength(content), sha256: contentSha }, verification: { identity_matches_snapshot: true, entrypoint_digest_matches_snapshot: true, package_fingerprint_matches_snapshot: true, package_fingerprint_complete: true }, task_success: "not_evaluated" } } });
+  const transcript = [
+    JSON.stringify({ type: "item.started", item: { id: "find", type: "command_execution", command } }),
+    JSON.stringify({ type: "item.completed", item: { id: "find", type: "command_execution", command, aggregated_output: envelope, exit_code: 0, status: "completed" } }),
+  ].join("\n");
+  const audit = { count: 1, contract_violation: false, calls: [{ argv_shape_valid: true, envelope_valid: true, exit_code: 0, hint_count: 1, hint_nonempty: true, task_sha256: await digest("完整任务"), top1_skill: "target", top1_path_sha256: await digest(realpathSync(target)), loaded_content_complete: true, loaded_content_sha256: contentSha }] };
+  assert.equal(assessOneCallLoad(transcript, target).passed, true);
+  assert.equal(assessRouteOrder(transcript, { bootstrapPath: bootstrap, targetPath: target, findAudit: audit, expectedTask: "完整任务", expectedSkill: "target", oneCall: true }).passed, true);
+  const redundantRead = `${transcript}\n${JSON.stringify({ type: "item.started", item: { id: "read", type: "command_execution", command: `cat '${target}'` } })}\n${JSON.stringify({ type: "item.completed", item: { id: "read", type: "command_execution", command: `cat '${target}'`, aggregated_output: content, exit_code: 0, status: "completed" } })}`;
+  assert.equal(assessRouteOrder(redundantRead, { bootstrapPath: bootstrap, targetPath: target, findAudit: audit, expectedTask: "完整任务", expectedSkill: "target", oneCall: true }).passed, false);
 });
 
 test("exact target load rejects path mentions, prefixes, and non-reading commands", () => {

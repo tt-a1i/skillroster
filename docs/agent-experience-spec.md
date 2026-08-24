@@ -158,8 +158,8 @@ The Agent uses stable IDs internally and displays them where they help follow-up
 The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 
 - route a task through `skillroster find` before acting when its required
-  specialized instructions are not already visible, then read the selected
-  result's exact `SKILL.md` path;
+  specialized instructions are not already visible, using `--load --limit 1`
+  to receive the selected complete verified `SKILL.md` in the same result;
 - invoke commands with explicit `--json`;
 - validate `schema_version` and `ok` before reading `result`;
 - set `schema_version: 1` on every declarative Plan request;
@@ -197,6 +197,9 @@ Machine results should expose facts, not preformatted prose:
 - Findings with stable ID, category, severity, Evidence quality, impact fields, and affected IDs;
 - a bounded selector-free `report --json` first view (`--summary` is an explicit alias) with no more than three Findings, one primary Evidence reference per selected Finding, and complete `finding_rollups` grouped by category, severity, and title with deduplicated affected counts; explicit `report --full --json` for exhaustive diagnostics; a category/severity-filterable `report --findings --json` page for enumerating compact Finding summaries; and compact paged Evidence items from `report --finding ID --json`; exact complete records require `--full`, exact-duplicate detail exposes at most five ranked owned canonical candidates, and large-Roster detail exposes bounded per-Agent Core selection previews without requiring pagination;
 - Find results that keep the original task, expose Agent-authored retrieval hints, name the ranking strategy, retain task and augmented channel ranks, and collapse same-name identities into one explicitly variant capability result; the linked divergent-content Finding groups readable paths, digests, Agents, providers, and governance facts by variant and requires a canonical-content choice before Plan;
+- an opt-in Find load result that separates Top-1 selection, complete bounded
+  content, governance, and verification facts; load failure returns no partial
+  instructions, and task success remains model- and task-evidence-owned;
 - bounded Plan `change_summary`, `operation_groups`, affected-scope counts and `impact` deltas for current and proposed state; exact-duplicate Library impact compares physical sources, total placements, and default-exposed placements before and after, while retaining relinked placements as an operation fact; its aggregate totals remain complete when the per-Skill preview is truncated and are identical in the summary and `plan --show`; semantic Roster summaries expose at most five named Core selections with reasons per Agent, while `plan --show PLAN_ID` exposes the exact immutable Core selections; `diff_summary` contains at most three semantic Roster, Library, and filesystem items, or bounded line details for a source update; full operations are loaded only through `plan --show PLAN_ID` when needed;
 - affected Agents, Skills, placements, operation groups, exclusions, and deletion count;
 - risk, reversibility, drift, confirmation, and recovery state;

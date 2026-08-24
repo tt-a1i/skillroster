@@ -6440,6 +6440,25 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
         None,
     ));
     assert_eq!(archived["result"]["matches"], json!([]));
+    let archived_load = run(
+        &[
+            &common[..],
+            &["find", "phosphorescent reconciliation", "--load"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!archived_load.status.success());
+    let archived_load: Value = serde_json::from_slice(&archived_load.stdout).unwrap();
+    assert_eq!(
+        archived_load["error"]["code"],
+        "verified_skill_load_blocked"
+    );
+    assert_eq!(
+        archived_load["error"]["details"]["reason"],
+        "archived_skill_not_routable"
+    );
+    assert!(archived_load["error"]["details"].get("content").is_none());
 
     json_output(&run(
         &[
@@ -6489,6 +6508,20 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         None,
     ));
     assert_eq!(before["result"]["matches"][0]["variant_count"], 2);
+    let ambiguous_load = run(
+        &[
+            &common[..],
+            &["find", "active search marker", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!ambiguous_load.status.success());
+    let ambiguous_load: Value = serde_json::from_slice(&ambiguous_load.stdout).unwrap();
+    assert_eq!(
+        ambiguous_load["error"]["details"]["reason"],
+        "same_name_variants_ambiguous"
+    );
 
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     let payload: String = database
@@ -6592,6 +6625,161 @@ fn find_rejects_content_drift_and_requests_rescan() {
             .unwrap()
             .contains("skillroster scan")
     );
+
+    let loaded = run(
+        &[
+            &common[..],
+            &["find", "needle before drift", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!loaded.status.success());
+    let loaded: Value = serde_json::from_slice(&loaded.stdout).unwrap();
+    assert_eq!(
+        loaded["error"]["details"]["reason"],
+        "entrypoint_content_drift"
+    );
+    assert!(loaded["error"]["details"].get("content").is_none());
+
+    fs::write(skill.join("SKILL.md"), vec![b'x'; 128 * 1024 + 1]).unwrap();
+    let oversized = run(
+        &[
+            &common[..],
+            &["find", "needle before drift", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!oversized.status.success());
+    let oversized: Value = serde_json::from_slice(&oversized.stdout).unwrap();
+    assert_eq!(
+        oversized["error"]["details"]["reason"],
+        "entrypoint_exceeds_content_limit"
+    );
+
+    fs::remove_file(skill.join("SKILL.md")).unwrap();
+    let unreadable = run(
+        &[
+            &common[..],
+            &["find", "needle before drift", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!unreadable.status.success());
+    let unreadable: Value = serde_json::from_slice(&unreadable.stdout).unwrap();
+    assert_eq!(
+        unreadable["error"]["details"]["reason"],
+        "entrypoint_unreadable"
+    );
+}
+
+#[test]
+fn find_load_returns_the_complete_verified_top_match_in_one_envelope() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/event-manifest");
+    fs::create_dir_all(&skill).unwrap();
+    let content = "---\nname: event-manifest\ndescription: Build a deterministic event manifest\n---\n\nFollow the complete event manifest instructions.\n";
+    fs::write(skill.join("SKILL.md"), content).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "build a deterministic event manifest",
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let loaded = &found["result"]["loaded_skill"];
+    assert_eq!(found["result"]["matches"][0]["name"], "event-manifest");
+    assert_eq!(loaded["selection"]["rank"], 1);
+    assert_eq!(loaded["content"]["text"], content);
+    assert_eq!(loaded["content"]["byte_length"], content.len());
+    assert_eq!(
+        loaded["content"]["sha256"],
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    );
+    assert_eq!(loaded["content"]["complete"], true);
+    assert_eq!(
+        loaded["verification"]["entrypoint_digest_matches_snapshot"],
+        true
+    );
+    assert_eq!(loaded["governance"]["content_endorsed"], false);
+    assert_eq!(loaded["task_success"], "not_evaluated");
+    assert_eq!(found["result"]["files_changed"], false);
+}
+
+#[test]
+fn find_load_rejects_an_untrusted_external_source_without_returning_content() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/external-helper");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: external-helper\ndescription: external trust fixture\n---\nsecret instructions\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&payload).unwrap();
+    payload["placements"][0]["mutation_scope"] = json!("untrusted_external");
+    payload["placements"][0]["governable"] = json!(false);
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            (payload.to_string(), snapshot),
+        )
+        .unwrap();
+
+    let loaded = run(
+        &[
+            &common[..],
+            &["find", "external trust fixture", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!loaded.status.success());
+    let loaded: Value = serde_json::from_slice(&loaded.stdout).unwrap();
+    assert_eq!(
+        loaded["error"]["details"]["reason"],
+        "untrusted_external_source"
+    );
+    assert!(!loaded.to_string().contains("secret instructions"));
 }
 
 #[test]
@@ -6676,6 +6864,21 @@ fn find_rejects_a_skill_symlink_that_now_escapes_approved_roots() {
     ));
     assert_eq!(found["result"]["matches"][0]["paths"], json!([]));
     assert_eq!(found["result"]["rescan_required"], true);
+
+    let loaded = run(
+        &[
+            &common[..],
+            &["find", "unique escape needle", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!loaded.status.success());
+    let loaded: Value = serde_json::from_slice(&loaded.stdout).unwrap();
+    assert_eq!(
+        loaded["error"]["details"]["reason"],
+        "entrypoint_escapes_approved_roots"
+    );
 }
 
 #[cfg(unix)]

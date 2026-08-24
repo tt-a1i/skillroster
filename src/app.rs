@@ -30,6 +30,9 @@ use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
+/// Agent tool-result transport bound, deliberately narrower than the 2 MiB
+/// inventory parser bound. Larger Skills should disclose references on demand.
+const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
 
 /// Global discovery and state options that a suggested action must retain to
 /// operate on the same local analysis context as the command that produced it.
@@ -386,6 +389,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 &args.task,
                 &args.hints,
                 usize::from(args.limit),
+                args.load,
             )?;
             ("find", result, vec![], actions)
         }
@@ -778,6 +782,33 @@ fn fingerprint_remediation(completeness: scan::FingerprintCompleteness) -> Value
 }
 
 fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError {
+    if let Some(blocker) = error.downcast_ref::<SkillLoadBlocked>() {
+        let next_action = match blocker.reason {
+            "same_name_variants_ambiguous" => "inspect_variant_finding",
+            "untrusted_external_source" => "confirm_exact_source_root_then_scan",
+            "archived_skill_not_routable" => "choose_non_archived_skill",
+            _ => "scan",
+        };
+        return ClassifiedError {
+            code: "verified_skill_load_blocked",
+            retryable: false,
+            details: Some(json!({
+                "reason": blocker.reason,
+                "skill_id": blocker.skill_id,
+                "skill_name": blocker.skill_name,
+                "path": blocker.path,
+                "roster_state": blocker.roster_state,
+                "mutation_scopes": blocker.mutation_scopes,
+                "expected_digest": blocker.expected_digest,
+                "actual_digest": blocker.actual_digest,
+                "content_limit_bytes": MAX_AGENT_LOADED_SKILL_BYTES,
+                "files_changed": false,
+                "state_files_changed": false,
+                "task_success": "not_evaluated",
+                "next_action": next_action,
+            })),
+        };
+    }
     if let Some(policy) = error.downcast_ref::<crate::source_policy::SourceRootPolicyError>() {
         use crate::source_policy::SourceRootPolicyError as PolicyError;
         let facts = match policy {
@@ -4140,6 +4171,7 @@ fn find_command(
     task: &str,
     hints: &[String],
     limit: usize,
+    load: bool,
 ) -> Result<(Value, Vec<SuggestedAction>)> {
     let (scan_id, scan) = latest_scan(store)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
@@ -4157,11 +4189,13 @@ fn find_command(
         .iter()
         .map(|skill| skill.id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    let mut archived_ids = BTreeSet::new();
     for skill_id in routable_ids.clone() {
         let id = SkillId::parse(skill_id.clone())?;
         let states = store.roster_states_for_skill(&id)?;
         if !states.is_empty() && states.iter().all(|state| *state == RosterState::Archived) {
             routable_ids.remove(&skill_id);
+            archived_ids.insert(skill_id);
         }
     }
     if crate::query::contains_cjk(retrieval_query.text()) {
@@ -4251,6 +4285,50 @@ fn find_command(
         &mut matches,
     )?;
     rescan_required |= variant_rescan_required;
+    if load && matches.is_empty() {
+        let archived_match = crate::query::find_matching(
+            &scan,
+            &retrieval_query,
+            1,
+            Some(&archived_ids),
+            Some(&archived_ids),
+        )
+        .into_iter()
+        .next();
+        return Err(SkillLoadBlocked {
+            reason: if archived_match.is_some() {
+                "archived_skill_not_routable"
+            } else {
+                "no_routable_match"
+            },
+            skill_id: archived_match
+                .as_ref()
+                .map(|matched| matched.skill_id.clone())
+                .unwrap_or_default(),
+            skill_name: archived_match
+                .as_ref()
+                .map(|matched| matched.name.clone())
+                .unwrap_or_else(|| "Top-1".into()),
+            path: None,
+            roster_state: archived_match
+                .map(|_| "archived".to_owned())
+                .unwrap_or_else(|| "unassigned".into()),
+            mutation_scopes: Vec::new(),
+            expected_digest: None,
+            actual_digest: None,
+        }
+        .into());
+    }
+    let loaded_skill = if load && !matches.is_empty() {
+        Some(verified_top_skill_load(
+            &scan_id,
+            &scan,
+            state_dir,
+            &matches[0],
+        )?)
+    } else {
+        None
+    };
     for found in matches
         .iter()
         .take(3)
@@ -4297,19 +4375,20 @@ fn find_command(
     }
     warnings.sort();
     warnings.dedup();
-    Ok((
-        json!({
-            "snapshot_id": scan_id,
-            "task": task,
-            "retrieval_hints": retrieval_hints,
-            "ranking_strategy": ranking_strategy,
-            "matches": matches,
-            "rescan_required": rescan_required,
-            "warnings": warnings,
-            "files_changed": false
-        }),
-        actions,
-    ))
+    let mut result = json!({
+        "snapshot_id": scan_id,
+        "task": task,
+        "retrieval_hints": retrieval_hints,
+        "ranking_strategy": ranking_strategy,
+        "matches": matches,
+        "rescan_required": rescan_required,
+        "warnings": warnings,
+        "files_changed": false
+    });
+    if let Some(loaded_skill) = loaded_skill {
+        result["loaded_skill"] = loaded_skill;
+    }
+    Ok((result, actions))
 }
 
 fn bind_variant_findings(
@@ -4590,6 +4669,257 @@ fn current_readable_skill_paths(
 struct CurrentSkillPaths {
     paths: Vec<String>,
     drifted: bool,
+}
+
+#[derive(Debug)]
+struct SkillLoadBlocked {
+    reason: &'static str,
+    skill_id: String,
+    skill_name: String,
+    path: Option<PathBuf>,
+    roster_state: String,
+    mutation_scopes: Vec<String>,
+    expected_digest: Option<String>,
+    actual_digest: Option<String>,
+}
+
+impl std::fmt::Display for SkillLoadBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "verified Skill load blocked for {} ({}): {}",
+            self.skill_name, self.skill_id, self.reason
+        )
+    }
+}
+
+impl std::error::Error for SkillLoadBlocked {}
+
+fn verified_top_skill_load(
+    scan_id: &ScanId,
+    scan: &ScanResult,
+    state_dir: &Path,
+    matched: &crate::query::FindMatch,
+) -> Result<Value> {
+    let blocked = |reason, path, expected_digest, actual_digest| SkillLoadBlocked {
+        reason,
+        skill_id: matched.skill_id.clone(),
+        skill_name: matched.name.clone(),
+        path,
+        roster_state: matched.roster_state.clone(),
+        mutation_scopes: matched
+            .mutation_scopes
+            .iter()
+            .map(|scope| scope.id().to_owned())
+            .collect(),
+        expected_digest,
+        actual_digest,
+    };
+
+    if matched.variant_count != 1 {
+        return Err(blocked("same_name_variants_ambiguous", None, None, None).into());
+    }
+    if matched.roster_state == "archived" {
+        return Err(blocked("archived_skill_not_routable", None, None, None).into());
+    }
+
+    let mut placements = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == matched.skill_id)
+        .collect::<Vec<_>>();
+    placements.sort_by(|left, right| left.entrypoint.cmp(&right.entrypoint));
+    if placements.is_empty() {
+        return Err(blocked("placement_missing_from_snapshot", None, None, None).into());
+    }
+    if placements.iter().all(|placement| {
+        placement
+            .mutation_scope
+            .is_none_or(|scope| scope == scan::MutationScope::UntrustedExternal)
+    }) {
+        return Err(blocked("untrusted_external_source", None, None, None).into());
+    }
+    if placements.iter().all(|placement| {
+        placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
+    }) {
+        return Err(blocked("package_fingerprint_incomplete", None, None, None).into());
+    }
+    if placements
+        .iter()
+        .filter(|placement| {
+            placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+                && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+        })
+        .all(|placement| placement.entrypoint_digest.is_none())
+    {
+        return Err(blocked("legacy_snapshot_requires_rescan", None, None, None).into());
+    }
+
+    let placement = placements
+        .into_iter()
+        .find(|placement| {
+            placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+                && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+                && placement.entrypoint_digest.is_some()
+        })
+        .ok_or_else(|| blocked("eligible_placement_missing", None, None, None))?;
+    let path = placement.entrypoint.clone();
+    let expected_entrypoint_digest = placement.entrypoint_digest.clone().ok_or_else(|| {
+        blocked(
+            "legacy_snapshot_requires_rescan",
+            Some(path.clone()),
+            None,
+            None,
+        )
+    })?;
+    let before = std::fs::canonicalize(&path).map_err(|_| {
+        blocked(
+            "entrypoint_unreadable",
+            Some(path.clone()),
+            Some(expected_entrypoint_digest.clone()),
+            None,
+        )
+    })?;
+    let mut allowed_roots = scan
+        .roots
+        .iter()
+        .filter(|root| root.kind == RootKind::Skills && root.status == scan::RootStatus::Included)
+        .filter_map(|root| std::fs::canonicalize(&root.path).ok())
+        .collect::<Vec<_>>();
+    if let Ok(library) = std::fs::canonicalize(state_dir.join("library")) {
+        allowed_roots.push(library);
+    }
+    if !before.is_file() || !allowed_roots.iter().any(|root| before.starts_with(root)) {
+        return Err(blocked(
+            "entrypoint_escapes_approved_roots",
+            Some(path),
+            Some(expected_entrypoint_digest),
+            None,
+        )
+        .into());
+    }
+    let metadata = std::fs::metadata(&before).map_err(|_| {
+        blocked(
+            "entrypoint_unreadable",
+            Some(path.clone()),
+            Some(expected_entrypoint_digest.clone()),
+            None,
+        )
+    })?;
+    if metadata.len() > MAX_AGENT_LOADED_SKILL_BYTES {
+        return Err(blocked(
+            "entrypoint_exceeds_content_limit",
+            Some(path),
+            Some(expected_entrypoint_digest),
+            None,
+        )
+        .into());
+    }
+    let bytes = std::fs::read(&before).map_err(|_| {
+        blocked(
+            "entrypoint_unreadable",
+            Some(path.clone()),
+            Some(expected_entrypoint_digest.clone()),
+            None,
+        )
+    })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_AGENT_LOADED_SKILL_BYTES {
+        return Err(blocked(
+            "entrypoint_exceeds_content_limit",
+            Some(path),
+            Some(expected_entrypoint_digest),
+            None,
+        )
+        .into());
+    }
+    let actual_entrypoint_digest = content_digest(&bytes);
+    if actual_entrypoint_digest != expected_entrypoint_digest {
+        return Err(blocked(
+            "entrypoint_content_drift",
+            Some(path),
+            Some(expected_entrypoint_digest),
+            Some(actual_entrypoint_digest),
+        )
+        .into());
+    }
+    let content = String::from_utf8(bytes).map_err(|_| {
+        blocked(
+            "entrypoint_not_utf8",
+            Some(path.clone()),
+            Some(expected_entrypoint_digest.clone()),
+            Some(actual_entrypoint_digest.clone()),
+        )
+    })?;
+    let (actual_id, actual_package_digest) = scan::inspect_skill_identity(&path).map_err(|_| {
+        blocked(
+            "package_identity_unreadable",
+            Some(path.clone()),
+            Some(placement.content_digest.clone()),
+            None,
+        )
+    })?;
+    let after = std::fs::canonicalize(&path).map_err(|_| {
+        blocked(
+            "entrypoint_unreadable",
+            Some(path.clone()),
+            Some(expected_entrypoint_digest.clone()),
+            None,
+        )
+    })?;
+    if before != after
+        || actual_id != matched.skill_id
+        || actual_package_digest != placement.content_digest
+    {
+        return Err(blocked(
+            "package_identity_drift",
+            Some(path),
+            Some(placement.content_digest.clone()),
+            Some(actual_package_digest),
+        )
+        .into());
+    }
+
+    let read_authority = match placement.mutation_scope {
+        Some(scan::MutationScope::Mutable) => "agent_or_managed_root",
+        Some(scan::MutationScope::ProviderReadOnly) => "provider_read_only",
+        Some(scan::MutationScope::DurableReadOnly) => "confirmed_durable_read_only",
+        Some(scan::MutationScope::UntrustedExternal) | None => unreachable!("filtered above"),
+    };
+    Ok(json!({
+        "selection": {
+            "rank": matched.rank,
+            "skill_id": matched.skill_id,
+            "name": matched.name,
+            "snapshot_id": scan_id,
+            "ranking_evidence": matched.match_reasons,
+        },
+        "content": {
+            "path": placement.entrypoint,
+            "media_type": "text/markdown; charset=utf-8",
+            "byte_length": content.len(),
+            "sha256": actual_entrypoint_digest,
+            "complete": true,
+            "text": content,
+        },
+        "governance": {
+            "roster_state": matched.roster_state,
+            "read_authority": read_authority,
+            "content_endorsed": false,
+            "owned_by_agent": placement.owned_by_agent,
+            "mutation_scope": placement.mutation_scope,
+            "governable": placement.is_mutable(),
+            "provider": placement.provider,
+        },
+        "verification": {
+            "identity_matches_snapshot": true,
+            "entrypoint_digest_matches_snapshot": true,
+            "package_fingerprint_matches_snapshot": true,
+            "package_fingerprint_complete": true,
+            "package_fingerprint": actual_package_digest,
+            "content_limit_bytes": MAX_AGENT_LOADED_SKILL_BYTES,
+        },
+        "task_success": "not_evaluated",
+    }))
 }
 
 fn plan_command(
@@ -8205,6 +8535,7 @@ mod recovery_tests {
             directory,
             physical_directory: None,
             content_digest: "legacy-digest".into(),
+            entrypoint_digest: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
             link_target: None,
@@ -8900,6 +9231,7 @@ mod recovery_tests {
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
             physical_directory: None,
             content_digest: "digest_shared".into(),
+            entrypoint_digest: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
             link_target: None,
@@ -8989,6 +9321,7 @@ mod recovery_tests {
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
             physical_directory: None,
             content_digest: "same-fallback-digest".into(),
+            entrypoint_digest: None,
             fingerprint_completeness: completeness,
             fingerprint_detail: Some("package exceeded fingerprint limit".into()),
             link_target: None,
@@ -9085,6 +9418,7 @@ mod recovery_tests {
                 entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
                 physical_directory: None,
                 content_digest: "legacy-digest".into(),
+                entrypoint_digest: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Unknown,
                 fingerprint_detail: None,
                 link_target: None,
@@ -9146,6 +9480,7 @@ mod recovery_tests {
                 entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
                 physical_directory: None,
                 content_digest: "legacy-digest".into(),
+                entrypoint_digest: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Complete,
                 fingerprint_detail: None,
                 link_target: None,

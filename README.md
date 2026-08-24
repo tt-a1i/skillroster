@@ -36,6 +36,7 @@ skillroster find "database migration" --json
 skillroster find "把中文改自然一点" --json
 skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
 skillroster find "分析本地表格" --hint "analyze standalone spreadsheet file workbook data" --json
+skillroster find "build an event manifest" --load --limit 1 --json
 skillroster plan --stdin --json
 skillroster plan --show <plan-id> --json
 skillroster apply <plan-id> --json

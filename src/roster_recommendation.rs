@@ -759,6 +759,7 @@ mod tests {
                 )),
                 physical_directory: None,
                 content_digest: skill.content_digest.clone(),
+                entrypoint_digest: None,
                 fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
                 fingerprint_detail: None,
                 link_target: None,

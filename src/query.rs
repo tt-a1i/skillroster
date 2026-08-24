@@ -3536,6 +3536,7 @@ mod tests {
                     entrypoint: PathBuf::from(format!("/{}/skills/{index}/SKILL.md", agent.id())),
                     physical_directory: None,
                     content_digest: format!("digest_{index}"),
+                    entrypoint_digest: None,
                     fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
                     fingerprint_detail: None,
                     link_target: None,

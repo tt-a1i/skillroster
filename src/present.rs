@@ -1070,9 +1070,14 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
             }
         }
     }
+    let loaded = value.get("loaded_skill").is_some_and(Value::is_object);
     lines.extend(summary(
         "Read-only · no Skill was activated",
-        "Read the selected SKILL.md directly",
+        if loaded {
+            "Top match verified and fully loaded in Agent JSON"
+        } else {
+            "Use --load for one-call verified instructions"
+        },
     ));
 }
 

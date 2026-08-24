@@ -79,6 +79,7 @@ export function validateManifest(manifest) {
     const protocolTerms = new RegExp(`skillroster|${escapedSkill}|capability\\s+search|能力检索|技能检索|\\bfind\\b`, "iu");
     if (protocolTerms.test(task.prompt)) fail(`${task.id} prompt must not disclose the routing protocol or target Skill`);
     if (task.required_find_calls !== undefined && (!Number.isSafeInteger(task.required_find_calls) || task.required_find_calls < 1 || task.required_find_calls > 2)) fail(`${task.id} required_find_calls must be 1 or 2`);
+    if (task.one_call_load !== undefined && typeof task.one_call_load !== "boolean") fail(`${task.id} one_call_load must be boolean`);
     if (!Array.isArray(task.allowed_changed_paths)) fail(`${task.id} allowed_changed_paths is required`);
     for (const path of [...Object.keys(task.workspace_files ?? {}), ...task.allowed_changed_paths]) safeRelative(path, `${task.id} path`);
     if (task.allowed_changed_paths.some((path) => Object.hasOwn(task.workspace_files ?? {}, path))) fail(`${task.id} cannot mutate an input`);
@@ -241,8 +242,10 @@ export function parseFindAudit(text, expected) {
     first_call_argv_exact: first?.argv_shape_valid === true,
     top1_correct: Boolean(successful),
     returned_path_exact: successful?.top1_path_sha256 === sha(canonicalPath(expected.path)),
+    loaded_content_complete: expected.oneCall ? Boolean(successful?.loaded_content_complete) : null,
+    loaded_content_exact: expected.oneCall ? successful?.loaded_content_sha256 === sha(readFileSync(expected.path)) : null,
     retry_classification: calls.length === 0 ? "no_retrieval" : calls.length === 1 ? "single_attempt" : first?.task_sha256 !== sha(expected.task) || !first?.hint_nonempty ? "recovered_after_argument_mismatch" : "retried_after_valid_call",
-    contract_violation: calls.length > 2 || !first || first.argv_shape_valid !== true || first.envelope_valid !== true || first.task_sha256 !== sha(expected.task) || !(first.hint_count > 0 && first.hint_nonempty),
+    contract_violation: calls.length > 2 || !first || first.argv_shape_valid !== true || first.envelope_valid !== true || first.task_sha256 !== sha(expected.task) || !(first.hint_count > 0 && first.hint_nonempty) || (expected.oneCall === true && (!successful?.loaded_content_complete || successful?.loaded_content_sha256 !== sha(readFileSync(expected.path)))),
     calls,
   };
 }
@@ -475,6 +478,31 @@ export function assessExactLoad(transcript, targetPath) {
   return { passed: loadEventIndex !== null, evidence_mode: evidenceMode, target_path_sha256: sha(canonical), audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed exact-path reads with verified content echo; compound suffixes must be fully classified as read-only" };
 }
 
+function verifiedFindLoad(output, targetPath) {
+  if (typeof output !== "string") return null;
+  let value; try { value = JSON.parse(output); } catch { return null; }
+  const loaded = value?.result?.loaded_skill; const content = loaded?.content; const verification = loaded?.verification;
+  const target = readFileSync(targetPath); const text = target.toString("utf8");
+  if (value?.schema_version !== 1 || value?.ok !== true || value?.command !== "find"
+      || loaded?.selection?.rank !== 1 || canonicalPath(content?.path ?? "") !== canonicalPath(targetPath)
+      || content?.complete !== true || content?.text !== text || content?.byte_length !== target.length
+      || content?.sha256 !== sha(target) || loaded?.task_success !== "not_evaluated"
+      || verification?.identity_matches_snapshot !== true
+      || verification?.entrypoint_digest_matches_snapshot !== true
+      || verification?.package_fingerprint_matches_snapshot !== true
+      || verification?.package_fingerprint_complete !== true) return null;
+  return { evidence_mode: "verified_find_json_content", target_path_sha256: sha(canonicalPath(targetPath)), content_sha256: sha(target), content_bytes: target.length };
+}
+
+export function assessOneCallLoad(transcript, targetPath) {
+  const commands = extractCommandEvents(transcript); let loaded = null; let loadEventIndex = null;
+  for (const [index, event] of commands.entries()) {
+    if (event.kind !== "command" || !isFindCommand(event.command) || event.exit_code !== 0 || event.status !== "completed") continue;
+    loaded = verifiedFindLoad(event.output, targetPath); if (loaded) { loadEventIndex = index; break; }
+  }
+  return { passed: Boolean(loaded), evidence_mode: loaded?.evidence_mode ?? null, target_path_sha256: sha(canonicalPath(targetPath)), content_sha256: loaded?.content_sha256 ?? null, content_bytes: loaded?.content_bytes ?? null, audited_command_count: commands.length, load_event_index: loadEventIndex, audit_scope: "completed standalone Find command with exact verified SKILL.md content in the same JSON tool result" };
+}
+
 function findCommandShape(command) {
   const tokens = simpleCommandTokens(command);
   if (tokens && basename(tokens[0]) === "skillroster" && tokens[1] === "find") return "standalone";
@@ -487,7 +515,7 @@ function findCommandShape(command) {
 
 function isFindCommand(command) { return findCommandShape(command) !== null; }
 
-export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAudit, expectedTask = null, expectedSkill = null }) {
+export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAudit, expectedTask = null, expectedSkill = null, oneCall = false }) {
   const events = extractRouteEvents(transcript); const violations = []; const bootstrapRanges = []; const targetRanges = []; const bootstrapLines = targetLineCount(canonicalPath(bootstrapPath)); const targetLines = targetLineCount(canonicalPath(targetPath));
   const findAttempts = new Map(); let bootstrapLoaded = false; let findStarted = false; let findAuthorized = false; let targetLoaded = false; let transcriptFindCount = 0;
   for (const [index, event] of events.entries()) {
@@ -500,7 +528,8 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
         const attempt = findAttempts.get(event.id); const call = Number.isInteger(attempt) ? findAudit.calls?.[attempt] : null;
         const contractValid = Boolean(call && call.argv_shape_valid === true && call.envelope_valid === true && call.exit_code === 0 && call.hint_count > 0 && call.hint_nonempty === true && (!expectedTask || call.task_sha256 === sha(expectedTask)));
         const targetMatch = Boolean(call && (!expectedSkill || call.top1_skill === expectedSkill) && call.top1_path_sha256 === sha(canonicalPath(targetPath)));
-        if (event.exit_code === 0 && event.status === "completed" && contractValid && targetMatch) findAuthorized = true;
+        const loadedMatch = !oneCall || (call?.loaded_content_complete === true && call?.loaded_content_sha256 === sha(readFileSync(targetPath)));
+        if (event.exit_code === 0 && event.status === "completed" && contractValid && targetMatch && loadedMatch) { findAuthorized = true; if (oneCall) targetLoaded = true; }
         else if (!(event.exit_code === 0 && event.status === "completed" && contractValid)) violations.push(`find_completion_contract_invalid:${index}:${attempt ?? "unmatched"}`);
         continue;
       }
@@ -512,7 +541,7 @@ export function assessRouteOrder(transcript, { bootstrapPath, targetPath, findAu
     }
     if (isFindCommand(event.command)) { const attempt = transcriptFindCount; transcriptFindCount += 1; if (event.id) findAttempts.set(event.id, attempt); if (findCommandShape(event.command) === "unsafe_compound") violations.push(`find_shell_shape_invalid:${index}`); if (targetLoaded) violations.push(`find_after_load:${index}`); findStarted = true; continue; }
     if (!findStarted && bootstrapRead) continue;
-    if (targetRead) { if (!findAuthorized) violations.push(`target_load_before_find_complete:${index}`); continue; }
+    if (targetRead) { if (!findAuthorized) violations.push(`target_load_before_find_complete:${index}`); else if (oneCall) violations.push(`redundant_target_read_after_one_call_load:${index}`); continue; }
     if (!findStarted) violations.push(`task_command_before_find:${index}`);
     else if (!findAuthorized) violations.push(`task_command_before_find_complete:${index}`);
     else if (!targetLoaded) violations.push(`task_command_before_load:${index}`);
@@ -697,7 +726,7 @@ export function parseFindEnvelope(stdout) {
   if (value.result?.ranking_strategy !== "task_hint_reciprocal_rank_fusion") fail("Find did not use task_hint_reciprocal_rank_fusion");
   const candidates = value?.result?.matches ?? [];
   const top = candidates[0] ?? null;
-  return { skill: top?.name ?? null, path: top?.paths?.[0] ?? null, roster_state: top?.roster_state ?? null, agents: top?.agents ?? [], raw: value };
+  return { skill: top?.name ?? null, path: top?.paths?.[0] ?? null, roster_state: top?.roster_state ?? null, agents: top?.agents ?? [], loaded: value?.result?.loaded_skill ?? null, raw: value };
 }
 
 function parseEnvelope(stdout, command) {
@@ -707,9 +736,9 @@ function parseEnvelope(stdout, command) {
 }
 
 export function skillRosterScanArgs(paths, sourceRoot) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "scan", "--source-root", sourceRoot]; }
-export function skillRosterFindArgs(paths, task) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "find", task.prompt, "--hint", task.hint]; }
+export function skillRosterFindArgs(paths, task) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "find", task.prompt, "--hint", task.hint, ...(task.one_call_load ? ["--load", "--limit", "1"] : [])]; }
 
-export function findWrapperSource() {
+export function findWrapperSource(oneCallLoad = false) {
   return `#!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
@@ -720,12 +749,15 @@ const sha = (value) => createHash("sha256").update(value).digest("hex");
 const args = process.argv.slice(2); const separator = args.indexOf("--hint");
 const task = args[0] === "find" ? (args[1] ?? "") : "";
 const hints = []; for (let i = 0; i < args.length; i += 1) if (args[i] === "--hint" && args[i + 1] !== undefined) hints.push(args[i + 1]);
-let result = { status: 64, stdout: "", stderr: "wrapper permits only: skillroster find TASK --hint HINT --json\\n" };
-const argvShapeValid = args.length === 5 && args[0] === "find" && args[2] === "--hint" && args[4] === "--json";
-if (argvShapeValid) result = spawnSync(process.env.SKILLROSTER_REAL_CLI, ["--home", process.env.SKILLROSTER_TEST_HOME, "--state-dir", process.env.SKILLROSTER_TEST_STATE, "--json", ...args.slice(0, 4)], { encoding: "utf8", shell: false });
-let top1 = {}; let envelopeValid = false; try { const value = JSON.parse(result.stdout ?? ""); envelopeValid = value?.schema_version === 1 && value?.ok === true && value?.command === "find" && value?.result?.ranking_strategy === "task_hint_reciprocal_rank_fusion"; const top = envelopeValid ? value?.result?.matches?.[0] ?? {} : {}; top1 = { skill: top.name ?? null, path: top.paths?.[0] ?? null }; } catch {}
+const oneCallLoad = ${JSON.stringify(oneCallLoad)};
+let result = { status: 64, stdout: "", stderr: oneCallLoad ? "wrapper permits only: skillroster find TASK --hint HINT --load --limit 1 --json\\n" : "wrapper permits only: skillroster find TASK --hint HINT --json\\n" };
+const argvShapeValid = oneCallLoad
+  ? args.length === 8 && args[0] === "find" && args[2] === "--hint" && args[4] === "--load" && args[5] === "--limit" && args[6] === "1" && args[7] === "--json"
+  : args.length === 5 && args[0] === "find" && args[2] === "--hint" && args[4] === "--json";
+if (argvShapeValid) result = spawnSync(process.env.SKILLROSTER_REAL_CLI, ["--home", process.env.SKILLROSTER_TEST_HOME, "--state-dir", process.env.SKILLROSTER_TEST_STATE, "--json", ...args.slice(0, oneCallLoad ? 7 : 4)], { encoding: "utf8", shell: false });
+let top1 = {}; let envelopeValid = false; let loadedContentComplete = false; let loadedContentSha256 = null; try { const value = JSON.parse(result.stdout ?? ""); envelopeValid = value?.schema_version === 1 && value?.ok === true && value?.command === "find" && value?.result?.ranking_strategy === "task_hint_reciprocal_rank_fusion"; const top = envelopeValid ? value?.result?.matches?.[0] ?? {} : {}; top1 = { skill: top.name ?? null, path: top.paths?.[0] ?? null }; const loaded = value?.result?.loaded_skill; loadedContentComplete = !oneCallLoad || (loaded?.selection?.rank === 1 && loaded?.content?.complete === true && typeof loaded?.content?.text === "string" && loaded?.content?.byte_length === Buffer.byteLength(loaded.content.text, "utf8") && loaded?.content?.sha256 === sha(loaded.content.text) && loaded?.verification?.identity_matches_snapshot === true && loaded?.verification?.entrypoint_digest_matches_snapshot === true && loaded?.verification?.package_fingerprint_matches_snapshot === true && loaded?.verification?.package_fingerprint_complete === true && loaded?.task_success === "not_evaluated"); loadedContentSha256 = loadedContentComplete && oneCallLoad ? sha(loaded.content.text) : null; envelopeValid = envelopeValid && (!oneCallLoad || loadedContentComplete); } catch {}
 let canonicalTopPath = null; try { canonicalTopPath = top1.path ? realpathSync(top1.path) : null; } catch { canonicalTopPath = top1.path ? resolve(top1.path) : null; }
-appendFileSync(process.env.SKILLROSTER_FIND_AUDIT, JSON.stringify({ kind: "find_call", argv_count: args.length, argv_shape_valid: argvShapeValid, envelope_valid: envelopeValid, task_sha256: sha(task), hint_count: hints.length, hint_nonempty: hints.length > 0 && hints.every((hint) => hint.trim().length > 0), hint_sha256: hints.map(sha), separator_index: separator, exit_code: result.status, top1_skill: top1.skill ?? null, top1_path_sha256: canonicalTopPath ? sha(canonicalTopPath) : null }) + "\\n", { mode: 0o600 });
+appendFileSync(process.env.SKILLROSTER_FIND_AUDIT, JSON.stringify({ kind: "find_call", argv_count: args.length, argv_shape_valid: argvShapeValid, envelope_valid: envelopeValid, task_sha256: sha(task), hint_count: hints.length, hint_nonempty: hints.length > 0 && hints.every((hint) => hint.trim().length > 0), hint_sha256: hints.map(sha), separator_index: separator, exit_code: result.status, top1_skill: top1.skill ?? null, top1_path_sha256: canonicalTopPath ? sha(canonicalTopPath) : null, loaded_content_complete: loadedContentComplete, loaded_content_sha256: loadedContentSha256 }) + "\\n", { mode: 0o600 });
 process.stdout.write(result.stdout ?? ""); process.stderr.write(result.stderr ?? ""); process.exit(result.status ?? 1);
 `;
 }
@@ -811,8 +843,9 @@ export function prepareOnDemand(paths, task, options, env) {
   if (findResult.status !== 0) fail(`SkillRoster Find preflight failed: ${findResult.stderr.trim()}`);
   const top = parseFindEnvelope(findResult.stdout); const status = invoke("status");
   if (top.skill !== task.expected_skill || !top.path || canonicalPath(top.path) !== canonicalTarget || top.roster_state !== "on_demand" || top.agents.length !== 0) fail("governed Find did not return one exact, non-exposed On-demand target");
+  if (task.one_call_load && !verifiedFindLoad(findResult.stdout, paths.targetPath)) fail("governed Find did not return one exact verified loaded Skill");
   if (status.result.recovery_state !== "clear" || status.result.journal_issues?.length || status.result.last_receipt?.receipt_id !== applied.result.receipt_id) fail("SkillRoster recovery or Receipt state is not clear");
-  const bin = join(dirname(paths.audit), "bin"); mkdirSync(bin, { recursive: true }); const wrapper = join(bin, "skillroster"); writeFileSync(wrapper, findWrapperSource(), { mode: 0o755 }); chmodSync(wrapper, 0o755);
+  const bin = join(dirname(paths.audit), "bin"); mkdirSync(bin, { recursive: true }); const wrapper = join(bin, "skillroster"); writeFileSync(wrapper, findWrapperSource(task.one_call_load === true), { mode: 0o755 }); chmodSync(wrapper, 0o755);
   return { bin, governance: { roster_state: top.roster_state, target_default_exposure: 0, receipt_id: applied.result.receipt_id, receipt_verification: applied.result.verification, recovery_state: status.result.recovery_state } };
 }
 
@@ -854,10 +887,10 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts) {
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     const after = walk(paths.workspace); const workspace = assessWorkspaceChanges(initialWorkspace, after, Object.keys(task.workspace_files), task.allowed_changed_paths);
     const oracle = result.status === 0 ? evaluateOracle(paths.workspace, task.oracle, { transcript: result.stdout, targetPackage: dirname(paths.targetPath), parentVerificationAuthority: { protected_scopes_passed: protectedScopes.passed, expected: suiteFacts.target_packages?.[task.expected_skill] } }) : { passed: false, failures: [`codex_exit:${result.status ?? "signal"}`] };
-    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath }) : { count: 0, contract_violation: false };
+    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(paths.audit) ? readFileSync(paths.audit, "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: paths.targetPath, oneCall: task.one_call_load === true }) : { count: 0, contract_violation: false };
     if (arm === "on_demand" && task.required_find_calls !== undefined && retrieval.count !== task.required_find_calls) retrieval.contract_violation = true;
-    const load = assessExactLoad(result.stdout, paths.targetPath);
-    const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
+    const load = arm === "on_demand" && task.one_call_load ? assessOneCallLoad(result.stdout, paths.targetPath) : assessExactLoad(result.stdout, paths.targetPath);
+    const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
     const outcome = deriveArmOutcome({ arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes });
@@ -885,10 +918,10 @@ export function reevaluateExistingRuns(suiteRoot, manifest) {
     if (!existsSync(workspacePath) || !existsSync(transcriptPath)) { results.push({ task: task.id, trial, arm, root, recomputed: false, formal_evidence_accepted: null, post_hoc_only: true, failures: ["workspace_or_transcript_missing"] }); continue; }
     const transcriptText = readFileSync(transcriptPath, "utf8"); const targetPath = arm === "core" ? join(root, "home", ".codex", "skills", task.expected_skill, "SKILL.md") : join(root, "source", task.expected_skill, "SKILL.md");
     const initial = new Map(Object.entries(task.workspace_files).map(([path, content]) => [path, sha(content)])); const workspace = assessWorkspaceChanges(initial, walk(workspacePath), Object.keys(task.workspace_files), task.allowed_changed_paths);
-    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(join(root, "find-audit.jsonl")) ? readFileSync(join(root, "find-audit.jsonl"), "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: targetPath }) : { count: 0, contract_violation: false };
+    const retrieval = arm === "on_demand" ? parseFindAudit(existsSync(join(root, "find-audit.jsonl")) ? readFileSync(join(root, "find-audit.jsonl"), "utf8") : "", { task: task.prompt, skill: task.expected_skill, path: targetPath, oneCall: task.one_call_load === true }) : { count: 0, contract_violation: false };
     if (arm === "on_demand" && task.required_find_calls !== undefined && retrieval.count !== task.required_find_calls) retrieval.contract_violation = true;
-    const load = assessExactLoad(transcriptText, targetPath); const transcript = assessTranscriptIntegrity(transcriptText);
-    const routeOrder = arm === "on_demand" ? assessRouteOrder(transcriptText, { bootstrapPath: join(root, "home", ".codex", "skills", "skillroster", "SKILL.md"), targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill }) : { passed: true, audit_scope: "not_applicable" };
+    const load = arm === "on_demand" && task.one_call_load ? assessOneCallLoad(transcriptText, targetPath) : assessExactLoad(transcriptText, targetPath); const transcript = assessTranscriptIntegrity(transcriptText);
+    const routeOrder = arm === "on_demand" ? assessRouteOrder(transcriptText, { bootstrapPath: join(root, "home", ".codex", "skills", "skillroster", "SKILL.md"), targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(transcriptText, targetPath) : { passed: true, audit_scope: "not_applicable" };
     const oracle = evaluateOracle(workspacePath, task.oracle, { transcript: transcriptText, targetPackage: dirname(targetPath), parentVerificationAuthority: { mode: "historical_untrusted" } });
     results.push({ task: task.id, trial, arm, root, recomputed: true, formal_evidence_accepted: null, post_hoc_only: true, recomputed_dimensions: { transcript: transcript.passed, retrieval: arm === "core" ? null : Boolean(retrieval.top1_correct && retrieval.returned_path_exact && !retrieval.contract_violation), load: load.passed, route_order: arm === "core" ? null : routeOrder.passed, core_order: arm === "core" ? coreOrder.passed : null, oracle: oracle.passed, parent_correctness: task.oracle.archify_receipt_contract ? oracle.archify_parent_verification?.passed ?? null : null, workspace: workspace.passed }, transcript, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, historical_evidence_limitations: ["post-hoc result is not a formal gate", "model-visible surface, earliest protected-scope baselines, and original suite ledger were not persisted"] });

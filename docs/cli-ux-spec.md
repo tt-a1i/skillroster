@@ -131,7 +131,10 @@ actionable lexical-retrieval warning when English metadata may be missed.
 Hints describe the desired surface, object, operation, and state. Results below
 the deterministic confidence floor are omitted instead of filling the first
 view with incidental body-token matches. Empty results are calm, successful
-output. Find never implies activation.
+output. `--load` is an Agent-oriented opt-in that returns the complete verified
+Top-1 `SKILL.md` in JSON after roster, trust, path, 128 KiB transport bound,
+identity, and drift checks. A load blocker fails the whole command without
+partial instructions. Find/load never implies activation or task success.
 
 ### `plan`
 
