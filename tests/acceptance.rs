@@ -177,6 +177,7 @@ fn public_scan_and_report_use_verified_agent_exposure_rules() {
                 placement["agent"] == agent
                     && placement["entrypoint"]
                         .as_str()
+                        .map(|path| path.replace('\\', "/"))
                         .is_some_and(|path| path.ends_with(suffix))
             })
             .unwrap_or_else(|| panic!("missing {agent} placement ending in {suffix}"))
@@ -201,6 +202,7 @@ fn public_scan_and_report_use_verified_agent_exposure_rules() {
                 placement["agent"] == "codex"
                     && placement["entrypoint"]
                         .as_str()
+                        .map(|path| path.replace('\\', "/"))
                         .is_some_and(|path| path.ends_with(".system/system/SKILL.md"))
             })
             .count(),
