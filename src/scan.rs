@@ -486,6 +486,7 @@ struct PhysicalPackageObservation {
     content_identity_digest: Option<String>,
     fingerprint_completeness: FingerprintCompleteness,
     fingerprint_detail: Option<String>,
+    checkpoint: Option<Vec<PackageFileCheckpoint>>,
     executable_relative_files: Vec<PathBuf>,
 }
 
@@ -1519,33 +1520,43 @@ fn observe_physical_skill_package(
         }
     };
     let metadata = parse_skill_markdown(&content);
-    let (digest, content_identity_digest, fingerprint_completeness, fingerprint_detail) =
-        match digest_skill_directory(physical_directory) {
-            Ok(fingerprint) => (
-                fingerprint.digest,
-                (fingerprint.completeness == FingerprintCompleteness::Complete)
-                    .then_some(fingerprint.content_identity_digest),
-                fingerprint.completeness,
-                fingerprint.detail,
-            ),
-            Err(error) => {
-                let completeness = if error.kind() == io::ErrorKind::InvalidData {
-                    FingerprintCompleteness::Bounded
-                } else {
-                    FingerprintCompleteness::Unreadable
-                };
-                result.warnings.push(format!(
-                    "could not completely fingerprint Skill package {}: {error}",
-                    display_directory.display()
-                ));
-                (
-                    stable_digest(content.as_bytes()),
-                    None,
-                    completeness,
-                    Some(error.to_string()),
-                )
-            }
-        };
+    let (
+        digest,
+        content_identity_digest,
+        fingerprint_completeness,
+        fingerprint_detail,
+        checkpoint,
+        executable_relative_files,
+    ) = match digest_skill_directory(physical_directory) {
+        Ok(fingerprint) => (
+            fingerprint.digest,
+            (fingerprint.completeness == FingerprintCompleteness::Complete)
+                .then_some(fingerprint.content_identity_digest),
+            fingerprint.completeness,
+            fingerprint.detail,
+            fingerprint.checkpoint,
+            fingerprint.executable_relative_files,
+        ),
+        Err(error) => {
+            let completeness = if error.kind() == io::ErrorKind::InvalidData {
+                FingerprintCompleteness::Bounded
+            } else {
+                FingerprintCompleteness::Unreadable
+            };
+            result.warnings.push(format!(
+                "could not completely fingerprint Skill package {}: {error}",
+                display_directory.display()
+            ));
+            (
+                stable_digest(content.as_bytes()),
+                None,
+                completeness,
+                Some(error.to_string()),
+                None,
+                Vec::new(),
+            )
+        }
+    };
     PhysicalPackageObservation {
         content,
         modified_at,
@@ -1554,8 +1565,8 @@ fn observe_physical_skill_package(
         content_identity_digest,
         fingerprint_completeness,
         fingerprint_detail,
-        executable_relative_files: executable_relative_files(physical_directory)
-            .unwrap_or_default(),
+        checkpoint,
+        executable_relative_files,
     }
 }
 
@@ -1568,6 +1579,7 @@ fn unreadable_package_observation(candidate: &EntryCandidate) -> PhysicalPackage
         content_identity_digest: None,
         fingerprint_completeness: FingerprintCompleteness::Unreadable,
         fingerprint_detail: Some("Skill package was not read because its link is unsafe".into()),
+        checkpoint: None,
         executable_relative_files: Vec::new(),
     }
 }
@@ -1615,7 +1627,7 @@ fn materialize_candidates_with_hook(
             LinkStatus::Broken | LinkStatus::EscapesRoot
         ) && placement_binding_valid_before_read
             && durable_binding_valid_before_read;
-        let observation = if initially_safe {
+        let (observation, package_checkpoint_valid) = if initially_safe {
             let physical_entrypoint = candidate
                 .expected_physical_entrypoint
                 .as_ref()
@@ -1625,7 +1637,19 @@ fn materialize_candidates_with_hook(
             let cacheable = durable_anchor.is_none() && !temporary_override;
             if cacheable {
                 if let Some(observation) = physical_packages.get(physical_entrypoint) {
-                    observation.clone()
+                    let checkpoint_valid =
+                        observation.checkpoint.as_ref().is_some_and(|expected| {
+                            package_checkpoint(physical_directory)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                == Some(expected)
+                        });
+                    if checkpoint_valid {
+                        (observation.clone(), true)
+                    } else {
+                        (unreadable_package_observation(&candidate), false)
+                    }
                 } else {
                     physical_package_observations += 1;
                     let observation = observe_physical_skill_package(
@@ -1635,17 +1659,22 @@ fn materialize_candidates_with_hook(
                         &directory,
                         result,
                     );
-                    physical_packages.insert(physical_entrypoint.clone(), observation.clone());
-                    observation
+                    if observation.checkpoint.is_some() {
+                        physical_packages.insert(physical_entrypoint.clone(), observation.clone());
+                    }
+                    (observation, true)
                 }
             } else {
                 physical_package_observations += 1;
-                observe_physical_skill_package(
-                    physical_entrypoint,
-                    physical_directory,
-                    &candidate.entrypoint,
-                    &directory,
-                    result,
+                (
+                    observe_physical_skill_package(
+                        physical_entrypoint,
+                        physical_directory,
+                        &candidate.entrypoint,
+                        &directory,
+                        result,
+                    ),
+                    true,
                 )
             }
         } else {
@@ -1653,7 +1682,7 @@ fn materialize_candidates_with_hook(
                 "did not read unsafe Skill link {}",
                 candidate.entrypoint.display()
             ));
-            unreadable_package_observation(&candidate)
+            (unreadable_package_observation(&candidate), true)
         };
         let PhysicalPackageObservation {
             mut content,
@@ -1663,6 +1692,7 @@ fn materialize_candidates_with_hook(
             mut content_identity_digest,
             mut fingerprint_completeness,
             mut fingerprint_detail,
+            checkpoint: _,
             executable_relative_files,
         } = observation;
         let mut executable_files = executable_relative_files
@@ -1672,12 +1702,15 @@ fn materialize_candidates_with_hook(
         let placement_binding_valid_after = candidate_binding_is_current(&candidate);
         let durable_binding_valid_after = durable_anchor
             .is_none_or(|root| durable_candidate_binding_is_current(&candidate, root));
-        let safe_to_read =
-            initially_safe && placement_binding_valid_after && durable_binding_valid_after;
+        let safe_to_read = initially_safe
+            && placement_binding_valid_after
+            && durable_binding_valid_after
+            && package_checkpoint_valid;
         if !placement_binding_valid_before_read
             || !placement_binding_valid_after
             || !durable_binding_valid_before_read
             || !durable_binding_valid_after
+            || !package_checkpoint_valid
         {
             if let Some(physical_entrypoint) = candidate.expected_physical_entrypoint.as_ref() {
                 physical_packages.remove(physical_entrypoint);
@@ -1687,7 +1720,9 @@ fn materialize_candidates_with_hook(
                     .durable_read_drifted_permission_ids
                     .insert(root.permission_id.clone());
             }
-            let drift_kind = if durable_anchor.is_some() {
+            let drift_kind = if !package_checkpoint_valid {
+                "physical package drift before cache reuse"
+            } else if durable_anchor.is_some() {
                 "durable source-root binding drift"
             } else {
                 "placement binding drift"
@@ -2017,12 +2052,111 @@ struct PackageFingerprint {
     content_identity_digest: String,
     completeness: FingerprintCompleteness,
     detail: Option<String>,
+    checkpoint: Option<Vec<PackageFileCheckpoint>>,
+    executable_relative_files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackageFileCheckpoint {
+    relative_path: PathBuf,
+    kind: PackageFileKind,
+    len: u64,
+    modified_nanos: Option<u128>,
+    readonly: bool,
+    mode: u32,
+    symlink_target: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackageFileKind {
+    File,
+    Symlink,
+}
+
+fn package_file_checkpoints(
+    files: &[(PathBuf, PathBuf, fs::FileType)],
+) -> io::Result<Vec<PackageFileCheckpoint>> {
+    files
+        .iter()
+        .map(|(relative_path, path, _)| {
+            let metadata = fs::symlink_metadata(path)?;
+            let file_type = metadata.file_type();
+            let symlink_target = file_type
+                .is_symlink()
+                .then(|| fs::read_link(path))
+                .transpose()?;
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            };
+            #[cfg(not(unix))]
+            let mode = 0;
+            Ok(PackageFileCheckpoint {
+                relative_path: relative_path.clone(),
+                kind: if file_type.is_symlink() {
+                    PackageFileKind::Symlink
+                } else {
+                    PackageFileKind::File
+                },
+                len: metadata.len(),
+                modified_nanos: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos()),
+                readonly: metadata.permissions().readonly(),
+                mode,
+                symlink_target,
+            })
+        })
+        .collect()
+}
+
+fn package_checkpoint(directory: &Path) -> io::Result<Option<Vec<PackageFileCheckpoint>>> {
+    let mut files = Vec::new();
+    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    if !complete {
+        return Ok(None);
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    package_file_checkpoints(&files).map(Some)
 }
 
 fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
     let mut files = Vec::new();
     let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
+    let checkpoints = package_file_checkpoints(&files)?;
+    let executable_relative_files = checkpoints
+        .iter()
+        .filter_map(|checkpoint| {
+            let extension_is_script = checkpoint
+                .relative_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "sh" | "bash"
+                            | "zsh"
+                            | "fish"
+                            | "py"
+                            | "pl"
+                            | "rb"
+                            | "js"
+                            | "mjs"
+                            | "cjs"
+                            | "ps1"
+                            | "bat"
+                            | "cmd"
+                    )
+                });
+            (checkpoint.kind == PackageFileKind::File
+                && (extension_is_script || checkpoint.mode & 0o111 != 0))
+                .then(|| checkpoint.relative_path.clone())
+        })
+        .collect();
 
     let mut digest = Sha256::new();
     let mut content_identity_digest = Sha256::new();
@@ -2075,6 +2209,8 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
             FingerprintCompleteness::Bounded
         },
         detail: (!complete).then(|| "Skill package fingerprint was bounded at depth 8".into()),
+        checkpoint: complete.then_some(checkpoints),
+        executable_relative_files,
     })
 }
 
@@ -3005,52 +3141,6 @@ fn normalize_search_text(markdown: &str) -> String {
     markdown.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn executable_relative_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    collect_skill_files(directory, directory, 0, 8, &mut files)?;
-    let mut executable = files
-        .into_iter()
-        .filter_map(|(relative, path, file_type)| {
-            if file_type.is_symlink() || !file_type.is_file() {
-                return None;
-            }
-            let extension_is_script = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    matches!(
-                        extension.to_ascii_lowercase().as_str(),
-                        "sh" | "bash"
-                            | "zsh"
-                            | "fish"
-                            | "py"
-                            | "pl"
-                            | "rb"
-                            | "js"
-                            | "mjs"
-                            | "cjs"
-                            | "ps1"
-                            | "bat"
-                            | "cmd"
-                    )
-                });
-            #[cfg(unix)]
-            let mode_is_executable = {
-                use std::os::unix::fs::PermissionsExt;
-                fs::metadata(&path)
-                    .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-                    .unwrap_or(false)
-            };
-            #[cfg(not(unix))]
-            let mode_is_executable = false;
-            (extension_is_script || mode_is_executable).then_some(relative)
-        })
-        .collect::<Vec<_>>();
-    executable.sort();
-    executable.dedup();
-    Ok(executable)
-}
-
 pub(crate) fn inspect_skill_identity(entrypoint: &Path) -> io::Result<(String, String)> {
     let directory = entrypoint
         .parent()
@@ -3893,6 +3983,75 @@ enabled = true
             placement.physical_directory.as_ref() == Some(&source)
                 && placement.executable_files == vec![placement.directory.join("scripts/run.sh")]
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changed_physical_package_is_not_reused_by_a_later_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("references")).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: shared\n---\nshared body\n",
+        )
+        .unwrap();
+        let supporting_file = source.join("references/guide.md");
+        fs::write(&supporting_file, "original\n").unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let physical_entrypoint = source.join("SKILL.md");
+
+        let mut candidates = Vec::new();
+        for (agent, directory_name) in [
+            (AgentKind::Codex, "codex"),
+            (AgentKind::ClaudeCode, "claude"),
+        ] {
+            let agent_root = temp.path().join(directory_name);
+            fs::create_dir(&agent_root).unwrap();
+            let linked = agent_root.join("shared");
+            std::os::unix::fs::symlink(&source, &linked).unwrap();
+            candidates.push(EntryCandidate {
+                agent: Some(agent),
+                root: agent_root,
+                governable: true,
+                provider: None,
+                expected_physical_entrypoint: Some(physical_entrypoint.clone()),
+                entrypoint: linked.join("SKILL.md"),
+                link_target: Some(source.clone()),
+                link_status: LinkStatus::Valid,
+                default_exposed: true,
+            });
+        }
+
+        let mut result = ScanResult::default();
+        let mut candidate_index = 0;
+        let observations =
+            materialize_candidates_with_hook(candidates, &[], &[], &mut result, |_| {
+                if candidate_index == 1 {
+                    fs::write(&supporting_file, "changed supporting content\n").unwrap();
+                }
+                candidate_index += 1;
+            });
+
+        assert_eq!(observations, 1);
+        assert_eq!(result.placements.len(), 2);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Complete
+        );
+        assert!(result.placements[0].governable);
+        assert_eq!(
+            result.placements[1].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert!(!result.placements[1].governable);
+        assert!(result.placements[1].physical_directory.is_none());
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("physical package drift before cache reuse") })
+        );
     }
 
     #[cfg(unix)]
