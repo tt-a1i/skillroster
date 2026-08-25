@@ -8807,3 +8807,76 @@ fn report_distinguishes_inaccessible_and_missing_session_roots() {
     assert!(stdout.contains("limited 0/8 · missing 7/8"), "{stdout}");
     assert!(stdout.contains("Inaccessible           1/8"), "{stdout}");
 }
+
+#[test]
+fn historical_finding_detail_exposes_current_continuity_by_placement() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let first_report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let historical_finding_id = first_report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    fs::create_dir_all(root.join("skill-051")).unwrap();
+    fs::write(
+        root.join("skill-051/SKILL.md"),
+        "---\nname: skill-051\n---\nfixture\n",
+    )
+    .unwrap();
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+
+    let detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "report",
+                "--finding",
+                &historical_finding_id,
+                "--full",
+                "--limit",
+                "20",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let continuity = &detail["result"]["current_continuity"];
+    assert_eq!(continuity["status"], "available");
+    assert_eq!(continuity["basis"], "stable_placement_id_intersection");
+    assert_eq!(continuity["missing_current_placement_count"], 0);
+    assert_eq!(continuity["matching_placement_count"], 51);
+    assert!(continuity["matching_finding_count"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        continuity["current_placements"].as_array().unwrap().len(),
+        20
+    );
+    assert!(continuity["current_placements"][0]["path"].is_string());
+    assert!(continuity["current_placements"][0]["current_finding_ids"].is_array());
+    assert_eq!(continuity["zero_overlap_is_not_resolution"], true);
+}

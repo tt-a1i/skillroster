@@ -2519,6 +2519,8 @@ enum ReportRequest<'a> {
 const DEFAULT_FINDING_DETAIL_LIMIT: usize = 5;
 const DEFAULT_REPORT_PAGE_LIMIT: usize = 20;
 const SOURCE_READ_CONTINUATION_TARGET_LIMIT: usize = 10;
+const FINDING_CONTINUITY_FINDING_LIMIT: usize = 20;
+const FINDING_CONTINUITY_ID_LIMIT: usize = 20;
 
 const fn finding_page_limit(full: bool, explicit: Option<usize>) -> usize {
     match explicit {
@@ -2724,6 +2726,16 @@ fn report_command(
                 .max(affected_placement_ids.len())
                 .max(ordered_evidence_ids.len());
             let next_offset = (end < total).then_some(end);
+            object.insert(
+                "current_continuity".into(),
+                finding_continuity(
+                    store,
+                    &report,
+                    &stored.id,
+                    &affected_placement_ids,
+                    &paged_placement_ids,
+                ),
+            );
             object.insert("affected_skill_ids".into(), json!(paged_skill_ids));
             object.insert("affected_placement_ids".into(), json!(paged_placement_ids));
             object.insert("evidence_ids".into(), json!(paged_evidence_ids));
@@ -3388,6 +3400,212 @@ fn compact_finding_detail(mut details: Value) -> Value {
     }
     object.insert("items".into(), json!(items));
     details
+}
+
+/// Relate a historical Finding to the latest persisted analysis without
+/// rescanning or inspecting any filesystem content. Placement IDs are the
+/// only join key: paths, Skill names, and digests can drift and must not turn
+/// continuity into a semantic guess.
+fn finding_continuity(
+    store: &StateStore,
+    historical_report: &ReportRecord,
+    historical_finding_id: &FindingId,
+    historical_placement_ids: &[Value],
+    paged_placement_ids: &[Value],
+) -> Value {
+    let historical_ids = historical_placement_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let unavailable = |reason: &str| {
+        json!({
+            "status": "unavailable",
+            "basis": "stable_placement_id_intersection",
+            "reason": reason,
+            "historical_report_id": historical_report.id,
+            "historical_snapshot_id": historical_report.scan_id,
+            "historical_finding_id": historical_finding_id,
+            "historical_affected_placement_count": historical_ids.len(),
+            "zero_overlap_is_not_resolution": true
+        })
+    };
+
+    let Some(latest_scan) = store.latest_completed_scan().ok().flatten() else {
+        return unavailable("latest_completed_snapshot_unavailable");
+    };
+    let Some(current_report) = store.latest_report().ok().flatten() else {
+        return unavailable("latest_report_unavailable");
+    };
+    if current_report.id == historical_report.id {
+        return unavailable("no_newer_report");
+    }
+    if current_report.scan_id != latest_scan.id {
+        return unavailable("latest_report_stale");
+    }
+    let Some(current_scan) = store
+        .scan_payload::<ScanResult>(&current_report.scan_id)
+        .ok()
+        .flatten()
+    else {
+        return unavailable("latest_snapshot_payload_unavailable");
+    };
+    let Some(current_findings) = current_report.summary["findings"].as_array() else {
+        return unavailable("latest_report_summary_malformed");
+    };
+
+    let current_placements = current_scan
+        .placements
+        .iter()
+        .map(|placement| (placement.id.clone(), placement))
+        .collect::<BTreeMap<_, _>>();
+    let matching_ids = historical_ids
+        .iter()
+        .filter(|id| current_placements.contains_key(*id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut matching_findings = Vec::new();
+    let mut matching_finding_membership = BTreeMap::<String, BTreeSet<String>>::new();
+    for finding in current_findings {
+        let Some(id) = finding["id"].as_str() else {
+            return unavailable("latest_report_summary_malformed");
+        };
+        if FindingId::parse(id.to_owned()).is_err() {
+            return unavailable("latest_report_summary_malformed");
+        }
+        let Some(affected_ids) = finding["affected_placement_ids"].as_array() else {
+            return unavailable("latest_report_summary_malformed");
+        };
+        let affected_ids = affected_ids
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<BTreeSet<_>>>();
+        let Some(affected_ids) = affected_ids else {
+            return unavailable("latest_report_summary_malformed");
+        };
+        let matched = affected_ids
+            .iter()
+            .filter(|placement_id| matching_ids.contains(**placement_id))
+            .map(|placement_id| (*placement_id).to_owned())
+            .collect::<BTreeSet<_>>();
+        if matched.is_empty() {
+            continue;
+        }
+        let matched_preview = bounded_id_preview(&matched, FINDING_CONTINUITY_ID_LIMIT);
+        matching_finding_membership.insert(id.to_owned(), matched.clone());
+        matching_findings.push(json!({
+            "id": id,
+            "kind": finding["kind"],
+            "category": finding["category"],
+            "severity": finding["severity"],
+            "title": finding["title"],
+            "summary": finding["summary"],
+            "matched_placement_count": matched.len(),
+            "matched_placement_ids": matched_preview.0,
+            "matched_placement_ids_truncated": matched_preview.1
+        }));
+    }
+    matching_findings.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+
+    let matching_finding_count = matching_findings.len();
+    let current_finding_ids = matching_findings
+        .iter()
+        .filter_map(|finding| finding["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let (current_finding_id_preview, current_finding_ids_truncated) =
+        bounded_vec_preview(&current_finding_ids, FINDING_CONTINUITY_ID_LIMIT);
+    let findings_truncated = matching_findings.len() > FINDING_CONTINUITY_FINDING_LIMIT;
+    matching_findings.truncate(FINDING_CONTINUITY_FINDING_LIMIT);
+    let (matching_placement_id_preview, matching_placement_ids_truncated) =
+        bounded_id_preview(&matching_ids, FINDING_CONTINUITY_ID_LIMIT);
+    let missing_ids = historical_ids
+        .difference(&matching_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let (missing_placement_id_preview, missing_placement_ids_truncated) =
+        bounded_id_preview(&missing_ids, FINDING_CONTINUITY_ID_LIMIT);
+
+    let current_placements_for_page = paged_placement_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|id| current_placements.get(id).copied())
+        .map(|placement| {
+            let finding_ids = matching_finding_membership
+                .iter()
+                .filter(|(_, placement_ids)| placement_ids.contains(&placement.id))
+                .map(|(finding_id, _)| finding_id.clone())
+                .collect::<Vec<_>>();
+            let (finding_id_preview, finding_ids_truncated) =
+                bounded_vec_preview(&finding_ids, FINDING_CONTINUITY_ID_LIMIT);
+            continuity_placement_json(
+                placement,
+                &finding_id_preview,
+                finding_ids.len(),
+                finding_ids_truncated,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "status": "available",
+        "basis": "stable_placement_id_intersection",
+        "historical_report_id": historical_report.id,
+        "historical_snapshot_id": historical_report.scan_id,
+        "historical_finding_id": historical_finding_id,
+        "current_report_id": current_report.id,
+        "current_snapshot_id": current_report.scan_id,
+        "historical_affected_placement_count": historical_ids.len(),
+        "current_snapshot_placement_count": current_placements.len(),
+        "matching_placement_count": matching_ids.len(),
+        "matching_placement_ids": matching_placement_id_preview,
+        "matching_placement_ids_truncated": matching_placement_ids_truncated,
+        "missing_current_placement_count": missing_ids.len(),
+        "missing_current_placement_ids": missing_placement_id_preview,
+        "missing_current_placement_ids_truncated": missing_placement_ids_truncated,
+        "current_report_finding_count": current_findings.len(),
+        "matching_finding_count": matching_finding_count,
+        "current_finding_ids": current_finding_id_preview,
+        "current_finding_ids_truncated": current_finding_ids_truncated,
+        "matching_finding_count_returned": matching_findings.len(),
+        "matching_findings_truncated": findings_truncated,
+        "matching_findings": matching_findings,
+        "current_placements": current_placements_for_page,
+        "current_placements_page_scope": true,
+        "zero_overlap_is_not_resolution": true
+    })
+}
+
+fn bounded_id_preview(ids: &BTreeSet<String>, limit: usize) -> (Vec<String>, bool) {
+    let values = ids.iter().take(limit).cloned().collect::<Vec<_>>();
+    (values, ids.len() > limit)
+}
+
+fn bounded_vec_preview(values: &[String], limit: usize) -> (Vec<String>, bool) {
+    let preview = values.iter().take(limit).cloned().collect::<Vec<_>>();
+    (preview, values.len() > limit)
+}
+
+fn continuity_placement_json(
+    placement: &scan::SkillPlacement,
+    current_finding_ids: &[String],
+    current_finding_count: usize,
+    current_finding_ids_truncated: bool,
+) -> Value {
+    json!({
+        "id": placement.id,
+        "skill_id": placement.skill_id,
+        "path": placement.entrypoint,
+        "agent": placement.agent.map(AgentKind::id),
+        "link_status": placement.link_status,
+        "default_exposed": placement.default_exposed,
+        "fingerprint_completeness": placement.fingerprint_completeness.id(),
+        "mutation_scope": placement.mutation_scope.map(scan::MutationScope::id),
+        "governable": placement.is_mutable(),
+        "current_finding_ids": current_finding_ids,
+        "current_finding_count": current_finding_count,
+        "current_finding_ids_truncated": current_finding_ids_truncated
+    })
 }
 
 fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAction> {
@@ -11850,6 +12068,111 @@ mod recovery_tests {
         );
         assert_eq!(output["error"]["details"]["next_action"], "scan");
         assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn finding_continuity_joins_only_stable_placements_and_bounds_previews() {
+        let store = StateStore::open_in_memory().unwrap();
+        let historical_scan = ScanRun {
+            id: ScanId::new(),
+            started_at: 1,
+            completed_at: Some(1),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        let current_scan = ScanRun {
+            id: ScanId::new(),
+            started_at: 2,
+            completed_at: Some(2),
+            status: ScanStatus::Completed,
+            coverage_notes: vec![],
+        };
+        store.save_scan(&historical_scan).unwrap();
+        store.save_scan(&current_scan).unwrap();
+        let current_placements = [
+            placement_with_scope(
+                "placement_shared",
+                "skill_shared",
+                "/fixture/shared",
+                Some(scan::MutationScope::Mutable),
+            ),
+            placement_with_scope(
+                "placement_current_only",
+                "skill_current_only",
+                "/fixture/current-only",
+                Some(scan::MutationScope::Mutable),
+            ),
+        ];
+        store
+            .save_scan_payload(&historical_scan.id, &ScanResult::default())
+            .unwrap();
+        store
+            .save_scan_payload(
+                &current_scan.id,
+                &ScanResult {
+                    placements: current_placements.into(),
+                    ..ScanResult::default()
+                },
+            )
+            .unwrap();
+
+        let historical_report = ReportRecord {
+            id: ReportId::new(),
+            scan_id: historical_scan.id.clone(),
+            created_at: 1,
+            summary: json!({"findings": []}),
+        };
+        let historical_finding = FindingRecord {
+            id: FindingId::new(),
+            report_id: historical_report.id.clone(),
+            category: FindingCategory::Exposure,
+            severity: Severity::Warning,
+            title: "Historical exposure".into(),
+            summary: "historical".into(),
+            details: json!({
+                "affected_placement_ids": ["placement_shared", "placement_missing"]
+            }),
+            evidence_ids: vec![],
+        };
+        store
+            .save_report(
+                &historical_report,
+                std::slice::from_ref(&historical_finding),
+            )
+            .unwrap();
+        let current_report = ReportRecord {
+            id: ReportId::new(),
+            scan_id: current_scan.id.clone(),
+            created_at: i64::MAX,
+            summary: json!({
+                "findings": [{
+                    "id": FindingId::new(),
+                    "kind": "current_exposure",
+                    "category": "exposure",
+                    "severity": "medium",
+                    "title": "Current exposure",
+                    "summary": "current",
+                    "affected_placement_ids": ["placement_shared"]
+                }]
+            }),
+        };
+        store.save_report(&current_report, &[]).unwrap();
+
+        let result = finding_continuity(
+            &store,
+            &historical_report,
+            &historical_finding.id,
+            &[json!("placement_shared"), json!("placement_missing")],
+            &[json!("placement_shared"), json!("placement_missing")],
+        );
+        assert_eq!(result["status"], "available");
+        assert_eq!(result["current_snapshot_placement_count"], 2);
+        assert_eq!(result["matching_placement_count"], 1);
+        assert_eq!(result["missing_current_placement_count"], 1);
+        assert_eq!(result["matching_finding_count"], 1);
+        assert_eq!(result["current_placements"][0]["id"], "placement_shared");
+        assert_eq!(result["current_placements"][0]["current_finding_count"], 1);
+        assert_eq!(result["zero_overlap_is_not_resolution"], true);
     }
 }
 
