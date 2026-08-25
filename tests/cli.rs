@@ -3203,7 +3203,11 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     let shared = home.join(".agents_skills");
     let opencode = home.join(".config/opencode/skills");
     let hermes = home.join(".hermes/skills");
-    for root in [&shared, &opencode, &hermes] {
+    let cursor = home.join(".cursor/skills");
+    let gemini = home.join(".gemini/skills");
+    let copilot = home.join(".copilot/skills");
+    let physical_roots = [&shared, &opencode, &hermes, &cursor, &gemini, &copilot];
+    for root in physical_roots {
         fs::create_dir_all(root).unwrap();
     }
     for (parent, link) in [
@@ -3227,28 +3231,66 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     assert_eq!(setup["result"]["state"], "preview_ready");
     assert_eq!(
         setup["result"]["detected_agents"].as_array().unwrap().len(),
-        5
+        8
     );
-    assert_eq!(setup["result"]["targets"].as_array().unwrap().len(), 5);
-    assert_eq!(setup["result"]["missing_count"], 5);
-    assert_eq!(setup["result"]["physical_target_count"], 3);
-    assert_eq!(setup["result"]["operation_count"], 18);
+    assert_eq!(setup["result"]["targets"].as_array().unwrap().len(), 8);
+    assert_eq!(setup["result"]["missing_count"], 8);
+    assert_eq!(setup["result"]["physical_target_count"], 6);
+    assert_eq!(setup["result"]["operation_count"], 36);
 
     let plan_id = setup["result"]["plan_id"].as_str().unwrap();
     let detail = json_output(&run(
         &[&common[..], &["plan", "--show", plan_id]].concat(),
         None,
     ));
+    for field in [
+        "snapshot_id",
+        "digest",
+        "change_summary",
+        "operation_groups",
+        "affected",
+        "diff_summary",
+        "impact",
+        "risk",
+        "reversible",
+        "canonical_deletion_count",
+        "confirmation_required",
+        "files_changed",
+    ] {
+        assert_eq!(setup["result"][field], detail["result"][field], "{field}");
+    }
+    assert_eq!(setup["result"]["detail"]["available"], true);
+    assert_eq!(
+        setup["result"]["detail"]["command"],
+        json!(["plan", "--show", plan_id, "--json"])
+    );
+    assert_eq!(setup["result"]["change_summary"]["operation_count"], 36);
+    assert_eq!(setup["result"]["operation_groups"]["create_directory"], 12);
+    assert_eq!(setup["result"]["operation_groups"]["write_file"], 24);
+    assert_eq!(setup["result"]["risk"], "filesystem_change");
+    assert_eq!(setup["result"]["reversible"], true);
+    assert_eq!(setup["result"]["confirmation_required"], true);
+    assert_eq!(setup["result"]["files_changed"], false);
+    assert!(setup["result"].get("operations").is_none());
+    let setup_json = serde_json::to_string(&setup).unwrap();
+    assert!(!setup_json.contains("\"content\":"));
+    assert!(!setup_json.contains("expected_fingerprint"));
+    assert!(serde_json::to_vec(&setup).unwrap().len() < serde_json::to_vec(&detail).unwrap().len());
     let operations = detail["result"]["operations"].as_array().unwrap();
-    assert_eq!(operations.len(), 18);
+    assert_eq!(operations.len(), 36);
     let unique_targets = operations
         .iter()
         .map(|operation| operation["target"].as_str().unwrap())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(unique_targets.len(), 18);
+    assert_eq!(unique_targets.len(), 36);
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 1);
+    assert!(status["result"]["last_receipt"].is_null());
+    assert_eq!(status["result"]["recovery_state"], "clear");
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
-    for root in [&shared, &opencode, &hermes] {
+    for root in physical_roots {
         assert!(root.join("skillroster/SKILL.md").is_file());
         assert!(root.join("skillroster/references/routing.md").is_file());
         assert!(root.join("skillroster/references/governance.md").is_file());
@@ -3257,7 +3299,7 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
-    for root in [&shared, &opencode, &hermes] {
+    for root in physical_roots {
         assert!(!root.join("skillroster").exists());
     }
 }
@@ -3423,6 +3465,59 @@ fn setup_reuse_and_status_actionability_follow_snapshot_lifecycle() {
             .unwrap();
         assert_eq!(retained_lifecycle["status"], lifecycle_status);
     }
+}
+
+#[test]
+fn setup_does_not_reuse_an_incomplete_legacy_plan_summary() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let first = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let first_plan_id = first["result"]["plan_id"].as_str().unwrap();
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let immutable: String = database
+        .query_row(
+            "SELECT immutable_json FROM plans WHERE id = ?1",
+            [first_plan_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&immutable).unwrap();
+    let summary = legacy["input"]["summary"].as_object_mut().unwrap();
+    summary.remove("operation_groups");
+    summary.remove("affected");
+    database
+        .execute(
+            "UPDATE plans SET immutable_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy.to_string(), first_plan_id],
+        )
+        .unwrap();
+    drop(database);
+
+    let retry = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(retry["result"]["state"], "preview_ready");
+    assert_ne!(retry["result"]["plan_id"], first["result"]["plan_id"]);
+    assert_eq!(retry["result"]["operation_groups"]["create_directory"], 2);
+    assert_eq!(retry["result"]["operation_groups"]["write_file"], 4);
+    assert!(retry["result"]["affected"].is_object());
+    assert_eq!(retry["result"]["confirmation_required"], true);
+    assert_eq!(retry["result"]["files_changed"], false);
+    assert!(!root.join("skillroster").exists());
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 2);
+    assert!(status["result"]["last_receipt"].is_null());
 }
 
 #[test]

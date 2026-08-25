@@ -212,7 +212,10 @@ or mutates; every write remains a normal Plan completed through Apply and
 recoverable through Undo. Repeating an unchanged setup preview on the same
 Snapshot reuses an equivalent Ready Plan instead of accumulating duplicate
 pending Plans. Terminal Plans, newer Snapshots, and changed setup inputs are
-never reused.
+never reused. A legacy Ready Plan whose stored summary lacks the current
+bounded decision fields is not equivalent: it remains immutable and auditable,
+while Setup creates one decision-complete replacement. Both can temporarily
+appear as pending; the Agent presents only the newly returned Plan ID.
 
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or

@@ -160,7 +160,13 @@ official-outdated, locally modified, and unsupported states. Installation and
 official upgrades remain a normal Plan followed by Apply. A modified copy
 stops planning until the user chooses `retain-local` or `adopt-current`; the
 Agent must not choose. Unsupported targets remain unchanged and are shown as
-blocked.
+blocked. A `preview_ready` JSON result includes the same bounded impact,
+operation groups, risk, reversibility, and exact-detail pointer as the Plan
+summary. It never embeds operations, file content, or fingerprints; Agents use
+`plan --show PLAN_ID --json` only for exact-detail questions.
+An incomplete legacy Plan summary is never reused or rewritten. Setup returns a
+new decision-complete Plan ID; Status can temporarily retain both pending Plans
+as immutable audit records.
 
 ## 7. Confirmation language
 
