@@ -328,12 +328,15 @@ at 60, 80, and 120 columns without printing session paths.
 
 The normative conversation flow, one-confirmation Apply behavior, state-dependent primary action, and bootstrap Skill rules live in [agent-experience-spec.md](agent-experience-spec.md).
 
-The bootstrap Skill instructs an Agent to prepare a complete read-only Plan when Evidence is sufficient, then present:
+When the user requested a concrete change proposal and Evidence is sufficient,
+the bootstrap Skill instructs an Agent to prepare a complete read-only Plan,
+then present:
 
 1. a one-sentence diagnosis;
 2. independent Skill count, placement count, default exposure, and observed-use count;
 3. the three most important Findings plus compact rollups that state the complete scale of every Finding group without loading the exhaustive report;
-4. prioritized recommendations with expected measurable impact;
+4. prioritized recommendations with current affected scale; measurable
+   before/after impact only when a validated Plan provides it;
 5. uncertainties, evidence quality, and safety risks;
 6. one primary next action and whether confirmation is required.
 

@@ -205,6 +205,22 @@ SkillRoster 不应把自己定义成“替模型决定用户意图的总路由�
 4. 将 `scan → report → plan → one confirmation → apply → receipt → undo` 视为状态链：每个状态都记录输入快照和输出，不用自然语言“已完成”替代文件 hash、变更清单和回滚证据。
 5. 结论只在同一 snapshot、harness、模型、任务集和方法下比较；跨供应商数字仅作方向性背景，最终阈值由 SkillRoster 自己的 paired eval 决定。
 
+## 七、自然语言治理 dogfood 的新增验证
+
+Issue #209 的四轮 Luna dogfood 把上述边界落到一个真实用户请求。无
+Bootstrap 的 Agent 能找到相同结构事实，但执行了 9 次 CLI 调用；修订后的
+Bootstrap 最终只用 Scan 和 bounded Report，仍保留四项核心指标、Top 3、
+完整 rollups 和覆盖限制。详细证据见
+[Natural-language Agent governance dogfood v1](../acceptance/agent-governance-natural-language-v1.md)。
+
+本轮同时验证了一个反例：Agent 曾把 9 个 placements 和 3 个物理来源推导为
+“可减少 6 个 placements”。这不是工具事实，也没有 Plan 支持。ReAct 的原始
+工作支持 observation-grounded 的行动循环，但不把观察后的自由推断变成确定性
+事实；Anthropic 的可信 Agent 原则同样强调 transparency、human control 和在
+高风险动作前请求介入。因此 Finding 只陈述当前影响规模，Plan 才能陈述拟议的
+before/after，Receipt 才能陈述实际变更结果。该结果支持收紧 Bootstrap，不支持
+增加一个新的 Rust 语义分析子系统。
+
 ## 来源索引
 
 - OpenAI：[Build skills](https://developers.openai.com/codex/skills/)、[Function calling](https://developers.openai.com/api/docs/guides/function-calling)、[Model guidance](https://developers.openai.com/api/docs/guides/latest-model)。
@@ -212,5 +228,6 @@ SkillRoster 不应把自己定义成“替模型决定用户意图的总路由�
 - Skills 论文：[SkillsBench v4](https://arxiv.org/abs/2602.12670)、[How Well Do Agentic Skills Work in the Wild](https://arxiv.org/abs/2604.04323)、[SWE-Skills-Bench](https://arxiv.org/abs/2603.15401)。
 - 候选深度论文：[How Many Tools Should an LLM Agent See?](https://arxiv.org/abs/2605.24660)。
 - 安全论文：[Agent Skills in the Wild](https://arxiv.org/abs/2601.10338)。
+- Agent 决策边界：[ReAct](https://arxiv.org/abs/2210.03629)、[Anthropic Trustworthy agents](https://www.anthropic.com/research/trustworthy-agents)。
 
 上述论文是特定实验条件下的原始研究或预印本；除官方文档描述的 Codex 机制外，所有性能数字都应被视为方向性证据，不能直接当作 SkillRoster 的验收结果。
