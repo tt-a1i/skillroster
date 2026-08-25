@@ -178,7 +178,7 @@ a:focus-visible, button:focus-visible {
 }
 h1 {
   font-weight: 650;
-  font-size: clamp(44px, 5.8vw, 74px);
+  font-size: clamp(52px, 7.6vw, 100px);
   line-height: 1.02;
   letter-spacing: -0.038em;
 }
@@ -248,11 +248,14 @@ h1 .accent {
   z-index: 2;
   max-width: 560px;
   margin: 0 auto;
-  background: #fff;
-  border: 1px solid var(--line-2);
-  border-radius: 18px;
-  box-shadow: var(--shadow-lift);
-  padding: 14px 16px 16px;
+  background: linear-gradient(180deg, #FFFFFF 0%, #F4F7F4 100%);
+  border: 1px solid rgba(15, 23, 18, .07);
+  border-radius: 22px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .95),
+    0 24px 48px -24px rgba(15, 23, 18, .22),
+    0 80px 120px -64px rgba(15, 23, 18, .16);
+  padding: 15px 17px 17px;
 }
 .lib-head {
   display: flex;
@@ -278,12 +281,24 @@ h1 .accent {
 }
 .lib-tile {
   aspect-ratio: 1;
-  border-radius: 8px;
-  background: linear-gradient(135deg, var(--g1), var(--g2));
-  box-shadow: 0 4px 10px -4px rgba(15,23,42,.3);
+  position: relative;
+  border-radius: 26%;
+  background: linear-gradient(160deg, var(--g1), var(--g2));
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, .5),
+    inset 0 -2px 4px rgba(15, 23, 18, .16),
+    0 8px 16px -8px var(--sh, rgba(15, 23, 18, .35));
   animation: libfloat var(--fd, 5s) ease-in-out infinite alternate;
   animation-delay: var(--d, 0s);
 }
+.lib-tile::after, .tile::after {
+  content: '';
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, .38), rgba(255, 255, 255, 0) 46%);
+  pointer-events: none;
+}
+.tile::after { background: linear-gradient(180deg, rgba(255, 255, 255, .22), rgba(255, 255, 255, 0) 42%); }
 @keyframes libfloat {
   from { transform: translateY(0); }
   to { transform: translateY(-4px); }
@@ -296,6 +311,7 @@ h1 .accent {
   position: relative;
   z-index: 1;
 }
+.beams circle { filter: drop-shadow(0 0 4px rgba(22, 163, 74, .85)); }
 .beams path {
   fill: none;
   stroke: rgba(15,23,42,.12);
@@ -338,10 +354,12 @@ h1 .accent {
 }
 .agent-tile {
   width: 40px; height: 40px;
-  background: #fff;
-  border: 1px solid var(--line-2);
+  background: linear-gradient(180deg, #FFFFFF, #F6F8F6);
+  border: 1px solid rgba(15, 23, 18, .08);
   border-radius: 13px;
-  box-shadow: var(--shadow-card);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, .9),
+    0 6px 14px -6px rgba(15, 23, 18, .18);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -382,7 +400,7 @@ h1 .accent {
 /* ============================================================
    Sections shared
    ============================================================ */
-section.block { padding: clamp(100px, 12vw, 150px) 0; position: relative; }
+section.block { padding: clamp(110px, 13vw, 170px) 0; position: relative; }
 section.block.tint { background: var(--bg-2); }
 .section-head { text-align: center; max-width: 760px; margin: 0 auto clamp(52px, 6vw, 76px); }
 .section-head .num {
@@ -494,13 +512,17 @@ section.block.tint { background: var(--bg-2); }
   font-size: 10.5px;
   font-weight: 500;
   color: rgba(255,255,255,.95);
-  background: linear-gradient(135deg, var(--g1), var(--g2));
-  box-shadow: 0 10px 24px -10px rgba(15,23,42,.35);
+  background: linear-gradient(160deg, var(--g1), var(--g2));
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, .42),
+    inset 0 -2px 4px rgba(15, 23, 18, .15),
+    0 12px 26px -12px var(--sh, rgba(15, 23, 42, .4));
   display: flex;
   align-items: center;
   justify-content: center;
   text-align: center;
   min-height: 58px;
+  overflow: hidden;
   transition:
     transform 1s var(--ease),
     opacity .8s ease,
@@ -587,106 +609,85 @@ section.block.tint { background: var(--bg-2); }
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
+  gap: 0;
 }
 .stat-card {
-  border: 1px solid var(--line-2);
-  background: #fff;
-  border-radius: 20px;
-  padding: 34px 26px;
-  text-align: center;
-  box-shadow: var(--shadow-card);
-  transition: transform .3s var(--ease), box-shadow .3s ease;
+  padding: 8px 34px;
+  border-left: 1px solid var(--line-2);
 }
-.stat-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-lift); }
+.stat-card:first-child { border-left: 0; padding-left: 0; }
 .stat-num {
-  font-weight: 700;
-  font-size: clamp(38px, 4.2vw, 54px);
-  letter-spacing: -0.035em;
+  font-weight: 650;
+  font-size: clamp(54px, 6vw, 92px);
+  letter-spacing: -0.045em;
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
-.stat-num sup { font-size: .42em; color: var(--gray); font-weight: 600; }
+.stat-num sup { font-size: .36em; color: var(--faint); font-weight: 600; }
 .stat-label {
-  margin-top: 14px;
+  margin-top: 20px;
   font-family: var(--mono);
   font-size: 9.5px;
   letter-spacing: .12em;
   text-transform: uppercase;
   color: var(--faint);
   line-height: 2;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
 }
-.stat-label::before {
-  content: "";
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--c, var(--green-2));
+@media (max-width: 860px) {
+  .stats-grid { grid-template-columns: 1fr 1fr; gap: 32px 0; }
+  .stat-card { padding: 0 0 0 22px; }
+  .stat-card:nth-child(odd) { border-left: 0; padding-left: 0; }
 }
-@media (max-width: 860px) { .stats-grid { grid-template-columns: 1fr 1fr; } }
 
 /* ============================================================
    Flow cards
    ============================================================ */
-.flow-grid {
+.steps { border-top: 1px solid var(--line-2); }
+.step {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 14px;
-}
-.flow-card {
-  border: 1px solid var(--line-2);
-  background: #fff;
-  border-radius: 22px;
-  padding: 36px 30px 38px;
-  box-shadow: var(--shadow-card);
-  transition: transform .3s var(--ease), box-shadow .3s ease;
-  position: relative;
-}
-.flow-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-lift); }
-.flow-glyph {
-  width: 46px; height: 46px;
-  border-radius: 14px;
-  display: flex;
+  grid-template-columns: 200px 1fr auto;
+  gap: clamp(24px, 4vw, 56px);
   align-items: center;
-  justify-content: center;
-  font-family: var(--mono);
-  font-size: 17px;
-  color: #fff;
-  font-weight: 500;
-  background: linear-gradient(135deg, var(--c1), var(--c2));
-  box-shadow: 0 10px 22px -8px rgba(15,23,42,.35);
-  margin-bottom: 26px;
+  padding: clamp(34px, 4.5vw, 52px) 0;
+  border-bottom: 1px solid var(--line-2);
+  transition: background .35s ease, padding-left .35s var(--ease);
 }
-.flow-card h3 {
+.step:hover {
+  background: linear-gradient(90deg, rgba(15, 23, 18, .028), transparent 62%);
+  padding-left: 14px;
+}
+.step-num {
+  font-weight: 700;
+  font-size: clamp(72px, 8vw, 118px);
+  letter-spacing: -0.05em;
+  line-height: .9;
+  color: transparent;
+  -webkit-text-stroke: 1.5px rgba(15, 23, 18, .22);
+  transition: color .4s ease, -webkit-text-stroke-color .4s ease;
+  user-select: none;
+}
+.step:hover .step-num { color: var(--c); -webkit-text-stroke-color: var(--c); }
+.step h3 {
   font-weight: 650;
-  font-size: 22px;
+  font-size: clamp(21px, 2.3vw, 28px);
   letter-spacing: -0.022em;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
 }
-.flow-card p { font-size: 14px; color: var(--gray); line-height: 1.75; }
-.flow-card .cmd {
-  margin-top: 22px;
+.step p { font-size: 14.5px; color: var(--gray); line-height: 1.75; max-width: 560px; }
+.step .cmd {
   font-family: var(--mono);
   font-size: 11px;
   color: var(--ink-2);
   background: var(--bg-3);
   border: 1px solid var(--line-2);
   border-radius: 8px;
-  padding: 8px 12px;
-  display: inline-block;
+  padding: 9px 13px;
+  white-space: nowrap;
 }
-.flow-step-tag {
-  position: absolute;
-  top: 24px; right: 26px;
-  font-family: var(--mono);
-  font-size: 9.5px;
-  letter-spacing: .14em;
-  color: var(--faint);
+@media (max-width: 860px) {
+  .step { grid-template-columns: 1fr; gap: 16px; }
+  .step-num { font-size: 56px; }
 }
-@media (max-width: 860px) { .flow-grid { grid-template-columns: 1fr; } }
 .flow-note {
   margin-top: 30px;
   text-align: center;
@@ -786,20 +787,29 @@ section.block.tint { background: var(--bg-2); }
 /* ============================================================
    Safety
    ============================================================ */
+section#safety { background: #0C1310; color: #E9F0EA; }
+section#safety .section-head .num { color: #7EE2A8; }
+section#safety .section-head .num::before { background: #7EE2A8; }
+section#safety .section-head h2 { color: #F4F8F4; }
+section#safety .section-head h2 em { color: #7EE2A8; }
+section#safety .section-head p { color: rgba(233, 240, 234, .56); }
 .safety-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   gap: 14px;
 }
 .safety-card {
-  border: 1px solid var(--line-2);
-  background: #fff;
+  border: 1px solid rgba(233, 240, 234, .1);
+  background: rgba(233, 240, 234, .03);
   border-radius: 22px;
   padding: 36px 30px 38px;
-  box-shadow: var(--shadow-card);
-  transition: transform .3s var(--ease), box-shadow .3s ease;
+  transition: transform .3s var(--ease), border-color .3s ease, background .3s ease;
 }
-.safety-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-lift); }
+.safety-card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(233, 240, 234, .22);
+  background: rgba(233, 240, 234, .05);
+}
 .safety-card .k {
   font-family: var(--mono);
   font-size: 10px;
@@ -821,36 +831,43 @@ section.block.tint { background: var(--bg-2); }
   font-size: 21px;
   letter-spacing: -0.02em;
   margin-bottom: 10px;
+  color: #F4F8F4;
 }
-.safety-card p { font-size: 13.5px; line-height: 1.78; color: var(--gray); }
+.safety-card p { font-size: 13.5px; line-height: 1.78; color: rgba(233, 240, 234, .6); }
 .safety-card p code {
   font-family: var(--mono);
   font-size: 12px;
-  color: var(--amber);
-  background: #FFFBEB;
-  border: 1px solid #FDE3B8;
+  color: #FCD34D;
+  background: rgba(252, 211, 77, .1);
+  border: 1px solid rgba(252, 211, 77, .24);
   border-radius: 5px;
   padding: 1px 6px;
 }
 .no-flags {
-  margin-top: clamp(48px, 6vw, 64px);
+  margin-top: clamp(64px, 8vw, 96px);
   display: flex;
   justify-content: center;
-  align-items: center;
-  gap: 13px;
+  align-items: baseline;
+  gap: clamp(10px, 2vw, 22px);
   flex-wrap: wrap;
-  font-family: var(--mono);
-  font-size: 11.5px;
-  letter-spacing: .05em;
-  color: var(--faint);
+  font-size: clamp(24px, 3.6vw, 46px);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  color: rgba(233, 240, 234, .92);
 }
+.no-flags .lead, .no-flags .tail { color: rgba(233, 240, 234, .42); font-weight: 500; }
 .no-flags .no {
-  color: var(--red);
-  border: 1px solid #FECACA;
-  background: #FEF2F2;
-  border-radius: 8px;
-  padding: 5px 13px;
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: .72em;
+  color: #FCA5A5;
+  background: rgba(248, 113, 113, .1);
+  border: 1px solid rgba(248, 113, 113, .25);
+  border-radius: 10px;
+  padding: .18em .5em;
   text-decoration: line-through;
+  text-decoration-thickness: 2px;
+  text-decoration-color: rgba(248, 113, 113, .85);
 }
 @media (max-width: 860px) { .safety-grid { grid-template-columns: 1fr; } }
 
@@ -927,6 +944,40 @@ section.block.tint { background: var(--bg-2); }
 .install-alt a:hover { border-color: var(--green); }
 @media (max-width: 760px) { .install-grid { grid-template-columns: 1fr; } }
 
+
+/* ============================================================
+   Polish — masks, tilt, spotlight, grain, terminal chrome
+   ============================================================ */
+body::before {
+  content: '';
+  position: fixed; inset: 0; z-index: 2000; pointer-events: none;
+  opacity: .03;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+.mask { display: inline-block; overflow: hidden; vertical-align: bottom; padding-bottom: .09em; margin-bottom: -.09em; }
+.mask-in { display: inline-block; transform: translateY(118%); transition: transform 1.05s cubic-bezier(.16, 1, .3, 1); }
+body.loaded .mask-in { transform: none; }
+.mask-2 .mask-in { transition-delay: .13s; }
+.lib-card { transition: box-shadow .3s; will-change: transform; }
+.lib-tile { transition: opacity .35s, filter .35s, box-shadow .35s; }
+.lib-tiles.focusing .lib-tile { opacity: .16; filter: grayscale(.8); }
+.lib-tiles.focusing .lib-tile.lit { opacity: 1; filter: none; box-shadow: 0 8px 20px -8px rgba(15, 23, 18, .35); }
+.agent-node.focus .agent-core { background: var(--green); border-color: var(--green); color: #fff; }
+.agent-node.focus .agent-tile { transform: translateY(-3px); box-shadow: 0 12px 28px -10px rgba(15, 23, 18, .22), 0 0 0 1px var(--green-soft); }
+.spot { position: relative; }
+.spot::after {
+  content: ''; position: absolute; inset: 0; border-radius: inherit;
+  opacity: 0; transition: opacity .45s; pointer-events: none;
+  background: radial-gradient(360px circle at var(--mx, 50%) var(--my, 50%), rgba(15, 23, 18, .055), transparent 65%);
+}
+.spot:hover::after { opacity: 1; }
+.install-card.spot::after {
+  background: radial-gradient(360px circle at var(--mx, 50%) var(--my, 50%), rgba(255, 255, 255, .08), transparent 65%);
+}
+.term-bar { display: flex; align-items: center; gap: 7px; margin-bottom: 18px; }
+.term-bar i { width: 9px; height: 9px; border-radius: 50%; background: #2E3A34; }
+.term-bar span { margin-left: 8px; font: 500 9.5px var(--mono); letter-spacing: .22em; color: #5C6A63; }
+
 /* ============================================================
    Footer
    ============================================================ */
@@ -978,17 +1029,18 @@ footer {
   color: var(--faint);
   letter-spacing: .08em;
 }
+footer { overflow: hidden; }
 .footer-giant {
   font-weight: 700;
-  font-size: clamp(84px, 15vw, 230px);
-  line-height: 1;
-  letter-spacing: -0.045em;
+  font-size: clamp(110px, 20vw, 300px);
+  line-height: .8;
+  letter-spacing: -0.05em;
   text-align: center;
-  padding-top: 56px;
-  color: #F1F1F3;
+  padding-top: 80px;
+  color: #EFF1EF;
   user-select: none;
   pointer-events: none;
-  transform: translateY(18%);
+  transform: translateY(26%);
 }
 
 /* ============================================================
@@ -1034,7 +1086,7 @@ footer {
 <!-- ============================ Hero ============================ -->
 <section class="hero" id="top">
   <div class="wrap hero-content">
-    <h1 class="reveal reveal-d1">One library. The right <span class="accent">roster</span><br>for every agent.</h1>
+    <h1><span class="mask"><span class="mask-in">One library. The right</span></span><br><span class="mask mask-2"><span class="mask-in"><span class="accent">roster</span> for every agent.</span></span></h1>
     <p class="hero-sub reveal reveal-d2">
       One Rust CLI that lets your agents inspect, right-size, and safely change
       their own skills — evidence before change, reversible by receipt.
@@ -1045,11 +1097,11 @@ footer {
     </div>
 
     <!-- One library, many rosters — the product in one glance -->
-    <div class="diagram reveal reveal-d3" id="diagram">
+    <div class="diagram" id="diagram">
       <div class="lib-card">
         <div class="lib-head">
           <span class="lib-title"><span class="lib-mark" aria-hidden="true"></span>ONE LIBRARY</span>
-          <span class="lib-count">36 SKILLS · ONE CANONICAL SOURCE</span>
+          <span class="lib-count" id="libMeta">36 SKILLS · ONE CANONICAL SOURCE</span>
         </div>
         <div class="lib-tiles" id="libTiles"></div>
       </div>
@@ -1065,9 +1117,9 @@ footer {
     <div class="section-head">
       <span class="num reveal">01 — The governance loop</span>
       <h2 class="reveal reveal-d1">From chaos, to <em>curated</em>.<br>Then back again — safely.</h2>
-      <p class="reveal reveal-d2">This is a real plan → apply → undo cycle. Press apply:
-      thirty-six scattered skills collapse into one curated roster. Press undo:
-      every byte returns. That is the whole product, in one gesture.</p>
+      <p class="reveal reveal-d2">A real plan → apply → undo cycle, playing on loop. Thirty-six
+      scattered skills collapse into one curated roster — then every byte
+      returns. That is the whole product, in one gesture.</p>
     </div>
     <div class="demo-stage-wrap chaos reveal" id="demoWrap">
       <div class="demo-head">
@@ -1095,19 +1147,19 @@ footer {
 <section class="block tint" style="padding-top:0; padding-bottom:clamp(60px,8vw,100px)">
   <div class="wrap" style="padding-top:clamp(60px,8vw,100px)">
     <div class="stats-grid">
-      <div class="stat-card reveal" style="--c:#16A34A">
+      <div class="stat-card reveal">
         <div class="stat-num" data-count="8">0</div>
         <div class="stat-label">Direct agent adapters<br>fixture-verified</div>
       </div>
-      <div class="stat-card reveal reveal-d1" style="--c:#7C3AED">
+      <div class="stat-card reveal reveal-d1">
         <div class="stat-num"><span data-count="59">0</span>/59</div>
         <div class="stat-label">Top-3 routing recall<br>maintained eval set</div>
       </div>
-      <div class="stat-card reveal reveal-d2" style="--c:#D97706">
+      <div class="stat-card reveal reveal-d2">
         <div class="stat-num"><span data-count="3.37" data-decimals="2">0</span><sup>s</sup></div>
         <div class="stat-label">676 placements scanned<br>reference machine</div>
       </div>
-      <div class="stat-card reveal reveal-d3" style="--c:#0891B2">
+      <div class="stat-card reveal reveal-d3">
         <div class="stat-num"><span data-count="100">0</span><sup>%</sup></div>
         <div class="stat-label">Fixture state restored<br>receipt-bounded undo</div>
       </div>
@@ -1125,32 +1177,35 @@ footer {
       agent owns judgment and presentation. SkillRoster owns deterministic discovery,
       validation, mutation, and recovery — a binary with no model calls inside.</p>
     </div>
-    <div class="flow-grid">
-      <div class="flow-card reveal" style="--c1:#22C55E;--c2:#0D9488">
-        <span class="flow-step-tag">STEP 01</span>
-        <div class="flow-glyph">◎</div>
-        <h3>Scan &amp; report</h3>
-        <p>A read-only scan persists an immutable snapshot of every skill, placement,
-        link, fingerprint, and usage signal. Seven categories of findings, each traced
-        to concrete evidence.</p>
+    <div class="steps reveal">
+      <div class="step" style="--c:#0D9488">
+        <span class="step-num">01</span>
+        <div>
+          <h3>Scan &amp; report</h3>
+          <p>A read-only scan persists an immutable snapshot of every skill, placement,
+          link, fingerprint, and usage signal. Seven categories of findings, each traced
+          to concrete evidence.</p>
+        </div>
         <span class="cmd">skillroster scan --summary --json</span>
       </div>
-      <div class="flow-card reveal reveal-d1" style="--c1:#A78BFA;--c2:#6366F1">
-        <span class="flow-step-tag">STEP 02</span>
-        <div class="flow-glyph">◈</div>
-        <h3>Plan</h3>
-        <p>The agent submits declarative target states against snapshot and evidence IDs.
-        The CLI validates ownership, conflicts, and fingerprints, then stores an
-        immutable preview. Raw filesystem operations are rejected.</p>
+      <div class="step" style="--c:#6366F1">
+        <span class="step-num">02</span>
+        <div>
+          <h3>Plan</h3>
+          <p>The agent submits declarative target states against snapshot and evidence
+          IDs. The CLI validates ownership, conflicts, and fingerprints, then stores an
+          immutable preview. Raw filesystem operations are rejected.</p>
+        </div>
         <span class="cmd">skillroster plan --stdin --json</span>
       </div>
-      <div class="flow-card reveal reveal-d2" style="--c1:#38BDF8;--c2:#2563EB">
-        <span class="flow-step-tag">STEP 03</span>
-        <div class="flow-glyph">↩</div>
-        <h3>Apply &amp; undo</h3>
-        <p>One confirmation applies the whole approved scope. Drift fails closed,
-        every mutation writes a receipt, and undo restores the original tree —
-        byte for byte.</p>
+      <div class="step" style="--c:#2563EB">
+        <span class="step-num">03</span>
+        <div>
+          <h3>Apply &amp; undo</h3>
+          <p>One confirmation applies the whole approved scope. Drift fails closed,
+          every mutation writes a receipt, and undo restores the original tree —
+          byte for byte.</p>
+        </div>
         <span class="cmd">skillroster undo &lt;receipt-id&gt; --json</span>
       </div>
     </div>
@@ -1258,21 +1313,21 @@ footer {
       live in the plan validator and the storage layer — not in a prompt.</p>
     </div>
     <div class="safety-grid">
-      <div class="safety-card reveal" style="--c:#16A34A">
+      <div class="safety-card reveal" style="--c:#4ADE80">
         <span class="k">DRIFT REFUSAL</span>
         <h3>Fingerprints or nothing</h3>
         <p>Apply revalidates every path, link, and fingerprint before mutating.
         A plan created by an older binary cannot bypass the
         <code>complete</code>-fingerprint boundary.</p>
       </div>
-      <div class="safety-card reveal reveal-d1" style="--c:#D97706">
+      <div class="safety-card reveal reveal-d1" style="--c:#FBBF24">
         <span class="k">TRUST IS EXPLICIT</span>
         <h3>No inferred permission</h3>
         <p>Escaping links stay untrusted until one exact directory is confirmed.
         No parent, sibling, wildcard, or alias permission is ever inferred —
         replaced or retargeted roots fail closed.</p>
       </div>
-      <div class="safety-card reveal reveal-d2" style="--c:#E11D48">
+      <div class="safety-card reveal reveal-d2" style="--c:#FB7185">
         <span class="k">RECOVERY BLOCKING</span>
         <h3>Unresolved means stop</h3>
         <p>While any receipt requires recovery, new writes are blocked. Undo is
@@ -1281,11 +1336,11 @@ footer {
       </div>
     </div>
     <div class="no-flags reveal">
-      <span>THERE IS NO</span>
+      <span class="lead">THERE IS NO</span>
       <span class="no">--force</span>
       <span class="no">--yes</span>
       <span class="no">--auto-fix</span>
-      <span>— BY DESIGN.</span>
+      <span class="tail">— BY DESIGN.</span>
     </div>
   </div>
 </section>
@@ -1301,7 +1356,8 @@ footer {
       skill — the agent takes it from there.</p>
     </div>
     <div class="install-grid reveal">
-      <div class="install-card">
+      <div class="install-card spot">
+        <div class="term-bar"><i></i><i></i><i></i><span>TERMINAL</span></div>
         <h3>Homebrew</h3>
         <div class="sub">REPOSITORY-BACKED TAP · MACOS &amp; LINUX</div>
         <div class="code-block">
@@ -1311,7 +1367,8 @@ footer {
           <button class="copy-btn" data-copy="brew tap tt-a1i/skillroster https://github.com/tt-a1i/skillroster.git && brew install tt-a1i/skillroster/skillroster">COPY</button>
         </div>
       </div>
-      <div class="install-card">
+      <div class="install-card spot">
+        <div class="term-bar"><i></i><i></i><i></i><span>TERMINAL</span></div>
         <h3>Cargo</h3>
         <div class="sub">IMMUTABLE RELEASE TAG · ANY PLATFORM</div>
         <div class="code-block">
@@ -1371,6 +1428,10 @@ window.__LOGO_SRC = {
   'github-copilot': 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDgiIGhlaWdodD0iNDgiIGZpbGw9IiMwMDAwMDAiIHJvbGU9ImltZyIgdmlld0JveD0iMCAwIDI0IDI0IiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciPjx0aXRsZT5HaXRIdWIgQ29waWxvdDwvdGl0bGU+PHBhdGggZD0iTTIzLjkyMiAxNi45OTdDMjMuMDYxIDE4LjQ5MiAxOC4wNjMgMjIuMDIgMTIgMjIuMDIgNS45MzcgMjIuMDIuOTM5IDE4LjQ5Mi4wNzggMTYuOTk3QS42NDEuNjQxIDAgMCAxIDAgMTYuNzQxdi0yLjg2OWEuODgzLjg4MyAwIDAgMSAuMDUzLS4yMmMuMzcyLS45MzUgMS4zNDctMi4yOTIgMi42MDUtMi42NTYuMTY3LS40MjkuNDE0LTEuMDU1LjY0NC0xLjUxN2ExMC4wOTggMTAuMDk4IDAgMCAxLS4wNTItMS4wODZjMC0xLjMzMS4yODItMi40OTkgMS4xMzItMy4zNjguMzk3LS40MDYuODktLjcxNyAxLjQ3NC0uOTUyQzcuMjU1IDIuOTM3IDkuMjQ4IDEuOTggMTEuOTc4IDEuOThjMi43MzEgMCA0Ljc2Ny45NTcgNi4xNjYgMi4wOTMuNTg0LjIzNSAxLjA3Ny41NDYgMS40NzQuOTUyLjg1Ljg2OSAxLjEzMiAyLjAzNyAxLjEzMiAzLjM2OCAwIC4zNjgtLjAxNC43MzMtLjA1MiAxLjA4Ni4yMy40NjIuNDc3IDEuMDg4LjY0NCAxLjUxNyAxLjI1OC4zNjQgMi4yMzMgMS43MjEgMi42MDUgMi42NTZhLjg0MS44NDEgMCAwIDEgLjA1My4yMnYyLjg2OWEuNjQxLjY0MSAwIDAgMS0uMDc4LjI1NlptLTExLjc1LTUuOTkyaC0uMzQ0YTQuMzU5IDQuMzU5IDAgMCAxLS4zNTUuNTA4Yy0uNzcuOTQ3LTEuOTE4IDEuNDkyLTMuNTA4IDEuNDkyLTEuNzI1IDAtMi45ODktLjM1OS0zLjc4Mi0xLjI1OWEyLjEzNyAyLjEzNyAwIDAgMS0uMDg1LS4xMDRMNCAxMS43NDZ2Ni41ODVjMS40MzUuNzc5IDQuNTE0IDIuMTc5IDggMi4xNzkgMy40ODYgMCA2LjU2NS0xLjQgOC0yLjE3OXYtNi41ODVsLS4wOTgtLjEwNHMtLjAzMy4wNDUtLjA4NS4xMDRjLS43OTMuOS0yLjA1NyAxLjI1OS0zLjc4MiAxLjI1OS0xLjU5IDAtMi43MzgtLjU0NS0zLjUwOC0xLjQ5MmE0LjM1OSA0LjM1OSAwIDAgMS0uMzU1LS41MDhabTIuMzI4IDMuMjVjLjU0OSAwIDEgLjQ1MSAxIDF2MmMwIC41NDktLjQ1MSAxLTEgMS0uNTQ5IDAtMS0uNDUxLTEtMXYtMmMwLS41NDkuNDUxLTEgMS0xWm0tNSAwYy41NDkgMCAxIC40NTEgMSAxdjJjMCAuNTQ5LS40NTEgMS0xIDEtLjU0OSAwLTEtLjQ1MS0xLTF2LTJjMC0uNTQ5LjQ1MS0xIDEtMVptMy4zMTMtNi4xODVjLjEzNiAxLjA1Ny40MDMgMS45MTMuODc4IDIuNDk3LjQ0Mi41NDQgMS4xMzQuOTM4IDIuMzQ0LjkzOCAxLjU3MyAwIDIuMjkyLS4zMzcgMi42NTctLjc1MS4zODQtLjQzNS41NTgtMS4xNS41NTgtMi4zNjEgMC0xLjE0LS4yNDMtMS44NDctLjcwNS0yLjMxOS0uNDc3LS40ODgtMS4zMTktLjg2Mi0yLjgyNC0xLjAyNS0xLjQ4Ny0uMTYxLTIuMTkyLjEzOC0yLjUzMy41MjktLjI2OS4zMDctLjQzNy44MDgtLjQzOCAxLjU3OHYuMDIxYzAgLjI2NS4wMjEuNTYyLjA2My44OTNabS0xLjYyNiAwYy4wNDItLjMzMS4wNjMtLjYyOC4wNjMtLjg5NHYtLjAyYy0uMDAxLS43Ny0uMTY5LTEuMjcxLS40MzgtMS41NzgtLjM0MS0uMzkxLTEuMDQ2LS42OS0yLjUzMy0uNTI5LTEuNTA1LjE2My0yLjM0Ny41MzctMi44MjQgMS4wMjUtLjQ2Mi40NzItLjcwNSAxLjE3OS0uNzA1IDIuMzE5IDAgMS4yMTEuMTc1IDEuOTI2LjU1OCAyLjM2MS4zNjUuNDE0IDEuMDg0Ljc1MSAyLjY1Ny43NTEgMS4yMSAwIDEuOTAyLS4zOTQgMi4zNDQtLjkzOC40NzUtLjU4NC43NDItMS40NC44NzgtMi40OTdaIi8+PC9zdmc+',
 };
 const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const hexA = (hex, a) => {
+  const n = parseInt(hex.slice(1), 16);
+  return 'rgba(' + ((n >> 16) & 255) + ', ' + ((n >> 8) & 255) + ', ' + (n & 255) + ', ' + a + ')';
+};
 const finePointer = window.matchMedia('(pointer: fine)').matches;
 
 /* ============================================================
@@ -1438,6 +1499,7 @@ if (reduced || !('IntersectionObserver' in window)) {
     t.className = 'lib-tile';
     t.style.setProperty('--g1', g1);
     t.style.setProperty('--g2', g2);
+    t.style.setProperty('--sh', hexA(g2, .42));
     t.style.setProperty('--d', (i * 0.14) + 's');
     t.style.setProperty('--fd', (4 + (i % 5) * 0.7) + 's');
     libTiles.appendChild(t);
@@ -1481,12 +1543,86 @@ if (reduced || !('IntersectionObserver' in window)) {
     }
   });
 
-  // hover: focus one agent's beam
+  // hover: focus one agent — its beam, its skills in the library
+  const meta = document.getElementById('libMeta');
+  const DEFAULT_META = meta.textContent;
+  const tiles = [...libTiles.children];
+  function focusAgent(i) {
+    const set = new Set();
+    for (let k = 0; k < AGENTS[i][2]; k++) set.add((i * 2 + k * 5) % SKILLS.length);
+    svg.dataset.active = i;
+    libTiles.classList.add('focusing');
+    tiles.forEach((t, j) => t.classList.toggle('lit', set.has(j)));
+    [...row.children].forEach((n, j) => n.classList.toggle('focus', j === i));
+    meta.textContent = AGENTS[i][1].toUpperCase() + ' ROSTER · ' + AGENTS[i][2] + ' SKILLS';
+  }
+  function clearFocus() {
+    delete svg.dataset.active;
+    libTiles.classList.remove('focusing');
+    tiles.forEach(t => t.classList.remove('lit'));
+    [...row.children].forEach(n => n.classList.remove('focus'));
+    meta.textContent = DEFAULT_META;
+  }
+  let userHold = false, inView = true, cycle = 0;
   row.addEventListener('mouseover', (e) => {
     const node = e.target.closest('.agent-node');
-    if (node) svg.dataset.active = node.dataset.i;
+    if (node) { userHold = true; focusAgent(+node.dataset.i); }
   });
-  row.addEventListener('mouseleave', () => { delete svg.dataset.active; });
+  row.addEventListener('mouseleave', () => { userHold = false; clearFocus(); });
+
+  // entrance choreography — tiles cascade, beams draw, agents pop
+  if (!reduced) {
+    const spring = 'cubic-bezier(.34, 1.35, .64, 1)';
+    tiles.forEach((t, i) => t.animate(
+      [{ opacity: 0, transform: 'translateY(26px) scale(.55)' }, { opacity: 1, transform: 'none' }],
+      { duration: 700, delay: 320 + i * 36, easing: spring, fill: 'backwards' }));
+    [...row.children].forEach((n, i) => n.animate(
+      [{ opacity: 0, transform: 'translateY(18px) scale(.72)' }, { opacity: 1, transform: 'none' }],
+      { duration: 650, delay: 1050 + i * 55, easing: spring, fill: 'backwards' }));
+    svg.querySelectorAll('path').forEach((pth, i) => {
+      const len = pth.getTotalLength();
+      pth.style.strokeDasharray = len;
+      pth.animate([{ strokeDashoffset: len }, { strokeDashoffset: 0 }],
+        { duration: 800, delay: 620 + i * 70, easing: 'cubic-bezier(.4, 0, .2, 1)', fill: 'backwards' });
+    });
+    svg.querySelectorAll('circle').forEach((c) => c.animate(
+      [{ opacity: 0 }, { opacity: 1 }], { duration: 700, delay: 1600, fill: 'backwards' }));
+  }
+
+  // ambient rotation — the diagram breathes until the user takes over
+  if (!reduced) {
+    new IntersectionObserver((entries) => { inView = entries[0].isIntersecting; }, { threshold: 0.15 })
+      .observe(document.getElementById('diagram'));
+    setTimeout(() => {
+      setInterval(() => {
+        if (userHold || !inView || document.hidden) return;
+        if (cycle % 2 === 0) focusAgent((cycle / 2) % AGENTS.length);
+        else clearFocus();
+        cycle++;
+      }, 2100);
+    }, 1800);
+  }
+
+  // gentle 3D tilt on the library card
+  const card = document.querySelector('.lib-card');
+  const diagramEl = document.getElementById('diagram');
+  if (finePointer && !reduced && card && diagramEl) {
+    let tx = 0, ty = 0, cx = 0, cy = 0, raf = null;
+    const loop = () => {
+      raf = requestAnimationFrame(() => {
+        cx += (tx - cx) * .08; cy += (ty - cy) * .08;
+        card.style.transform = 'perspective(1200px) rotateX(' + cy.toFixed(2) + 'deg) rotateY(' + cx.toFixed(2) + 'deg)';
+        if (Math.abs(tx - cx) > .01 || Math.abs(ty - cy) > .01) loop(); else raf = null;
+      });
+    };
+    diagramEl.addEventListener('mousemove', (e) => {
+      const r = card.getBoundingClientRect();
+      tx = ((e.clientX - (r.left + r.width / 2)) / r.width) * 4;
+      ty = -((e.clientY - (r.top + r.height / 2)) / r.height) * 5;
+      if (!raf) loop();
+    });
+    diagramEl.addEventListener('mouseleave', () => { tx = 0; ty = 0; if (!raf) loop(); });
+  }
 })();
 
 /* ============================================================
@@ -1556,6 +1692,7 @@ if (reduced || !('IntersectionObserver' in window)) {
     el.textContent = name;
     el.style.setProperty('--g1', g1);
     el.style.setProperty('--g2', g2);
+    el.style.setProperty('--sh', hexA(g2, .45));
     el.style.setProperty('--d', (i * 0.028) + 's');
     el.style.setProperty('--wd', (3.5 + rand() * 3) + 's');
     grid.appendChild(el);
@@ -1585,8 +1722,9 @@ if (reduced || !('IntersectionObserver' in window)) {
   addEventListener('resize', layoutChaos);
   if (reduced) wrap.classList.remove('chaos');
 
-  let applied = false;
-  btnApply.addEventListener('click', () => {
+  let applied = false, autoHold = 0, demoSeen = false;
+  function pokeManual() { autoHold = Date.now() + 12000; }
+  function doApply() {
     if (applied) return;
     applied = true;
     wrap.classList.remove('chaos');
@@ -1598,8 +1736,8 @@ if (reduced || !('IntersectionObserver' in window)) {
     metricNoise.style.color = 'var(--green)';
     btnApply.style.opacity = '.45';
     btnApply.style.pointerEvents = 'none';
-  });
-  btnUndo.addEventListener('click', () => {
+  }
+  function doUndo() {
     if (!applied) return;
     applied = false;
     wrap.classList.add('chaos');
@@ -1611,7 +1749,18 @@ if (reduced || !('IntersectionObserver' in window)) {
     metricNoise.style.color = '';
     btnApply.style.opacity = '1';
     btnApply.style.pointerEvents = 'auto';
-  });
+  }
+  btnApply.addEventListener('click', () => { doApply(); pokeManual(); });
+  btnUndo.addEventListener('click', () => { doUndo(); pokeManual(); });
+
+  // autoplay the loop while the demo is on screen
+  if (!reduced) {
+    new IntersectionObserver((es) => { demoSeen = es[0].isIntersecting; }, { threshold: 0.3 }).observe(wrap);
+    setInterval(() => {
+      if (!demoSeen || document.hidden || Date.now() < autoHold) return;
+      if (applied) doUndo(); else doApply();
+    }, 4200);
+  }
 })();
 
 /* ============================================================
@@ -1646,6 +1795,20 @@ if (reduced || !('IntersectionObserver' in window)) {
   }, { threshold: 0.5 });
   els.forEach((el) => io.observe(el));
 })();
+
+/* ============================================================
+   Polish — load state + card spotlight
+   ============================================================ */
+requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.add('loaded')));
+if (finePointer) {
+  document.querySelectorAll('.spot').forEach((el) => {
+    el.addEventListener('pointermove', (e) => {
+      const r = el.getBoundingClientRect();
+      el.style.setProperty('--mx', (e.clientX - r.left) + 'px');
+      el.style.setProperty('--my', (e.clientY - r.top) + 'px');
+    });
+  });
+}
 </script>
 </body>
 </html>
