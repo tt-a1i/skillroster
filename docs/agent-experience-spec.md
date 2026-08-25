@@ -110,6 +110,11 @@ read-only `view_source_confirmation_finding` action when available. The
 opened escaping-link Finding remains the only surface that offers exact
 confirmation-gated source-root actions. Never execute a confirmation-gated
 Core-protection template or source-link change on the user's behalf.
+Its additive `permission_paths` are mutually exclusive: durable confirmation
+continues with a plain Scan, while temporary `--source-root` overrides belong
+to a one-Scan alternative that creates no permission record. The legacy
+`confirm_trusted_source_roots` value is an opaque decision alias, not a content
+trust assessment.
 
 ## 5. Ready Plan response
 
@@ -277,10 +282,12 @@ The Agent distinguishes “not observed” from “unused,” names missing cove
 
 The Agent leaves an escaping link unread, shows its target, and asks whether
 the source is intentional. After confirmation it records an exact local read
-permission with `source-root confirm`, then rescans without increasing any
-Agent's default exposure. The decision does not endorse content or authorize a
-Plan; unconfirmed, revoked, or identity-drifted sources remain excluded. The
-temporary `--source-root` flag remains available for one Scan. Drift detection
+permission with `source-root confirm`, then follows the returned plain Scan
+action without adding the confirmed path as `--source-root`. Alternatively, it
+can skip durable confirmation and use temporary `--source-root` flags for one
+Scan. These paths are never combined. Neither decision endorses content or
+authorizes a Plan; unconfirmed, revoked, or identity-drifted sources remain
+excluded. Drift detection
 uses bounded identity and entrypoint-binding checks around discovery and
 content consumption; it detects accidental or persistent changes, not a
 malicious same-user ABA race completed entirely between checkpoints.
