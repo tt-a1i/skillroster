@@ -4130,6 +4130,37 @@ fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
                 && root["kind"] == "sessions"
                 && root["status"] == "excluded")
     );
+    let summary = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    assert_eq!(summary["result"]["session_coverage"]["supported_agents"], 8);
+    assert_eq!(summary["result"]["session_coverage"]["excluded_agents"], 1);
+    assert_eq!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["agent"] == "codex" && agent["state"] == "excluded")
+    );
+    assert!(
+        summary["result"]["session_coverage"]["next_step_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("codex"))
+                && group["steps"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("do_not_infer_usage_for_excluded_agent")))
+    );
     let inspect = json_output(&run(
         &[&common[..], &["lifecycle", "inspect"]].concat(),
         None,

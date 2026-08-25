@@ -2376,32 +2376,60 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
     let mut coverage_limitations =
         BTreeMap::<scan::SessionCoverageLimitation, BTreeSet<String>>::new();
     let mut coverage_next_steps = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
-    for coverage in &result.coverage {
-        let details = session_coverage_details(coverage)?;
-        let limitations = coverage.limitations.as_deref().unwrap_or_default();
-        let supported_next_steps = details["actionability"]["supported_next_steps"]
-            .as_array()
-            .ok_or_else(|| anyhow!("session Coverage actionability must contain an array"))?
+    let mut excluded_agent_count = 0;
+    for agent in AgentKind::ALL {
+        if let Some(coverage) = result
+            .coverage
             .iter()
-            .map(|step| {
-                step.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| anyhow!("session Coverage next step must be a string"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for limitation in limitations {
-            coverage_limitations
-                .entry(limitation.clone())
+            .find(|coverage| coverage.agent == agent)
+        {
+            let details = session_coverage_details(coverage)?;
+            let supported_next_steps = details["actionability"]["supported_next_steps"]
+                .as_array()
+                .ok_or_else(|| anyhow!("session Coverage actionability must contain an array"))?
+                .iter()
+                .map(|step| {
+                    step.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow!("session Coverage next step must be a string"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for limitation in coverage.limitations.as_deref().unwrap_or_default() {
+                coverage_limitations
+                    .entry(limitation.clone())
+                    .or_default()
+                    .insert(agent.id().to_owned());
+            }
+            coverage_next_steps
+                .entry(supported_next_steps)
                 .or_default()
-                .insert(coverage.agent.id().to_owned());
+                .insert(agent.id().to_owned());
+            coverage_agents.push(json!({
+                "agent": agent.id(),
+                "state": summary_coverage_state(coverage),
+            }));
+            continue;
         }
+
+        let excluded = result.roots.iter().any(|root| {
+            root.agent == Some(agent)
+                && root.kind == scan::RootKind::Sessions
+                && root.status == scan::RootStatus::Excluded
+        });
+        if !excluded {
+            return Err(anyhow!(
+                "Scan summary has neither Coverage nor an excluded session root for {}",
+                agent.id()
+            ));
+        }
+        excluded_agent_count += 1;
         coverage_next_steps
-            .entry(supported_next_steps)
+            .entry(vec!["do_not_infer_usage_for_excluded_agent".to_owned()])
             .or_default()
-            .insert(coverage.agent.id().to_owned());
+            .insert(agent.id().to_owned());
         coverage_agents.push(json!({
-            "agent": coverage.agent.id(),
-            "state": summary_coverage_state(coverage),
+            "agent": agent.id(),
+            "state": "excluded",
         }));
     }
     let coverage_limitations = coverage_limitations
@@ -2455,13 +2483,14 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
             "items": root_issue_items,
         },
         "session_coverage": {
-            "supported_agents": result.coverage.len(),
+            "supported_agents": AgentKind::ALL.len(),
             "roots_present_agents": metrics.agents_with_session_roots,
             "sampled_agents": metrics.agents_with_sampled_session_data,
             "complete_agents": metrics.agents_with_reliable_session_denominator,
             "limited_agents": metrics.agents_with_limited_session_data,
             "missing_root_agents": metrics.agents_missing_session_roots,
             "inaccessible_agents": metrics.agents_with_inaccessible_session_roots,
+            "excluded_agents": excluded_agent_count,
             "inference_boundary": {
                 "unused_claim_supported": false,
                 "automatic_governance_supported": false,
