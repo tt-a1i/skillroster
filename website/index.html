@@ -1206,10 +1206,6 @@ footer { overflow: hidden; }
           <span>DEFAULT EXPOSURE <b class="before" id="metricBefore">36</b> <span id="metricArrow" style="opacity:0">→</span> <b class="after" id="metricAfter" style="opacity:0">7</b></span>
           <span>CONTEXT NOISE <b id="metricNoise">HIGH</b></span>
         </div>
-        <div class="demo-actions">
-          <button class="btn-undo" id="btnUndo">↩ Undo receipt</button>
-          <button class="btn-plan" id="btnApply">Apply plan_a1f2 →</button>
-        </div>
       </div>
     </div>
   </div>
@@ -1776,8 +1772,6 @@ if (reduced || !('IntersectionObserver' in window)) {
   const wrap = document.getElementById('demoWrap');
   const grid = document.getElementById('tileGrid');
   const status = document.getElementById('demoStatus');
-  const btnApply = document.getElementById('btnApply');
-  const btnUndo = document.getElementById('btnUndo');
   const metricAfter = document.getElementById('metricAfter');
   const metricArrow = document.getElementById('metricArrow');
   const metricNoise = document.getElementById('metricNoise');
@@ -1818,8 +1812,7 @@ if (reduced || !('IntersectionObserver' in window)) {
   addEventListener('resize', layoutChaos);
   if (reduced) wrap.classList.remove('chaos');
 
-  let applied = false, autoHold = 0, demoSeen = false;
-  function pokeManual() { autoHold = Date.now() + 12000; }
+  let applied = false, demoSeen = false;
   function doApply() {
     if (applied) return;
     applied = true;
@@ -1830,8 +1823,6 @@ if (reduced || !('IntersectionObserver' in window)) {
     metricArrow.style.opacity = '1';
     metricNoise.textContent = 'LOW';
     metricNoise.style.color = 'var(--green)';
-    btnApply.style.opacity = '.45';
-    btnApply.style.pointerEvents = 'none';
   }
   function doUndo() {
     if (!applied) return;
@@ -1843,17 +1834,12 @@ if (reduced || !('IntersectionObserver' in window)) {
     metricArrow.style.opacity = '0';
     metricNoise.textContent = 'HIGH';
     metricNoise.style.color = '';
-    btnApply.style.opacity = '1';
-    btnApply.style.pointerEvents = 'auto';
   }
-  btnApply.addEventListener('click', () => { doApply(); pokeManual(); });
-  btnUndo.addEventListener('click', () => { doUndo(); pokeManual(); });
-
   // autoplay the loop while the demo is on screen
   if (!reduced) {
     new IntersectionObserver((es) => { demoSeen = es[0].isIntersecting; }, { threshold: 0.3 }).observe(wrap);
     setInterval(() => {
-      if (!demoSeen || document.hidden || Date.now() < autoHold) return;
+      if (!demoSeen || document.hidden) return;
       if (applied) doUndo(); else doApply();
     }, 4200);
   }
