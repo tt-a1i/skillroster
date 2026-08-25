@@ -1,7 +1,3 @@
-<p align="center">
-  <img src=".github/assets/skillroster-readme-hero.png" alt="SkillRoster routes one local Skill library into focused rosters for multiple AI agents" width="100%">
-</p>
-
 <h1 align="center">SkillRoster</h1>
 
 <p align="center">
