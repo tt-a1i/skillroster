@@ -8,7 +8,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 19 19'%3E%3Crect x='0.5' y='0.5' width='8' height='8' fill='none' stroke='%230A0A0A'/%3E%3Crect x='10.5' y='0.5' width='8' height='8' fill='none' stroke='%230A0A0A'/%3E%3Crect x='0.5' y='10.5' width='8' height='8' fill='none' stroke='%230A0A0A'/%3E%3Crect x='10.5' y='10.5' width='8' height='8' fill='%2316A34A'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=Newsreader:ital,opsz,wght@1,6..72,300;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;450;500;600;700&family=Instrument+Serif:ital,wght@0,400;1,400&family=Newsreader:ital,opsz,wght@1,6..72,300;1,6..72,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 /* ============================================================
    SkillRoster — light, mobbin-grade tokens
@@ -31,6 +31,7 @@
   --red:       #DC2626;
   --sans:      "Inter", -apple-system, "Segoe UI", sans-serif;
   --serif:     "Newsreader", Georgia, serif;
+  --serif-d:   "Instrument Serif", "Newsreader", Georgia, serif;
   --mono:      "JetBrains Mono", "SF Mono", Menlo, monospace;
   --maxw: 1180px;
   --gutter: clamp(20px, 4vw, 40px);
@@ -177,16 +178,17 @@ a:focus-visible, button:focus-visible {
   100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
 }
 h1 {
-  font-weight: 650;
-  font-size: clamp(52px, 7.6vw, 100px);
-  line-height: 1.02;
-  letter-spacing: -0.038em;
+  font-family: var(--serif-d);
+  font-weight: 400;
+  font-size: clamp(58px, 8.2vw, 110px);
+  line-height: 1.0;
+  letter-spacing: -0.018em;
 }
 h1 .accent {
-  font-family: var(--serif);
+  font-family: var(--serif-d);
   font-style: italic;
-  font-weight: 300;
-  letter-spacing: -0.01em;
+  font-weight: 400;
+  letter-spacing: 0;
   color: var(--green);
 }
 .hero-sub {
@@ -421,15 +423,16 @@ section.block.tint { background: var(--bg-2); }
   border-radius: 2px;
 }
 .section-head h2 {
-  font-weight: 650;
-  font-size: clamp(34px, 4.6vw, 56px);
-  line-height: 1.06;
-  letter-spacing: -0.032em;
+  font-family: var(--serif-d);
+  font-weight: 400;
+  font-size: clamp(40px, 5.2vw, 66px);
+  line-height: 1.04;
+  letter-spacing: -0.018em;
 }
 .section-head h2 em {
-  font-family: var(--serif);
+  font-family: var(--serif-d);
   font-style: italic;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--green);
 }
 .section-head p {
@@ -984,10 +987,11 @@ body.loaded .mask-in { transform: none; }
    ============================================================ */
 .statement { padding: clamp(80px, 10vw, 140px) 0 clamp(40px, 5vw, 70px); }
 .statement h2 {
-  font-size: clamp(46px, 8.6vw, 122px);
-  font-weight: 650;
-  letter-spacing: -0.05em;
-  line-height: 1.04;
+  font-family: var(--serif-d);
+  font-size: clamp(50px, 9vw, 128px);
+  font-weight: 400;
+  letter-spacing: -0.018em;
+  line-height: 1.02;
   overflow: hidden;
 }
 .statement h2 span {
@@ -999,11 +1003,11 @@ body.loaded .mask-in { transform: none; }
 .statement h2.l2 { margin-left: clamp(40px, 11vw, 180px); }
 .statement h2.l2 span { transition-delay: .16s; }
 .statement h2 em {
-  font-family: var(--serif);
+  font-family: var(--serif-d);
   font-style: italic;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--green);
-  letter-spacing: -0.015em;
+  letter-spacing: 0;
 }
 
 /* ============================================================
@@ -1061,14 +1065,15 @@ footer {
   flex-wrap: wrap;
 }
 .footer-brand {
-  font-weight: 700;
-  font-size: 24px;
-  letter-spacing: -0.03em;
+  font-family: var(--serif-d);
+  font-weight: 400;
+  font-size: 27px;
+  letter-spacing: -0.01em;
 }
 .footer-brand em {
-  font-family: var(--serif);
+  font-family: var(--serif-d);
   font-style: italic;
-  font-weight: 300;
+  font-weight: 400;
   color: var(--green);
 }
 .footer-tag {
@@ -1097,10 +1102,11 @@ footer {
 }
 footer { overflow: hidden; }
 .footer-giant {
-  font-weight: 700;
-  font-size: clamp(110px, 20vw, 300px);
+  font-family: var(--serif-d);
+  font-weight: 400;
+  font-size: clamp(120px, 21vw, 310px);
   line-height: .8;
-  letter-spacing: -0.05em;
+  letter-spacing: -0.03em;
   text-align: center;
   padding-top: 80px;
   color: #EFF1EF;
