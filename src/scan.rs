@@ -361,7 +361,7 @@ pub enum SessionCoverageLimitationSource {
     SessionJsonl,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SessionCoverageLimitation {
     pub code: SessionCoverageLimitationCode,
     pub scope: SessionCoverageScope,

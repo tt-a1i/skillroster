@@ -325,10 +325,17 @@ IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, o
 Scan but returns a bounded Agent continuation view: Snapshot and inventory
 counts, exact root totals, at most ten actionable root issues with exact
 total/truncation facts, aggregate and per-Agent typed session-coverage limits,
-source-root policy counts, and the ordinary Report action. Existing
+their supported next steps, and mutually exclusive `reliable`,
+`sampled_limited`, `missing`, `inaccessible`, `excluded`, or `legacy_unknown`
+states; source-root policy counts; and the ordinary Report action. Existing
 `scan --json` remains the complete diagnostic projection. Agent-generated Scan
 actions and the Bootstrap governance workflow use the Summary view; neither
 view changes Agent or Skill files.
+
+To avoid repeating identical typed facts, Summary groups Coverage limitations
+and supported next steps by their affected Agent IDs. Every group remains an
+explicit Agent-to-fact mapping; callers do not infer one Agent's boundary from
+another Agent's state.
 
 Selector-free `report --json` returns the bounded three-Finding Summary view;
 `--summary` is an explicit alias. The exhaustive diagnostic report requires

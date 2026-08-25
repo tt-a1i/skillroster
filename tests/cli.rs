@@ -140,13 +140,40 @@ fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
     let home = temp.path().join("home");
     let full_state = temp.path().join("full-state");
     let summary_state = temp.path().join("summary-state");
-    let skill = home.join(".codex/skills/example");
-    fs::create_dir_all(&skill).unwrap();
-    fs::write(
-        skill.join("SKILL.md"),
-        "---\nname: example\ndescription: Example task helper\n---\n",
-    )
-    .unwrap();
+    let agent_roots = [
+        (".codex/skills", ".codex/sessions"),
+        (".claude/skills", ".claude/projects"),
+        (".pi/agent/skills", ".pi/agent/sessions"),
+        (
+            ".config/opencode/skills",
+            ".local/share/opencode/storage/session",
+        ),
+        (".hermes/skills", ".hermes/sessions"),
+        (".cursor/skills", ".cursor/projects"),
+        (".gemini/skills", ".gemini/tmp"),
+        (".copilot/skills", ".copilot/session-state"),
+    ];
+    for (agent_index, (skill_root, session_root)) in agent_roots.iter().enumerate() {
+        for skill_index in 0..8 {
+            let name = format!("fixture-{agent_index}-{skill_index}");
+            let skill = home.join(skill_root).join(&name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Representative task helper\n---\n"),
+            )
+            .unwrap();
+        }
+        if agent_index < 7 {
+            let sessions = home.join(session_root);
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join("representative.jsonl"),
+                "{\"type\":\"message\",\"content\":\"bounded fixture\"}\n",
+            )
+            .unwrap();
+        }
+    }
 
     let scan_args = |state: &Path, summary: bool| {
         let mut args = vec![
@@ -198,12 +225,61 @@ fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
         summary["result"]["session_coverage"]["inference_boundary"]["automatic_governance_supported"],
         false
     );
+    assert_eq!(summary["result"]["skill_count"], 64);
+    assert_eq!(summary["result"]["placement_count"], 64);
+    assert_eq!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
     assert!(
-        summary["result"]["session_coverage"]["supported_next_steps"]
+        summary["result"]["session_coverage"]["agents"]
             .as_array()
             .unwrap()
             .iter()
-            .all(Value::is_string)
+            .all(|agent| agent["state"].is_string())
+    );
+    let missing_coverage = summary["result"]["session_coverage"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["state"] == "missing")
+        .unwrap();
+    assert_eq!(missing_coverage["agent"], "github-copilot");
+    let missing_limitation = summary["result"]["session_coverage"]["limitation_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|limitation| limitation["code"] == "root_missing")
+        .unwrap();
+    assert!(
+        missing_limitation["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("github-copilot"))
+    );
+    for field in ["scope", "count_kind", "observed", "unit", "source"] {
+        assert!(
+            missing_limitation.get(field).is_some(),
+            "typed limitation field {field}"
+        );
+    }
+    assert!(missing_limitation.get("limit").is_some());
+    assert!(
+        summary["result"]["session_coverage"]["next_step_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("github-copilot"))
+                && group["steps"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("verify_session_root_before_rescan")))
     );
     assert!(
         summary_output.stdout.len() * 100 <= full_output.stdout.len() * 40,
@@ -234,21 +310,34 @@ fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
         ],
         None,
     ));
-    for field in [
-        "skill_count",
-        "placement_count",
-        "default_exposure",
-        "observed_use_agent_count",
-        "primary_metrics",
-        "session_coverage",
-        "category_counts",
-        "finding_rollups",
-    ] {
-        assert_eq!(
-            summary_report["result"][field], full_report["result"][field],
-            "report field {field}"
-        );
+    let full_payload: String = rusqlite::Connection::open(full_state.join("skillroster.db"))
+        .unwrap()
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let summary_payload: String = rusqlite::Connection::open(summary_state.join("skillroster.db"))
+        .unwrap()
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(summary_payload, full_payload);
+
+    let mut full_report_result = full_report["result"].clone();
+    let mut summary_report_result = summary_report["result"].clone();
+    for result in [&mut full_report_result, &mut summary_report_result] {
+        result.as_object_mut().unwrap().remove("report_id");
+        result.as_object_mut().unwrap().remove("snapshot_id");
+        for finding in result["findings"].as_array_mut().unwrap() {
+            finding.as_object_mut().unwrap().remove("id");
+            finding
+                .as_object_mut()
+                .unwrap()
+                .remove("primary_evidence_id");
+        }
     }
+    assert_eq!(summary_report_result, full_report_result);
 }
 
 #[test]
@@ -8052,8 +8141,8 @@ fn find_rejects_content_drift_and_requests_rescan() {
     );
     let retry_argv = loaded["suggested_actions"][0]["argv"].as_array().unwrap();
     assert_eq!(
-        &retry_argv[retry_argv.len() - 2..],
-        &[json!("scan"), json!("--json")]
+        &retry_argv[retry_argv.len() - 3..],
+        &[json!("scan"), json!("--summary"), json!("--json")]
     );
     assert!(loaded["error"]["details"].get("content").is_none());
 

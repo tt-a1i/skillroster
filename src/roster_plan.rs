@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
-const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 2;
+const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 3;
 
 use crate::change::{self, LibraryChangeAction, RosterChange};
 use crate::harness::AgentKind;
@@ -398,6 +398,7 @@ fn scan_with_source_roots_argv(
         argv.push(root.clone());
     }
     argv.push("scan".into());
+    argv.push("--summary".into());
     argv.push("--json".into());
     argv
 }
@@ -2355,7 +2356,7 @@ mod tests {
             "atomic publication must not leave a temporary artifact"
         );
         let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
-        assert_eq!(complete["schema_version"], 2);
+        assert_eq!(complete["schema_version"], 3);
         assert_eq!(complete["action_context_argv"], json!([]));
         assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
         assert_eq!(complete["source_roots"], json!(expected_roots));
@@ -2369,6 +2370,7 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert_eq!(&argv[argv.len() - 3..], ["scan", "--summary", "--json"]);
         for root in &expected_roots {
             let root = root.display().to_string();
             assert!(

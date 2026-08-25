@@ -706,7 +706,7 @@ pub fn error_json_with_context(
                 argv.push("--source-root");
                 argv.push(path.as_str());
             }
-            argv.extend(["scan", "--json"]);
+            argv.extend(["scan", "--summary", "--json"]);
             envelope.suggested_actions = vec![action(
                 "scan_with_confirmed_source_roots",
                 &argv,
@@ -742,7 +742,9 @@ pub fn error_json_with_context(
             | "legacy_snapshot_requires_rescan"
             | "eligible_placement_missing"
             | "entrypoint_content_drift"
-            | "package_identity_drift" => Some(("refresh_snapshot", vec!["scan", "--json"])),
+            | "package_identity_drift" => {
+                Some(("refresh_snapshot", vec!["scan", "--summary", "--json"]))
+            }
             _ => None,
         };
         if let Some((name, argv)) = safe_retry {
@@ -1746,7 +1748,7 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
         "removed_receipt_journals": removed_journals,
         "removed_recovery_directories": removed_recovery_directories,
         "removed_source_confirmation_details": removed_source_confirmation_details,
-        "rebuild_command": "skillroster scan --json",
+        "rebuild_command": "skillroster scan --summary --json",
         "agent_files_changed": false,
         "library_files_changed": false,
         "files_changed": files_changed,
@@ -1876,7 +1878,7 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         .collect::<Vec<_>>();
         let action_context_argv = match schema_version {
             1 => Vec::new(),
-            2 => detail["action_context_argv"]
+            2 | 3 => detail["action_context_argv"]
                 .as_array()?
                 .iter()
                 .map(Value::as_str)
@@ -1889,14 +1891,18 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         for root in &source_roots {
             expected_argv.extend(["--source-root", *root]);
         }
-        expected_argv.extend(["scan", "--json"]);
+        match schema_version {
+            1 | 2 => expected_argv.extend(["scan", "--json"]),
+            3 => expected_argv.extend(["scan", "--summary", "--json"]),
+            _ => return None,
+        }
         let argv = detail["after_confirmation"]["argv"]
             .as_array()?
             .iter()
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()?;
         Some(
-            matches!(schema_version, 1 | 2)
+            matches!(schema_version, 1..=3)
                 && detail["reason"] == "trusted_canonical_sources_required"
                 && detail["decision"] == "confirm_trusted_source_roots"
                 && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
@@ -2367,27 +2373,49 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
 
     let metrics = crate::query::primary_metrics(result);
     let mut coverage_agents = Vec::new();
-    let mut coverage_next_steps = BTreeSet::new();
+    let mut coverage_limitations =
+        BTreeMap::<scan::SessionCoverageLimitation, BTreeSet<String>>::new();
+    let mut coverage_next_steps = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
     for coverage in &result.coverage {
         let details = session_coverage_details(coverage)?;
-        let limitation_codes = coverage
-            .limitations
-            .as_deref()
-            .unwrap_or_default()
+        let limitations = coverage.limitations.as_deref().unwrap_or_default();
+        let supported_next_steps = details["actionability"]["supported_next_steps"]
+            .as_array()
+            .ok_or_else(|| anyhow!("session Coverage actionability must contain an array"))?
             .iter()
-            .map(|limitation| serde_json::to_value(limitation.code))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if let Some(steps) = details["actionability"]["supported_next_steps"].as_array() {
-            coverage_next_steps.extend(steps.iter().filter_map(Value::as_str).map(str::to_owned));
+            .map(|step| {
+                step.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("session Coverage next step must be a string"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for limitation in limitations {
+            coverage_limitations
+                .entry(limitation.clone())
+                .or_default()
+                .insert(coverage.agent.id().to_owned());
         }
+        coverage_next_steps
+            .entry(supported_next_steps)
+            .or_default()
+            .insert(coverage.agent.id().to_owned());
         coverage_agents.push(json!({
             "agent": coverage.agent.id(),
-            "limitation_state": details["limitation_state"],
-            "limitations_recorded": coverage.limitations.is_some(),
-            "limitation_codes": limitation_codes,
-            "denominator_reliable": details["denominator_reliable"],
+            "state": summary_coverage_state(coverage),
         }));
     }
+    let coverage_limitations = coverage_limitations
+        .into_iter()
+        .map(|(limitation, agents)| -> Result<Value> {
+            let mut fact = serde_json::to_value(limitation)?;
+            fact["agents"] = json!(agents);
+            Ok(fact)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let coverage_next_steps = coverage_next_steps
+        .into_iter()
+        .map(|(steps, agents)| json!({"agents": agents, "steps": steps}))
+        .collect::<Vec<_>>();
 
     let source_states = [
         crate::source_policy::SourceRootState::Active,
@@ -2438,8 +2466,9 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
                 "unused_claim_supported": false,
                 "automatic_governance_supported": false,
             },
-            "supported_next_steps": coverage_next_steps,
             "agents": coverage_agents,
+            "limitation_groups": coverage_limitations,
+            "next_step_groups": coverage_next_steps,
         },
         "source_root_policy": {
             "scope": "exact_local_read_only",
@@ -2452,6 +2481,22 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         },
         "files_changed": false,
     }))
+}
+
+fn summary_coverage_state(coverage: &scan::SessionCoverage) -> &'static str {
+    if coverage.limitations.is_none() {
+        "legacy_unknown"
+    } else if coverage.roots_inaccessible > 0 {
+        "inaccessible"
+    } else if coverage.roots_missing > 0 {
+        "missing"
+    } else if coverage.denominator_is_reliable() {
+        "reliable"
+    } else if coverage.roots_present > 0 {
+        "sampled_limited"
+    } else {
+        "excluded"
+    }
 }
 
 /// Merge policy observations conservatively across a Scan. Once a permission
@@ -3114,7 +3159,7 @@ fn add_finding_resolution(
                     "next": {
                         "action": "scan",
                         "confirmed_source_root_option_required": false,
-                        "argv_template": ["skillroster", "scan", "--json"]
+                        "argv_template": ["skillroster", "scan", "--summary", "--json"]
                     }
                 },
                 "temporary_one_scan": {
@@ -3128,6 +3173,7 @@ fn add_finding_resolution(
                         "--source-root",
                         "<observed-canonical-source-directory>",
                         "scan",
+                        "--summary",
                         "--json"
                     ]
                 }
@@ -3142,6 +3188,7 @@ fn add_finding_resolution(
                     "--source-root",
                     "<confirmed-canonical-source-directory>",
                     "scan",
+                    "--summary",
                     "--json"
                 ]
             }
@@ -8490,7 +8537,7 @@ fn setup_command_with_manifests<'a>(
             "physical_target_count": 0,
             "canonical_deletion_count": 0,
             "files_changed": false,
-            "next": "skillroster scan --json"
+            "next": "skillroster scan --summary --json"
         }));
     };
     let current_package = current_bootstrap_package();
@@ -12122,7 +12169,7 @@ mod recovery_tests {
             .as_str()
             .unwrap();
         let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
-        assert_eq!(complete["schema_version"], 2);
+        assert_eq!(complete["schema_version"], 3);
         assert_eq!(complete["action_context_argv"], json!(action_argv_prefix));
         assert_eq!(complete["source_roots"], json!(expected_roots));
         let complete_argv = complete["after_confirmation"]["argv"]
@@ -12134,6 +12181,10 @@ mod recovery_tests {
         assert_eq!(
             complete_argv[1..=action_argv_prefix.len()],
             action_argv_prefix
+        );
+        assert_eq!(
+            &complete_argv[complete_argv.len() - 3..],
+            ["scan", "--summary", "--json"]
         );
         for root in &expected_roots {
             assert!(
