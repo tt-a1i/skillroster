@@ -3413,9 +3413,13 @@ fn finding_continuity(
     historical_placement_ids: &[Value],
     paged_placement_ids: &[Value],
 ) -> Value {
+    let historical_affected_placement_count = historical_placement_ids.len();
     let historical_ids = historical_placement_ids
         .iter()
-        .filter_map(Value::as_str)
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+        .into_iter()
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let unavailable = |reason: &str| {
@@ -3426,10 +3430,13 @@ fn finding_continuity(
             "historical_report_id": historical_report.id,
             "historical_snapshot_id": historical_report.scan_id,
             "historical_finding_id": historical_finding_id,
-            "historical_affected_placement_count": historical_ids.len(),
+            "historical_affected_placement_count": historical_affected_placement_count,
             "zero_overlap_is_not_resolution": true
         })
     };
+    if historical_ids.len() != historical_affected_placement_count {
+        return unavailable("historical_finding_scope_malformed");
+    }
 
     let Some(latest_scan) = store.latest_completed_scan().ok().flatten() else {
         return unavailable("latest_completed_snapshot_unavailable");
@@ -3555,7 +3562,7 @@ fn finding_continuity(
         "historical_finding_id": historical_finding_id,
         "current_report_id": current_report.id,
         "current_snapshot_id": current_report.scan_id,
-        "historical_affected_placement_count": historical_ids.len(),
+        "historical_affected_placement_count": historical_affected_placement_count,
         "current_snapshot_placement_count": current_placements.len(),
         "matching_placement_count": matching_ids.len(),
         "matching_placement_ids": matching_placement_id_preview,
@@ -12173,6 +12180,23 @@ mod recovery_tests {
         assert_eq!(result["current_placements"][0]["id"], "placement_shared");
         assert_eq!(result["current_placements"][0]["current_finding_count"], 1);
         assert_eq!(result["zero_overlap_is_not_resolution"], true);
+
+        let malformed_historical_scope = finding_continuity(
+            &store,
+            &historical_report,
+            &historical_finding.id,
+            &[json!("placement_shared"), json!(7)],
+            &[json!("placement_shared")],
+        );
+        assert_eq!(malformed_historical_scope["status"], "unavailable");
+        assert_eq!(
+            malformed_historical_scope["reason"],
+            "historical_finding_scope_malformed"
+        );
+        assert_eq!(
+            malformed_historical_scope["historical_affected_placement_count"],
+            2
+        );
     }
 }
 

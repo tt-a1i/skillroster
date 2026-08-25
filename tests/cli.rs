@@ -8842,6 +8842,20 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
         .as_str()
         .unwrap()
         .to_owned();
+    let finding_detail = |extra: &[&str]| {
+        let mut arguments = vec!["report", "--finding", historical_finding_id.as_str()];
+        arguments.extend_from_slice(extra);
+        json_output(&run(&[&common[..], &arguments].concat(), None))
+    };
+    let no_newer_report = finding_detail(&["--limit", "20"]);
+    assert_eq!(
+        no_newer_report["result"]["current_continuity"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        no_newer_report["result"]["current_continuity"]["reason"],
+        "no_newer_report"
+    );
     fs::create_dir_all(root.join("skill-051")).unwrap();
     fs::write(
         root.join("skill-051/SKILL.md"),
@@ -8849,24 +8863,11 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
     )
     .unwrap();
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
-    json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let current_report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
 
-    let detail = json_output(&run(
-        &[
-            &common[..],
-            &[
-                "report",
-                "--finding",
-                &historical_finding_id,
-                "--full",
-                "--limit",
-                "20",
-            ],
-        ]
-        .concat(),
-        None,
-    ));
-    let continuity = &detail["result"]["current_continuity"];
+    let compact = finding_detail(&["--limit", "20"]);
+    let full_second_page = finding_detail(&["--full", "--limit", "20", "--offset", "20"]);
+    let continuity = &compact["result"]["current_continuity"];
     assert_eq!(continuity["status"], "available");
     assert_eq!(continuity["basis"], "stable_placement_id_intersection");
     assert_eq!(continuity["missing_current_placement_count"], 0);
@@ -8879,4 +8880,47 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
     assert!(continuity["current_placements"][0]["path"].is_string());
     assert!(continuity["current_placements"][0]["current_finding_ids"].is_array());
     assert_eq!(continuity["zero_overlap_is_not_resolution"], true);
+    assert_eq!(
+        full_second_page["result"]["current_continuity"]["matching_placement_count"],
+        continuity["matching_placement_count"]
+    );
+    assert_eq!(
+        full_second_page["result"]["current_continuity"]["matching_finding_count"],
+        continuity["matching_finding_count"]
+    );
+    assert_eq!(
+        full_second_page["result"]["current_continuity"]["current_finding_ids"],
+        continuity["current_finding_ids"]
+    );
+    assert_eq!(
+        full_second_page["result"]["current_continuity"]["current_placements"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    database
+        .execute(
+            "UPDATE reports SET summary_json = '{}' WHERE id = ?1",
+            [current_report["result"]["report_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let malformed = finding_detail(&["--limit", "20"]);
+    assert_eq!(
+        malformed["result"]["current_continuity"]["reason"],
+        "latest_report_summary_malformed"
+    );
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let stale = finding_detail(&["--limit", "20"]);
+    assert_eq!(
+        stale["result"]["current_continuity"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        stale["result"]["current_continuity"]["reason"],
+        "latest_report_stale"
+    );
 }
