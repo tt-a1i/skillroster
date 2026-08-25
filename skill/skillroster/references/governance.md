@@ -9,6 +9,13 @@ by one category or severity, only when enumeration is needed. Follow
 `page.next_offset` while that decision remains open. Reserve `report --full`
 for deliberate exhaustive export.
 
+The initial diagnosis is complete when the bounded Report supplies the four
+core metrics, selected Findings, complete rollups, coverage, and a primary next
+action. Stop there. If one exact fact required to explain that primary action is
+absent, make one `report --finding` call for it. Help, status, Finding
+enumeration, other Finding drills, and full detail belong to a later user
+question; they are not initial-diagnosis checks.
+
 Usage evidence is five-stage and conservative. Read `session_coverage` before
 describing it. `sampled_agents` support bounded observed events;
 `complete_agents` alone support a complete observable-session denominator;
@@ -75,9 +82,13 @@ Show one bounded viewport with a one-sentence diagnosis and exactly these four
 core metrics: independent Skill count, placement count, default exposure, and
 observed-use count. Show the three highest-priority Findings plus compact
 rollups for the complete scale of every Finding group. Prioritize
-recommendations and state their expected measurable impact. Include
-uncertainties, evidence quality, safety risks, and whether confirmation is
-required. Name one primary next action. For a proposed change, include its
+recommendations and keep each typed count's field meaning and unit. A Finding
+describes current affected scale: canonical candidates, physical sources,
+logical placements, default exposure, and relinks are distinct facts. Do not
+derive deletion or reduction counts from them. State measurable before/after
+impact only from a validated Plan, and actual impact only from its Receipt.
+Include uncertainties, evidence quality, safety risks, and whether confirmation
+is required. Name one primary next action. For a proposed change, include its
 measurable before/after impact, `change_summary`, operation groups, affected
 facts, uncertainty, reversibility, canonical deletion count, and Plan ID. Use
 `plan --show PLAN_ID --json` only when an exact operation, path, selection, or

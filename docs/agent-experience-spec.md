@@ -1,6 +1,9 @@
 # Agent Experience Specification
 
-SkillRoster is primarily used through an Agent conversation. The CLI is the deterministic local engine; the bootstrap Skill tells the Agent how to gather facts, prepare a complete Plan, present it clearly, obtain one user confirmation, and execute it safely.
+SkillRoster is primarily used through an Agent conversation. The CLI is the
+deterministic local engine; the bootstrap Skill tells the Agent how to gather
+facts and, when the user requests a concrete change proposal, prepare a complete
+Plan, present it clearly, obtain one user confirmation, and execute it safely.
 
 ## 1. Primary promise
 
@@ -17,6 +20,10 @@ In the same Agent turn, when evidence is sufficient, the Agent should:
 5. present the validated Plan and one primary action: **应用这份方案**.
 
 Plan generation is read-only, so it should not require a separate user round trip. Apply always requires confirmation after the Plan is visible.
+
+An analysis-only request ends at the bounded Report. The Agent may recommend a
+next decision, but it prepares a Plan only when the user asks for a concrete
+proposal or accepts that recommendation.
 
 ## 2. One-confirmation Apply
 
@@ -42,7 +49,8 @@ The Agent selects one primary action from current state:
 | Not initialized | Explain local setup targets | 安装 SkillRoster |
 | No Snapshot | Run Scan automatically | 查看检查结果 |
 | Healthy, no useful change | Say no governance is needed | 保持现状 |
-| Findings, sufficient Evidence | Prepare and show a Plan | 应用这份方案 |
+| Findings, analysis requested | Show priorities and boundaries | 深挖最高优先级问题 |
+| Findings, change proposal requested and Evidence sufficient | Prepare and show a Plan | 应用这份方案 |
 | Findings, insufficient Evidence | Explain the exact unknown | 补充信息 or 保持现状 |
 | Plan blocked or stale | Explain the blocker | 重新扫描并生成方案 |
 | Applied | Show verification and Receipt | 完成 |
@@ -60,7 +68,10 @@ The initial response should fit roughly one conversation viewport. It contains:
 1. **One-sentence diagnosis** with only evidence-backed numbers.
 2. **Four core metrics:** independent Skills, placements, default exposure, and observed-use coverage. Usage coverage names sampled, complete, limited, missing-root, and inaccessible Agent counts separately.
 3. **Top three Findings:** fact, impact, and Evidence quality.
-4. **Proposed change:** current → proposed counts and affected Agents.
+4. **Impact:** current affected scale for Finding-only diagnosis; current →
+   proposed counts and affected Agents only from a validated Plan. Preserve each
+   field's unit: source, placement, exposure, relink, and deletion counts are
+   not interchangeable.
 5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty. For semantic Roster Plans, include forced, target-Agent, cross-Agent, and stable-fallback Core counts plus the bounded named Core preview and its reasons. Cross-Agent selections name the Agent that supplied exact-identity evidence and are described as used elsewhere, not as target-Agent usage. Fallback- or cross-Agent-dominated selection remains a review-required proposal.
 6. **One primary action:** the exact phrase the user can reply with.
 
@@ -176,7 +187,8 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
   high-ranked hint evidence must outrank weak overlap that only appears in both
   lexical channels;
 - treat `suggested_actions` as typed options, not authorization;
-- automatically prepare a read-only Plan when evidence is sufficient;
+- prepare a read-only Plan when evidence is sufficient and the user requested a
+  concrete change proposal or accepted a recommendation;
 - show the complete Plan impact before Apply;
 - require one explicit user confirmation for Apply or Undo;
 - never use `--force`, `--yes`, hidden shell writes, or direct filesystem substitutes;
@@ -241,7 +253,10 @@ The Agent decides wording and information order from these fields. The CLI must 
 
 ### Disorder found
 
-The Agent discovers 100+ Skills, creates a Plan in the same read-only turn, makes the largest problems obvious, and offers one Apply action.
+When the user asks for a concrete proposal, the Agent discovers 100+ Skills,
+creates a Plan in the same read-only turn, makes the largest problems obvious,
+and offers one Apply action. An analysis-only request stops at the bounded
+Report and offers one follow-up decision instead.
 
 ### Healthy setup
 
