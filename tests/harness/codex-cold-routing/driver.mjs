@@ -343,6 +343,70 @@ export function assessTranscriptIntegrity(jsonl) {
   return { passed: violations.length === 0, violations, turn_completed_count: turnCompleted, successful_command_count: successfulCommands, unsuccessful_command_count: unsuccessfulCommands };
 }
 
+export function extractTokenUsage(jsonl) {
+  const usages = [];
+  for (const line of jsonl.split("\n")) {
+    if (!line.trim()) continue;
+    let value; try { value = JSON.parse(line); } catch { continue; }
+    if (value?.type === "turn.completed") usages.push(value.usage);
+  }
+  const fields = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens"];
+  if (usages.length !== 1 || !usages[0] || fields.some((field) => !Number.isSafeInteger(usages[0][field]) || usages[0][field] < 0)) {
+    return { available: false, limitation: usages.length === 1 ? "turn usage is incomplete or invalid" : `expected one completed-turn usage record; observed ${usages.length}` };
+  }
+  const usage = Object.fromEntries(fields.map((field) => [field, usages[0][field]]));
+  if (usage.cached_input_tokens > usage.input_tokens) return { available: false, limitation: "cached input exceeds total input" };
+  return {
+    available: true,
+    ...usage,
+    uncached_input_tokens: usage.input_tokens - usage.cached_input_tokens,
+    cache_utilization_ratio: usage.input_tokens === 0 ? null : usage.cached_input_tokens / usage.input_tokens,
+  };
+}
+
+function efficiencyDelta(core, onDemand) {
+  if (core?.available !== true || onDemand?.available !== true) return { available: false, limitation: "both paired arms require valid usage evidence" };
+  const delta = (field) => onDemand[field] - core[field];
+  return {
+    available: true,
+    direction: "on_demand_minus_core",
+    input_tokens: delta("input_tokens"),
+    cached_input_tokens: delta("cached_input_tokens"),
+    uncached_input_tokens: delta("uncached_input_tokens"),
+    cache_write_input_tokens: delta("cache_write_input_tokens"),
+    output_tokens: delta("output_tokens"),
+    reasoning_output_tokens: delta("reasoning_output_tokens"),
+    cache_utilization_percentage_points: (onDemand.cache_utilization_ratio - core.cache_utilization_ratio) * 100,
+    successful_command_count: (onDemand.successful_command_count ?? 0) - (core.successful_command_count ?? 0),
+    codex_wall_time_ms: Number.isFinite(core.codex_wall_time_ms) && Number.isFinite(onDemand.codex_wall_time_ms) ? delta("codex_wall_time_ms") : null,
+    arm_wall_time_ms: Number.isFinite(core.arm_wall_time_ms) && Number.isFinite(onDemand.arm_wall_time_ms) ? delta("arm_wall_time_ms") : null,
+  };
+}
+
+export function summarizeEfficiency(results) {
+  const byArm = Object.fromEntries(["core", "on_demand"].map((arm) => {
+    const samples = results.filter((result) => result.arm === arm && result.efficiency?.available === true).map((result) => result.efficiency);
+    if (!samples.length) return [arm, { available: false, sample_count: 0 }];
+    const sum = (field) => samples.reduce((total, sample) => total + sample[field], 0);
+    const inputTokens = sum("input_tokens"); const cachedInputTokens = sum("cached_input_tokens");
+    return [arm, {
+      available: true,
+      sample_count: samples.length,
+      input_tokens: inputTokens,
+      cached_input_tokens: cachedInputTokens,
+      uncached_input_tokens: sum("uncached_input_tokens"),
+      cache_write_input_tokens: sum("cache_write_input_tokens"),
+      output_tokens: sum("output_tokens"),
+      reasoning_output_tokens: sum("reasoning_output_tokens"),
+      cache_utilization_ratio: inputTokens === 0 ? null : cachedInputTokens / inputTokens,
+      successful_command_count: sum("successful_command_count"),
+      codex_wall_time_ms: sum("codex_wall_time_ms"),
+      arm_wall_time_ms: sum("arm_wall_time_ms"),
+    }];
+  }));
+  return { definition: "cache_utilization_ratio = cached_input_tokens / input_tokens; totals are weighted across valid trials", by_arm: byArm };
+}
+
 function writeTargetAllowed(path, workspace, tempRoot) {
   const candidate = isAbsolute(path) ? resolve(path) : resolve(workspace, path);
   return inside(candidate, workspace) || inside(candidate, tempRoot);
@@ -752,7 +816,7 @@ export function groupPairedResults(tasks, results, trialsPerArm) {
     if (coreResult && onDemandResult && coreResult.pair_invariant !== onDemandResult.pair_invariant) return { family: task.family, task: task.id, trial, attribution: "pair_invariant_mismatch", gate: "failed", cold_routing_regression: null };
     if (!coreResult || !onDemandResult) return { family: task.family, task: task.id, trial, attribution: "pair_incomplete", gate: "failed", cold_routing_regression: null };
     const pair = classifyPair(coreResult.outcome, onDemandResult.outcome);
-    return { family: task.family, task: task.id, trial, ...pair, gate: pair.attribution === "no_observed_regression" ? "passed" : "failed" };
+    return { family: task.family, task: task.id, trial, ...pair, gate: pair.attribution === "no_observed_regression" ? "passed" : "failed", efficiency_delta: efficiencyDelta(coreResult.efficiency, onDemandResult.efficiency) };
   }));
 }
 
@@ -1131,6 +1195,7 @@ export function formalOnDemandTransferGateEligible({ completeSchedule, sourceIde
 }
 
 function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts, evaluationMode = "paired") {
+  const armStartedAt = process.hrtime.bigint();
   const key = trialKey(task.id, trial, trialsPerArm); const frozenPairInvariant = suiteFacts.pair_invariants?.[key]; if (!frozenPairInvariant) fail(`pair invariant was not frozen before invocation: ${key}`);
   const runPrefix = trialsPerArm === 1 ? `${task.id}-${arm}-` : `${task.id}-trial-${trial}-${arm}-`;
   const root = mkdtempSync(join(options.runsDir, runPrefix)); const paths = setupArm(root, task, arm, options);
@@ -1154,7 +1219,9 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts, evaluat
     const runEnv = { ...env };
     if (prepared) Object.assign(runEnv, { SKILLROSTER_REAL_CLI: options.cli, SKILLROSTER_TEST_HOME: paths.home, SKILLROSTER_TEST_STATE: paths.state, SKILLROSTER_FIND_AUDIT: paths.runtimeAudit });
     if (prepared) runEnv.PATH = `${prepared.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`;
+    const codexStartedAt = process.hrtime.bigint();
     const result = run(options.codex, codexExecutionArgs(options, paths, task.prompt), { cwd: paths.workspace, env: runEnv, timeout: options.timeoutMs });
+    const codexWallTimeMs = Number((process.hrtime.bigint() - codexStartedAt) / 1_000_000n);
     const protectedScopes = assessProtectedScopes(initialProtected, captureProtectedScopes(protectedPaths));
     writeFileSync(paths.transcript, result.stdout, { mode: 0o600 });
     if (existsSync(paths.runtimeAudit)) copyFileSync(paths.runtimeAudit, paths.audit);
@@ -1166,10 +1233,11 @@ function executeArm(task, arm, trial, trialsPerArm, options, suiteFacts, evaluat
     const routeOrder = arm === "on_demand" ? assessRouteOrder(result.stdout, { bootstrapPath: join(paths.codexHome, "skills", "skillroster", "SKILL.md"), targetPath: paths.targetPath, findAudit: retrieval, expectedTask: task.prompt, expectedSkill: task.expected_skill, oneCall: task.one_call_load === true }) : { passed: true, audit_scope: "not_applicable" };
     const coreOrder = arm === "core" ? assessCoreOrder(result.stdout, paths.targetPath) : { passed: true, audit_scope: "not_applicable" };
     const transcript = assessTranscriptIntegrity(result.stdout);
+    const efficiency = { ...extractTokenUsage(result.stdout), successful_command_count: transcript.successful_command_count, codex_wall_time_ms: codexWallTimeMs, arm_wall_time_ms: Number((process.hrtime.bigint() - armStartedAt) / 1_000_000n) };
     const externalWrites = assessExternalWrites(result.stdout, paths.workspace, paths.temp);
     const outcomeInputs = { arm, surface, retrieval, load, oracle, workspace, routeOrder, coreOrder, transcript, protectedScopes, externalWrites };
     const outcome = evaluationMode === "on_demand_transfer" ? deriveOnDemandTransferOutcome(outcomeInputs) : deriveArmOutcome(outcomeInputs);
-    return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, protected_scopes: protectedScopes, external_writes: externalWrites, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
+    return { family: task.family, task: task.id, trial, arm, root, pair_invariant: frozenPairInvariant, codex_exit_code: result.status, surface, governance: prepared?.governance ?? null, transcript, efficiency, protected_scopes: protectedScopes, external_writes: externalWrites, retrieval, load, route_order: routeOrder, core_order: coreOrder, oracle, workspace, outcome };
   } finally {
     cleanupAuth(authCopy);
     cleanupRuntime(paths.temp);
@@ -1248,7 +1316,7 @@ export function main(argv = process.argv.slice(2)) {
     : completeSchedule && sourceIdentityStable && codexExecutableStable && results.every(resultEligibility) && pairs.every((pair) => pair.attribution !== "pair_invariant_mismatch" && pair.attribution !== "pair_incomplete");
   const acceptedResults = results.every((result) => result.outcome?.accepted) && pairs.every((pair) => pair.gate === "passed");
   const statusPassed = acceptedResults && (evaluationMode !== "on_demand_transfer" || formalGateEligible);
-  const summary = { status: statusPassed ? "passed" : "failed", suite_id: manifest.suite_id, ...(evaluationMode === "on_demand_transfer" ? { evaluation_mode: evaluationMode } : {}), formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, ...(evaluationMode === "on_demand_transfer" ? { frozen_inputs_stable: frozenInputsStable, frozen_inputs_after: frozenInputsAfter } : {}), protocol_decision: protocolDecision, suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
+  const summary = { status: statusPassed ? "passed" : "failed", suite_id: manifest.suite_id, ...(evaluationMode === "on_demand_transfer" ? { evaluation_mode: evaluationMode } : {}), formal_gate_eligible: formalGateEligible, source_identity_stable: sourceIdentityStable, source_identity_after: sourceIdentityAfter, codex_executable_stable: codexExecutableStable, codex_executable_after: codexExecutableAfter, ...(evaluationMode === "on_demand_transfer" ? { frozen_inputs_stable: frozenInputsStable, frozen_inputs_after: frozenInputsAfter } : {}), protocol_decision: protocolDecision, efficiency_summary: summarizeEfficiency(results), suite_snapshot: frozen.facts, signal_cleanup: "SIGINT/SIGTERM remove auth copies and runtime state best effort; SIGKILL cannot guarantee cleanup", results, pairs };
   emitSummary(summary, options); return summary.status === "passed" ? 0 : 2;
 }
 

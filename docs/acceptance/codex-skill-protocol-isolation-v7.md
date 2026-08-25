@@ -30,6 +30,13 @@ The result supports retaining deterministic lexical retrieval plus Agent-owned
 intent and hint generation. It does not justify embeddings, reranking, a built-in
 model, MCP, or another routing Skill.
 
+This v7 result is a protocol/task score comparison only. Its raw transcripts
+were removed after the bounded projection was produced, and the projection did
+not retain token usage or wall-clock measurements. Cache utilization, token
+cost, and latency therefore remain unavailable for v7 and must not be inferred
+from the 3/3 versus 3/3 score. The harness now records those dimensions for
+future runs.
+
 ## Evidence boundary
 
 The run froze the clean source commit/tree, CLI, Bootstrap, target package,

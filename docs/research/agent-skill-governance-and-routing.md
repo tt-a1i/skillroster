@@ -191,8 +191,13 @@ SkillRoster 的当前运行条件，不能据此添加 reranker 或 source class
 | Safety | 是否越界读写或绕过确认？ | filesystem diff、Receipt、policy checks |
 | Core validity | 控制臂是否完成其预期协议？ | arm-specific invariants |
 | Formal eligibility | 配对、指纹、时序是否允许归因？ | frozen digest、run ledger |
+| Efficiency / cost | 成功是否以更多上下文、缓存依赖、命令或时间换取？ | input/cached/uncached/output/reasoning tokens、加权缓存利用率、命令数、Codex/全臂 wall time |
 
 只有前置层可用且控制臂有效，最终差异才可能用于讨论 routing 机制。
+缓存利用率固定定义为 `cached_input_tokens / input_tokens`，并与绝对 cached、
+uncached token 同时报告。比例更高只说明更多输入命中了缓存，不能单独推出
+成本更低、延迟更低或任务质量更高；所有对照应报告逐 trial、按输入 token
+加权的 arm 汇总，以及 On-demand 减 Core 的成对差值。
 
 ### 4. shortlist 深度是独立变量，正确呈现不等于正确执行
 
@@ -533,6 +538,15 @@ Plan、Receipt 和 Undo 的本地 fixture，以及 Agent 实际可获得的 opaq
 评分器应只对真实产品不变量严格：文件是否创建、字段是否存在、是否越界、返回路径是否被读取。表达质量用 rubric + 盲审，不用精确句子或任意字符阈值。
 
 PR #148 的 v6 suite 已按该设计形成正式冻结证据：`formal_gate_eligible=true`，但 protocol gate 失败：Core 3/3，On-demand 1/3；后者的 retrieval、full-load、task oracle 和 safety 均为 3/3，失败集中在 ordered contract。因此已经触发下列原定停止条件中的“只修 Bootstrap/CLI seam，不改排名器”。历史设计和停止条件保留如下，作为决策审计：
+
+v6 保留下来的 usage 事件还显示了效率差异：Core 三轮合计 118,166 input /
+72,192 cached（加权缓存利用率 61.09%），On-demand 为 320,228 input /
+239,616 cached（74.83%）。On-demand 相比 Core 多 202,062 input（+171.0%），
+其中 uncached 多 34,638（+75.3%），成功命令数为 14 对 6。这个差异主要来自
+Find、完整加载和顺序处理带来的额外操作与更长的重复上下文；更高缓存比例并未
+抵消绝对 token 增长。协议分差则来自两次 ordered-contract 违规，不是 ranking、
+task oracle 或 safety 差异。v7 虽然两臂均 3/3，但其 bounded artifact 未保留
+usage/latency，不能事后补写效率结论；详见 [v6 验收](../acceptance/codex-skill-protocol-isolation-v6.md)。
 
 - Core 少于 3/3 协议有效：停止比较，先修 task/oracle/harness；不得做产品归因。
 - Core 有效，但 On-demand 至少 2/3 发生调用/加载协议失败：只改 Bootstrap/CLI schema、错误返回或示例；不改排名器。v6 正是这一分支。

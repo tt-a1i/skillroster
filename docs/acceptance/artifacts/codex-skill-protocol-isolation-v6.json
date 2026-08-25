@@ -14,6 +14,25 @@
     "on_demand_accepted": 1,
     "on_demand_contract_failures": 2
   },
+  "post_hoc_efficiency_analysis": {
+    "source": "retained external raw turn.completed usage records",
+    "definition": "cache_utilization_ratio = cached_input_tokens / input_tokens; aggregate ratio is weighted by input tokens",
+    "latency_available": false,
+    "latency_limitation": "v6 did not capture wall-clock timestamps",
+    "trials": [
+      { "trial": 1, "arm": "core", "input_tokens": 39484, "cached_input_tokens": 25088, "uncached_input_tokens": 14396, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.635397, "output_tokens": 495, "reasoning_output_tokens": 165, "successful_command_count": 2 },
+      { "trial": 1, "arm": "on_demand", "input_tokens": 161768, "cached_input_tokens": 137216, "uncached_input_tokens": 24552, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.848227, "output_tokens": 1608, "reasoning_output_tokens": 719, "successful_command_count": 5 },
+      { "trial": 2, "arm": "core", "input_tokens": 39353, "cached_input_tokens": 25088, "uncached_input_tokens": 14265, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.637512, "output_tokens": 430, "reasoning_output_tokens": 104, "successful_command_count": 2 },
+      { "trial": 2, "arm": "on_demand", "input_tokens": 69937, "cached_input_tokens": 49152, "uncached_input_tokens": 20785, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.702804, "output_tokens": 898, "reasoning_output_tokens": 260, "successful_command_count": 4 },
+      { "trial": 3, "arm": "core", "input_tokens": 39329, "cached_input_tokens": 22016, "uncached_input_tokens": 17313, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.559790, "output_tokens": 458, "reasoning_output_tokens": 128, "successful_command_count": 2 },
+      { "trial": 3, "arm": "on_demand", "input_tokens": 88523, "cached_input_tokens": 53248, "uncached_input_tokens": 35275, "cache_write_input_tokens": 0, "cache_utilization_ratio": 0.601516, "output_tokens": 1206, "reasoning_output_tokens": 368, "successful_command_count": 5 }
+    ],
+    "by_arm": {
+      "core": { "input_tokens": 118166, "cached_input_tokens": 72192, "uncached_input_tokens": 45974, "cache_utilization_ratio": 0.610937, "output_tokens": 1383, "reasoning_output_tokens": 397, "successful_command_count": 6 },
+      "on_demand": { "input_tokens": 320228, "cached_input_tokens": 239616, "uncached_input_tokens": 80612, "cache_utilization_ratio": 0.748267, "output_tokens": 3712, "reasoning_output_tokens": 1347, "successful_command_count": 14 }
+    },
+    "on_demand_minus_core": { "input_tokens": 202062, "input_tokens_percent": 171.0, "cached_input_tokens": 167424, "uncached_input_tokens": 34638, "uncached_input_tokens_percent": 75.3, "cache_utilization_percentage_points": 13.73, "output_tokens": 2329, "reasoning_output_tokens": 950, "successful_command_count": 8 }
+  },
   "frozen": {
     "source_commit": "fdf508a03c2068ec47cee816809f986d3a95013a",
     "source_tree": "ed20e4dbdb107db5f6d2a420c1fba0435b10b3fd",

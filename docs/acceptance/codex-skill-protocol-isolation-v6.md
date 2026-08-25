@@ -25,6 +25,41 @@ Agent contract:
 | 2 | Pass | Fail: valid Find argv was wrapped in an unsafe shell shape | Pass / pass |
 | 3 | Pass | Pass | Pass / pass |
 
+## Efficiency and score-difference analysis
+
+The retained raw `turn.completed` records allow a post-hoc token comparison.
+Cache utilization is defined as `cached_input_tokens / input_tokens`; it is a
+cost/context-reuse measure, not a task-quality score. Precise wall-clock latency
+was not captured by the v6 runner and cannot be reconstructed honestly.
+
+| Trial | Arm | Input | Cached input | Uncached input | Cache utilization | Output | Reasoning output | Successful commands |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | Core | 39,484 | 25,088 | 14,396 | 63.54% | 495 | 165 | 2 |
+| 1 | On-demand | 161,768 | 137,216 | 24,552 | 84.82% | 1,608 | 719 | 5 |
+| 2 | Core | 39,353 | 25,088 | 14,265 | 63.75% | 430 | 104 | 2 |
+| 2 | On-demand | 69,937 | 49,152 | 20,785 | 70.28% | 898 | 260 | 4 |
+| 3 | Core | 39,329 | 22,016 | 17,313 | 55.98% | 458 | 128 | 2 |
+| 3 | On-demand | 88,523 | 53,248 | 35,275 | 60.15% | 1,206 | 368 | 5 |
+| **Total / weighted** | **Core** | **118,166** | **72,192** | **45,974** | **61.09%** | **1,383** | **397** | **6** |
+| **Total / weighted** | **On-demand** | **320,228** | **239,616** | **80,612** | **74.83%** | **3,712** | **1,347** | **14** |
+
+On-demand used 202,062 more input tokens (+171.0%), including 34,638 more
+uncached input tokens (+75.3%), and its weighted cache utilization was 13.73
+percentage points higher. The higher cache share did not make it cheaper: most
+of the extra cached tokens came from a longer repeated prefix and additional
+tool-turn context, while the additional Find/load/order work increased both
+fresh context and output/reasoning tokens.
+
+The protocol score gap (Core 3/3 versus On-demand 1/3) was not a task-quality or
+ranking gap. Retrieval, exact load, task oracle, and safety were 3/3 in both
+arms. Two On-demand trials lost only the ordered-contract point: one attempted
+two MCP actions before target load, and one wrapped a valid Find argv in an
+unsafe shell shape. The extra 2-3 successful commands per On-demand trial are
+consistent with the larger token footprint, but six runs are too few to claim a
+stable causal cost multiplier. The v7 one-call contract removed the protocol
+score gap; its raw usage evidence was intentionally deleted, so no v7 token or
+cache comparison is claimed.
+
 The result does not justify embeddings, reranking, a semantic router, or more
 routing Skills. It supports a narrower follow-up: make the Bootstrap/CLI seam
 easier for an Agent to execute as one safe, observable operation while keeping

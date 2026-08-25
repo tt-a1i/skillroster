@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessFrozenInputIdentities, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveOnDemandTransferDecision, deriveOnDemandTransferOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractVisibleSkills, findWrapperSource, formalOnDemandTransferGateEligible, formalOnDemandTransferResultEligible, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, validateManifest, verifyArchifyParent } from "./driver.mjs";
+import { assessCoreOrder, assessExactLoad, assessExternalWrites, assessFrozenInputIdentities, assessOneCallLoad, assessProtectedScopes, assessRouteOrder, assessSkillSurface, assessTranscriptIntegrity, assessWorkspaceChanges, captureProtectedScopes, classifyPair, codexExecutionArgs, codexSandboxPolicy, deriveArmOutcome, deriveOnDemandTransferDecision, deriveOnDemandTransferOutcome, deriveProtocolDecision, evaluateArchitectureSpec, evaluateArchifyReceipts, evaluateOracle, extractTokenUsage, extractVisibleSkills, findWrapperSource, formalOnDemandTransferGateEligible, formalOnDemandTransferResultEligible, formalResultEligible, groupPairedResults, main, pairInvariant, parseArgs, parseFindAudit, parseFindEnvelope, setupArm, skillRosterFindArgs, skillRosterScanArgs, snapshotWorkspace, summarizeEfficiency, validateManifest, verifyArchifyParent } from "./driver.mjs";
 
 const DRIVER = fileURLToPath(new URL("./driver.mjs", import.meta.url));
 
@@ -604,6 +604,26 @@ test("transcript integrity requires complete JSONL, one turn completion, and a s
   const failed = JSON.stringify({ type: "item.completed", item: { type: "command_execution", command: "false", exit_code: 1, status: "failed" } });
   const assessed = assessTranscriptIntegrity(`${failed}\n${command}\n${completed}`);
   assert.equal(assessed.passed, true); assert.equal(assessed.unsuccessful_command_count, 1); assert.doesNotMatch(assessed.violations.join(","), /incomplete/u);
+});
+
+test("token usage preserves cache and uncached input as separate efficiency evidence", () => {
+  const usage = extractTokenUsage(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20, reasoning_output_tokens: 8 } })}\n`);
+  assert.deepEqual(usage, { available: true, input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20, reasoning_output_tokens: 8, uncached_input_tokens: 40, cache_utilization_ratio: 0.6 });
+  assert.equal(extractTokenUsage("").available, false);
+  assert.equal(extractTokenUsage(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 11, cache_write_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0 } })).available, false);
+});
+
+test("efficiency summary uses weighted cache utilization and keeps arm totals separate", () => {
+  const results = [
+    { arm: "core", efficiency: { available: true, input_tokens: 100, cached_input_tokens: 50, uncached_input_tokens: 50, cache_write_input_tokens: 0, output_tokens: 10, reasoning_output_tokens: 4, successful_command_count: 2, codex_wall_time_ms: 1000, arm_wall_time_ms: 1100 } },
+    { arm: "core", efficiency: { available: true, input_tokens: 300, cached_input_tokens: 250, uncached_input_tokens: 50, cache_write_input_tokens: 3, output_tokens: 20, reasoning_output_tokens: 6, successful_command_count: 2, codex_wall_time_ms: 2000, arm_wall_time_ms: 2200 } },
+    { arm: "on_demand", efficiency: { available: true, input_tokens: 200, cached_input_tokens: 120, uncached_input_tokens: 80, cache_write_input_tokens: 2, output_tokens: 30, reasoning_output_tokens: 9, successful_command_count: 4, codex_wall_time_ms: 1500, arm_wall_time_ms: 1900 } },
+  ];
+  const summary = summarizeEfficiency(results);
+  assert.equal(summary.by_arm.core.cache_utilization_ratio, 0.75);
+  assert.equal(summary.by_arm.core.input_tokens, 400);
+  assert.equal(summary.by_arm.core.cache_write_input_tokens, 3);
+  assert.equal(summary.by_arm.on_demand.uncached_input_tokens, 80);
 });
 
 test("oracle and safety remain independent outcome dimensions", () => {
