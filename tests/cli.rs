@@ -45,8 +45,8 @@ fn json_output(output: &std::process::Output) -> Value {
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.23");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.23");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.28");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.28");
 }
 
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
@@ -2843,7 +2843,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.23"
+        "1.8.28"
     );
 
     let undone = json_output(&run(
@@ -2928,6 +2928,106 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
         assert_eq!(undone["result"]["verification"], "passed");
         assert_eq!(fs::read_to_string(&bootstrap).unwrap(), legacy);
         assert!(!bootstrap.parent().unwrap().join("references").exists());
+    }
+}
+
+#[test]
+fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let package = home.join(".codex/skills/skillroster");
+    let legacy_files = [
+        (
+            "SKILL.md",
+            include_str!("../skill/skillroster/SKILL.md").replace(
+                "bootstrap-version: \"1.8.28\"",
+                "bootstrap-version: \"1.8.23\"",
+            ),
+        ),
+        (
+            "references/routing.md",
+            include_str!("../skill/skillroster/references/routing.md").to_owned(),
+        ),
+        (
+            "references/governance.md",
+            include_str!("fixtures/bootstrap-governance-v1.8.23.md").to_owned(),
+        ),
+        (
+            "references/mutation.md",
+            include_str!("../skill/skillroster/references/mutation.md").to_owned(),
+        ),
+    ];
+    for (relative_path, content) in &legacy_files {
+        let target = package.join(relative_path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, content).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let preview = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(preview["result"]["state"], "preview_ready");
+    assert_eq!(preview["result"]["outdated_count"], 1);
+    assert_eq!(preview["result"]["modified_count"], 0);
+    assert_eq!(
+        preview["result"]["targets"][0]["status"],
+        "official_outdated"
+    );
+    assert_eq!(
+        preview["result"]["targets"][0]["installed_version"],
+        "1.8.23"
+    );
+    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 2);
+    assert_eq!(preview["result"]["files_changed"], false);
+
+    let plan_id = preview["result"]["plan_id"].as_str().unwrap();
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert_eq!(applied["result"]["changed_path_count"], 2);
+    for (relative_path, expected) in [
+        ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
+        (
+            "references/routing.md",
+            include_str!("../skill/skillroster/references/routing.md"),
+        ),
+        (
+            "references/governance.md",
+            include_str!("../skill/skillroster/references/governance.md"),
+        ),
+        (
+            "references/mutation.md",
+            include_str!("../skill/skillroster/references/mutation.md"),
+        ),
+    ] {
+        assert_eq!(
+            fs::read_to_string(package.join(relative_path))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            expected.replace("\r\n", "\n")
+        );
+    }
+    let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(current["result"]["state"], "up_to_date");
+    assert_eq!(
+        current["result"]["targets"][0]["installed_version"],
+        "1.8.28"
+    );
+
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    for (relative_path, expected) in legacy_files {
+        assert_eq!(
+            fs::read_to_string(package.join(relative_path)).unwrap(),
+            expected
+        );
     }
 }
 

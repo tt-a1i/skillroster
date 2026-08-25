@@ -8170,7 +8170,28 @@ struct BootstrapPackageManifest<'a> {
     file_digests: &'a [(&'a str, &'a str)],
 }
 
-const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[];
+const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] =
+    &[BootstrapPackageManifest {
+        version: "1.8.23",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "0b5ff8d4ab352ef5b78908a6619352fce668ff5cbdcbc4258c450ceb5a34637f",
+            ),
+            (
+                "references/routing.md",
+                "be2ccff81b8b85c298abaa7f59a71c2f44dc6f1c990804cdf0f901d715c2f782",
+            ),
+            (
+                "references/governance.md",
+                "3285223b046721c6719fa8c6fa3628f2d33488efb4b23bf334a9763f442e95b6",
+            ),
+            (
+                "references/mutation.md",
+                "6490e355033f9fe6de5d027902241a514449a59fbf87831f7971ab1b98687927",
+            ),
+        ],
+    }];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapFileStatus {
@@ -11219,6 +11240,36 @@ mod recovery_tests {
                 &current
             ),
             BootstrapContentStatus::OfficialOutdated("1.4.0")
+        );
+    }
+
+    #[test]
+    fn released_complete_bootstrap_manifest_is_exact_and_recognized() {
+        let manifest = LEGACY_COMPLETE_BOOTSTRAP_PACKAGES
+            .iter()
+            .find(|package| package.version == "1.8.23")
+            .unwrap();
+        let observed = BOOTSTRAP_PACKAGE_FILES
+            .iter()
+            .map(|file| {
+                manifest
+                    .file_digests
+                    .iter()
+                    .find(|(relative_path, _)| *relative_path == file.relative_path)
+                    .map(|(_, digest)| (*digest).to_owned())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
+            Some("1.8.23")
+        );
+
+        let mut mixed = observed;
+        mixed[2] = Some(current_bootstrap_package()[2].1.clone());
+        assert_eq!(
+            legacy_bootstrap_package_version(&mixed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
+            None
         );
     }
 
