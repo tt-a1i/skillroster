@@ -64,17 +64,26 @@ points to a SkillRoster-owned JSON detail file; validate its schema before
 using the complete identities and argv. Do not inspect or trust targets
 independently, synthesize broader parents, or submit a partial Plan.
 
-For an escaping Skill link, show the observed target and obtain confirmation
-before running
-`skillroster source-root confirm --finding FINDING_ID --path ABSOLUTE_PATH --json`.
-This records factual read access for that exact canonical directory and stable
-filesystem identity only. It does not endorse content, raise Evidence quality,
-or authorize Plan/Apply. Then rescan. Use `source-root inspect --json` to audit
-active, revoked, or drifted permissions and `source-root revoke ID --json` to
-revoke one. The temporary repeatable `--source-root` option remains a one-scan
-alternative. Treat its drift facts as bounded accidental/persistent-drift
-evidence, not proof against a malicious same-user ABA race. Never infer a
-parent, sibling, descendant, alias, or wildcard.
+For an escaping Skill link, show the observed target, obtain confirmation, and
+choose exactly one typed `permission_paths` continuation:
+
+- `durable_permission`: run
+  `skillroster source-root confirm --finding FINDING_ID --path ABSOLUTE_PATH --json`,
+  then follow its plain Scan action. Do not add the confirmed path as a
+  `--source-root` override.
+- `temporary_one_scan`: skip `source-root confirm` and run one Scan with the
+  repeatable exact `--source-root` option. This creates no durable permission.
+
+Both paths grant factual read access only. They do not assess or endorse
+content, raise Evidence quality, or authorize Plan/Apply. Treat the legacy
+`confirm_trusted_source_roots` decision as an opaque compatibility alias; use
+`decision_code` and `decision_semantics` for meaning. Use `source-root inspect
+--json` to audit active, revoked, or drifted durable permissions and
+`source-root revoke ID --json` to revoke one. Treat drift facts as bounded
+accidental/persistent-drift evidence, not proof against a malicious same-user
+ABA race. When `observed_link_targets_truncated` is true, follow Finding pages;
+each page's exact confirmation actions cover its `page_observed_link_targets`.
+Never infer a parent, sibling, descendant, alias, or wildcard.
 
 ## Present
 

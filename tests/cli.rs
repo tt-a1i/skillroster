@@ -7998,7 +7998,157 @@ fn find_rejects_a_skill_symlink_that_now_escapes_approved_roots() {
 
 #[cfg(unix)]
 #[test]
-fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
+fn escaping_link_resolution_separates_durable_and_temporary_read_paths() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let mut sources = Vec::new();
+    for index in 0..11 {
+        let source = temp.path().join(format!("source-{index}"));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            format!("---\nname: external-{index}\ndescription: fixture\n---\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&source, root.join(format!("external-{index}"))).unwrap();
+        sources.push(source);
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                sources[0].to_str().unwrap(),
+                "report",
+                "--finding",
+                finding_id,
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let resolution = &detail["result"]["resolution"];
+    assert_eq!(detail["result"]["page"]["returned"]["items"], 5);
+    assert_eq!(
+        detail["result"]["page"]["totals"]["affected_placements"],
+        11
+    );
+    assert_eq!(
+        resolution["decision_code"],
+        "source_read_permission_required"
+    );
+    assert_eq!(resolution["content_trust"], "not_assessed");
+    assert_eq!(resolution["observed_link_target_count"], 11);
+    assert_eq!(
+        resolution["observed_link_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    assert_eq!(resolution["observed_link_targets_truncated"], true);
+    assert_eq!(
+        resolution["page_observed_link_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(resolution["permission_paths"]["exclusive"], true);
+    assert_eq!(
+        resolution["permission_paths"]["durable_permission"]["next"]["confirmed_source_root_option_required"],
+        false
+    );
+    let durable_argv =
+        resolution["permission_paths"]["durable_permission"]["next"]["argv_template"]
+            .as_array()
+            .unwrap();
+    assert!(!durable_argv.iter().any(|arg| arg == "--source-root"));
+    assert_eq!(
+        resolution["permission_paths"]["temporary_one_scan"]["persists"],
+        false
+    );
+    assert!(
+        resolution["permission_paths"]["temporary_one_scan"]["argv_template"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--source-root")
+    );
+    let confirm_actions = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "confirm_source_root_read_permission")
+        .count();
+    assert_eq!(confirm_actions, 5);
+
+    let expanded_detail = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--finding", finding_id, "--limit", "11"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        expanded_detail["result"]["resolution"]["page_observed_link_targets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        11
+    );
+    assert_eq!(
+        expanded_detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "confirm_source_root_read_permission")
+            .count(),
+        11
+    );
+
+    let temporary_scan = json_output(&run(
+        &[
+            &common[..],
+            &["--source-root", sources[0].to_str().unwrap(), "scan"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        temporary_scan["result"]["source_root_policy"]["permissions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn escaping_link_finding_requests_exact_read_permission_instead_of_a_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -8034,7 +8184,17 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
         .unwrap();
 
     let detail = json_output(&run(
-        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                source.to_str().unwrap(),
+                "report",
+                "--finding",
+                finding_id,
+            ],
+        ]
+        .concat(),
         None,
     ));
     assert_eq!(
@@ -8124,6 +8284,19 @@ fn escaping_link_finding_requests_trust_confirmation_instead_of_a_plan() {
     assert_eq!(confirmed["result"]["plan_apply_authorized"], false);
     assert_eq!(confirmed["result"]["files_changed"], false);
     assert_eq!(confirmed["result"]["state_files_changed"], true);
+    let next_scan = confirmed["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "scan")
+        .unwrap();
+    assert!(
+        !next_scan["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--source-root")
+    );
     let mut permission_id = confirmed["result"]["permission"]["permission_id"]
         .as_str()
         .unwrap()

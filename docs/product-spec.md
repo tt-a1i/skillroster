@@ -183,6 +183,18 @@ separate security hardening. The persisted object epoch is conservative:
 platform metadata changes that could indicate object reuse may require an
 explicit revoke and reconfirm rather than silently retaining read access.
 
+The escaping-link Finding keeps legacy resolution fields for schema
+compatibility and adds the canonical `decision_code` plus two explicitly
+exclusive `permission_paths`. The durable path runs `source-root confirm` and
+continues with a plain Scan; the temporary path skips confirmation persistence
+and uses repeatable exact `--source-root` overrides for one Scan. The resolution
+reports the complete unique observed-target count, a bounded target list, and a
+truncation flag independently of the current placement page. When that list is
+truncated, `page_observed_link_targets` and the page's typed confirmation
+actions make the remaining exact targets retrievable through ordinary Finding
+pagination. The legacy `confirm_trusted_source_roots` value never means that
+content trust was assessed.
+
 `setup` detects supported Agents and returns a preview for installing or
 upgrading the single bootstrap Skill. Exact official older copies are eligible
 for automatic planning. Unknown content is treated as a local modification and

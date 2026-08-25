@@ -39,6 +39,7 @@ const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
 #[derive(Clone, Debug, Default)]
 pub struct ActionContext {
     argv: Vec<String>,
+    argv_without_source_roots: Vec<String>,
 }
 
 impl ActionContext {
@@ -63,13 +64,17 @@ impl ActionContext {
         for root in &cli.roots {
             argv.extend(["--root".to_owned(), root.clone()]);
         }
+        let argv_without_source_roots = argv.clone();
         for source_root in &cli.source_roots {
             argv.extend([
                 "--source-root".to_owned(),
                 action_path(source_root, "--source-root")?,
             ]);
         }
-        Ok(Self { argv })
+        Ok(Self {
+            argv,
+            argv_without_source_roots,
+        })
     }
 
     fn apply(&self, actions: &mut [SuggestedAction]) {
@@ -77,9 +82,16 @@ impl ActionContext {
             return;
         }
         for action in actions {
+            let context = if action.action == "scan"
+                && action.reason_code == "source_root_permission_recorded"
+            {
+                &self.argv_without_source_roots
+            } else {
+                &self.argv
+            };
             let insertion =
                 usize::from(action.argv.first().is_some_and(|arg| arg == "skillroster"));
-            action.argv.splice(insertion..insertion, self.argv.clone());
+            action.argv.splice(insertion..insertion, context.clone());
         }
     }
 
@@ -88,17 +100,7 @@ impl ActionContext {
     }
 
     fn apply_json_argv(&self, argv: &mut Value) {
-        let Some(values) = argv.as_array_mut() else {
-            return;
-        };
-        if self.argv.is_empty() {
-            return;
-        }
-        let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
-        values.splice(
-            insertion..insertion,
-            self.argv.iter().cloned().map(Value::String),
-        );
+        apply_json_argv_context(argv, &self.argv);
     }
 
     fn apply_result(&self, command: &str, result: &mut Value) {
@@ -113,15 +115,37 @@ impl ActionContext {
                 }
             }
             "report" => {
-                if let Some(argv) =
-                    result.pointer_mut("/resolution/after_confirmation/argv_template")
-                {
-                    self.apply_json_argv(argv);
+                for pointer in [
+                    "/resolution/after_confirmation/argv_template",
+                    "/resolution/permission_paths/temporary_one_scan/argv_template",
+                ] {
+                    if let Some(argv) = result.pointer_mut(pointer) {
+                        self.apply_json_argv(argv);
+                    }
+                }
+                if let Some(argv) = result.pointer_mut(
+                    "/resolution/permission_paths/durable_permission/next/argv_template",
+                ) {
+                    apply_json_argv_context(argv, &self.argv_without_source_roots);
                 }
             }
             _ => {}
         }
     }
+}
+
+fn apply_json_argv_context(argv: &mut Value, context: &[String]) {
+    let Some(values) = argv.as_array_mut() else {
+        return;
+    };
+    if context.is_empty() {
+        return;
+    }
+    let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
+    values.splice(
+        insertion..insertion,
+        context.iter().cloned().map(Value::String),
+    );
 }
 
 fn action_path(path: &Path, option: &str) -> Result<String> {
@@ -2494,6 +2518,7 @@ enum ReportRequest<'a> {
 
 const DEFAULT_FINDING_DETAIL_LIMIT: usize = 5;
 const DEFAULT_REPORT_PAGE_LIMIT: usize = 20;
+const SOURCE_READ_CONTINUATION_TARGET_LIMIT: usize = 10;
 
 const fn finding_page_limit(full: bool, explicit: Option<usize>) -> usize {
     match explicit {
@@ -2576,6 +2601,17 @@ fn report_command(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let affected_placement_id_set = affected_placement_ids
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>();
+            let observed_link_targets = scan
+                .placements
+                .iter()
+                .filter(|placement| affected_placement_id_set.contains(placement.id.as_str()))
+                .filter_map(|placement| placement.link_target.as_ref())
+                .map(|path| path.display().to_string())
+                .collect::<BTreeSet<_>>();
             let ordered_evidence = if stored.title == "Five-stage usage evidence" {
                 let mut evidence = store.finding_evidence(&id)?;
                 for record in &mut evidence {
@@ -2716,7 +2752,7 @@ fn report_command(
                     }
                 }),
             );
-            add_finding_resolution(object);
+            add_finding_resolution(object, &observed_link_targets);
             object.insert(
                 "detail".into(),
                 json!({
@@ -2855,13 +2891,22 @@ fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
         })
 }
 
-fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
+fn add_finding_resolution(
+    object: &mut serde_json::Map<String, Value>,
+    complete_observed_link_targets: &BTreeSet<String>,
+) {
     if object.get("kind").and_then(Value::as_str)
         != Some(crate::source_policy::ESCAPING_LINK_FINDING_KIND)
     {
         return;
     }
-    let observed_link_targets = object
+    let observed_link_target_count = complete_observed_link_targets.len();
+    let observed_link_targets = complete_observed_link_targets
+        .iter()
+        .take(SOURCE_READ_CONTINUATION_TARGET_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let page_observed_link_targets = object
         .get("placements")
         .and_then(Value::as_array)
         .into_iter()
@@ -2873,15 +2918,51 @@ fn add_finding_resolution(object: &mut serde_json::Map<String, Value>) {
         "resolution".into(),
         json!({
             "decision": "confirm_trusted_source_roots",
+            "decision_code": "source_read_permission_required",
             "decision_semantics": "confirm_exact_local_read_permission",
+            "legacy_decision_alias": true,
             "permission_scope": "exact_local_read_only",
+            "content_trust": "not_assessed",
             "content_endorsed": false,
             "evidence_quality_changed": false,
             "governance_authorized": false,
             "plan_apply_authorized": false,
             "automatic_change_supported": false,
+            "observed_link_target_count": observed_link_target_count,
             "observed_link_targets": observed_link_targets,
+            "observed_link_targets_truncated": observed_link_target_count
+                > SOURCE_READ_CONTINUATION_TARGET_LIMIT,
+            "page_observed_link_targets": page_observed_link_targets,
+            "permission_paths": {
+                "exclusive": true,
+                "durable_permission": {
+                    "action": "confirm_source_root_read_permission",
+                    "persists": true,
+                    "requires_confirmation": true,
+                    "next": {
+                        "action": "scan",
+                        "confirmed_source_root_option_required": false,
+                        "argv_template": ["skillroster", "scan", "--json"]
+                    }
+                },
+                "temporary_one_scan": {
+                    "action": "scan_with_source_root_override",
+                    "persists": false,
+                    "requires_confirmation": true,
+                    "repeatable_option": "--source-root",
+                    "value": "observed canonical source directory",
+                    "argv_template": [
+                        "skillroster",
+                        "--source-root",
+                        "<observed-canonical-source-directory>",
+                        "scan",
+                        "--json"
+                    ]
+                }
+            },
             "after_confirmation": {
+                "legacy_compatibility": true,
+                "permission_path": "temporary_one_scan",
                 "repeatable_option": "--source-root",
                 "value": "absolute canonical source directory",
                 "argv_template": [
@@ -3445,12 +3526,18 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
                 }
             }
             if requires_trust_decision {
-                for path in result["resolution"]["observed_link_targets"]
+                let targets = if result["resolution"]["observed_link_targets_truncated"].as_bool()
+                    == Some(true)
+                {
+                    &result["resolution"]["page_observed_link_targets"]
+                } else {
+                    &result["resolution"]["observed_link_targets"]
+                };
+                for path in targets
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(Value::as_str)
-                    .take(10)
                 {
                     actions.push(action(
                         "confirm_source_root_read_permission",
@@ -11531,6 +11618,7 @@ mod recovery_tests {
             &blocked,
             &ActionContext {
                 argv: action_argv_prefix.clone(),
+                argv_without_source_roots: action_argv_prefix.clone(),
             },
         ))
         .unwrap();
