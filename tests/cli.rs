@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::{FileTimes, OpenOptions};
 use std::io::Write;
@@ -8023,7 +8024,8 @@ fn escaping_link_resolution_separates_durable_and_temporary_read_paths() {
         state.to_str().unwrap(),
         "--json",
     ];
-    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let initial_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let initial_snapshot = initial_scan["result"]["snapshot_id"].as_str().unwrap();
     let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
     let finding_id = report["result"]["findings"]
         .as_array()
@@ -8144,6 +8146,71 @@ fn escaping_link_resolution_separates_durable_and_temporary_read_paths() {
             .len(),
         0
     );
+    let temporary_snapshot = temporary_scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let load_payload = |snapshot| {
+        database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+                [snapshot],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|payload| serde_json::from_str::<Value>(&payload).unwrap())
+            .unwrap()
+    };
+    let initial_payload = load_payload(initial_snapshot);
+    let payload = load_payload(temporary_snapshot);
+    let initial_placements = initial_payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|placement| {
+            (
+                placement["id"].as_str().unwrap(),
+                placement["default_exposed"].as_bool().unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(initial_placements.len(), 11);
+    let payload_placement_ids = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|placement| placement["id"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        initial_placements
+            .keys()
+            .all(|id| payload_placement_ids.contains(id))
+    );
+    let mut statement = database
+        .prepare("SELECT id, exposed FROM placements WHERE scan_id = ?1")
+        .unwrap();
+    let stored_placements = statement
+        .query_map([temporary_snapshot], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .unwrap()
+        .collect::<Result<BTreeMap<_, _>, _>>()
+        .unwrap();
+    assert!(initial_placements.iter().all(|(id, exposed)| {
+        stored_placements
+            .get(*id)
+            .is_some_and(|stored| stored == exposed)
+    }));
+    assert_eq!(
+        stored_placements.keys().cloned().collect::<BTreeSet<_>>(),
+        payload_placement_ids
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+    let foreign_key_violations: u64 = database
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(foreign_key_violations, 0);
 }
 
 #[cfg(unix)]
