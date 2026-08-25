@@ -30,6 +30,21 @@ use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
+const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
+    "snapshot_id",
+    "digest",
+    "change_summary",
+    "operation_groups",
+    "affected",
+    "diff_summary",
+    "impact",
+    "detail",
+    "risk",
+    "reversible",
+    "canonical_deletion_count",
+    "confirmation_required",
+    "files_changed",
+];
 /// Agent tool-result transport bound, deliberately narrower than the 2 MiB
 /// inventory parser bound. Larger Skills should disclose references on demand.
 const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
@@ -7647,7 +7662,11 @@ fn prepare_plan(
             &input,
             reuse_identity.as_ref(),
         )? {
-            if let Some(summary) = existing.input.get("summary") {
+            if let Some(summary) = existing.input.get("summary").filter(|summary| {
+                SETUP_PLAN_SUMMARY_FIELDS
+                    .iter()
+                    .all(|field| summary.get(*field).is_some())
+            }) {
                 return Ok(summary.clone());
             }
         }
@@ -8534,7 +8553,11 @@ fn setup_command_with_manifests<'a>(
     result["plan_id"] = plan["plan_id"].clone();
     result["state"] = json!("preview_ready");
     result["operation_count"] = json!(operation_count);
-    result["confirmation_required"] = json!(true);
+    for &field in SETUP_PLAN_SUMMARY_FIELDS {
+        if let Some(value) = plan.get(field) {
+            result[field] = value.clone();
+        }
+    }
     Ok(result)
 }
 
