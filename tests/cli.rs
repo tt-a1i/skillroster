@@ -8856,6 +8856,28 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
         no_newer_report["result"]["current_continuity"]["reason"],
         "no_newer_report"
     );
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    database
+        .execute(
+            "UPDATE scan_payloads SET updated_at = ?1 WHERE scan_id = (SELECT scan_id FROM reports WHERE id = ?2)",
+            rusqlite::params![i64::MAX, first_report["result"]["report_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    let missing_current_report = finding_detail(&["--limit", "20"]);
+    assert_eq!(
+        missing_current_report["result"]["current_continuity"]["status"],
+        "unavailable"
+    );
+    assert_eq!(
+        missing_current_report["result"]["current_continuity"]["reason"],
+        "latest_report_unavailable"
+    );
+    database
+        .execute(
+            "UPDATE scan_payloads SET updated_at = 0 WHERE scan_id = (SELECT scan_id FROM reports WHERE id = ?1)",
+            [first_report["result"]["report_id"].as_str().unwrap()],
+        )
+        .unwrap();
     fs::create_dir_all(root.join("skill-051")).unwrap();
     fs::write(
         root.join("skill-051/SKILL.md"),
@@ -8900,7 +8922,6 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
         20
     );
 
-    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     database
         .execute(
             "UPDATE reports SET summary_json = '{}' WHERE id = ?1",

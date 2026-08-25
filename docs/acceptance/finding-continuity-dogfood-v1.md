@@ -55,8 +55,8 @@ intersection is explicitly not a resolution claim.
 - CLI acceptance creates a 51-placement historical Finding, adds one current
   placement, and verifies the 20-item requested page, current paths, Finding
   IDs, complete overlap count, and zero missing placements. It also compares
-  compact and full nonzero-offset counts, then proves absent, stale, and
-  malformed current Reports leave historical detail readable.
+  compact and full nonzero-offset counts, then proves no-newer, unavailable,
+  stale, and malformed current Reports leave historical detail readable.
 - A focused `simplify-codebase` pass removed the duplicate current placement-ID
   set and narrowed the helper dependency from a complete Finding record to its
   stable ID. Preview helpers and membership state were retained because they
