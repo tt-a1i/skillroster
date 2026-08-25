@@ -468,13 +468,25 @@ struct EntryCandidate {
     root: PathBuf,
     governable: bool,
     provider: Option<String>,
+    /// Canonical physical SKILL.md resolved during discovery. Safe reuse is
+    /// bound to this exact file for the lifetime of one Scan.
+    expected_physical_entrypoint: Option<PathBuf>,
     entrypoint: PathBuf,
-    /// Canonical physical Skill directory resolved during discovery. Durable
-    /// reads must remain bound to this exact directory at consumption time.
-    expected_physical_directory: Option<PathBuf>,
     link_target: Option<PathBuf>,
     link_status: LinkStatus,
     default_exposed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PhysicalPackageObservation {
+    content: String,
+    modified_at: Option<u64>,
+    metadata: SkillMetadata,
+    digest: String,
+    content_identity_digest: Option<String>,
+    fingerprint_completeness: FingerprintCompleteness,
+    fingerprint_detail: Option<String>,
+    executable_relative_files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -1249,6 +1261,7 @@ fn discover_entrypoints(
         let file_name = entry.file_name();
         if file_name == "SKILL.md" {
             let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
+            let expected_physical_entrypoint = fs::canonicalize(&path).ok();
             let default_exposed =
                 default_exposure_for_candidate(policy, placement_root, &path, depth, state);
             output.push(EntryCandidate {
@@ -1256,7 +1269,7 @@ fn discover_entrypoints(
                 root: placement_root.to_path_buf(),
                 governable: policy.governable,
                 provider: policy.provider.clone(),
-                expected_physical_directory: canonical_entrypoint_directory(&path),
+                expected_physical_entrypoint,
                 entrypoint: path,
                 link_target: target,
                 link_status,
@@ -1280,6 +1293,7 @@ fn discover_entrypoints(
             let linked_entrypoint = path.join("SKILL.md");
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
+                let expected_physical_entrypoint = fs::canonicalize(&linked_entrypoint).ok();
                 let child_name = file_name.to_string_lossy();
                 let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
                 let default_exposed = default_exposure_for_candidate(
@@ -1294,7 +1308,7 @@ fn discover_entrypoints(
                     root: placement_root.to_path_buf(),
                     governable: policy.governable,
                     provider: policy.provider.clone(),
-                    expected_physical_directory: canonical_entrypoint_directory(&linked_entrypoint),
+                    expected_physical_entrypoint,
                     entrypoint: linked_entrypoint,
                     link_target: target,
                     link_status: status,
@@ -1448,22 +1462,28 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
-fn canonical_entrypoint_directory(entrypoint: &Path) -> Option<PathBuf> {
-    fs::canonicalize(entrypoint)
-        .ok()
-        .and_then(|entrypoint| entrypoint.parent().map(Path::to_path_buf))
-}
-
 fn durable_candidate_binding_is_current(
     candidate: &EntryCandidate,
     anchor: &DurableReadRoot,
 ) -> bool {
-    let Some(expected) = candidate.expected_physical_directory.as_ref() else {
+    let Some(expected) = candidate
+        .expected_physical_entrypoint
+        .as_deref()
+        .and_then(Path::parent)
+    else {
         return false;
     };
     expected.starts_with(&anchor.path)
         && crate::source_policy::identity_matches_exact(&anchor.path, &anchor.identity)
-        && canonical_entrypoint_directory(&candidate.entrypoint).as_ref() == Some(expected)
+}
+
+fn candidate_binding_is_current(candidate: &EntryCandidate) -> bool {
+    let Some(expected_entrypoint) = candidate.expected_physical_entrypoint.as_ref() else {
+        return false;
+    };
+    fs::canonicalize(&candidate.entrypoint)
+        .ok()
+        .is_some_and(|current| current == *expected_entrypoint)
 }
 
 fn materialize_candidates(
@@ -1472,7 +1492,7 @@ fn materialize_candidates(
     temporary_source_roots: &[PathBuf],
     result: &mut ScanResult,
 ) {
-    materialize_candidates_with_hook(
+    let _ = materialize_candidates_with_hook(
         candidates,
         durable_read_roots,
         temporary_source_roots,
@@ -1481,21 +1501,97 @@ fn materialize_candidates(
     );
 }
 
+fn observe_physical_skill_package(
+    physical_entrypoint: &Path,
+    physical_directory: &Path,
+    display_entrypoint: &Path,
+    display_directory: &Path,
+    result: &mut ScanResult,
+) -> PhysicalPackageObservation {
+    let (content, modified_at) = match read_bounded(physical_entrypoint, MAX_SKILL_FILE_BYTES) {
+        Ok(value) => value,
+        Err(error) => {
+            result.warnings.push(format!(
+                "could not read Skill entrypoint {}: {error}",
+                display_entrypoint.display()
+            ));
+            (String::new(), None)
+        }
+    };
+    let metadata = parse_skill_markdown(&content);
+    let (digest, content_identity_digest, fingerprint_completeness, fingerprint_detail) =
+        match digest_skill_directory(physical_directory) {
+            Ok(fingerprint) => (
+                fingerprint.digest,
+                (fingerprint.completeness == FingerprintCompleteness::Complete)
+                    .then_some(fingerprint.content_identity_digest),
+                fingerprint.completeness,
+                fingerprint.detail,
+            ),
+            Err(error) => {
+                let completeness = if error.kind() == io::ErrorKind::InvalidData {
+                    FingerprintCompleteness::Bounded
+                } else {
+                    FingerprintCompleteness::Unreadable
+                };
+                result.warnings.push(format!(
+                    "could not completely fingerprint Skill package {}: {error}",
+                    display_directory.display()
+                ));
+                (
+                    stable_digest(content.as_bytes()),
+                    None,
+                    completeness,
+                    Some(error.to_string()),
+                )
+            }
+        };
+    PhysicalPackageObservation {
+        content,
+        modified_at,
+        metadata,
+        digest,
+        content_identity_digest,
+        fingerprint_completeness,
+        fingerprint_detail,
+        executable_relative_files: executable_relative_files(physical_directory)
+            .unwrap_or_default(),
+    }
+}
+
+fn unreadable_package_observation(candidate: &EntryCandidate) -> PhysicalPackageObservation {
+    PhysicalPackageObservation {
+        content: String::new(),
+        modified_at: None,
+        metadata: SkillMetadata::default(),
+        digest: stable_digest(candidate.entrypoint.to_string_lossy().as_bytes()),
+        content_identity_digest: None,
+        fingerprint_completeness: FingerprintCompleteness::Unreadable,
+        fingerprint_detail: Some("Skill package was not read because its link is unsafe".into()),
+        executable_relative_files: Vec::new(),
+    }
+}
+
 fn materialize_candidates_with_hook(
     candidates: Vec<EntryCandidate>,
     durable_read_roots: &[DurableReadRoot],
     temporary_source_roots: &[PathBuf],
     result: &mut ScanResult,
     mut before_read: impl FnMut(&Path),
-) {
+) -> usize {
     let mut skills = BTreeMap::<String, ScannedSkill>::new();
+    let mut physical_packages = BTreeMap::<PathBuf, PhysicalPackageObservation>::new();
+    let mut physical_package_observations = 0;
     for candidate in candidates {
         let directory = candidate
             .entrypoint
             .parent()
             .unwrap_or(&candidate.root)
             .to_path_buf();
-        let expected_directory = candidate.expected_physical_directory.as_ref();
+        let expected_directory = candidate
+            .expected_physical_entrypoint
+            .as_deref()
+            .and_then(Path::parent);
         let temporary_override = expected_directory.is_some_and(|resolved| {
             temporary_source_roots
                 .iter()
@@ -1511,90 +1607,93 @@ fn materialize_candidates_with_hook(
             })
             .flatten();
         before_read(&candidate.entrypoint);
-        let binding_valid_before_read = durable_anchor
+        let placement_binding_valid_before_read = candidate_binding_is_current(&candidate);
+        let durable_binding_valid_before_read = durable_anchor
             .is_none_or(|root| durable_candidate_binding_is_current(&candidate, root));
         let initially_safe = !matches!(
             candidate.link_status,
             LinkStatus::Broken | LinkStatus::EscapesRoot
-        ) && binding_valid_before_read;
-        let (mut content, mut modified_at) = if initially_safe {
-            match read_bounded(&candidate.entrypoint, MAX_SKILL_FILE_BYTES) {
-                Ok(value) => value,
-                Err(error) => {
-                    result.warnings.push(format!(
-                        "could not read Skill entrypoint {}: {error}",
-                        candidate.entrypoint.display()
-                    ));
-                    (String::new(), None)
+        ) && placement_binding_valid_before_read
+            && durable_binding_valid_before_read;
+        let observation = if initially_safe {
+            let physical_entrypoint = candidate
+                .expected_physical_entrypoint
+                .as_ref()
+                .expect("safe binding has a physical entrypoint");
+            let physical_directory =
+                expected_directory.expect("safe binding has a physical directory");
+            let cacheable = durable_anchor.is_none() && !temporary_override;
+            if cacheable {
+                if let Some(observation) = physical_packages.get(physical_entrypoint) {
+                    observation.clone()
+                } else {
+                    physical_package_observations += 1;
+                    let observation = observe_physical_skill_package(
+                        physical_entrypoint,
+                        physical_directory,
+                        &candidate.entrypoint,
+                        &directory,
+                        result,
+                    );
+                    physical_packages.insert(physical_entrypoint.clone(), observation.clone());
+                    observation
                 }
+            } else {
+                physical_package_observations += 1;
+                observe_physical_skill_package(
+                    physical_entrypoint,
+                    physical_directory,
+                    &candidate.entrypoint,
+                    &directory,
+                    result,
+                )
             }
         } else {
             result.warnings.push(format!(
                 "did not read unsafe Skill link {}",
                 candidate.entrypoint.display()
             ));
-            (String::new(), None)
+            unreadable_package_observation(&candidate)
         };
-        let mut metadata = parse_skill_markdown(&content);
-        let (
+        let PhysicalPackageObservation {
+            mut content,
+            mut modified_at,
+            mut metadata,
             mut digest,
             mut content_identity_digest,
             mut fingerprint_completeness,
             mut fingerprint_detail,
-        ) = if initially_safe {
-            match digest_skill_directory(&directory) {
-                Ok(fingerprint) => (
-                    fingerprint.digest,
-                    (fingerprint.completeness == FingerprintCompleteness::Complete)
-                        .then_some(fingerprint.content_identity_digest),
-                    fingerprint.completeness,
-                    fingerprint.detail,
-                ),
-                Err(error) => {
-                    let completeness = if error.kind() == io::ErrorKind::InvalidData {
-                        FingerprintCompleteness::Bounded
-                    } else {
-                        FingerprintCompleteness::Unreadable
-                    };
-                    result.warnings.push(format!(
-                        "could not completely fingerprint Skill package {}: {error}",
-                        directory.display()
-                    ));
-                    (
-                        stable_digest(content.as_bytes()),
-                        None,
-                        completeness,
-                        Some(error.to_string()),
-                    )
-                }
-            }
-        } else {
-            (
-                stable_digest(candidate.entrypoint.to_string_lossy().as_bytes()),
-                None,
-                FingerprintCompleteness::Unreadable,
-                Some("Skill package was not read because its link is unsafe".into()),
-            )
-        };
-        let mut executable_files = if initially_safe {
-            executable_files(&directory).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let binding_valid_after = durable_anchor
+            executable_relative_files,
+        } = observation;
+        let mut executable_files = executable_relative_files
+            .into_iter()
+            .map(|relative| directory.join(relative))
+            .collect::<Vec<_>>();
+        let placement_binding_valid_after = candidate_binding_is_current(&candidate);
+        let durable_binding_valid_after = durable_anchor
             .is_none_or(|root| durable_candidate_binding_is_current(&candidate, root));
-        let safe_to_read = initially_safe && binding_valid_after;
-        if durable_anchor.is_some() && (!binding_valid_before_read || !binding_valid_after) {
+        let safe_to_read =
+            initially_safe && placement_binding_valid_after && durable_binding_valid_after;
+        if !placement_binding_valid_before_read
+            || !placement_binding_valid_after
+            || !durable_binding_valid_before_read
+            || !durable_binding_valid_after
+        {
+            if let Some(physical_entrypoint) = candidate.expected_physical_entrypoint.as_ref() {
+                physical_packages.remove(physical_entrypoint);
+            }
             if let Some(root) = durable_anchor {
                 result
                     .durable_read_drifted_permission_ids
                     .insert(root.permission_id.clone());
             }
-            // The root or candidate binding changed at a bounded pre/post
-            // checkpoint. Discard every byte and derived fact; replacement
-            // content must not enter identity, search, Evidence, or governance.
+            let drift_kind = if durable_anchor.is_some() {
+                "durable source-root binding drift"
+            } else {
+                "placement binding drift"
+            };
             result.warnings.push(format!(
-                "discarded Skill data after durable source-root binding drift: {}",
+                "discarded Skill data after {drift_kind}: {}",
                 candidate.entrypoint.display()
             ));
             content.clear();
@@ -1603,12 +1702,11 @@ fn materialize_candidates_with_hook(
             digest = stable_digest(candidate.entrypoint.to_string_lossy().as_bytes());
             content_identity_digest = None;
             fingerprint_completeness = FingerprintCompleteness::Unreadable;
-            fingerprint_detail = Some(
-                "Skill package data was discarded because its durable read permission drifted"
-                    .into(),
-            );
+            fingerprint_detail = Some(format!(
+                "Skill package data was discarded because its {drift_kind} was detected"
+            ));
             executable_files.clear();
-        }
+        };
         let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
             (Some(source), Some(version), _) => format!("source:{source}@{version}"),
             (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
@@ -1703,6 +1801,7 @@ fn materialize_candidates_with_hook(
         });
     }
     result.skills = skills.into_values().collect();
+    physical_package_observations
 }
 
 pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
@@ -2906,12 +3005,12 @@ fn normalize_search_text(markdown: &str) -> String {
     markdown.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn executable_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
+fn executable_relative_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect_skill_files(directory, directory, 0, 8, &mut files)?;
     let mut executable = files
         .into_iter()
-        .filter_map(|(_, path, file_type)| {
+        .filter_map(|(relative, path, file_type)| {
             if file_type.is_symlink() || !file_type.is_file() {
                 return None;
             }
@@ -2944,7 +3043,7 @@ fn executable_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
             };
             #[cfg(not(unix))]
             let mode_is_executable = false;
-            (extension_is_script || mode_is_executable).then_some(path)
+            (extension_is_script || mode_is_executable).then_some(relative)
         })
         .collect::<Vec<_>>();
     executable.sort();
@@ -3645,7 +3744,7 @@ enabled = true
             root: agent_root,
             governable: true,
             provider: None,
-            expected_physical_directory: Some(source.clone()),
+            expected_physical_entrypoint: Some(source.join("SKILL.md")),
             entrypoint: linked.join("SKILL.md"),
             link_target: Some(source.clone()),
             link_status: LinkStatus::Valid,
@@ -3724,7 +3823,7 @@ enabled = true
             governable: true,
             provider: None,
             entrypoint: linked.join("SKILL.md"),
-            expected_physical_directory: Some(source.clone()),
+            expected_physical_entrypoint: Some(source.join("SKILL.md")),
             link_target: Some(source),
             link_status: LinkStatus::Valid,
             default_exposed: true,
@@ -3735,6 +3834,109 @@ enabled = true
             std::os::unix::fs::symlink(&external, &linked).unwrap();
         });
 
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(
+            result.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert!(!result.placements[0].governable);
+        assert!(result.placements[0].physical_directory.is_none());
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("external-marker"));
+        assert!(!encoded.contains("EXTERNAL-SECRET-MARKER"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_physical_package_is_observed_once_with_logical_placement_facts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir_all(source.join("scripts")).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: shared\n---\nshared body\n",
+        )
+        .unwrap();
+        fs::write(source.join("scripts/run.sh"), "#!/bin/sh\n").unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let physical_entrypoint = source.join("SKILL.md");
+
+        let mut candidates = Vec::new();
+        for (agent, directory_name) in [
+            (AgentKind::Codex, "codex"),
+            (AgentKind::ClaudeCode, "claude"),
+        ] {
+            let agent_root = temp.path().join(directory_name);
+            fs::create_dir(&agent_root).unwrap();
+            let linked = agent_root.join("shared");
+            std::os::unix::fs::symlink(&source, &linked).unwrap();
+            candidates.push(EntryCandidate {
+                agent: Some(agent),
+                root: agent_root,
+                governable: true,
+                provider: None,
+                expected_physical_entrypoint: Some(physical_entrypoint.clone()),
+                entrypoint: linked.join("SKILL.md"),
+                link_target: Some(source.clone()),
+                link_status: LinkStatus::Valid,
+                default_exposed: true,
+            });
+        }
+
+        let mut result = ScanResult::default();
+        let stats = materialize_candidates_with_hook(candidates, &[], &[], &mut result, |_| {});
+
+        assert_eq!(stats, 1);
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.placements.len(), 2);
+        assert!(result.placements.iter().all(|placement| {
+            placement.physical_directory.as_ref() == Some(&source)
+                && placement.executable_files == vec![placement.directory.join("scripts/run.sh")]
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_alias_retargeted_before_read_is_not_observed_or_reused() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: permitted\n---\npermitted body\n",
+        )
+        .unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::write(
+            external.join("SKILL.md"),
+            "---\nname: external-marker\n---\nEXTERNAL-SECRET-MARKER\n",
+        )
+        .unwrap();
+        let agent_root = temp.path().join("agent");
+        fs::create_dir(&agent_root).unwrap();
+        let linked = agent_root.join("shared");
+        std::os::unix::fs::symlink(&source, &linked).unwrap();
+        let candidate = EntryCandidate {
+            agent: Some(AgentKind::Codex),
+            root: agent_root,
+            governable: true,
+            provider: None,
+            expected_physical_entrypoint: Some(source.join("SKILL.md")),
+            entrypoint: linked.join("SKILL.md"),
+            link_target: Some(source),
+            link_status: LinkStatus::Valid,
+            default_exposed: true,
+        };
+        let mut result = ScanResult::default();
+        let stats =
+            materialize_candidates_with_hook(vec![candidate], &[], &[], &mut result, |_| {
+                fs::remove_file(&linked).unwrap();
+                std::os::unix::fs::symlink(&external, &linked).unwrap();
+            });
+
+        assert_eq!(stats, 0);
         assert_eq!(result.placements.len(), 1);
         assert_eq!(
             result.placements[0].fingerprint_completeness,
