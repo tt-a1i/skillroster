@@ -56,6 +56,14 @@ Use this placement test for every capability: local truth, stable identity, repr
 
 A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently.
 
+The immutable Scan payload is the historical Snapshot record. SQLite's
+normalized placement table is the current projection: when a stable placement
+is observed again, the same placement ID moves to the latest Snapshot and every
+current Skill, Agent, root, path, kind, link, fingerprint, and exposure fact is
+refreshed. The latest payload placement IDs and normalized latest-Snapshot
+placement IDs must be identical; historical graphs remain available in their
+immutable payloads rather than stale projection rows.
+
 Skill-root discovery and package fingerprints carry explicit completeness facts. A configured root whose depth limit was reached remains Included but is marked discovery-incomplete, making structural coverage unreliable. Each placement fingerprint is `complete`, `bounded`, `unreadable`, or `unknown`; payloads created before this contract default to `unknown`. Only a complete package fingerprint may support an exact-duplicate Finding or any Library/Roster Plan that relies on exact content. Bounded or unreadable packages remain inventory facts and require a new complete Scan before governance. Apply repeats this check so a Ready Plan created by an older binary cannot bypass the boundary.
 
 Scan records two deliberately separate hashes in one bounded traversal. The complete package fingerprint covers every retained package file, including `.gitignore`, and remains the only hash used for drift checks, exact load, Plan, Apply, Receipt, Undo, and recovery. The versioned routing content identity excludes only the package-root `.gitignore`; it is used for unsourced logical identity and same-name variant grouping because source-control metadata is not Agent Skills payload. `SKILL.md`, scripts, references, assets, and symlink targets remain identity-bearing. A legacy Snapshot without the current content-identity algorithm must be rescanned; the CLI never backfills or infers equality from old package fingerprints.

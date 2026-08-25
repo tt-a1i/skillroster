@@ -710,8 +710,11 @@ impl StateStore {
                 (id, scan_id, skill_id, agent_id, root_id, path, kind, symlink_target,
                  fingerprint, exposed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(id) DO UPDATE SET fingerprint = excluded.fingerprint,
-                 symlink_target = excluded.symlink_target, exposed = excluded.exposed",
+             ON CONFLICT(id) DO UPDATE SET scan_id = excluded.scan_id,
+                 skill_id = excluded.skill_id, agent_id = excluded.agent_id,
+                 root_id = excluded.root_id, path = excluded.path, kind = excluded.kind,
+                 symlink_target = excluded.symlink_target,
+                 fingerprint = excluded.fingerprint, exposed = excluded.exposed",
             params![
                 placement.id.as_str(),
                 placement.scan_id.as_str(),
@@ -3318,6 +3321,122 @@ mod tests {
             })
             .unwrap();
         assert_eq!(store.latest_completed_scan().unwrap().unwrap().id, scan.id);
+    }
+
+    #[test]
+    fn stable_placement_moves_to_the_latest_scan_graph() {
+        let store = StateStore::open_in_memory().unwrap();
+        let agent = AgentRecord {
+            id: AgentId::new(),
+            kind: AgentKind::Codex,
+            display_name: "Codex".to_owned(),
+        };
+        store.save_agent(&agent).unwrap();
+        let placement_id = PlacementId::new();
+
+        let first_scan = scan();
+        store.save_scan(&first_scan).unwrap();
+        let first_root = RootRecord {
+            id: RootId::new(),
+            scan_id: first_scan.id.clone(),
+            agent_id: Some(agent.id.clone()),
+            path: "/tmp/skills-a".to_owned(),
+            kind: "skills".to_owned(),
+            status: RootStatus::Included,
+            explicit: false,
+            detail: None,
+        };
+        store.save_root(&first_root).unwrap();
+        let first_skill_record = SkillRecord {
+            id: SkillId::new(),
+            identity_key: "sha256:first".to_owned(),
+            name: "example".to_owned(),
+            description: None,
+            declared_source: None,
+            declared_revision: None,
+            content_digest: "sha256:first".to_owned(),
+            digest_version: 1,
+            governance_state: GovernanceState::Observed,
+            canonical_path: None,
+        };
+        let first_skill = store.save_skill(&first_skill_record).unwrap();
+        let first_placement = PlacementRecord {
+            id: placement_id.clone(),
+            scan_id: first_scan.id,
+            skill_id: first_skill,
+            agent_id: Some(agent.id.clone()),
+            root_id: first_root.id.clone(),
+            path: "/tmp/skills-a/example".to_owned(),
+            kind: PlacementKind::Directory,
+            symlink_target: None,
+            fingerprint: "first".to_owned(),
+            exposed: false,
+        };
+        store.save_placement(&first_placement).unwrap();
+
+        let second_scan = scan();
+        store.save_scan(&second_scan).unwrap();
+        let second_root = RootRecord {
+            id: RootId::new(),
+            scan_id: second_scan.id.clone(),
+            path: "/tmp/skills-b".to_owned(),
+            explicit: true,
+            ..first_root
+        };
+        store.save_root(&second_root).unwrap();
+        let second_skill = store
+            .save_skill(&SkillRecord {
+                id: SkillId::new(),
+                identity_key: "sha256:second".to_owned(),
+                content_digest: "sha256:second".to_owned(),
+                ..first_skill_record
+            })
+            .unwrap();
+        store
+            .save_placement(&PlacementRecord {
+                scan_id: second_scan.id.clone(),
+                skill_id: second_skill.clone(),
+                root_id: second_root.id.clone(),
+                path: "/tmp/skills-b/example".to_owned(),
+                kind: PlacementKind::Symlink,
+                symlink_target: Some("/tmp/source/example".to_owned()),
+                fingerprint: "second".to_owned(),
+                exposed: true,
+                ..first_placement
+            })
+            .unwrap();
+
+        let stored = store
+            .connection
+            .query_row(
+                "SELECT scan_id, skill_id, agent_id, root_id, path, kind,
+                        symlink_target, fingerprint, exposed
+                 FROM placements WHERE id = ?1",
+                [placement_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, bool>(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored.0, second_scan.id.as_str());
+        assert_eq!(stored.1, second_skill.as_str());
+        assert_eq!(stored.2.as_deref(), Some(agent.id.as_str()));
+        assert_eq!(stored.3, second_root.id.as_str());
+        assert_eq!(stored.4, "/tmp/skills-b/example");
+        assert_eq!(stored.5, "symlink");
+        assert_eq!(stored.6.as_deref(), Some("/tmp/source/example"));
+        assert_eq!(stored.7, "second");
+        assert!(stored.8);
     }
 
     #[test]
