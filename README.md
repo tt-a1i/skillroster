@@ -24,8 +24,8 @@ The agent then calls the `skillroster` CLI and returns an evidence-backed plan f
 ## Workflow
 
 ```bash
-skillroster scan --json
-skillroster --source-root /absolute/confirmed/source scan --json
+skillroster scan --summary --json
+skillroster --source-root /absolute/confirmed/source scan --summary --json
 skillroster report --json
 skillroster report --findings --limit 20 --json
 skillroster report --findings --category usage --json

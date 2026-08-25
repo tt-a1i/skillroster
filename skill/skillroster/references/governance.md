@@ -2,7 +2,9 @@
 
 ## Inspect
 
-Run `skillroster scan --json`, then the bounded `skillroster report --json`.
+Run `skillroster scan --summary --json`, then the bounded
+`skillroster report --json`. Use full `scan --json` only for deliberate root or
+coverage diagnostics.
 Use `finding_rollups` for complete group scale and the selected findings for the
 first decisions. Use `report --findings --limit 20 --json`, optionally narrowed
 by one category or severity, only when enumeration is needed. Follow

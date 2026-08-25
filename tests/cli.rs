@@ -135,6 +135,212 @@ fn suggested_action_argv_replays_the_same_discovery_context() {
 }
 
 #[test]
+fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let full_state = temp.path().join("full-state");
+    let summary_state = temp.path().join("summary-state");
+    let agent_roots = [
+        (".codex/skills", ".codex/sessions"),
+        (".claude/skills", ".claude/projects"),
+        (".pi/agent/skills", ".pi/agent/sessions"),
+        (
+            ".config/opencode/skills",
+            ".local/share/opencode/storage/session",
+        ),
+        (".hermes/skills", ".hermes/sessions"),
+        (".cursor/skills", ".cursor/projects"),
+        (".gemini/skills", ".gemini/tmp"),
+        (".copilot/skills", ".copilot/session-state"),
+    ];
+    for (agent_index, (skill_root, session_root)) in agent_roots.iter().enumerate() {
+        for skill_index in 0..8 {
+            let name = format!("fixture-{agent_index}-{skill_index}");
+            let skill = home.join(skill_root).join(&name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Representative task helper\n---\n"),
+            )
+            .unwrap();
+        }
+        if agent_index < 7 {
+            let sessions = home.join(session_root);
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join("representative.jsonl"),
+                "{\"type\":\"message\",\"content\":\"bounded fixture\"}\n",
+            )
+            .unwrap();
+        }
+    }
+
+    let scan_args = |state: &Path, summary: bool| {
+        let mut args = vec![
+            "--home".to_owned(),
+            home.to_string_lossy().into_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ];
+        for index in 0..12 {
+            args.push("--root".to_owned());
+            args.push(format!(
+                "codex={}",
+                temp.path().join(format!("missing-{index}")).display()
+            ));
+        }
+        args.push("scan".to_owned());
+        if summary {
+            args.push("--summary".to_owned());
+        }
+        args
+    };
+    let full_args = scan_args(&full_state, false);
+    let summary_args = scan_args(&summary_state, true);
+    let full_output = run(
+        &full_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+    );
+    let summary_output = run(
+        &summary_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+    );
+    let full = json_output(&full_output);
+    let summary = json_output(&summary_output);
+
+    assert!(full["result"]["roots"].is_array());
+    assert!(full["result"]["coverage"].is_array());
+    assert_eq!(summary["result"]["view"], "summary");
+    assert!(summary["result"].get("roots").is_none());
+    assert!(summary["result"].get("coverage").is_none());
+    assert_eq!(summary["result"]["root_issues"]["returned"], 10);
+    assert_eq!(summary["result"]["root_issues"]["truncated"], true);
+    assert!(summary["result"]["root_issues"]["total"].as_u64().unwrap() > 10);
+    assert_eq!(
+        summary["result"]["session_coverage"]["inference_boundary"]["unused_claim_supported"],
+        false
+    );
+    assert_eq!(
+        summary["result"]["session_coverage"]["inference_boundary"]["automatic_governance_supported"],
+        false
+    );
+    assert_eq!(summary["result"]["skill_count"], 64);
+    assert_eq!(summary["result"]["placement_count"], 64);
+    assert_eq!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|agent| agent["state"].is_string())
+    );
+    let missing_coverage = summary["result"]["session_coverage"]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["state"] == "missing")
+        .unwrap();
+    assert_eq!(missing_coverage["agent"], "github-copilot");
+    let missing_limitation = summary["result"]["session_coverage"]["limitation_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|limitation| limitation["code"] == "root_missing")
+        .unwrap();
+    assert!(
+        missing_limitation["agents"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("github-copilot"))
+    );
+    for field in ["scope", "count_kind", "observed", "unit", "source"] {
+        assert!(
+            missing_limitation.get(field).is_some(),
+            "typed limitation field {field}"
+        );
+    }
+    assert!(missing_limitation.get("limit").is_some());
+    assert!(
+        summary["result"]["session_coverage"]["next_step_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("github-copilot"))
+                && group["steps"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("verify_session_root_before_rescan")))
+    );
+    assert!(
+        summary_output.stdout.len() * 100 <= full_output.stdout.len() * 40,
+        "summary={} full={}",
+        summary_output.stdout.len(),
+        full_output.stdout.len()
+    );
+
+    let full_report = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            full_state.to_str().unwrap(),
+            "--json",
+            "report",
+        ],
+        None,
+    ));
+    let summary_report = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            summary_state.to_str().unwrap(),
+            "--json",
+            "report",
+        ],
+        None,
+    ));
+    let full_payload: String = rusqlite::Connection::open(full_state.join("skillroster.db"))
+        .unwrap()
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let summary_payload: String = rusqlite::Connection::open(summary_state.join("skillroster.db"))
+        .unwrap()
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(summary_payload, full_payload);
+
+    let mut full_report_result = full_report["result"].clone();
+    let mut summary_report_result = summary_report["result"].clone();
+    for result in [&mut full_report_result, &mut summary_report_result] {
+        result.as_object_mut().unwrap().remove("report_id");
+        result.as_object_mut().unwrap().remove("snapshot_id");
+        for finding in result["findings"].as_array_mut().unwrap() {
+            finding.as_object_mut().unwrap().remove("id");
+            finding
+                .as_object_mut()
+                .unwrap()
+                .remove("primary_evidence_id");
+        }
+    }
+    assert_eq!(summary_report_result, full_report_result);
+}
+
+#[test]
 fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
     let output = run(&["report", "--help"], None);
     assert!(output.status.success());
@@ -385,7 +591,7 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     let missing_snapshot = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["reason_code"],
@@ -1301,7 +1507,7 @@ fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
         assert_eq!(rejected["error"]["details"]["files_changed"], false);
         assert_eq!(
             rejected["suggested_actions"][0]["argv"],
-            context_action_argv(&home, &state, &["scan", "--json"])
+            context_action_argv(&home, &state, &["scan", "--summary", "--json"])
         );
     }
 
@@ -1525,7 +1731,7 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert!(drifted_find["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
     assert_eq!(
         drifted_find["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
 
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
@@ -3642,7 +3848,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
 }
 
@@ -3923,6 +4129,37 @@ fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
             .any(|root| root["agent"] == "codex"
                 && root["kind"] == "sessions"
                 && root["status"] == "excluded")
+    );
+    let summary = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    assert_eq!(summary["result"]["session_coverage"]["supported_agents"], 8);
+    assert_eq!(summary["result"]["session_coverage"]["excluded_agents"], 1);
+    assert_eq!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(
+        summary["result"]["session_coverage"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["agent"] == "codex" && agent["state"] == "excluded")
+    );
+    assert!(
+        summary["result"]["session_coverage"]["next_step_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group["agents"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("codex"))
+                && group["steps"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("do_not_infer_usage_for_excluded_agent")))
     );
     let inspect = json_output(&run(
         &[&common[..], &["lifecycle", "inspect"]].concat(),
@@ -7935,8 +8172,8 @@ fn find_rejects_content_drift_and_requests_rescan() {
     );
     let retry_argv = loaded["suggested_actions"][0]["argv"].as_array().unwrap();
     assert_eq!(
-        &retry_argv[retry_argv.len() - 2..],
-        &[json!("scan"), json!("--json")]
+        &retry_argv[retry_argv.len() - 3..],
+        &[json!("scan"), json!("--summary"), json!("--json")]
     );
     assert!(loaded["error"]["details"].get("content").is_none());
 

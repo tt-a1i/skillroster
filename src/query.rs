@@ -337,8 +337,8 @@ impl RetrievalQuery {
     }
 }
 
-pub fn build_report(scan: &ScanResult) -> Report {
-    let metrics = PrimaryMetrics {
+pub(crate) fn primary_metrics(scan: &ScanResult) -> PrimaryMetrics {
+    PrimaryMetrics {
         independent_skills: scan.skills.len(),
         placements: scan.placements.len(),
         default_exposure: scan
@@ -381,7 +381,11 @@ pub fn build_report(scan: &ScanResult) -> Report {
             .iter()
             .filter(|coverage| coverage.roots_inaccessible > 0)
             .count(),
-    };
+    }
+}
+
+pub fn build_report(scan: &ScanResult) -> Report {
+    let metrics = primary_metrics(scan);
     let mut findings = Vec::new();
     inventory_findings(scan, &mut findings);
     layout_findings(scan, &mut findings);

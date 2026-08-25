@@ -151,7 +151,7 @@ SkillRoster records source, revision, and content hash when available. A source-
 The first complete command surface is:
 
 ```bash
-skillroster scan [--json]
+skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--json]
 skillroster plan --stdin [--json]
@@ -320,6 +320,22 @@ All JSON responses use a versioned envelope:
 ```
 
 IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
+
+`scan --summary --json` persists the same complete immutable Snapshot as a full
+Scan but returns a bounded Agent continuation view: Snapshot and inventory
+counts, exact root totals, at most ten actionable root issues with exact
+total/truncation facts, aggregate and per-Agent typed session-coverage limits,
+their supported next steps, and mutually exclusive `reliable`,
+`sampled_limited`, `missing`, `inaccessible`, `excluded`, or `legacy_unknown`
+states; source-root policy counts; and the ordinary Report action. Existing
+`scan --json` remains the complete diagnostic projection. Agent-generated Scan
+actions and the Bootstrap governance workflow use the Summary view; neither
+view changes Agent or Skill files.
+
+To avoid repeating identical typed facts, Summary groups Coverage limitations
+and supported next steps by their affected Agent IDs. Every group remains an
+explicit Agent-to-fact mapping; callers do not infer one Agent's boundary from
+another Agent's state.
 
 Selector-free `report --json` returns the bounded three-Finding Summary view;
 `--summary` is an explicit alias. The exhaustive diagnostic report requires
