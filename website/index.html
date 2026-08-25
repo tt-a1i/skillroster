@@ -978,6 +978,72 @@ body.loaded .mask-in { transform: none; }
 .term-bar i { width: 9px; height: 9px; border-radius: 50%; background: #2E3A34; }
 .term-bar span { margin-left: 8px; font: 500 9.5px var(--mono); letter-spacing: .22em; color: #5C6A63; }
 
+
+/* ============================================================
+   Statement band
+   ============================================================ */
+.statement { padding: clamp(80px, 10vw, 140px) 0 clamp(40px, 5vw, 70px); }
+.statement h2 {
+  font-size: clamp(46px, 8.6vw, 122px);
+  font-weight: 650;
+  letter-spacing: -0.05em;
+  line-height: 1.04;
+  overflow: hidden;
+}
+.statement h2 span {
+  display: inline-block;
+  transform: translateY(112%);
+  transition: transform 1.1s cubic-bezier(.16, 1, .3, 1);
+}
+.statement.play h2 span { transform: none; }
+.statement h2.l2 { margin-left: clamp(40px, 11vw, 180px); }
+.statement h2.l2 span { transition-delay: .16s; }
+.statement h2 em {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 300;
+  color: var(--green);
+  letter-spacing: -0.015em;
+}
+
+/* ============================================================
+   Terminal session
+   ============================================================ */
+.term {
+  max-width: 840px;
+  margin: 0 auto;
+  background: #0C1310;
+  border: 1px solid rgba(233, 240, 234, .1);
+  border-radius: 20px;
+  box-shadow: 0 40px 90px -40px rgba(12, 19, 16, .45), 0 2px 6px rgba(15, 23, 42, .06);
+  padding: 22px 26px 26px;
+  overflow: hidden;
+}
+.term-body {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  min-height: 360px;
+  white-space: pre-wrap;
+  color: rgba(233, 240, 234, .62);
+}
+.term-line { display: block; }
+.term-line.cmd { color: #F2F7F2; margin-top: 12px; }
+.term-line.cmd:first-child { margin-top: 0; }
+.term-line .ps { color: #7EE2A8; margin-right: 9px; }
+.tk { color: #7DD3FC; }
+.ts { color: #86EFAC; }
+.tn { color: #FCD34D; }
+.term-cursor {
+  display: inline-block;
+  width: 8px; height: 15px;
+  background: #7EE2A8;
+  vertical-align: -2px;
+  margin-left: 3px;
+  animation: termblink 1.05s steps(1) infinite;
+}
+@keyframes termblink { 50% { opacity: 0; } }
+
 /* ============================================================
    Footer
    ============================================================ */
@@ -1143,6 +1209,14 @@ footer { overflow: hidden; }
   </div>
 </section>
 
+<!-- ============================ Statement ============================ -->
+<section class="statement" id="statement">
+  <div class="wrap">
+    <h2 class="l1"><span>The agent plans.</span></h2>
+    <h2 class="l2"><span>The CLI <em>proves</em>.</span></h2>
+  </div>
+</section>
+
 <!-- ============================ Stats ============================ -->
 <section class="block tint" style="padding-top:0; padding-bottom:clamp(60px,8vw,100px)">
   <div class="wrap" style="padding-top:clamp(60px,8vw,100px)">
@@ -1239,11 +1313,27 @@ footer { overflow: hidden; }
   </div>
 </section>
 
+<!-- ============================ Session ============================ -->
+<section class="block" id="session">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="num reveal">03 — A real session</span>
+      <h2 class="reveal reveal-d1">Watch it <em>work</em>.</h2>
+      <p class="reveal reveal-d2">One versioned JSON envelope in, typed suggested actions
+      out — replayed end to end. No scraped prose, no surprises.</p>
+    </div>
+    <div class="term reveal">
+      <div class="term-bar"><i></i><i></i><i></i><span>SKILLROSTER — ZSH</span></div>
+      <div class="term-body" id="termBody"></div>
+    </div>
+  </div>
+</section>
+
 <!-- ============================ Commands ============================ -->
 <section class="block tint" id="commands">
   <div class="wrap">
     <div class="section-head">
-      <span class="num reveal">03 — Command surface</span>
+      <span class="num reveal">04 — Command surface</span>
       <h2 class="reveal reveal-d1">A small grammar,<br><em>deliberately</em> kept small.</h2>
       <p class="reveal reveal-d2">Every JSON response shares one versioned envelope with typed
       suggested actions. Agents consume structure — never scraped prose.</p>
@@ -1307,7 +1397,7 @@ footer { overflow: hidden; }
 <section class="block" id="safety">
   <div class="wrap">
     <div class="section-head">
-      <span class="num reveal">04 — Safety model</span>
+      <span class="num reveal">05 — Safety model</span>
       <h2 class="reveal reveal-d1">Fail closed,<br>by <em>default</em>.</h2>
       <p class="reveal reveal-d2">Governance you cannot talk your way past. The rules below
       live in the plan validator and the storage layer — not in a prompt.</p>
@@ -1349,7 +1439,7 @@ footer { overflow: hidden; }
 <section class="block tint" id="install">
   <div class="wrap">
     <div class="section-head">
-      <span class="num reveal">05 — Install</span>
+      <span class="num reveal">06 — Install</span>
       <h2 class="reveal reveal-d1">One binary.<br>Ready in <em>seconds</em>.</h2>
       <p class="reveal reveal-d2">Rust 1.85+ from source, a source-building Homebrew tap,
       or verified release archives. Then refresh the snapshot and set up the bootstrap
@@ -1809,6 +1899,93 @@ if (finePointer) {
     });
   });
 }
+
+/* ============================================================
+   Statement — scroll-triggered line reveal
+   ============================================================ */
+(function statement() {
+  const el = document.getElementById('statement');
+  if (!el) return;
+  if (reduced) { el.classList.add('play'); return; }
+  new IntersectionObserver((es) => {
+    if (es[0].isIntersecting) el.classList.add('play');
+  }, { threshold: 0.35 }).observe(el);
+})();
+
+/* ============================================================
+   Terminal — auto-typed real session, on loop
+   ============================================================ */
+(function termSession() {
+  const body = document.getElementById('termBody');
+  if (!body) return;
+  const SESSION = [
+    ['cmd', 'skillroster scan --summary --json'],
+    ['out', '{ "schema_version": 1, "kind": "scan_summary",\n  "snapshot_id": "snap_7f3a", "skills": 36,\n  "placements": 676, "findings": 12 }'],
+    ['cmd', 'skillroster plan --stdin --json'],
+    ['out', '{ "schema_version": 1, "kind": "plan",\n  "plan_id": "plan_a1f2", "changes": 9,\n  "validation": "complete", "status": "preview_stored" }'],
+    ['cmd', 'skillroster apply plan_a1f2 --json'],
+    ['out', '{ "schema_version": 1, "kind": "receipt",\n  "receipt_id": "receipt_3e08", "applied": 9,\n  "undo": "available" }'],
+    ['cmd', 'skillroster undo receipt_3e08 --json'],
+    ['out', '{ "schema_version": 1, "kind": "receipt",\n  "receipt_id": "receipt_9b41", "restored": 9,\n  "state": "byte_identical" }'],
+  ];
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const hi = (line) => esc(line).replace(/"([a-z_]+)":|"([^"]*)"|\b(\d+)\b/g,
+    (m, k, s, n) => {
+      if (k !== undefined) return '<span class="tk">"' + k + '"</span>:';
+      if (s !== undefined) return '<span class="ts">"' + s + '"</span>';
+      return '<span class="tn">' + n + '</span>';
+    });
+  const cursor = '<span class="term-cursor"></span>';
+  function render(lines, typing, typed) {
+    let out = '';
+    lines.forEach(([kind, text]) => {
+      if (kind === 'cmd') {
+        out += '<span class="term-line cmd"><span class="ps">$</span>' + esc(text) + '</span>';
+      } else {
+        text.split('\n').forEach((l) => { out += '<span class="term-line">' + hi(l) + '</span>'; });
+      }
+    });
+    if (typing) out += '<span class="term-line cmd"><span class="ps">$</span>' + esc(typed) + cursor + '</span>';
+    else out += '<span class="term-line cmd"><span class="ps">$</span>' + cursor + '</span>';
+    body.innerHTML = out;
+  }
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function playOnce() {
+    const done = [];
+    for (const [kind, text] of SESSION) {
+      if (kind === 'cmd') {
+        for (let i = 1; i <= text.length; i++) {
+          render(done, true, text.slice(0, i));
+          await wait(24 + Math.random() * 30);
+        }
+        done.push(['cmd', text]);
+        await wait(340);
+      } else {
+        const parts = text.split('\n');
+        for (let i = 1; i <= parts.length; i++) {
+          render(done.concat([['out', parts.slice(0, i).join('\n')]]), false, '');
+          await wait(80);
+        }
+        done.push(['out', text]);
+        await wait(700);
+      }
+    }
+    render(done, false, '');
+    await wait(3800);
+  }
+  let inView = false, started = false;
+  async function loop() {
+    for (;;) {
+      if (inView && !document.hidden) await playOnce();
+      else await wait(800);
+    }
+  }
+  if (reduced) { render(SESSION, false, ''); return; }
+  new IntersectionObserver((es) => {
+    inView = es[0].isIntersecting;
+    if (inView && !started) { started = true; loop(); }
+  }, { threshold: 0.25 }).observe(body);
+})();
 </script>
 </body>
 </html>
