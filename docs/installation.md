@@ -78,7 +78,7 @@ After installing a new CLI version, refresh the local Snapshot and inspect all
 detected bootstrap targets:
 
 ```sh
-skillroster scan --json
+skillroster scan --summary --json
 skillroster setup --json
 ```
 

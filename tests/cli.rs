@@ -135,6 +135,123 @@ fn suggested_action_argv_replays_the_same_discovery_context() {
 }
 
 #[test]
+fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let full_state = temp.path().join("full-state");
+    let summary_state = temp.path().join("summary-state");
+    let skill = home.join(".codex/skills/example");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: example\ndescription: Example task helper\n---\n",
+    )
+    .unwrap();
+
+    let scan_args = |state: &Path, summary: bool| {
+        let mut args = vec![
+            "--home".to_owned(),
+            home.to_string_lossy().into_owned(),
+            "--state-dir".to_owned(),
+            state.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ];
+        for index in 0..12 {
+            args.push("--root".to_owned());
+            args.push(format!(
+                "codex={}",
+                temp.path().join(format!("missing-{index}")).display()
+            ));
+        }
+        args.push("scan".to_owned());
+        if summary {
+            args.push("--summary".to_owned());
+        }
+        args
+    };
+    let full_args = scan_args(&full_state, false);
+    let summary_args = scan_args(&summary_state, true);
+    let full_output = run(
+        &full_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+    );
+    let summary_output = run(
+        &summary_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+    );
+    let full = json_output(&full_output);
+    let summary = json_output(&summary_output);
+
+    assert!(full["result"]["roots"].is_array());
+    assert!(full["result"]["coverage"].is_array());
+    assert_eq!(summary["result"]["view"], "summary");
+    assert!(summary["result"].get("roots").is_none());
+    assert!(summary["result"].get("coverage").is_none());
+    assert_eq!(summary["result"]["root_issues"]["returned"], 10);
+    assert_eq!(summary["result"]["root_issues"]["truncated"], true);
+    assert!(summary["result"]["root_issues"]["total"].as_u64().unwrap() > 10);
+    assert_eq!(
+        summary["result"]["session_coverage"]["inference_boundary"]["unused_claim_supported"],
+        false
+    );
+    assert_eq!(
+        summary["result"]["session_coverage"]["inference_boundary"]["automatic_governance_supported"],
+        false
+    );
+    assert!(
+        summary["result"]["session_coverage"]["supported_next_steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(Value::is_string)
+    );
+    assert!(
+        summary_output.stdout.len() * 100 <= full_output.stdout.len() * 40,
+        "summary={} full={}",
+        summary_output.stdout.len(),
+        full_output.stdout.len()
+    );
+
+    let full_report = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            full_state.to_str().unwrap(),
+            "--json",
+            "report",
+        ],
+        None,
+    ));
+    let summary_report = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            summary_state.to_str().unwrap(),
+            "--json",
+            "report",
+        ],
+        None,
+    ));
+    for field in [
+        "skill_count",
+        "placement_count",
+        "default_exposure",
+        "observed_use_agent_count",
+        "primary_metrics",
+        "session_coverage",
+        "category_counts",
+        "finding_rollups",
+    ] {
+        assert_eq!(
+            summary_report["result"][field], full_report["result"][field],
+            "report field {field}"
+        );
+    }
+}
+
+#[test]
 fn report_help_names_the_safe_default_and_explicit_exhaustive_export() {
     let output = run(&["report", "--help"], None);
     assert!(output.status.success());
@@ -385,7 +502,7 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     let missing_snapshot = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
     assert_eq!(
         missing_snapshot["suggested_actions"][0]["reason_code"],
@@ -1301,7 +1418,7 @@ fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
         assert_eq!(rejected["error"]["details"]["files_changed"], false);
         assert_eq!(
             rejected["suggested_actions"][0]["argv"],
-            context_action_argv(&home, &state, &["scan", "--json"])
+            context_action_argv(&home, &state, &["scan", "--summary", "--json"])
         );
     }
 
@@ -1525,7 +1642,7 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
     assert!(drifted_find["result"]["matches"][0]["variant_finding"]["finding_id"].is_null());
     assert_eq!(
         drifted_find["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
 
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
@@ -3642,7 +3759,7 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
     assert_eq!(output["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(
         output["suggested_actions"][0]["argv"],
-        context_action_argv(&home, &state, &["scan", "--json"])
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
 }
 

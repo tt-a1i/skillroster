@@ -236,7 +236,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             } else if result["latest_snapshot_id"].is_null() {
                 vec![action(
                     "scan",
-                    &["scan", "--json"],
+                    &["scan", "--summary", "--json"],
                     false,
                     false,
                     "snapshot_required",
@@ -302,7 +302,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                     vec![],
                     vec![action(
                         "scan",
-                        &["scan", "--json"],
+                        &["scan", "--summary", "--json"],
                         false,
                         false,
                         "source_root_permission_recorded",
@@ -372,7 +372,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                     vec![],
                     vec![action(
                         "scan",
-                        &["scan", "--json"],
+                        &["scan", "--summary", "--json"],
                         false,
                         false,
                         "source_root_permission_revoked",
@@ -380,13 +380,14 @@ pub fn run(cli: Cli) -> Result<Output> {
                 )
             }
         },
-        Some(Command::Scan) => {
+        Some(Command::Scan(args)) => {
             let (result, warnings) = scan_command(
                 &store,
                 &home,
                 &state_dir,
                 parse_explicit_roots(&cli.roots)?,
                 parse_source_roots(&cli.source_roots)?,
+                args.summary,
             )?;
             (
                 "scan",
@@ -581,7 +582,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             if result["state"].as_str() == Some("scan_required") {
                 actions.push(action(
                     "scan",
-                    &["scan", "--json"],
+                    &["scan", "--summary", "--json"],
                     false,
                     false,
                     "setup_requires_snapshot",
@@ -628,7 +629,7 @@ pub fn run(cli: Cli) -> Result<Output> {
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
     match command {
-        Some(Command::Scan | Command::Apply(_) | Command::Undo(_) | Command::Setup(_)) => true,
+        Some(Command::Scan(_) | Command::Apply(_) | Command::Undo(_) | Command::Setup(_)) => true,
         Some(Command::Report(args)) => args.finding.is_none(),
         Some(Command::Plan(args)) => args.show.is_none(),
         Some(Command::SourceRoot(args)) => matches!(
@@ -678,7 +679,7 @@ pub fn error_json_with_context(
         );
         envelope.suggested_actions = vec![action(
             "refresh_snapshot_content_identity",
-            &["scan", "--json"],
+            &["scan", "--summary", "--json"],
             false,
             false,
             "content_identity_rescan_required",
@@ -2157,6 +2158,7 @@ fn scan_command(
     state_dir: &Path,
     explicit: Vec<ExplicitSkillRoot>,
     source_roots: Vec<PathBuf>,
+    summary: bool,
 ) -> Result<(Value, Vec<String>)> {
     let started = Utc::now().timestamp();
     let id = ScanId::new();
@@ -2273,24 +2275,26 @@ fn scan_command(
         .filter_map(|root| root.agent)
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let roots = result
-        .roots
-        .iter()
-        .map(|root| {
-            let mut value = json!(root);
-            value["agent"] = json!(root.agent.map(AgentKind::id));
-            value
-        })
-        .collect::<Vec<_>>();
-    let coverage = result
-        .coverage
-        .iter()
-        .map(session_coverage_details)
-        .collect::<Result<Vec<_>>>()?;
-    let warnings = compact_scan_warnings(result.warnings);
-    Ok((
+    let warnings = compact_scan_warnings(result.warnings.clone());
+    let public_result = if summary {
+        scan_summary_value(&id, agents_checked, &result)?
+    } else {
+        let roots = result
+            .roots
+            .iter()
+            .map(|root| {
+                let mut value = json!(root);
+                value["agent"] = json!(root.agent.map(AgentKind::id));
+                value
+            })
+            .collect::<Vec<_>>();
+        let coverage = result
+            .coverage
+            .iter()
+            .map(session_coverage_details)
+            .collect::<Result<Vec<_>>>()?;
         json!({
-            "snapshot_id": id,
+            "snapshot_id": &id,
             "agents_checked": agents_checked,
             "skill_count": result.skills.len(),
             "placement_count": result.placements.len(),
@@ -2304,9 +2308,150 @@ fn scan_command(
                 "permissions": result.source_root_policy,
             },
             "files_changed": false
-        }),
-        warnings,
-    ))
+        })
+    };
+    Ok((public_result, warnings))
+}
+
+const SCAN_SUMMARY_ROOT_ISSUE_LIMIT: usize = 10;
+
+fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -> Result<Value> {
+    let root_kinds = [scan::RootKind::Skills, scan::RootKind::Sessions];
+    let root_statuses = [
+        scan::RootStatus::Included,
+        scan::RootStatus::Missing,
+        scan::RootStatus::Inaccessible,
+        scan::RootStatus::Excluded,
+    ];
+    let mut root_counts = Vec::new();
+    for kind in root_kinds {
+        for status in root_statuses {
+            let count = result
+                .roots
+                .iter()
+                .filter(|root| root.kind == kind && root.status == status)
+                .count();
+            if count > 0 {
+                root_counts.push(json!({
+                    "kind": kind,
+                    "status": status,
+                    "count": count,
+                }));
+            }
+        }
+    }
+
+    let root_issues = result
+        .roots
+        .iter()
+        .filter(|root| {
+            root.status != scan::RootStatus::Included
+                || (root.kind == scan::RootKind::Skills && !root.discovery_complete)
+        })
+        .collect::<Vec<_>>();
+    let root_issue_items = root_issues
+        .iter()
+        .take(SCAN_SUMMARY_ROOT_ISSUE_LIMIT)
+        .map(|root| {
+            json!({
+                "agent": root.agent.map(AgentKind::id),
+                "kind": root.kind,
+                "path": root.path,
+                "status": root.status,
+                "explicit": root.explicit,
+                "discovery_complete": root.discovery_complete,
+                "detail": root.detail,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let metrics = crate::query::primary_metrics(result);
+    let mut coverage_agents = Vec::new();
+    let mut coverage_next_steps = BTreeSet::new();
+    for coverage in &result.coverage {
+        let details = session_coverage_details(coverage)?;
+        let limitation_codes = coverage
+            .limitations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|limitation| serde_json::to_value(limitation.code))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if let Some(steps) = details["actionability"]["supported_next_steps"].as_array() {
+            coverage_next_steps.extend(steps.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        coverage_agents.push(json!({
+            "agent": coverage.agent.id(),
+            "limitation_state": details["limitation_state"],
+            "limitations_recorded": coverage.limitations.is_some(),
+            "limitation_codes": limitation_codes,
+            "denominator_reliable": details["denominator_reliable"],
+        }));
+    }
+
+    let source_states = [
+        crate::source_policy::SourceRootState::Active,
+        crate::source_policy::SourceRootState::Missing,
+        crate::source_policy::SourceRootState::Inaccessible,
+        crate::source_policy::SourceRootState::Replaced,
+        crate::source_policy::SourceRootState::Retargeted,
+    ];
+    let source_state_counts = source_states
+        .into_iter()
+        .filter_map(|state| {
+            let count = result
+                .source_root_policy
+                .iter()
+                .filter(|fact| fact.state == state)
+                .count();
+            (count > 0).then(|| json!({"state": state, "count": count}))
+        })
+        .collect::<Vec<_>>();
+    let source_issue_count = result
+        .source_root_policy
+        .iter()
+        .filter(|fact| fact.state != crate::source_policy::SourceRootState::Active)
+        .count();
+
+    Ok(json!({
+        "view": "summary",
+        "snapshot_id": id,
+        "agents_checked": agents_checked,
+        "skill_count": result.skills.len(),
+        "placement_count": result.placements.len(),
+        "root_counts": root_counts,
+        "root_issues": {
+            "total": root_issues.len(),
+            "returned": root_issue_items.len(),
+            "truncated": root_issue_items.len() < root_issues.len(),
+            "items": root_issue_items,
+        },
+        "session_coverage": {
+            "supported_agents": result.coverage.len(),
+            "roots_present_agents": metrics.agents_with_session_roots,
+            "sampled_agents": metrics.agents_with_sampled_session_data,
+            "complete_agents": metrics.agents_with_reliable_session_denominator,
+            "limited_agents": metrics.agents_with_limited_session_data,
+            "missing_root_agents": metrics.agents_missing_session_roots,
+            "inaccessible_agents": metrics.agents_with_inaccessible_session_roots,
+            "inference_boundary": {
+                "unused_claim_supported": false,
+                "automatic_governance_supported": false,
+            },
+            "supported_next_steps": coverage_next_steps,
+            "agents": coverage_agents,
+        },
+        "source_root_policy": {
+            "scope": "exact_local_read_only",
+            "permission_count": result.source_root_policy.len(),
+            "issue_count": source_issue_count,
+            "state_counts": source_state_counts,
+            "content_endorsed": false,
+            "evidence_quality_changed": false,
+            "governance_authorized": false,
+        },
+        "files_changed": false,
+    }))
 }
 
 /// Merge policy observations conservatively across a Scan. Once a permission
@@ -5313,7 +5458,7 @@ fn bind_variant_findings(
         let (reference, suggested) = if variant_drifted {
             let suggested = action(
                 "refresh_drifted_snapshot",
-                &["scan", "--json"],
+                &["scan", "--summary", "--json"],
                 false,
                 false,
                 "routable_variant_drift_detected",
@@ -11304,7 +11449,7 @@ mod recovery_tests {
             std::fs::write(package.join(relative_path), content).unwrap();
         }
         let store = StateStore::open(state.join("skillroster.db")).unwrap();
-        scan_command(&store, &home, &state, Vec::new(), Vec::new()).unwrap();
+        scan_command(&store, &home, &state, Vec::new(), Vec::new(), false).unwrap();
 
         std::fs::write(package.join(current[1].0), &current[1].2).unwrap();
         let mixed = setup_command_with_manifests(&store, &home, &state, None, &manifests).unwrap();

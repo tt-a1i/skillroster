@@ -37,7 +37,7 @@ pub struct Cli {
 impl Cli {
     pub fn command_name(&self) -> &'static str {
         match &self.command {
-            Some(Command::Scan) => "scan",
+            Some(Command::Scan(_)) => "scan",
             Some(Command::Report(_)) => "report",
             Some(Command::Find(_)) => "find",
             Some(Command::Plan(_)) => "plan",
@@ -55,7 +55,7 @@ impl Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Discover Skills and persist an immutable Snapshot.
-    Scan,
+    Scan(ScanArgs),
     /// Analyze the latest Snapshot or drill into one Finding. Defaults to the bounded Summary view.
     Report(ReportArgs),
     /// Rank locally known Skills for a task without activating them.
@@ -74,6 +74,13 @@ pub enum Command {
     Setup(SetupArgs),
     /// Confirm, inspect, or revoke exact local source-root read permissions.
     SourceRoot(SourceRootArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ScanArgs {
+    /// Return the bounded Agent continuation view while persisting the complete Snapshot.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(Debug, Args)]
