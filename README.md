@@ -1,154 +1,204 @@
-# SkillRoster
+<p align="center">
+  <img src=".github/assets/skillroster-readme-hero.png" alt="SkillRoster routes one local Skill library into focused rosters for multiple AI agents" width="100%">
+</p>
 
-> One library. The right roster for every agent.
+<h1 align="center">SkillRoster</h1>
 
-SkillRoster is a local-first Agent Skill Manager. It helps people ask an AI agent to inspect, organize, search, right-size, and safely change the Skills installed across local agent harnesses.
+<p align="center">
+  <strong>One library. The right roster for every agent.</strong>
+</p>
 
-The primary caller is an agent. A person should be able to say:
+<p align="center">
+  Local-first Skill governance for AI agents.<br>
+  See what is installed, reduce default exposure, find the right Skill on demand, and make reversible changes.
+</p>
 
-> Use SkillRoster to check whether my agents have too many Skills and propose a safer setup.
+<p align="center">
+  <a href="https://github.com/tt-a1i/skillroster/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/tt-a1i/skillroster?style=flat-square&color=4ADE80"></a>
+  <a href="https://github.com/tt-a1i/skillroster/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/tt-a1i/skillroster/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://github.com/tt-a1i/homebrew-skillroster"><img alt="Homebrew tap" src="https://img.shields.io/badge/Homebrew-tap-FBB040?style=flat-square&logo=homebrew&logoColor=111111"></a>
+  <a href="https://www.rust-lang.org"><img alt="Rust 1.85 or newer" src="https://img.shields.io/badge/Rust-1.85%2B-000000?style=flat-square&logo=rust"></a>
+  <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/badge/License-Apache--2.0-60A5FA?style=flat-square"></a>
+</p>
 
-The agent then calls the `skillroster` CLI and returns an evidence-backed plan for human review.
+<p align="center">
+  <a href="#start-in-30-seconds">Install</a> ·
+  <a href="#what-it-sees">See it work</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="docs/product-spec.md">Product spec</a> ·
+  <a href="docs/installation.md">All platforms</a>
+</p>
 
-## Product principles
+---
 
-- **Agent-first:** one product name, one CLI token, and one bootstrap Skill: `skillroster`.
-- **One-confirmation Apply:** the Agent prepares and explains a complete Plan; the person approves the whole scope once.
-- **Two intentional interfaces:** stable JSON for Agents and a polished, accessible terminal experience for people.
-- **Local-first:** inventory, usage evidence, configuration, plans, and receipts stay on the user's machine by default.
-- **One library, many rosters:** Skills have one canonical local source; each agent receives a curated view instead of the entire catalog.
-- **Evidence before change:** distinguish installed, exposed, invoked, useful, duplicated, stale, and unsafe.
-- **Reversible by default:** mutating operations follow `plan -> apply -> undo` and produce receipts.
-- **No MCP in v1:** the initial product is a Rust CLI plus one thin bootstrap Skill.
+## Your agents do not need every Skill
 
-## Workflow
+Skills accumulate across Codex, Claude Code, Pi, OpenCode, Hermes, Cursor,
+Gemini CLI, and GitHub Copilot. Copies drift. Links break. Narrow Skills occupy
+every default context. Usage evidence gets mistaken for certainty.
+
+SkillRoster gives your agent a deterministic local CLI for understanding that
+estate before changing it.
+
+| See the whole estate | Right-size each Roster | Change without fear |
+| --- | --- | --- |
+| Inventory Skills, placements, links, sources, exposure, and bounded usage evidence. | Keep broadly useful Skills in Core and leave narrower ones searchable On-demand. | Preview immutable Plans, require confirmation, record Receipts, and Undo owned changes. |
+
+It is **not** another marketplace, model, or MCP server. The AI agent interprets
+your intent; SkillRoster supplies bounded facts and executes approved changes.
+
+## Start in 30 seconds
+
+Install the current release with Homebrew:
 
 ```bash
+brew install tt-a1i/skillroster/skillroster
+skillroster --version
+```
+
+Then ask your agent:
+
+> Use SkillRoster to inspect my local Skills, explain the biggest problems, and
+> propose a safer setup. Do not change files until I approve the complete Plan.
+
+Or begin directly in the terminal:
+
+```bash
+skillroster scan --summary
+skillroster report
+```
+
+Agents add `--json` for one stable machine-readable document. Release archives,
+Cargo installation, Windows instructions, and checksum verification are in the
+[installation guide](docs/installation.md).
+
+## What it sees
+
+This is a real read-only v1.8.28 dogfood result from one changing local estate,
+not a benchmark or a universal inventory size:
+
+```text
+SkillRoster · Report
+
+  Independent Skills     252
+  Placements             892
+  Default exposure       525
+  Observed-use Agents    3
+  Session sample         sampled 5/8 · complete 0/8
+
+  Top Findings
+  high    layout     Skill links escape an approved root
+  medium  exposure   Large default Rosters need review
+  medium  overlap    Exact duplicate Skill placements
+
+Read-only · no Agent files changed
+Review evidence before planning changes
+```
+
+The important part is not the large numbers. It is the boundary: SkillRoster
+reports incomplete coverage instead of turning missing observations into an
+“unused” claim. See the full [release acceptance record](docs/acceptance/release-v1.8.28-candidate.md).
+
+## How it works
+
+```mermaid
+flowchart LR
+    P[Person] --> A[AI agent]
+    A --> B[skillroster bootstrap Skill]
+    B --> C[Rust CLI]
+    C --> S[Snapshot + Evidence]
+    S --> F[Findings]
+    F --> L[Immutable Plan]
+    L -->|one confirmation| R[Apply + Receipt]
+    R -. bounded Undo .-> C
+    C --> D[(Local Library)]
+    D --> V[Per-agent Rosters]
+```
+
+Three ideas keep the model simple:
+
+| Concept | Meaning |
+| --- | --- |
+| **Library** | The complete logical collection of known local Skills. |
+| **Roster** | The curated view exposed to one agent; it is not another copy of the Library. |
+| **On-demand Skill** | A valid Skill omitted from default exposure but retained for local search and exact loading. |
+
+The primary caller is an agent. Semantic judgment stays with the model; identity,
+filesystem boundaries, persistence, validation, and mutation stay with the CLI.
+
+## The Agent-facing loop
+
+```bash
+# Observe
 skillroster scan --summary --json
-skillroster --source-root /absolute/confirmed/source scan --summary --json
-skillroster report --json
 skillroster report --findings --limit 20 --json
-skillroster report --findings --category usage --json
-skillroster report --finding <finding-id> --json       # 5-row compact first view
-skillroster report --finding <finding-id> --full --json
-skillroster report --full --json
-skillroster find "database migration" --json
-skillroster find "把中文改自然一点" --json
-skillroster find "诊断命令性能回归" --hint "diagnose command performance regression" --json
-skillroster find "分析本地表格" --hint "analyze standalone spreadsheet file workbook data" --json
-skillroster find "build an event manifest" --load --limit 1 --json
-skillroster find "compare exact variants" --load --limit 1 --variant-skill-id skill_... --json
+
+# Retrieve one complete, fingerprint-verified Skill
+skillroster find "review this pull request" --load --limit 1 --json
+
+# Preview bootstrap installation across detected agents
+skillroster setup --json
+
+# Review and execute an Agent-authored governance decision
 skillroster plan --stdin --json
 skillroster plan --show <plan-id> --json
 skillroster apply <plan-id> --json
 skillroster undo <receipt-id> --json
-skillroster setup --json
+
+# Inspect recovery and retained local state
 skillroster status --json
-skillroster source-root confirm --finding <finding-id> --path /absolute/observed/source --json
-skillroster source-root inspect --json
-skillroster source-root revoke <permission-id> --json
-skillroster lifecycle inspect --json
-skillroster lifecycle export --output ./skillroster-export.json --json
-skillroster lifecycle exclude codex --json
-skillroster lifecycle purge --raw-days 180 --json
-skillroster lifecycle recovery --json
 ```
 
-Agents use JSON mode; people can omit it for concise terminal output. Read-only
-commands never change Agent files. Plan stores an immutable preview, while Apply
-and Undo use fingerprints, journals, receipts, and recovery blocking.
-When Top-1 has divergent same-name identities, ordinary Find returns exact
-read-only retry actions. Each action can load one exposed identity for the Agent
-to compare; it never selects canonical content or changes a Roster.
-See [docs/local-data-lifecycle.md](docs/local-data-lifecycle.md) before purging
-Plan/Receipt history or deleting the local database.
-See [docs/installation.md](docs/installation.md) for verified Release, Cargo,
-and Homebrew installation paths.
+The CLI also supports Finding drilldown, exact same-name variants, confirmed
+source roots, lifecycle export and retention controls. Read the
+[product specification](docs/product-spec.md) for the complete contract and the
+[local data lifecycle](docs/local-data-lifecycle.md) before purging history.
 
-Run `setup` after the first Scan and after each CLI upgrade. Missing or exact
-official older bootstrap Skills become a recoverable Plan. A locally modified
-copy is never replaced implicitly: the Agent must show the affected targets and
-ask the user before retrying with `--modified-choice retain-local` or
-`--modified-choice adopt-current`. Links, non-files, and unreadable targets are
-preserved and reported as blocked.
+## Safety is product behavior
 
-`--root AGENT=PATH` adds an Agent placement root and therefore contributes to
-that Agent's default exposure. `--source-root PATH` approves a non-exposed
-canonical source directory for the current Scan. Neither option crawls outside
-the exact supplied path.
+- **Read-only first.** Scan, Report, Find, Setup preview, and Status do not
+  modify Agent files.
+- **Evidence before action.** A Finding describes an observed condition; it
+  never authorizes a change by itself.
+- **One explicit confirmation.** The agent explains one complete Plan before
+  Apply.
+- **Fail closed on drift.** Changed, ambiguous, unreadable, or unsupported
+  targets block mutation instead of producing a partial success.
+- **Receipts and recovery.** Every successful mutation is journaled, verified,
+  and bounded by an Undo Receipt.
+- **Local by default.** Inventory, fingerprints, bounded usage observations,
+  Plans, and Receipts stay on the machine; raw conversation text is not stored.
 
-For a reusable decision, `source-root confirm` records one exact local read
-permission bound to the current escaping-link Finding and stable filesystem
-identity. It does not endorse the source, raise Evidence quality, or authorize
-Plan/Apply. Missing, replaced, or retargeted roots fail closed; inspect or
-revoke the local audit record explicitly. Scan checks the frozen identity and
-entrypoint binding before and after bounded discovery/consumption and discards
-facts when it observes drift. This detects accidental or persistent local
-drift; it is not a sandbox against a malicious same-user ABA race.
+## Supported local agents
 
-Agent-authored Plans are declarative: they reference the latest Snapshot and
-Evidence IDs, then request Roster states, managed/hosted Library placement, or a
-source update. Raw filesystem operations are rejected. Library consolidation
-keeps canonical content recoverable and replaces verified duplicate placements
-with links; every applied sequence is bounded by a Receipt and can be undone.
-The initial Plan response is a bounded decision summary. Its `diff_summary`
-shows the semantic Roster, Library, and filesystem deltas (or bounded line
-facts for a source update). Exact operations and complete internal ID lists
-remain in the immutable local Plan and are available on demand through
-`plan --show`, so large governance scopes do not flood the Agent's context.
+| Codex | Claude Code | Pi | OpenCode |
+| :---: | :---: | :---: | :---: |
+| ✓ | ✓ | ✓ | ✓ |
 
-For an exact-duplicate Finding, the Agent submits only the choices it owns:
+| Hermes | Cursor | Gemini CLI | GitHub Copilot |
+| :---: | :---: | :---: | :---: |
+| ✓ | ✓ | ✓ | ✓ |
 
-```json
-{"schema_version":1,"finding_library_changes":[{"finding_id":"finding_...","canonical_placement_id":"placement_...","requested_state":"managed"}]}
-```
+Support is capability-aware: discovery does not imply that every harness allows
+the same activation or mutation mechanism. SkillRoster reports those boundaries
+instead of pretending the adapters are interchangeable.
 
-SkillRoster resolves the current Snapshot, Evidence, Skill, and complete
-placement set from that immutable Finding and rejects stale or mismatched input.
+## Project status
 
-For a large default-Roster Finding, the Agent chooses a Core budget instead of
-copying every Skill and placement into the request:
+SkillRoster v1.8.28 implements the local governance loop: discovery, normalized
+inventory, conservative usage evidence, bounded reporting, local retrieval,
+immutable planning, Apply/Undo, recovery, lifecycle controls, and eight direct
+agent adapters.
 
-```json
-{"schema_version":1,"finding_roster_changes":[{"finding_id":"finding_...","core_budget":50,"protected_skill_ids":[]}]}
-```
-
-The CLI preserves declared and protected Core Skills, ranks target-Agent usage
-first, then usage from another local Agent for the exact same stable Skill ID,
-and moves only the remainder to On-demand. Cross-Agent evidence is labeled with
-its source Agent and never inferred from a matching name. Missing usage is not
-treated as evidence for archiving. A placement without exact owned canonical
-content blocks the semantic Plan; the Agent follows the typed decision to
-confirm source roots or resolve a dependent source link, then rescans instead
-of applying a partial scope.
-
-Finding drilldown is compact by default: each paged `item` carries one
-traceable Evidence ID, subject, path, and decision facts. Complete duplicate ID
-collections, placement records, and Evidence records stay behind explicit
-`report --finding ID --full --json`. Unsafe escaping links return a trust
-decision and observed targets instead of suggesting an automatic filesystem
-Plan.
-
-The three-Finding summary also includes compact Finding-group rollups with
-deduplicated affected Skill and placement counts. It leads to
-`report --findings`, a compact paged list that can be filtered by category or
-severity. This gives Agents both the complete problem scale and a bounded path
-to every Finding without loading the exhaustive report. Selector-free `report`
-returns this bounded summary; `--summary` is an explicit alias and `--full`
-requests the exhaustive diagnostic export. Only a selected Finding leads to
-Evidence inspection or planning.
-
-## Status
-
-SkillRoster 1.0 implements the complete local governance loop,
-including read-only analysis, versioned immutable Plans, Receipt-bounded
-Apply/Undo, lifecycle controls, recovery, and eight direct Agent adapters.
-Platform support is claimed only after the corresponding release workflow and
-artifact smoke test are recorded in the release acceptance evidence.
-
-See [docs/product-spec.md](docs/product-spec.md) for the complete requirements, [docs/implementation-plan.md](docs/implementation-plan.md) for delivery checkpoints, and [CONTEXT.md](CONTEXT.md) for canonical vocabulary.
+- [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
+- [Release and platform evidence](docs/acceptance/release-v1.8.28-candidate.md)
+- [Acceptance ledger](docs/acceptance.md)
+- [Product brief](docs/product-brief.md)
+- [Canonical vocabulary](CONTEXT.md)
 
 ## Development
+
+Rust 1.85 or newer is required.
 
 ```bash
 cargo fmt --check
@@ -157,6 +207,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- --help
 ```
 
+Core logic and high-risk mutation boundaries are tested. See
+[AGENTS.md](AGENTS.md) for repository conventions.
+
 ## License
 
-SkillRoster is licensed under the [Apache License 2.0](LICENSE).
+SkillRoster is available under the [Apache License 2.0](LICENSE).
