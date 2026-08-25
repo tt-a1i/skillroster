@@ -328,6 +328,13 @@ action for pagination and the direct drilldowns follow in Summary order.
 `report --finding ID --json` returns compact paged Evidence items by default.
 Each item contains the Evidence ID, subject, path, quality, and decision facts;
 it does not repeat complete affected-ID, placement, and Evidence collections.
+When the Finding belongs to an older Report and a newer persisted Report covers
+the latest completed Snapshot, the same response includes bounded
+`current_continuity` facts. Stable placement ID intersection is the only join:
+the result exposes complete overlap and missing counts, compact current Finding
+references, and current path/status facts for the requested historical page.
+Unavailable current facts fail soft, and zero overlap is never a resolution
+claim. This comparison does not Scan, inspect new Skill content, Plan, or Apply.
 `--full` explicitly requests those complete paged records. For escaping links,
 the Finding returns a trust-confirmation resolution and observed link targets;
 it must not advertise an automatic Plan before the source is confirmed.
