@@ -3008,7 +3008,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
     ] {
         assert_eq!(
             fs::read_to_string(package.join(relative_path)).unwrap(),
-            expected
+            expected.replace("\r\n", "\n")
         );
     }
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
