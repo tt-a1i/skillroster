@@ -59,18 +59,21 @@ installation with `skillroster --version` and `skillroster --help`.
 
 ## Homebrew
 
-The public repository also acts as a source-building Homebrew tap:
+Install from the official SkillRoster tap. Homebrew adds the tap automatically:
 
 ```sh
-brew tap tt-a1i/skillroster https://github.com/tt-a1i/skillroster.git
 brew install tt-a1i/skillroster/skillroster
 brew test skillroster
 ```
 
-The repository is public, so cloning the source and downloading Release
-archives do not require GitHub authentication. This is a repository-backed
-custom tap, not a Homebrew/core Formula. Never paste a GitHub token into the
-Formula or a command line.
+To add the tap before installing, run `brew tap tt-a1i/skillroster`, then
+`brew install skillroster`.
+
+The source repository and the
+[Homebrew tap](https://github.com/tt-a1i/homebrew-skillroster) are public, so
+installation does not require GitHub authentication. This is an upstream tap,
+not a Homebrew/core Formula. Never paste a GitHub token into a Formula or a
+command line.
 
 ## Install or upgrade the Agent bootstrap Skill
 
