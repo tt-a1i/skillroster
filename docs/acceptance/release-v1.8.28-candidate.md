@@ -45,11 +45,35 @@ An isolated macOS arm64 upgrade used the exact files from tag v1.8.27:
 
 ## Candidate gates
 
-The release-candidate workflow must still prove the packaged binary on macOS
-arm64, macOS x64, Linux x64, Windows x64, and checksum-pinned Ubuntu WSL. The
-four archives and adjacent SHA-256 files must be downloaded and independently
-verified. A packaged v1.8.28 binary must then repeat the read-only real-home
-cold start without Apply or user-file changes.
+Candidate source revision `ff357bb96c5487197471eae67b9d3908ba5cb624`
+passed the complete PR CI matrix in run
+[`32809541414`](https://github.com/tt-a1i/skillroster/actions/runs/32809541414).
+Linux x64, macOS arm64, macOS x64, and Windows x64 passed their required tests;
+the CI gate passed.
+
+Release-candidate run
+[`32809543938`](https://github.com/tt-a1i/skillroster/actions/runs/32809543938)
+passed for macOS arm64, macOS x64, Linux x64, Windows x64, and checksum-pinned
+Ubuntu WSL. All four downloaded archives passed their adjacent SHA-256 checks.
+All tar listings and the Windows zip integrity check passed. The packaged
+macOS arm64 binary reported SkillRoster 1.8.28 and passed its help smoke test.
+
+The same downloaded macOS arm64 candidate then performed a fresh read-only
+real-home cold start against a temporary state directory:
+
+- Scan completed in 6.47 seconds; Report in 0.59 seconds; Find in 0.13 seconds;
+  Status in 0.01 seconds on this machine. These are observations, not portable
+  performance guarantees.
+- Report found 251 independent Skills, 887 placements, and 521 default
+  exposures, matching the v1.8.27 baseline. It observed use for three Agents.
+- Coverage remained conservative: zero complete Agents, five sampled/limited
+  Agents, and three missing session roots. No unused claim is supported.
+- The review task ranked `code-review`, `review`, and `github-code-review` as
+  its Top 3 matches.
+- Status reported zero pending Plans, no Receipt, clear recovery, and no
+  journal issues.
+- Scan, Report, Find, and Status each reported `files_changed: false`. Setup,
+  Apply, and Undo were not invoked against the real home.
 
 Candidate artifacts do not publish a tag or GitHub Release. Final publication
 remains a separate user-authorized gate.
