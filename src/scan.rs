@@ -1547,13 +1547,18 @@ fn observe_physical_skill_package(
                 "could not completely fingerprint Skill package {}: {error}",
                 display_directory.display()
             ));
+            let executable_relative_files = package_checkpoint(physical_directory)
+                .ok()
+                .flatten()
+                .map(|checkpoints| executable_files_from_checkpoints(&checkpoints))
+                .unwrap_or_default();
             (
                 stable_digest(content.as_bytes()),
                 None,
                 completeness,
                 Some(error.to_string()),
                 None,
-                Vec::new(),
+                executable_relative_files,
             )
         }
     };
@@ -1593,6 +1598,7 @@ fn materialize_candidates_with_hook(
 ) -> usize {
     let mut skills = BTreeMap::<String, ScannedSkill>::new();
     let mut physical_packages = BTreeMap::<PathBuf, PhysicalPackageObservation>::new();
+    let mut drifted_physical_packages = BTreeMap::<PathBuf, String>::new();
     let mut physical_package_observations = 0;
     for candidate in candidates {
         let directory = candidate
@@ -1627,7 +1633,7 @@ fn materialize_candidates_with_hook(
             LinkStatus::Broken | LinkStatus::EscapesRoot
         ) && placement_binding_valid_before_read
             && durable_binding_valid_before_read;
-        let (observation, package_checkpoint_valid) = if initially_safe {
+        let (observation, package_validation_error) = if initially_safe {
             let physical_entrypoint = candidate
                 .expected_physical_entrypoint
                 .as_ref()
@@ -1636,19 +1642,37 @@ fn materialize_candidates_with_hook(
                 expected_directory.expect("safe binding has a physical directory");
             let cacheable = durable_anchor.is_none() && !temporary_override;
             if cacheable {
-                if let Some(observation) = physical_packages.get(physical_entrypoint) {
-                    let checkpoint_valid =
-                        observation.checkpoint.as_ref().is_some_and(|expected| {
-                            package_checkpoint(physical_directory)
-                                .ok()
-                                .flatten()
-                                .as_ref()
-                                == Some(expected)
-                        });
-                    if checkpoint_valid {
-                        (observation.clone(), true)
+                if let Some(reason) = drifted_physical_packages.get(physical_entrypoint) {
+                    (
+                        unreadable_package_observation(&candidate),
+                        Some(reason.clone()),
+                    )
+                } else if let Some(observation) =
+                    physical_packages.get(physical_entrypoint).cloned()
+                {
+                    let validation_error = match package_checkpoint(physical_directory) {
+                        Ok(Some(current))
+                            if observation.checkpoint.as_ref() == Some(&current) =>
+                        {
+                            None
+                        }
+                        Ok(Some(_)) => {
+                            Some("physical package changed before cache reuse".into())
+                        }
+                        Ok(None) => Some(
+                            "physical package could not be completely revalidated before cache reuse"
+                                .into(),
+                        ),
+                        Err(error) => Some(format!(
+                            "physical package could not be revalidated before cache reuse: {error}"
+                        )),
+                    };
+                    if let Some(reason) = validation_error {
+                        drifted_physical_packages
+                            .insert(physical_entrypoint.clone(), reason.clone());
+                        (unreadable_package_observation(&candidate), Some(reason))
                     } else {
-                        (unreadable_package_observation(&candidate), false)
+                        (observation, None)
                     }
                 } else {
                     physical_package_observations += 1;
@@ -1662,7 +1686,7 @@ fn materialize_candidates_with_hook(
                     if observation.checkpoint.is_some() {
                         physical_packages.insert(physical_entrypoint.clone(), observation.clone());
                     }
-                    (observation, true)
+                    (observation, None)
                 }
             } else {
                 physical_package_observations += 1;
@@ -1674,7 +1698,7 @@ fn materialize_candidates_with_hook(
                         &directory,
                         result,
                     ),
-                    true,
+                    None,
                 )
             }
         } else {
@@ -1682,7 +1706,7 @@ fn materialize_candidates_with_hook(
                 "did not read unsafe Skill link {}",
                 candidate.entrypoint.display()
             ));
-            (unreadable_package_observation(&candidate), true)
+            (unreadable_package_observation(&candidate), None)
         };
         let PhysicalPackageObservation {
             mut content,
@@ -1705,12 +1729,12 @@ fn materialize_candidates_with_hook(
         let safe_to_read = initially_safe
             && placement_binding_valid_after
             && durable_binding_valid_after
-            && package_checkpoint_valid;
+            && package_validation_error.is_none();
         if !placement_binding_valid_before_read
             || !placement_binding_valid_after
             || !durable_binding_valid_before_read
             || !durable_binding_valid_after
-            || !package_checkpoint_valid
+            || package_validation_error.is_some()
         {
             if let Some(physical_entrypoint) = candidate.expected_physical_entrypoint.as_ref() {
                 physical_packages.remove(physical_entrypoint);
@@ -1720,8 +1744,8 @@ fn materialize_candidates_with_hook(
                     .durable_read_drifted_permission_ids
                     .insert(root.permission_id.clone());
             }
-            let drift_kind = if !package_checkpoint_valid {
-                "physical package drift before cache reuse"
+            let drift_kind = if let Some(reason) = package_validation_error.as_deref() {
+                reason
             } else if durable_anchor.is_some() {
                 "durable source-root binding drift"
             } else {
@@ -1738,7 +1762,7 @@ fn materialize_candidates_with_hook(
             content_identity_digest = None;
             fingerprint_completeness = FingerprintCompleteness::Unreadable;
             fingerprint_detail = Some(format!(
-                "Skill package data was discarded because its {drift_kind} was detected"
+                "Skill package data was discarded because {drift_kind}"
             ));
             executable_files.clear();
         };
@@ -2123,12 +2147,8 @@ fn package_checkpoint(directory: &Path) -> io::Result<Option<Vec<PackageFileChec
     package_file_checkpoints(&files).map(Some)
 }
 
-fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
-    let mut files = Vec::new();
-    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    let checkpoints = package_file_checkpoints(&files)?;
-    let executable_relative_files = checkpoints
+fn executable_files_from_checkpoints(checkpoints: &[PackageFileCheckpoint]) -> Vec<PathBuf> {
+    checkpoints
         .iter()
         .filter_map(|checkpoint| {
             let extension_is_script = checkpoint
@@ -2156,7 +2176,15 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
                 && (extension_is_script || checkpoint.mode & 0o111 != 0))
                 .then(|| checkpoint.relative_path.clone())
         })
-        .collect();
+        .collect()
+}
+
+fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
+    let mut files = Vec::new();
+    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let checkpoints = package_file_checkpoints(&files)?;
+    let executable_relative_files = executable_files_from_checkpoints(&checkpoints);
 
     let mut digest = Sha256::new();
     let mut content_identity_digest = Sha256::new();
@@ -3611,6 +3639,7 @@ enabled = true
         let skill = root.join("oversized");
         fs::create_dir_all(&skill).unwrap();
         fs::write(skill.join("SKILL.md"), "---\nname: oversized\n---\n").unwrap();
+        fs::write(skill.join("repair.sh"), "#!/bin/sh\n").unwrap();
         let asset = File::create(skill.join("asset.bin")).unwrap();
         asset.set_len(MAX_SKILL_PACKAGE_BYTES + 1).unwrap();
 
@@ -3632,6 +3661,10 @@ enabled = true
                 .fingerprint_detail
                 .as_deref()
                 .is_some_and(|detail| detail.contains("fingerprint safety limit"))
+        );
+        assert_eq!(
+            result.placements[0].executable_files,
+            vec![skill.join("repair.sh")]
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3955,6 +3988,7 @@ enabled = true
         for (agent, directory_name) in [
             (AgentKind::Codex, "codex"),
             (AgentKind::ClaudeCode, "claude"),
+            (AgentKind::Pi, "pi"),
         ] {
             let agent_root = temp.path().join(directory_name);
             fs::create_dir(&agent_root).unwrap();
@@ -3978,7 +4012,7 @@ enabled = true
 
         assert_eq!(stats, 1);
         assert_eq!(result.skills.len(), 1);
-        assert_eq!(result.placements.len(), 2);
+        assert_eq!(result.placements.len(), 3);
         assert!(result.placements.iter().all(|placement| {
             placement.physical_directory.as_ref() == Some(&source)
                 && placement.executable_files == vec![placement.directory.join("scripts/run.sh")]
@@ -4005,6 +4039,7 @@ enabled = true
         for (agent, directory_name) in [
             (AgentKind::Codex, "codex"),
             (AgentKind::ClaudeCode, "claude"),
+            (AgentKind::Pi, "pi"),
         ] {
             let agent_root = temp.path().join(directory_name);
             fs::create_dir(&agent_root).unwrap();
@@ -4034,7 +4069,7 @@ enabled = true
             });
 
         assert_eq!(observations, 1);
-        assert_eq!(result.placements.len(), 2);
+        assert_eq!(result.placements.len(), 3);
         assert_eq!(
             result.placements[0].fingerprint_completeness,
             FingerprintCompleteness::Complete
@@ -4046,11 +4081,17 @@ enabled = true
         );
         assert!(!result.placements[1].governable);
         assert!(result.placements[1].physical_directory.is_none());
+        assert_eq!(
+            result.placements[2].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert!(!result.placements[2].governable);
+        assert!(result.placements[2].physical_directory.is_none());
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|warning| { warning.contains("physical package drift before cache reuse") })
+                .any(|warning| warning.contains("physical package changed before cache reuse"))
         );
     }
 
