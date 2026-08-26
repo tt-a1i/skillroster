@@ -1340,6 +1340,9 @@ fn classify_generic_error(error: &(dyn std::error::Error + 'static)) -> (&'stati
         };
     }
     if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if scan::is_non_unicode_identity_error(io) {
+            return ("non_unicode_identity_path", false);
+        }
         return match io.kind() {
             std::io::ErrorKind::PermissionDenied => ("path_permission_denied", false),
             std::io::ErrorKind::NotFound => ("path_not_found", false),
@@ -2705,6 +2708,7 @@ const fn coverage_retry_disposition(
         | scan::SessionCoverageLimitationCode::SampledByteLimit
         | scan::SessionCoverageLimitationCode::SampledLineLimit
         | scan::SessionCoverageLimitationCode::FileByteLimit
+        | scan::SessionCoverageLimitationCode::FilePathNotUnicode
         | scan::SessionCoverageLimitationCode::JsonExtractionLimit
         | scan::SessionCoverageLimitationCode::JsonRecordLimit
         | scan::SessionCoverageLimitationCode::LineAlignmentLoss => {
@@ -10686,6 +10690,25 @@ mod recovery_tests {
         let error = ActionContext::from_cli(&cli).unwrap_err();
 
         assert!(error.to_string().contains("must be valid Unicode"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_classifies_a_non_unicode_identity_path_without_lossy_text() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut options = ScanOptions::for_home("/tmp/skillroster-unicode-home");
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff])),
+        });
+        let error = scan::scan(&options).unwrap_err();
+
+        assert_eq!(
+            classify_generic_error(&error),
+            ("non_unicode_identity_path", false)
+        );
+        assert!(!error.to_string().contains('\u{fffd}'));
     }
 
     #[test]

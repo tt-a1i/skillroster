@@ -318,6 +318,7 @@ pub enum SessionCoverageLimitationCode {
     FileMetadataFailure,
     FileReadFailure,
     FileZeroRead,
+    FilePathNotUnicode,
     JsonExtractionLimit,
     JsonRecordLimit,
     LineAlignmentLoss,
@@ -504,6 +505,23 @@ struct DiscoveryState {
     hidden_ancestor: bool,
     inside_skill_package: bool,
     harness_excluded: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SkillDiscoveryOutcome {
+    depth_bounded: bool,
+    non_unicode_skipped: bool,
+}
+
+impl SkillDiscoveryOutcome {
+    fn merge(&mut self, other: Self) {
+        self.depth_bounded |= other.depth_bounded;
+        self.non_unicode_skipped |= other.non_unicode_skipped;
+    }
+
+    fn is_complete(self) -> bool {
+        !self.depth_bounded && !self.non_unicode_skipped
+    }
 }
 
 impl DiscoveryState {
@@ -880,6 +898,7 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 }
 
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
+    require_unicode_scan_options(options)?;
     let mut result = ScanResult {
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
         ..ScanResult::default()
@@ -1060,6 +1079,29 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     Ok(result)
 }
 
+fn require_unicode_scan_options(options: &ScanOptions) -> io::Result<()> {
+    let paths = std::iter::once(options.home.as_path())
+        .chain(
+            options
+                .explicit_skill_roots
+                .iter()
+                .map(|root| root.path.as_path()),
+        )
+        .chain(options.explicit_source_roots.iter().map(PathBuf::as_path))
+        .chain(
+            options
+                .durable_read_roots
+                .iter()
+                .map(|root| root.path.as_path()),
+        )
+        .chain(options.managed_source_roots.iter().map(PathBuf::as_path));
+    if paths.into_iter().all(|path| path.to_str().is_some()) {
+        Ok(())
+    } else {
+        Err(non_unicode_identity_error())
+    }
+}
+
 fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut normalized = roots
         .iter()
@@ -1124,9 +1166,19 @@ fn observe_skill_root(
         DiscoveryState::default(),
         candidates,
     ) {
-        Ok(true) => {}
-        Ok(false) => {
-            let detail = format!("Skill discovery was bounded at depth {max_depth}");
+        Ok(outcome) if outcome.is_complete() => {}
+        Ok(outcome) => {
+            let mut details = Vec::new();
+            if outcome.depth_bounded {
+                details.push(format!("Skill discovery was bounded at depth {max_depth}"));
+            }
+            if outcome.non_unicode_skipped {
+                details.push(
+                    "Skill discovery skipped a non-Unicode path that cannot have stable identity"
+                        .to_owned(),
+                );
+            }
+            let detail = details.join("; ");
             result.warnings.push(format!(
                 "could not completely inspect skill root {}: {detail}",
                 root.display()
@@ -1244,15 +1296,18 @@ fn discover_entrypoints(
     max_depth: usize,
     state: DiscoveryState,
     output: &mut Vec<EntryCandidate>,
-) -> io::Result<bool> {
+) -> io::Result<SkillDiscoveryOutcome> {
     let depth = directory
         .strip_prefix(placement_root)
         .map(|path| path.components().count())
         .unwrap_or(max_depth.saturating_add(1));
     if depth > max_depth {
-        return Ok(false);
+        return Ok(SkillDiscoveryOutcome {
+            depth_bounded: true,
+            non_unicode_skipped: false,
+        });
     }
-    let mut complete = true;
+    let mut outcome = SkillDiscoveryOutcome::default();
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     let directory_has_skill = directory.join("SKILL.md").is_file();
@@ -1262,7 +1317,9 @@ fn discover_entrypoints(
         let file_name = entry.file_name();
         if file_name == "SKILL.md" {
             let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
-            let expected_physical_entrypoint = fs::canonicalize(&path).ok();
+            let expected_physical_entrypoint = fs::canonicalize(&path)
+                .ok()
+                .filter(|path| path.to_str().is_some());
             let default_exposed =
                 default_exposure_for_candidate(policy, placement_root, &path, depth, state);
             output.push(EntryCandidate {
@@ -1277,9 +1334,12 @@ fn discover_entrypoints(
                 default_exposed,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            let child_name = file_name.to_string_lossy();
-            let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
-            complete &= discover_entrypoints(
+            let Some(child_name) = file_name.to_str() else {
+                outcome.non_unicode_skipped = true;
+                continue;
+            };
+            let child_state = state.descend(policy.agent, child_name, directory_has_skill);
+            outcome.merge(discover_entrypoints(
                 policy,
                 placement_root,
                 approved_roots,
@@ -1287,16 +1347,21 @@ fn discover_entrypoints(
                 max_depth,
                 child_state,
                 output,
-            )?;
+            )?);
         } else if metadata.file_type().is_symlink() {
             // A linked Skill directory is a placement too, but it is never
             // traversed recursively before the boundary has been evaluated.
             let linked_entrypoint = path.join("SKILL.md");
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
+            let Some(child_name) = file_name.to_str() else {
+                outcome.non_unicode_skipped = true;
+                continue;
+            };
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
-                let expected_physical_entrypoint = fs::canonicalize(&linked_entrypoint).ok();
-                let child_name = file_name.to_string_lossy();
-                let child_state = state.descend(policy.agent, &child_name, directory_has_skill);
+                let expected_physical_entrypoint = fs::canonicalize(&linked_entrypoint)
+                    .ok()
+                    .filter(|path| path.to_str().is_some());
+                let child_state = state.descend(policy.agent, child_name, directory_has_skill);
                 let default_exposed = default_exposure_for_candidate(
                     policy,
                     placement_root,
@@ -1318,7 +1383,7 @@ fn discover_entrypoints(
             }
         }
     }
-    Ok(complete)
+    Ok(outcome)
 }
 
 const HERMES_EXCLUDED_SKILL_DIRS: &[&str] = &[
@@ -1368,7 +1433,10 @@ fn default_exposure_for_candidate(
                     let mut components = path.components();
                     (components.next()?.as_os_str() == ".system").then(|| {
                         components.all(|component| {
-                            !component.as_os_str().to_string_lossy().starts_with('.')
+                            component
+                                .as_os_str()
+                                .to_str()
+                                .is_some_and(|name| !name.starts_with('.'))
                         })
                     })
                 })
@@ -1389,7 +1457,8 @@ fn default_exposure_for_candidate(
                 && entrypoint
                     .parent()
                     .and_then(Path::file_name)
-                    .is_some_and(|name| !name.to_string_lossy().starts_with('.'))
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
         }
         SkillDiscoverySemantics::Pi => {
             !state.hidden_ancestor && !state.inside_skill_package && !state.harness_excluded
@@ -1411,6 +1480,9 @@ fn inspect_link(
         Ok(target) => target,
         Err(_) => return (None, LinkStatus::Broken),
     };
+    if raw_target.to_str().is_none() {
+        return (None, LinkStatus::Broken);
+    }
     let target = if raw_target.is_absolute() {
         raw_target
     } else {
@@ -1538,7 +1610,9 @@ fn observe_physical_skill_package(
             fingerprint.executable_relative_files,
         ),
         Err(error) => {
-            let completeness = if error.kind() == io::ErrorKind::InvalidData {
+            let completeness = if is_non_unicode_identity_error(&error) {
+                FingerprintCompleteness::Unreadable
+            } else if error.kind() == io::ErrorKind::InvalidData {
                 FingerprintCompleteness::Bounded
             } else {
                 FingerprintCompleteness::Unreadable
@@ -1576,11 +1650,15 @@ fn observe_physical_skill_package(
 }
 
 fn unreadable_package_observation(candidate: &EntryCandidate) -> PhysicalPackageObservation {
+    let entrypoint = candidate
+        .entrypoint
+        .to_str()
+        .expect("discovery excludes non-Unicode entrypoints");
     PhysicalPackageObservation {
         content: String::new(),
         modified_at: None,
         metadata: SkillMetadata::default(),
-        digest: stable_digest(candidate.entrypoint.to_string_lossy().as_bytes()),
+        digest: stable_digest(entrypoint.as_bytes()),
         content_identity_digest: None,
         fingerprint_completeness: FingerprintCompleteness::Unreadable,
         fingerprint_detail: Some("Skill package was not read because its link is unsafe".into()),
@@ -1758,7 +1836,11 @@ fn materialize_candidates_with_hook(
             content.clear();
             modified_at = None;
             metadata = SkillMetadata::default();
-            digest = stable_digest(candidate.entrypoint.to_string_lossy().as_bytes());
+            let entrypoint = candidate
+                .entrypoint
+                .to_str()
+                .expect("discovery excludes non-Unicode entrypoints");
+            digest = stable_digest(entrypoint.as_bytes());
             content_identity_digest = None;
             fingerprint_completeness = FingerprintCompleteness::Unreadable;
             fingerprint_detail = Some(format!(
@@ -1772,15 +1854,22 @@ fn materialize_candidates_with_hook(
             _ if safe_to_read && !content.is_empty() => {
                 content_identity_digest.as_ref().map_or_else(
                     || {
-                        format!(
-                            "incomplete-content:{}:{digest}",
-                            candidate.entrypoint.display()
-                        )
+                        let entrypoint = candidate
+                            .entrypoint
+                            .to_str()
+                            .expect("discovery excludes non-Unicode entrypoints");
+                        format!("incomplete-content:{entrypoint}:{digest}")
                     },
                     |identity| format!("content:{identity}"),
                 )
             }
-            _ => format!("unreadable-link:{}", candidate.entrypoint.display()),
+            _ => {
+                let entrypoint = candidate
+                    .entrypoint
+                    .to_str()
+                    .expect("discovery excludes non-Unicode entrypoints");
+                format!("unreadable-link:{entrypoint}")
+            }
         };
         let skill_id = format!("skill_{}", stable_digest(identity_basis.as_bytes()));
         let name = metadata
@@ -1789,7 +1878,7 @@ fn materialize_candidates_with_hook(
             .or_else(|| {
                 directory
                     .file_name()
-                    .map(|name| name.to_string_lossy().into())
+                    .and_then(|name| name.to_str().map(str::to_owned))
             })
             .unwrap_or_else(|| "unnamed".into());
         let normalized_text = normalize_search_text(&content);
@@ -1802,7 +1891,9 @@ fn materialize_candidates_with_hook(
         });
         let declared_name_matches_directory = metadata.name.as_ref().and_then(|declared| {
             directory.file_name().map(|directory_name| {
-                declared.eq_ignore_ascii_case(&directory_name.to_string_lossy())
+                directory_name
+                    .to_str()
+                    .is_some_and(|name| declared.eq_ignore_ascii_case(name))
             })
         });
         skills
@@ -1818,11 +1909,19 @@ fn materialize_candidates_with_hook(
                 normalized_text,
                 modified_at_unix: modified_at,
             });
+        let root = candidate
+            .root
+            .to_str()
+            .expect("discovery excludes non-Unicode roots");
+        let entrypoint = candidate
+            .entrypoint
+            .to_str()
+            .expect("discovery excludes non-Unicode entrypoints");
         let placement_basis = format!(
             "{}\0{}\0{}",
             candidate.agent.map(AgentKind::id).unwrap_or("explicit"),
-            candidate.root.display(),
-            candidate.entrypoint.display()
+            root,
+            entrypoint
         );
         let mutation_scope = if candidate.provider.is_some() {
             MutationScope::ProviderReadOnly
@@ -2080,6 +2179,31 @@ struct PackageFingerprint {
     executable_relative_files: Vec<PathBuf>,
 }
 
+const NON_UNICODE_IDENTITY_DETAIL: &str = "non-Unicode path cannot participate in stable identity";
+
+#[derive(Debug)]
+struct NonUnicodeIdentityPath;
+
+impl std::fmt::Display for NonUnicodeIdentityPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(NON_UNICODE_IDENTITY_DETAIL)
+    }
+}
+
+impl std::error::Error for NonUnicodeIdentityPath {}
+
+fn non_unicode_identity_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, NonUnicodeIdentityPath)
+}
+
+pub(crate) fn is_non_unicode_identity_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::InvalidData
+        && error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<NonUnicodeIdentityPath>())
+            .is_some()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PackageFileCheckpoint {
     relative_path: PathBuf,
@@ -2103,12 +2227,21 @@ fn package_file_checkpoints(
     files
         .iter()
         .map(|(relative_path, path, _)| {
+            if relative_path.to_str().is_none() {
+                return Err(non_unicode_identity_error());
+            }
             let metadata = fs::symlink_metadata(path)?;
             let file_type = metadata.file_type();
             let symlink_target = file_type
                 .is_symlink()
                 .then(|| fs::read_link(path))
                 .transpose()?;
+            if symlink_target
+                .as_deref()
+                .is_some_and(|target| target.to_str().is_none())
+            {
+                return Err(non_unicode_identity_error());
+            }
             #[cfg(unix)]
             let mode = {
                 use std::os::unix::fs::PermissionsExt;
@@ -2191,7 +2324,9 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
     let mut total_bytes = 0_u64;
     for (relative_path, path, file_type) in files {
         let is_source_control_metadata = relative_path == Path::new(".gitignore");
-        let relative_path_bytes = relative_path.to_string_lossy();
+        let relative_path_bytes = relative_path
+            .to_str()
+            .expect("package checkpoints reject non-Unicode paths");
         digest.update(relative_path_bytes.as_bytes());
         digest.update([0]);
         if !is_source_control_metadata {
@@ -2200,11 +2335,12 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
         }
         if file_type.is_symlink() {
             let target = fs::read_link(path)?;
+            let target = target.to_str().ok_or_else(non_unicode_identity_error)?;
             digest.update(b"symlink\0");
-            digest.update(target.to_string_lossy().as_bytes());
+            digest.update(target.as_bytes());
             if !is_source_control_metadata {
                 content_identity_digest.update(b"symlink\0");
-                content_identity_digest.update(target.to_string_lossy().as_bytes());
+                content_identity_digest.update(target.as_bytes());
             }
         } else {
             let metadata = fs::metadata(&path)?;
@@ -2337,8 +2473,11 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             }
         }
         for entrypoint in entrypoints {
+            let Some(entrypoint) = entrypoint.to_str() else {
+                continue;
+            };
             skill_ids_by_reference
-                .entry(normalize_reference_text(&entrypoint.to_string_lossy()))
+                .entry(normalize_reference_text(entrypoint))
                 .or_default()
                 .insert(placement.skill_id.clone());
         }
@@ -2512,6 +2651,19 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 }
                 break;
             }
+            let Some(file_identity) = file.to_str() else {
+                coverage.files_skipped += 1;
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::FilePathNotUnicode,
+                    SessionCoverageScope::File,
+                    SessionCoverageCountKind::Exact,
+                    Some(coverage.files_skipped as u64),
+                    None,
+                    SessionCoverageLimitationSource::SessionSampling,
+                );
+                continue;
+            };
             let metadata = match fs::metadata(file) {
                 Ok(metadata) => metadata,
                 _ => {
@@ -2608,7 +2760,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 &mut coverage.last_seen_unix,
                 timestamp,
             );
-            let source_path_digest = stable_digest(file.to_string_lossy().as_bytes());
+            let source_path_digest = stable_digest(file_identity.as_bytes());
             let sample = String::from_utf8_lossy(&sample);
             let complete_json = is_json
                 && sample_bytes == metadata.len()
@@ -2823,7 +2975,8 @@ const fn limitation_unit(code: SessionCoverageLimitationCode) -> SessionCoverage
         | SessionCoverageLimitationCode::SampledFileLimit
         | SessionCoverageLimitationCode::FileMetadataFailure
         | SessionCoverageLimitationCode::FileReadFailure
-        | SessionCoverageLimitationCode::FileZeroRead => SessionCoverageUnit::Files,
+        | SessionCoverageLimitationCode::FileZeroRead
+        | SessionCoverageLimitationCode::FilePathNotUnicode => SessionCoverageUnit::Files,
         SessionCoverageLimitationCode::DiscoveryDepthLimit => SessionCoverageUnit::Depth,
         SessionCoverageLimitationCode::DiscoveryWalkFailure => SessionCoverageUnit::Walks,
         SessionCoverageLimitationCode::SampledByteLimit
@@ -3666,6 +3819,107 @@ enabled = true
             result.placements[0].executable_files,
             vec![skill.join("repair.sh")]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_non_unicode_root_fails_before_snapshot_construction() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut options = ScanOptions::for_home("/tmp/skillroster-unicode-home");
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: PathBuf::from(OsString::from_vec(vec![b'/', 0x80])),
+        });
+
+        let error = scan(&options).unwrap_err();
+
+        assert!(is_non_unicode_identity_error(&error));
+        assert_eq!(error.to_string(), NON_UNICODE_IDENTITY_DETAIL);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_skips_distinct_non_unicode_skill_paths_without_identity_collision() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_directory("non-unicode-entrypoints");
+        let valid = root.join("valid");
+        fs::create_dir(&valid).unwrap();
+        fs::write(valid.join("SKILL.md"), "---\nname: valid\n---\n").unwrap();
+        for bytes in [vec![0x80], vec![0x81]] {
+            let directory = root.join(OsString::from_vec(bytes));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "valid");
+        let observed = result.roots.iter().find(|seen| seen.path == root).unwrap();
+        assert!(!observed.discovery_complete);
+        assert!(
+            observed
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("non-Unicode"))
+        );
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains('\u{fffd}'));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_unicode_package_member_makes_exact_fingerprint_unreadable() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_directory("non-unicode-package-member");
+        let skill = root.join("valid-skill");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: valid-skill\ndescription: Unicode entrypoint\n---\n",
+        )
+        .unwrap();
+        for (bytes, content) in [(vec![0x80], "first"), (vec![0x81], "second")] {
+            fs::write(skill.join(OsString::from_vec(bytes)), content).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+
+        let first = scan(&options).unwrap();
+        let second = scan(&options).unwrap();
+
+        assert_eq!(first.placements.len(), 1);
+        assert_eq!(first.placements[0].id, second.placements[0].id);
+        assert_eq!(
+            first.placements[0].fingerprint_completeness,
+            FingerprintCompleteness::Unreadable
+        );
+        assert_eq!(
+            first.placements[0].fingerprint_detail.as_deref(),
+            Some(NON_UNICODE_IDENTITY_DETAIL)
+        );
+        assert!(first.skills[0].content_identity_digest.is_none());
+        assert!(serde_json::to_string(&first).is_ok());
+        assert!(inspect_skill_identity(&skill.join("SKILL.md")).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
