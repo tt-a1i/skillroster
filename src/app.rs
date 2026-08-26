@@ -7274,7 +7274,7 @@ fn normalize_agent_plan(
     if requests.is_empty() {
         if !roster_changes.is_empty() {
             let derived = crate::roster_plan::derive(scan, state_dir, &roster_changes)?;
-            input["operations"] = Value::Array(derived.operations);
+            input["operations"] = serde_json::to_value(derived.operations)?;
             input["library_changes"] = serde_json::to_value(derived.implicit_library_changes)?;
             return Ok((input, vec![derived.impact], PlanOrigin::RosterGovernance));
         }
