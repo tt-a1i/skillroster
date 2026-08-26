@@ -2,6 +2,7 @@ pub mod app;
 mod bootstrap;
 pub mod change;
 pub mod cli;
+mod durable_fs;
 pub mod harness;
 pub mod model;
 pub mod present;

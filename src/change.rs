@@ -13,6 +13,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::durable_fs::{DirectorySync, SystemDirectorySync};
+
 #[derive(Debug)]
 pub struct ChangeError {
     pub code: &'static str,
@@ -303,6 +305,8 @@ pub enum Compensation {
         target: PathBuf,
         expected_original: String,
         expected_replacement: String,
+        #[serde(default)]
+        staged_replacement: Option<PathBuf>,
     },
 }
 
@@ -498,6 +502,13 @@ pub fn apply(plan: &PreparedPlan) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
+    apply_locked_with(plan, &SystemDirectorySync)
+}
+
+fn apply_locked_with(
+    plan: &PreparedPlan,
+    directory_sync: &dyn DirectorySync,
+) -> Result<ApplyOutcome> {
     validate_prepared_plan(plan)?;
     reject_unresolved_recovery(&plan.state_dir)?;
     validate_operation_sequence(&plan.operations, &plan.approved_roots)?;
@@ -515,7 +526,7 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
         reverses_receipt_id: None,
         operation_results: Vec::new(),
     };
-    persist_journal(&receipt)?;
+    persist_journal_with(&receipt, directory_sync)?;
 
     for (index, operation) in plan.operations.iter().enumerate() {
         receipt.operation_results.push(JournalOperationResult {
@@ -528,14 +539,24 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
             after_fingerprint: None,
             error: None,
         });
-        persist_journal(&receipt)?;
-        if let Some(compensation) =
-            stage_compensation(operation, &receipt.id, index, &plan.state_dir)?
-        {
+        persist_journal_with(&receipt, directory_sync)?;
+        if let Some(compensation) = stage_compensation(
+            operation,
+            &receipt.id,
+            index,
+            &plan.state_dir,
+            directory_sync,
+        )? {
             receipt.compensations.push(compensation);
-            persist_journal(&receipt)?;
+            persist_journal_with(&receipt, directory_sync)?;
         }
-        match execute(operation, &receipt.id, index, &plan.approved_roots) {
+        match execute(
+            operation,
+            &receipt.id,
+            index,
+            &plan.approved_roots,
+            directory_sync,
+        ) {
             Ok(compensation) => {
                 receipt.changed_paths.push(operation.target().to_path_buf());
                 if let Some(compensation) = compensation {
@@ -545,9 +566,9 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
                     result.status = "applied".to_owned();
                     result.after_fingerprint = fingerprint(operation.target()).ok();
                 }
-                if let Err(journal_error) = persist_journal(&receipt) {
+                if let Err(journal_error) = persist_journal_with(&receipt, directory_sync) {
                     receipt.error = Some(journal_error.to_string());
-                    let rollback = compensate_all(&receipt);
+                    let rollback = compensate_all(&receipt, directory_sync);
                     receipt.status = if rollback.is_ok() {
                         ReceiptStatus::FailedRolledBack
                     } else {
@@ -561,7 +582,7 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
                     }
                     // Best effort: if storage remains unavailable, the last durable
                     // journal stays Applying and therefore blocks future writes.
-                    let _ = persist_journal(&receipt);
+                    let _ = persist_journal_with(&receipt, directory_sync);
                     return Ok(ApplyOutcome {
                         receipt,
                         verification_passed: false,
@@ -575,35 +596,29 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
                     result.error = Some(error.to_string());
                 }
                 receipt.error = Some(error.to_string());
-                // Recursive copy can fail after creating a partial target. Record
-                // the concrete artifact before compensating so a partial copy is
-                // never reported as a clean rollback.
-                if operation_creates_missing_target(operation)
-                    && fs::symlink_metadata(operation.target()).is_ok()
-                {
-                    match fingerprint(operation.target()) {
-                        Ok(expected_fingerprint) => {
-                            receipt.compensations.push(Compensation::StashCreated {
-                                path: operation.target().to_path_buf(),
-                                expected_fingerprint,
-                            });
-                            receipt.changed_paths.push(operation.target().to_path_buf());
-                            let _ = persist_journal(&receipt);
-                        }
-                        Err(fingerprint_error) => {
-                            receipt.status = ReceiptStatus::RecoveryRequired;
-                            receipt.error = Some(format!(
-                                "{error}; partial target could not be fingerprinted: {fingerprint_error}"
-                            ));
-                            let _ = persist_journal(&receipt);
-                            return Ok(ApplyOutcome {
-                                receipt,
-                                verification_passed: false,
-                            });
-                        }
+                // A durability barrier can fail after the directory entry changed.
+                // Record the concrete recovery action before compensating so the
+                // mutation is never reported as a clean rollback.
+                match partial_operation_compensation(operation, &receipt.id, index) {
+                    Ok(Some(compensation)) => {
+                        receipt.compensations.push(compensation);
+                        receipt.changed_paths.push(operation.target().to_path_buf());
+                        let _ = persist_journal_with(&receipt, directory_sync);
+                    }
+                    Ok(None) => {}
+                    Err(fingerprint_error) => {
+                        receipt.status = ReceiptStatus::RecoveryRequired;
+                        receipt.error = Some(format!(
+                            "{error}; partial target could not be fingerprinted: {fingerprint_error}"
+                        ));
+                        let _ = persist_journal_with(&receipt, directory_sync);
+                        return Ok(ApplyOutcome {
+                            receipt,
+                            verification_passed: false,
+                        });
                     }
                 }
-                let rollback = compensate_all(&receipt);
+                let rollback = compensate_all(&receipt, directory_sync);
                 receipt.status = if rollback.is_ok() {
                     ReceiptStatus::FailedRolledBack
                 } else {
@@ -613,7 +628,7 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
                 if let Err(rollback_error) = rollback {
                     receipt.error = Some(format!("{error}; compensation failed: {rollback_error}"));
                 }
-                persist_journal(&receipt)?;
+                persist_journal_with(&receipt, directory_sync)?;
                 return Ok(ApplyOutcome {
                     receipt,
                     verification_passed: false,
@@ -623,12 +638,12 @@ pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
     }
 
     receipt.status = ReceiptStatus::Applied;
-    if let Err(error) = persist_journal(&receipt) {
+    if let Err(error) = persist_journal_with(&receipt, directory_sync) {
         receipt.status = ReceiptStatus::RecoveryRequired;
         receipt.error = Some(format!(
             "changes were applied but the final receipt could not be persisted: {error}"
         ));
-        let _ = persist_journal(&receipt);
+        let _ = persist_journal_with(&receipt, directory_sync);
         return Ok(ApplyOutcome {
             receipt,
             verification_passed: false,
@@ -652,6 +667,13 @@ pub fn undo(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
+    undo_locked_with(receipt, &SystemDirectorySync)
+}
+
+fn undo_locked_with(
+    receipt: &ChangeReceipt,
+    directory_sync: &dyn DirectorySync,
+) -> Result<ApplyOutcome> {
     if receipt.status != ReceiptStatus::Applied {
         return Err(ChangeError::new(
             "receipt_not_undoable",
@@ -691,8 +713,8 @@ pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
             })
             .collect(),
     };
-    persist_journal(&undo_receipt)?;
-    match compensate_all(receipt) {
+    persist_journal_with(&undo_receipt, directory_sync)?;
+    match compensate_all(receipt, directory_sync) {
         Ok(()) => {
             for result in &mut undo_receipt.operation_results {
                 result.status = "undone".to_owned();
@@ -700,7 +722,7 @@ pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
             }
             undo_receipt.status = ReceiptStatus::Undone;
             undo_receipt.changed_paths = receipt.changed_paths.clone();
-            persist_journal(&undo_receipt)?;
+            persist_journal_with(&undo_receipt, directory_sync)?;
             Ok(ApplyOutcome {
                 receipt: undo_receipt,
                 verification_passed: true,
@@ -714,7 +736,7 @@ pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
             }
             undo_receipt.status = ReceiptStatus::RecoveryRequired;
             undo_receipt.error = Some(error.to_string());
-            persist_journal(&undo_receipt)?;
+            persist_journal_with(&undo_receipt, directory_sync)?;
             Ok(ApplyOutcome {
                 receipt: undo_receipt,
                 verification_passed: false,
@@ -738,6 +760,13 @@ pub fn rollback_apply(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn rollback_apply_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
+    rollback_apply_locked_with(receipt, &SystemDirectorySync)
+}
+
+fn rollback_apply_locked_with(
+    receipt: &ChangeReceipt,
+    directory_sync: &dyn DirectorySync,
+) -> Result<ApplyOutcome> {
     if receipt.status != ReceiptStatus::Applied {
         return Err(ChangeError::new(
             "receipt_not_rollbackable",
@@ -745,14 +774,14 @@ pub(crate) fn rollback_apply_locked(receipt: &ChangeReceipt) -> Result<ApplyOutc
         ));
     }
     let mut rolled_back = receipt.clone();
-    match compensate_all(receipt) {
+    match compensate_all(receipt, directory_sync) {
         Ok(()) => {
             rolled_back.status = ReceiptStatus::FailedRolledBack;
             for result in &mut rolled_back.operation_results {
                 result.status = "failed_rolled_back".to_owned();
                 result.after_fingerprint = fingerprint(&result.target).ok();
             }
-            persist_journal(&rolled_back)?;
+            persist_journal_with(&rolled_back, directory_sync)?;
             Ok(ApplyOutcome {
                 receipt: rolled_back,
                 verification_passed: true,
@@ -766,7 +795,7 @@ pub(crate) fn rollback_apply_locked(receipt: &ChangeReceipt) -> Result<ApplyOutc
                 result.after_fingerprint = fingerprint(&result.target).ok();
                 result.error = Some(error.to_string());
             }
-            persist_journal(&rolled_back)?;
+            persist_journal_with(&rolled_back, directory_sync)?;
             Ok(ApplyOutcome {
                 receipt: rolled_back,
                 verification_passed: false,
@@ -785,6 +814,114 @@ fn operation_kind(operation: &Operation) -> &'static str {
         Operation::Copy { .. } => "copy",
         Operation::MoveRecoverable { .. } => "move_recoverable",
     }
+}
+
+fn sync_parent_directory(
+    path: &Path,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ChangeError::new("unsafe_path", path.display().to_string()))?;
+    directory_sync
+        .sync_directory(parent)
+        .map_err(|error| ChangeError::io(action, parent, error))
+}
+
+fn sync_rename_directories(
+    source: &Path,
+    target: &Path,
+    directory_sync: &dyn DirectorySync,
+) -> Result<()> {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| ChangeError::new("unsafe_path", target.display().to_string()))?;
+    let source_result = directory_sync
+        .sync_directory(source_parent)
+        .map_err(|error| ChangeError::io("sync renamed source directory", source_parent, error));
+    let target_result = if source_parent == target_parent {
+        Ok(())
+    } else {
+        directory_sync
+            .sync_directory(target_parent)
+            .map_err(|error| ChangeError::io("sync renamed target directory", target_parent, error))
+    };
+    source_result.and(target_result)
+}
+
+fn create_dir_all_durable(path: &Path, directory_sync: &dyn DirectorySync) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
+            Ok(_) => {
+                return Err(ChangeError::new(
+                    "unsafe_path",
+                    format!("{} is not a regular directory", cursor.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .ok_or_else(|| ChangeError::new("unsafe_path", path.display().to_string()))?;
+            }
+            Err(error) => {
+                return Err(ChangeError::io("inspect directory", cursor, error));
+            }
+        }
+    }
+    for directory in missing.iter().rev() {
+        fs::create_dir(directory)
+            .map_err(|error| ChangeError::io("create directory", directory, error))?;
+        sync_parent_directory(directory, directory_sync, "sync created directory parent")?;
+    }
+    Ok(())
+}
+
+fn create_dir_durable(path: &Path, directory_sync: &dyn DirectorySync) -> Result<()> {
+    fs::create_dir(path).map_err(|error| ChangeError::io("create directory", path, error))?;
+    sync_parent_directory(path, directory_sync, "sync created directory parent")
+}
+
+fn rename_durable(
+    source: &Path,
+    target: &Path,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    fs::rename(source, target).map_err(|error| ChangeError::io(action, source, error))?;
+    sync_rename_directories(source, target, directory_sync)
+}
+
+fn remove_file_durable(
+    path: &Path,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    fs::remove_file(path).map_err(|error| ChangeError::io(action, path, error))?;
+    sync_parent_directory(path, directory_sync, "sync removed file parent")
+}
+
+fn copy_file_durable(
+    source: &Path,
+    target: &Path,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    fs::copy(source, target).map_err(|error| ChangeError::io(action, source, error))?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| ChangeError::io("sync copied file", target, error))?;
+    sync_parent_directory(target, directory_sync, "sync copied file parent")
 }
 
 fn finalize_rollback_results(receipt: &mut ChangeReceipt, recovered: bool) {
@@ -811,6 +948,51 @@ fn operation_creates_missing_target(operation: &Operation) -> bool {
             | Operation::Copy { .. }
             | Operation::MoveRecoverable { .. }
     )
+}
+
+fn move_backup_path(source: &Path, receipt_id: &str, index: usize) -> Result<PathBuf> {
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
+    Ok(source.with_file_name(format!(
+        ".{file_name}.skillroster-backup-{receipt_id}-{index}"
+    )))
+}
+
+fn partial_operation_compensation(
+    operation: &Operation,
+    receipt_id: &str,
+    index: usize,
+) -> Result<Option<Compensation>> {
+    if !operation_creates_missing_target(operation)
+        || fs::symlink_metadata(operation.target()).is_err()
+    {
+        return Ok(None);
+    }
+    let expected_fingerprint = fingerprint(operation.target())?;
+    if let Operation::MoveRecoverable { target, source, .. } = operation {
+        let backup = move_backup_path(source, receipt_id, index)?;
+        if fs::symlink_metadata(source).is_err() && fs::symlink_metadata(&backup).is_ok() {
+            return Ok(Some(Compensation::RestoreBackup {
+                backup,
+                original: source.clone(),
+                created: target.clone(),
+                expected_created: expected_fingerprint,
+            }));
+        }
+        if fs::symlink_metadata(source).is_err() {
+            return Ok(Some(Compensation::RenameBack {
+                from: target.clone(),
+                to: source.clone(),
+                expected_fingerprint,
+            }));
+        }
+    }
+    Ok(Some(Compensation::StashCreated {
+        path: operation.target().to_path_buf(),
+        expected_fingerprint,
+    }))
 }
 
 fn normalize_operation(
@@ -1128,55 +1310,63 @@ fn stage_compensation(
     receipt_id: &str,
     index: usize,
     state_dir: &Path,
+    directory_sync: &dyn DirectorySync,
 ) -> Result<Option<Compensation>> {
-    let Operation::ReplaceFile {
-        target,
-        content,
-        expected_fingerprint,
-    } = operation
-    else {
-        return Ok(None);
-    };
-    verify_fingerprint(target, expected_fingerprint)?;
-    let directory = recovery_dir(state_dir, receipt_id);
-    fs::create_dir_all(&directory)
-        .map_err(|error| ChangeError::io("create recovery directory", &directory, error))?;
-    let backup = directory.join(format!("replace-{index}.backup"));
-    require_missing(&backup)?;
-    fs::copy(target, &backup)
-        .map_err(|error| ChangeError::io("persist replacement backup", target, error))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&backup)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| ChangeError::io("sync replacement backup", &backup, error))?;
-    let backup_fingerprint = fingerprint(&backup)?;
-    if backup_fingerprint != *expected_fingerprint {
-        return Err(ChangeError::new(
-            "backup_verification_failed",
-            format!(
-                "backup for {} does not match its precondition",
-                target.display()
-            ),
-        ));
+    match operation {
+        Operation::ReplaceFile {
+            target,
+            content,
+            expected_fingerprint,
+        } => {
+            verify_fingerprint(target, expected_fingerprint)?;
+            let directory = recovery_dir(state_dir, receipt_id);
+            create_dir_all_durable(&directory, directory_sync)?;
+            let backup = directory.join(format!("replace-{index}.backup"));
+            require_missing(&backup)?;
+            copy_file_durable(
+                target,
+                &backup,
+                directory_sync,
+                "persist replacement backup",
+            )?;
+            let backup_fingerprint = fingerprint(&backup)?;
+            if backup_fingerprint != *expected_fingerprint {
+                return Err(ChangeError::new(
+                    "backup_verification_failed",
+                    format!(
+                        "backup for {} does not match its precondition",
+                        target.display()
+                    ),
+                ));
+            }
+            Ok(Some(Compensation::RestoreReplacedFile {
+                backup,
+                target: target.clone(),
+                expected_original: expected_fingerprint.clone(),
+                expected_replacement: file_content_fingerprint(content.as_bytes()),
+                staged_replacement: Some(replacement_temp_path(target, receipt_id, index)?),
+            }))
+        }
+        Operation::RemoveSymlink { target, .. } => {
+            let link_target = fs::read_link(target)
+                .map_err(|error| ChangeError::io("read symlink", target, error))?;
+            Ok(Some(Compensation::RestoreSymlink {
+                path: target.clone(),
+                target: link_target,
+            }))
+        }
+        _ => Ok(None),
     }
-    Ok(Some(Compensation::RestoreReplacedFile {
-        backup,
-        target: target.clone(),
-        expected_original: expected_fingerprint.clone(),
-        expected_replacement: file_content_fingerprint(content.as_bytes()),
-    }))
 }
 
-fn replace_file(target: &Path, content: &str, receipt_id: &str, index: usize) -> Result<()> {
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ChangeError::new("unsafe_path", target.display().to_string()))?;
-    let temp = target.with_file_name(format!(
-        ".{file_name}.skillroster-replace-{receipt_id}-{index}"
-    ));
+fn replace_file(
+    target: &Path,
+    content: &str,
+    receipt_id: &str,
+    index: usize,
+    directory_sync: &dyn DirectorySync,
+) -> Result<()> {
+    let temp = replacement_temp_path(target, receipt_id, index)?;
     require_missing(&temp)?;
     let mut file = OpenOptions::new()
         .write(true)
@@ -1187,11 +1377,18 @@ fn replace_file(target: &Path, content: &str, receipt_id: &str, index: usize) ->
         .map_err(|error| ChangeError::io("write replacement", &temp, error))?;
     file.sync_all()
         .map_err(|error| ChangeError::io("sync replacement", &temp, error))?;
-    fs::remove_file(target)
-        .map_err(|error| ChangeError::io("remove replaced file", target, error))?;
-    fs::rename(&temp, target)
-        .map_err(|error| ChangeError::io("publish replacement", target, error))?;
-    Ok(())
+    remove_file_durable(target, directory_sync, "remove replaced file")?;
+    rename_durable(&temp, target, directory_sync, "publish replacement")
+}
+
+fn replacement_temp_path(target: &Path, receipt_id: &str, index: usize) -> Result<PathBuf> {
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ChangeError::new("unsafe_path", target.display().to_string()))?;
+    Ok(target.with_file_name(format!(
+        ".{file_name}.skillroster-replace-{receipt_id}-{index}"
+    )))
 }
 
 fn file_content_fingerprint(content: &[u8]) -> String {
@@ -1203,10 +1400,11 @@ fn execute(
     receipt_id: &str,
     index: usize,
     roots: &[PathBuf],
+    directory_sync: &dyn DirectorySync,
 ) -> Result<Option<Compensation>> {
     match operation {
         Operation::CreateDirectory { target, .. } => {
-            fs::create_dir(target).map_err(|e| ChangeError::io("create directory", target, e))?;
+            create_dir_durable(target, directory_sync)?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
                 expected_fingerprint: fingerprint(target)?,
@@ -1214,6 +1412,7 @@ fn execute(
         }
         Operation::CreateSymlink { target, source, .. } => {
             create_symlink(source, target)?;
+            sync_parent_directory(target, directory_sync, "sync created symlink parent")?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
                 expected_fingerprint: fingerprint(target)?,
@@ -1231,6 +1430,7 @@ fn execute(
                 .map_err(|e| ChangeError::io("write file", target, e))?;
             file.sync_all()
                 .map_err(|e| ChangeError::io("sync file", target, e))?;
+            sync_parent_directory(target, directory_sync, "sync created file parent")?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
                 expected_fingerprint: fingerprint(target)?,
@@ -1239,20 +1439,16 @@ fn execute(
         Operation::ReplaceFile {
             target, content, ..
         } => {
-            replace_file(target, content, receipt_id, index)?;
+            replace_file(target, content, receipt_id, index, directory_sync)?;
             Ok(None)
         }
         Operation::RemoveSymlink { target, .. } => {
-            let link_target =
-                fs::read_link(target).map_err(|e| ChangeError::io("read symlink", target, e))?;
             remove_symlink(target)?;
-            Ok(Some(Compensation::RestoreSymlink {
-                path: target.clone(),
-                target: link_target,
-            }))
+            sync_parent_directory(target, directory_sync, "sync removed symlink parent")?;
+            Ok(None)
         }
         Operation::Copy { target, source, .. } => {
-            copy_tree(source, target, roots)?;
+            copy_tree(source, target, roots, directory_sync)?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
                 expected_fingerprint: fingerprint(target)?,
@@ -1262,6 +1458,7 @@ fn execute(
             let expected = fingerprint(source)?;
             match fs::rename(source, target) {
                 Ok(()) => {
+                    sync_rename_directories(source, target, directory_sync)?;
                     return Ok(Some(Compensation::RenameBack {
                         from: target.clone(),
                         to: source.clone(),
@@ -1273,18 +1470,10 @@ fn execute(
             }
             // Cross-device recovery must remain on the source filesystem, so the
             // original can be hidden atomically after the destination copy lands.
-            let file_name = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
-            let backup = source.with_file_name(format!(
-                ".{file_name}.skillroster-backup-{receipt_id}-{index}"
-            ));
+            let backup = move_backup_path(source, receipt_id, index)?;
             require_missing(&backup)?;
-            copy_tree(source, target, roots)?;
-            if let Err(error) = fs::rename(source, &backup) {
-                return Err(ChangeError::io("move source to recovery", source, error));
-            }
+            copy_tree(source, target, roots, directory_sync)?;
+            rename_durable(source, &backup, directory_sync, "move source to recovery")?;
             Ok(Some(Compensation::RestoreBackup {
                 backup,
                 original: source.clone(),
@@ -1295,7 +1484,7 @@ fn execute(
     }
 }
 
-fn compensate_all(receipt: &ChangeReceipt) -> Result<()> {
+fn compensate_all(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
     for (index, compensation) in receipt.compensations.iter().enumerate().rev() {
         compensate(
             compensation,
@@ -1303,6 +1492,7 @@ fn compensate_all(receipt: &ChangeReceipt) -> Result<()> {
             index,
             &receipt.approved_roots,
             &receipt.state_dir,
+            directory_sync,
         )?;
     }
     Ok(())
@@ -1314,6 +1504,7 @@ fn compensate(
     index: usize,
     roots: &[PathBuf],
     state_dir: &Path,
+    directory_sync: &dyn DirectorySync,
 ) -> Result<()> {
     match compensation {
         Compensation::StashCreated {
@@ -1323,14 +1514,14 @@ fn compensate(
             verify_fingerprint(path, expected_fingerprint)?;
             normalize_target(path, roots)?;
             let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-{index}"));
-            fs::create_dir_all(stash.parent().expect("stash has parent"))
-                .map_err(|e| ChangeError::io("create recovery directory", state_dir, e))?;
-            fs::rename(path, &stash).map_err(|e| ChangeError::io("stash created path", path, e))?;
+            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            rename_durable(path, &stash, directory_sync, "stash created path")?;
         }
         Compensation::RestoreSymlink { path, target } => {
             require_missing(path)?;
             normalize_target(path, roots)?;
             create_symlink(target, path)?;
+            sync_parent_directory(path, directory_sync, "sync restored symlink parent")?;
         }
         Compensation::RenameBack {
             from,
@@ -1341,7 +1532,7 @@ fn compensate(
             require_missing(to)?;
             normalize_target(from, roots)?;
             normalize_target(to, roots)?;
-            fs::rename(from, to).map_err(|e| ChangeError::io("restore moved path", from, e))?;
+            rename_durable(from, to, directory_sync, "restore moved path")?;
         }
         Compensation::RestoreBackup {
             backup,
@@ -1354,21 +1545,33 @@ fn compensate(
             normalize_target(created, roots)?;
             normalize_target(original, roots)?;
             let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-created-{index}"));
-            fs::rename(created, &stash)
-                .map_err(|e| ChangeError::io("stash copied destination", created, e))?;
-            fs::rename(backup, original)
-                .map_err(|e| ChangeError::io("restore source backup", backup, e))?;
+            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            rename_durable(created, &stash, directory_sync, "stash copied destination")?;
+            rename_durable(backup, original, directory_sync, "restore source backup")?;
         }
         Compensation::RestoreReplacedFile {
             backup,
             target,
             expected_original,
             expected_replacement,
+            staged_replacement,
         } => {
+            if let Some(staged_replacement) = staged_replacement {
+                remove_expected_file_if_present_durable(
+                    staged_replacement,
+                    expected_replacement,
+                    directory_sync,
+                    "remove staged replacement",
+                )?;
+            }
             let actual = fingerprint(target)?;
             if actual == *expected_original {
-                fs::remove_file(backup)
-                    .map_err(|error| ChangeError::io("remove unused backup", backup, error))?;
+                remove_expected_file_if_present_durable(
+                    backup,
+                    expected_original,
+                    directory_sync,
+                    "remove unused backup",
+                )?;
                 return Ok(());
             }
             if actual != "missing" && actual != *expected_replacement {
@@ -1388,26 +1591,44 @@ fn compensate(
                     .unwrap_or("file")
             ));
             require_missing(&restore)?;
-            fs::copy(backup, &restore)
-                .map_err(|error| ChangeError::io("stage restored file", backup, error))?;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&restore)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| ChangeError::io("sync restored file", &restore, error))?;
+            copy_file_durable(backup, &restore, directory_sync, "stage restored file")?;
             if actual != "missing" {
-                fs::remove_file(target)
-                    .map_err(|error| ChangeError::io("remove replacement", target, error))?;
+                remove_file_durable(target, directory_sync, "remove replacement")?;
             }
-            fs::rename(&restore, target)
-                .map_err(|error| ChangeError::io("restore replaced file", target, error))?;
+            rename_durable(&restore, target, directory_sync, "restore replaced file")?;
             verify_fingerprint(target, expected_original)?;
-            fs::remove_file(backup)
-                .map_err(|error| ChangeError::io("remove consumed backup", backup, error))?;
+            remove_expected_file_if_present_durable(
+                backup,
+                expected_original,
+                directory_sync,
+                "remove consumed backup",
+            )?;
         }
     }
     Ok(())
+}
+
+fn remove_expected_file_if_present_durable(
+    path: &Path,
+    expected_fingerprint: &str,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    match fingerprint(path)? {
+        actual if actual == expected_fingerprint => {
+            remove_file_durable(path, directory_sync, action)
+        }
+        actual if actual == "missing" => {
+            sync_parent_directory(path, directory_sync, "sync absent recovery file parent")
+        }
+        actual => Err(ChangeError::new(
+            "undo_drifted",
+            format!(
+                "{} expected {expected_fingerprint} or missing, found {actual}",
+                path.display()
+            ),
+        )),
+    }
 }
 
 fn validate_prepared_plan(plan: &PreparedPlan) -> Result<()> {
@@ -1487,7 +1708,12 @@ pub fn fingerprint(path: &Path) -> Result<String> {
     ))
 }
 
-fn copy_tree(source: &Path, target: &Path, roots: &[PathBuf]) -> Result<()> {
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    roots: &[PathBuf],
+    directory_sync: &dyn DirectorySync,
+) -> Result<()> {
     normalize_source(source, roots)?;
     normalize_target(target, roots)?;
     require_missing(target)?;
@@ -1500,7 +1726,7 @@ fn copy_tree(source: &Path, target: &Path, roots: &[PathBuf]) -> Result<()> {
         ));
     }
     if metadata.is_file() {
-        fs::copy(source, target).map_err(|e| ChangeError::io("copy file", source, e))?;
+        copy_file_durable(source, target, directory_sync, "copy file")?;
         return Ok(());
     }
     if !metadata.is_dir() {
@@ -1509,12 +1735,17 @@ fn copy_tree(source: &Path, target: &Path, roots: &[PathBuf]) -> Result<()> {
             source.display().to_string(),
         ));
     }
-    fs::create_dir(target).map_err(|e| ChangeError::io("create copied directory", target, e))?;
+    create_dir_durable(target, directory_sync)?;
     for entry in
         fs::read_dir(source).map_err(|e| ChangeError::io("read source directory", source, e))?
     {
         let entry = entry.map_err(|e| ChangeError::io("read source directory", source, e))?;
-        copy_tree(&entry.path(), &target.join(entry.file_name()), roots)?;
+        copy_tree(
+            &entry.path(),
+            &target.join(entry.file_name()),
+            roots,
+            directory_sync,
+        )?;
     }
     Ok(())
 }
@@ -1730,9 +1961,12 @@ fn recovery_dir(state_dir: &Path, receipt_id: &str) -> PathBuf {
 }
 
 fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
+    persist_journal_with(receipt, &SystemDirectorySync)
+}
+
+fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
     let directory = receipt.state_dir.join("receipts");
-    fs::create_dir_all(&directory)
-        .map_err(|e| ChangeError::io("create receipt directory", &directory, e))?;
+    create_dir_all_durable(&directory, directory_sync)?;
     let path = directory.join(format!("{}.json", receipt.id));
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
@@ -1743,8 +1977,7 @@ fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
     file.sync_all()
         .map_err(|e| ChangeError::io("sync receipt journal", &temp, e))?;
-    fs::rename(&temp, &path).map_err(|e| ChangeError::io("publish receipt journal", &path, e))?;
-    Ok(())
+    rename_durable(&temp, &path, directory_sync, "publish receipt journal")
 }
 
 pub(crate) fn persist_journal_state(receipt: &ChangeReceipt) -> Result<()> {
@@ -1926,7 +2159,32 @@ impl WriteLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use tempfile::TempDir;
+
+    struct FailOnceDirectorySync {
+        path: PathBuf,
+        failed: Cell<bool>,
+    }
+
+    impl FailOnceDirectorySync {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                failed: Cell::new(false),
+            }
+        }
+    }
+
+    impl DirectorySync for FailOnceDirectorySync {
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            if path == self.path && !self.failed.replace(true) {
+                Err(io::Error::other("injected directory sync failure"))
+            } else {
+                SystemDirectorySync.sync_directory(path)
+            }
+        }
+    }
 
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
         let temp = TempDir::new().unwrap();
@@ -2124,6 +2382,193 @@ mod tests {
         .unwrap();
         fs::write(&source, "after").unwrap();
         assert_eq!(apply(&plan).unwrap_err().code, "plan_drifted");
+    }
+
+    #[test]
+    fn journal_directory_sync_failure_precedes_governed_mutation() {
+        let (_temp, root, state) = fixture();
+        let target = root.join("not-created.md");
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": target,
+                "content": "must not be published",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state.clone(),
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let directory_sync = FailOnceDirectorySync::new(plan.state_dir.join("receipts"));
+
+        let error = apply_locked_with(&plan, &directory_sync).unwrap_err();
+
+        assert_eq!(error.code, "filesystem_error");
+        assert!(error.message.contains("sync renamed source directory"));
+        assert!(directory_sync.failed.get());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn target_directory_sync_failure_is_not_reported_as_success() {
+        let (_temp, root, state) = fixture();
+        let target = root.join("rolled-back.md");
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": target,
+                "content": "published before injected barrier failure",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root.clone()],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
+
+        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
+        assert!(directory_sync.failed.get());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn moved_path_sync_failure_restores_the_source() {
+        let (_temp, root, state) = fixture();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::write(&source, "original").unwrap();
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "move_recoverable",
+                "source": source,
+                "target": target,
+                "expected_fingerprint": fingerprint(&source).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
+
+        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn removed_symlink_sync_failure_restores_the_link() {
+        let (_temp, root, state) = fixture();
+        let source = root.join("source");
+        let target = root.join("link");
+        fs::write(&source, "original").unwrap();
+        create_symlink(&source, &target).unwrap();
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "remove_symlink",
+                "target": target,
+                "expected_fingerprint": fingerprint(&target).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
+
+        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+    }
+
+    #[test]
+    fn replaced_file_sync_failure_restores_original_content() {
+        let (_temp, root, state) = fixture();
+        let target = root.join("replace.txt");
+        fs::write(&target, "before").unwrap();
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "replace_file",
+                "target": target,
+                "content": "after",
+                "expected_fingerprint": fingerprint(&target).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root.clone()],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
+
+        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        let remaining = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![target.file_name().unwrap()]);
+        assert!(outcome.receipt.compensations.iter().any(|compensation| {
+            matches!(
+                compensation,
+                Compensation::RestoreReplacedFile {
+                    staged_replacement: Some(_),
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
