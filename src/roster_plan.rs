@@ -421,20 +421,19 @@ fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result
             return Err(error).with_context(|| format!("cannot inspect {}", directory.display()));
         }
     }
+    crate::state_security::secure_directory(&directory)
+        .with_context(|| format!("cannot secure {}", directory.display()))?;
     let id = ulid::Ulid::new();
     let path = directory.join(format!("{id}.json"));
     let temporary_path = directory.join(format!(".{id}.tmp"));
     let bytes = serde_json::to_vec(&complete)?;
-    let mut options = std::fs::OpenOptions::new();
+    let mut options = crate::state_security::private_file_options();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     let mut file = options
         .open(&temporary_path)
         .with_context(|| format!("cannot create {}", temporary_path.display()))?;
+    crate::state_security::secure_opened_file(&file)
+        .with_context(|| format!("cannot secure {}", temporary_path.display()))?;
     let write_result = (|| -> Result<()> {
         file.write_all(&bytes)
             .with_context(|| format!("cannot write {}", temporary_path.display()))?;
@@ -457,6 +456,8 @@ fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result
         }
     }
     write_result?;
+    crate::state_security::secure_file(&path)
+        .with_context(|| format!("cannot secure {}", path.display()))?;
     Ok(path)
 }
 
@@ -2343,6 +2344,23 @@ mod tests {
             json!(bounded_roots)
         );
         let detail_path = blocked.details["detail"]["path"].as_str().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(state.path().join("source-confirmation"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(detail_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         let detail_name = Path::new(detail_path)
             .file_stem()
             .and_then(|value| value.to_str())

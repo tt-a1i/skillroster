@@ -17,6 +17,7 @@ use crate::cli::{
     Cli, Command, LifecycleCommand, ModifiedBootstrapChoice, ReportCategory, ReportSeverity,
     SourceRootCommand,
 };
+use crate::durable_fs::{DirectorySync, SystemDirectorySync};
 use crate::harness::{self, AgentKind};
 use crate::model::{
     AgentId, AgentRecord, ApiError, EvidenceId, EvidenceKind, EvidenceQuality, EvidenceRecord,
@@ -28,6 +29,7 @@ use crate::model::{
 };
 use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
+use crate::state_security;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
 const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
@@ -179,6 +181,11 @@ pub fn run(cli: Cli) -> Result<Output> {
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
+    state_security::prepare_state_root(&state_dir)
+        .with_context(|| format!("cannot secure state root {}", state_dir.display()))?;
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
+    secure_owned_control_files(&state_dir)?;
     if let Some(Command::Lifecycle(args)) = &cli.command {
         if let LifecycleCommand::Delete(args) = &args.command {
             if args.confirm != "DELETE-LOCAL-STATE" {
@@ -203,8 +210,6 @@ pub fn run(cli: Cli) -> Result<Output> {
             });
         }
     }
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
     let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
@@ -219,6 +224,8 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
     };
     let store = StateStore::open(&database_path)?;
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
 
     let (command, mut result, warnings, actions) = match cli.command {
         None => ("home", home_result(&store, &state_dir)?, vec![], vec![]),
@@ -617,6 +624,8 @@ pub fn run(cli: Cli) -> Result<Output> {
     };
 
     action_context.apply_result(command, &mut result);
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
     let mut envelope = JsonEnvelope::success(command, result.clone());
     envelope.warnings = warnings;
     envelope.suggested_actions = actions;
@@ -625,6 +634,54 @@ pub fn run(cli: Cli) -> Result<Output> {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
     })
+}
+
+fn secure_owned_control_files(state_dir: &Path) -> Result<()> {
+    state_security::secure_control_directory(
+        &state_dir.join("receipts"),
+        change::owned_receipt_control_file,
+    )
+    .with_context(|| "cannot validate and secure Receipt journals")?;
+    state_security::secure_control_directory(
+        &state_dir.join("source-confirmation"),
+        owned_source_confirmation_control_file,
+    )
+    .with_context(|| "cannot validate and secure source-confirmation details")?;
+    Ok(())
+}
+
+fn owned_source_confirmation_control_file(
+    name: &std::ffi::OsStr,
+    file: &mut std::fs::File,
+) -> std::io::Result<bool> {
+    if owned_source_confirmation_temp_name(name) {
+        return Ok(true);
+    }
+    let path = Path::new(name);
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Ok(false);
+    }
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return Ok(false);
+    };
+    if ulid::Ulid::from_string(stem).is_err() {
+        return Ok(false);
+    }
+    let Ok(detail) = serde_json::from_reader::<_, Value>(file) else {
+        return Ok(false);
+    };
+    Ok(recognized_source_confirmation_detail(&detail))
+}
+
+fn owned_source_confirmation_temp_name(name: &std::ffi::OsStr) -> bool {
+    let Some(id) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    ulid::Ulid::from_string(id).is_ok()
 }
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
@@ -1701,8 +1758,6 @@ fn lifecycle_purge_command(
 }
 
 fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Value> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
     let _write_lock = change::WriteLock::acquire(state_dir)?;
     let existed = database_path.exists();
     let journals = change::journals(state_dir)?;
@@ -1775,10 +1830,16 @@ fn source_confirmation_detail_paths(state_dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("json")
-        {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "refusing invalid source-confirmation detail: {}",
+                path.display()
+            );
+        }
+        if owned_source_confirmation_temp_name(&entry.file_name()) {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
             bail!(
                 "refusing invalid source-confirmation detail: {}",
                 path.display()
@@ -1974,11 +2035,31 @@ fn remove_source_confirmation_details(state_dir: &Path) -> Result<u64> {
     for path in &paths {
         std::fs::remove_file(path).with_context(|| format!("cannot delete {}", path.display()))?;
     }
+    let mut removed_temps = 0_u64;
+    if directory.is_dir() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if !owned_source_confirmation_temp_name(&entry.file_name()) {
+                bail!(
+                    "refusing invalid source-confirmation detail: {}",
+                    entry.path().display()
+                );
+            }
+            std::fs::remove_file(entry.path())?;
+            removed_temps += 1;
+        }
+        SystemDirectorySync
+            .sync_directory(&directory)
+            .with_context(|| format!("cannot sync {}", directory.display()))?;
+    }
     if std::fs::symlink_metadata(&directory).is_ok() {
         std::fs::remove_dir(&directory)
             .with_context(|| format!("cannot delete {}", directory.display()))?;
+        SystemDirectorySync
+            .sync_directory(state_dir)
+            .with_context(|| format!("cannot sync {}", state_dir.display()))?;
     }
-    Ok(paths.len() as u64)
+    Ok(paths.len() as u64 + removed_temps)
 }
 
 fn remove_receipt_journals(state_dir: &Path) -> Result<u64> {

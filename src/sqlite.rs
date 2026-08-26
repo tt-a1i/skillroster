@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
@@ -10,8 +10,36 @@ use crate::model::{
     RosterEntry, ScanId, ScanRun, SkillId, SkillRecord, UsageEvent,
 };
 use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermission};
+use crate::state_security;
 
 const SCHEMA_VERSION: i64 = 10;
+
+fn sqlite_nofollow_path(path: &Path) -> StorageResult<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        StorageError::InvalidData(format!(
+            "state database path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        StorageError::InvalidData(format!(
+            "state database path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = parent.canonicalize().map_err(|error| {
+        StorageError::InvalidData(format!(
+            "cannot resolve state database directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(parent.join(name))
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LifecycleCounts {
@@ -146,10 +174,26 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn requires_migration(path: impl AsRef<Path>) -> StorageResult<bool> {
-        if !path.as_ref().exists() {
-            return Ok(true);
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => state_security::secure_file(path).map_err(|error| {
+                StorageError::InvalidData(format!(
+                    "cannot secure state database {}: {error}",
+                    path.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(StorageError::InvalidData(format!(
+                    "cannot inspect state database {}: {error}",
+                    path.display()
+                )));
+            }
         }
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let connection = Connection::open_with_flags(
+            sqlite_nofollow_path(path)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         Ok(version != SCHEMA_VERSION)
     }
@@ -176,15 +220,34 @@ impl StateStore {
 
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
+            state_security::prepare_state_root(parent).map_err(|error| {
                 StorageError::InvalidData(format!(
-                    "cannot create state directory {}: {error}",
+                    "cannot secure state directory {}: {error}",
                     parent.display()
                 ))
             })?;
         }
-        let connection = Connection::open(path)?;
-        Self::initialize(connection)
+        let path = path.as_ref();
+        state_security::prepare_private_file(path).map_err(|error| {
+            StorageError::InvalidData(format!(
+                "cannot prepare state database {}: {error}",
+                path.display()
+            ))
+        })?;
+        let connection = Connection::open_with_flags(
+            sqlite_nofollow_path(path)?,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        let store = Self::initialize(connection)?;
+        for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
+            state_security::secure_optional_file(&sidecar).map_err(|error| {
+                StorageError::InvalidData(format!(
+                    "cannot secure state database sidecar {}: {error}",
+                    sidecar.display()
+                ))
+            })?;
+        }
+        Ok(store)
     }
 
     pub fn open_in_memory() -> StorageResult<Self> {

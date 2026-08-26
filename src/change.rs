@@ -4,6 +4,7 @@
 //! fingerprints, and every apply/undo obtains the same process write lock.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::durable_fs::{DirectorySync, SystemDirectorySync};
+use crate::state_security;
 
 #[derive(Debug)]
 pub struct ChangeError {
@@ -1319,8 +1321,7 @@ fn stage_compensation(
             expected_fingerprint,
         } => {
             verify_fingerprint(target, expected_fingerprint)?;
-            let directory = recovery_dir(state_dir, receipt_id);
-            create_dir_all_durable(&directory, directory_sync)?;
+            let directory = create_recovery_dir(state_dir, receipt_id, directory_sync)?;
             let backup = directory.join(format!("replace-{index}.backup"));
             require_missing(&backup)?;
             copy_file_durable(
@@ -1513,8 +1514,8 @@ fn compensate(
         } => {
             verify_fingerprint(path, expected_fingerprint)?;
             normalize_target(path, roots)?;
-            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-{index}"));
-            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
+                .join(format!("undo-{index}"));
             rename_durable(path, &stash, directory_sync, "stash created path")?;
         }
         Compensation::RestoreSymlink { path, target } => {
@@ -1544,8 +1545,8 @@ fn compensate(
             require_missing(original)?;
             normalize_target(created, roots)?;
             normalize_target(original, roots)?;
-            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-created-{index}"));
-            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
+                .join(format!("undo-created-{index}"));
             rename_durable(created, &stash, directory_sync, "stash copied destination")?;
             rename_durable(backup, original, directory_sync, "restore source backup")?;
         }
@@ -1956,8 +1957,19 @@ fn remove_symlink(path: &Path) -> Result<()> {
     result.map_err(|error| ChangeError::io("remove symlink", path, error))
 }
 
-fn recovery_dir(state_dir: &Path, receipt_id: &str) -> PathBuf {
-    state_dir.join("recovery").join(receipt_id)
+fn create_recovery_dir(
+    state_dir: &Path,
+    receipt_id: &str,
+    directory_sync: &dyn DirectorySync,
+) -> Result<PathBuf> {
+    let root = state_dir.join("recovery");
+    let directory = root.join(receipt_id);
+    create_dir_all_durable(&directory, directory_sync)?;
+    state_security::secure_directory(&root)
+        .map_err(|error| ChangeError::io("secure recovery directory", &root, error))?;
+    state_security::secure_directory(&directory)
+        .map_err(|error| ChangeError::io("secure recovery directory", &directory, error))?;
+    Ok(directory)
 }
 
 fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
@@ -1967,12 +1979,14 @@ fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
 fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
     let directory = receipt.state_dir.join("receipts");
     create_dir_all_durable(&directory, directory_sync)?;
+    state_security::secure_directory(&directory)
+        .map_err(|e| ChangeError::io("secure receipt directory", &directory, e))?;
     let path = directory.join(format!("{}.json", receipt.id));
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|e| ChangeError::new("receipt_encoding_failed", e.to_string()))?;
-    let mut file =
-        File::create(&temp).map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
+    let mut file = state_security::open_private_file_for_replace(&temp)
+        .map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
     file.write_all(&bytes)
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
     file.sync_all()
@@ -1982,6 +1996,32 @@ fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectoryS
 
 pub(crate) fn persist_journal_state(receipt: &ChangeReceipt) -> Result<()> {
     persist_journal(receipt)
+}
+
+pub(crate) fn owned_receipt_control_file(name: &OsStr, file: &mut File) -> io::Result<bool> {
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    if let Some(id) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .and_then(|name| name.strip_prefix("receipt_"))
+    {
+        return Ok(ulid::Ulid::from_string(id).is_ok());
+    }
+    let Some(id) = name
+        .strip_suffix(".json")
+        .and_then(|name| name.strip_prefix("receipt_"))
+    else {
+        return Ok(false);
+    };
+    if ulid::Ulid::from_string(id).is_err() {
+        return Ok(false);
+    }
+    let Ok(receipt) = serde_json::from_reader::<_, ChangeReceipt>(file) else {
+        return Ok(false);
+    };
+    Ok(receipt.id == name.trim_end_matches(".json"))
 }
 
 /// Loads the durable filesystem journal without changing it. Invalid entries are
@@ -2113,13 +2153,16 @@ impl StateLock {
 
     fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
         let path = state_dir.join("write.lock");
-        let file = OpenOptions::new()
+        let mut options = state_security::private_file_options();
+        let file = options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .map_err(|e| ChangeError::io("open state lock", &path, e))?;
+        state_security::secure_opened_file(&file)
+            .map_err(|e| ChangeError::io("secure state lock", &path, e))?;
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)
         } else {
@@ -2419,6 +2462,58 @@ mod tests {
     }
 
     #[test]
+    fn journal_reuses_an_owned_temp_left_by_an_interrupted_write() {
+        let (_temp, root, state) = fixture();
+        let receipt = ChangeReceipt {
+            id: format!("receipt_{}", ulid::Ulid::new()),
+            plan_id: "plan_retry".to_owned(),
+            status: ReceiptStatus::Applying,
+            changed_paths: Vec::new(),
+            compensations: Vec::new(),
+            approved_roots: vec![root],
+            state_dir: state.clone(),
+            error: None,
+            reverses_receipt_id: None,
+            operation_results: Vec::new(),
+        };
+        let receipts = state.join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        let temp = receipts.join(format!(".{}.tmp", receipt.id));
+        fs::write(&temp, b"incomplete").unwrap();
+
+        persist_journal(&receipt).unwrap();
+
+        assert!(!temp.exists());
+        let published = receipts.join(format!("{}.json", receipt.id));
+        let decoded: ChangeReceipt = serde_json::from_slice(&fs::read(published).unwrap()).unwrap();
+        assert_eq!(decoded.id, receipt.id);
+        assert_eq!(decoded.status, ReceiptStatus::Applying);
+    }
+
+    #[test]
+    fn owned_receipt_validation_has_no_smaller_limit_than_receipt_creation() {
+        let (_temp, root, state) = fixture();
+        let receipt = ChangeReceipt {
+            id: format!("receipt_{}", ulid::Ulid::new()),
+            plan_id: "plan_large_receipt".to_owned(),
+            status: ReceiptStatus::RecoveryRequired,
+            changed_paths: Vec::new(),
+            compensations: Vec::new(),
+            approved_roots: vec![root],
+            state_dir: state.clone(),
+            error: Some("x".repeat(9 * 1024 * 1024)),
+            reverses_receipt_id: None,
+            operation_results: Vec::new(),
+        };
+        let name = format!("{}.json", receipt.id);
+        let path = state.join(&name);
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let mut file = File::open(path).unwrap();
+
+        assert!(owned_receipt_control_file(OsStr::new(&name), &mut file).unwrap());
+    }
+
+    #[test]
     fn target_directory_sync_failure_is_not_reported_as_success() {
         let (_temp, root, state) = fixture();
         let target = root.join("rolled-back.md");
@@ -2635,12 +2730,27 @@ mod tests {
             &input,
             &PrepareContext {
                 approved_roots: vec![root],
-                state_dir: state,
+                state_dir: state.clone(),
                 operation_policy: OperationPolicy::TestOnly,
             },
         )
         .unwrap();
         let applied = apply(&plan).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let receipts = state.join("receipts");
+            let journal = receipts.join(format!("{}.json", applied.receipt.id));
+            assert_eq!(
+                fs::metadata(receipts).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(journal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "---\nname: test\n---\n"
