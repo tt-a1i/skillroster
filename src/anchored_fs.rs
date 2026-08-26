@@ -153,11 +153,29 @@ impl AnchoredFs {
         }
         #[cfg(windows)]
         {
-            let (source_anchor, source_relative) = self.resolve(source)?;
-            if source_anchor.dir.metadata(source_relative)?.is_dir() {
-                target_anchor.dir.symlink_dir(source, target_relative)
+            let target_parent = target.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "symlink target has no parent")
+            })?;
+            let resolved_source = if source.is_absolute() {
+                source.to_path_buf()
             } else {
-                target_anchor.dir.symlink_file(source, target_relative)
+                target_parent.join(source)
+            };
+            let (source_anchor, source_relative) = self.resolve(&resolved_source)?;
+            let link_source = if source.is_absolute() {
+                relative_path(target_parent, source).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cannot create a handle-bound symlink across Windows volumes",
+                    )
+                })?
+            } else {
+                source.to_path_buf()
+            };
+            if source_anchor.dir.metadata(source_relative)?.is_dir() {
+                target_anchor.dir.symlink_dir(link_source, target_relative)
+            } else {
+                target_anchor.dir.symlink_file(link_source, target_relative)
             }
         }
     }
@@ -262,6 +280,31 @@ impl AnchoredFs {
             format!("path has no approved directory handle: {}", path.display()),
         ))
     }
+}
+
+#[cfg(windows)]
+fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &from[common..] {
+        if matches!(component, std::path::Component::Normal(_)) {
+            relative.push("..");
+        }
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    Some(relative)
 }
 
 #[cfg(unix)]
