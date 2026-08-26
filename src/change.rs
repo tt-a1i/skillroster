@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
@@ -910,20 +910,113 @@ fn remove_file_durable(
     sync_parent_directory(path, directory_sync, "sync removed file parent")
 }
 
+fn remove_file_durable_allowing_readonly(
+    path: &Path,
+    directory_sync: &dyn DirectorySync,
+    action: &str,
+) -> Result<()> {
+    #[cfg(not(windows))]
+    return remove_file_durable(path, directory_sync, action);
+
+    #[cfg(windows)]
+    {
+        remove_file_ignoring_readonly(path, action)?;
+        sync_parent_directory(path, directory_sync, "sync removed file parent")
+    }
+}
+
+#[cfg(windows)]
+fn remove_file_ignoring_readonly(path: &Path, action: &str) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_INFO_EX, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+
+    let file = OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| ChangeError::io("open file for removal", path, error))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ChangeError::io("inspect file for removal", path, error))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(ChangeError::new(
+            "not_a_regular_file",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    let removed = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if removed == 0 {
+        return Err(ChangeError::io(action, path, io::Error::last_os_error()));
+    }
+    drop(file);
+    Ok(())
+}
+
 fn copy_file_durable(
     source: &Path,
     target: &Path,
     directory_sync: &dyn DirectorySync,
     action: &str,
 ) -> Result<()> {
-    fs::copy(source, target).map_err(|error| ChangeError::io(action, source, error))?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(target)
-        .and_then(|file| file.sync_all())
+    let (file, original_permissions) = copy_file_exclusive(source, target, action)?;
+    file.set_permissions(original_permissions)
+        .map_err(|error| ChangeError::io("restore copied file metadata", target, error))?;
+    file.sync_all()
         .map_err(|error| ChangeError::io("sync copied file", target, error))?;
     sync_parent_directory(target, directory_sync, "sync copied file parent")
+}
+
+fn copy_file_exclusive(
+    source: &Path,
+    target: &Path,
+    action: &str,
+) -> Result<(File, fs::Permissions)> {
+    let mut source_file = File::open(source)
+        .map_err(|error| ChangeError::io("open copied file source", source, error))?;
+    let permissions = source_file
+        .metadata()
+        .map_err(|error| ChangeError::io("inspect copied file source", source, error))?
+        .permissions();
+    let mut target_options = OpenOptions::new();
+    target_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        // The staging entry is visible as soon as it is created. Start it no
+        // wider than the source instead of exposing copied bytes under the
+        // process's default creation mode until set_permissions runs.
+        target_options.mode(permissions.mode() & 0o7777);
+    }
+    let mut target_file = match target_options.open(target) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(ChangeError::new(
+                "target_exists",
+                format!("{} already exists", target.display()),
+            ));
+        }
+        Err(error) => return Err(ChangeError::io(action, target, error)),
+    };
+    io::copy(&mut source_file, &mut target_file)
+        .map_err(|error| ChangeError::io(action, target, error))?;
+    Ok((target_file, permissions))
 }
 
 fn finalize_rollback_results(receipt: &mut ChangeReceipt, recovered: bool) {
@@ -1368,17 +1461,19 @@ fn replace_file(
     directory_sync: &dyn DirectorySync,
 ) -> Result<()> {
     let temp = replacement_temp_path(target, receipt_id, index)?;
-    require_missing(&temp)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|error| ChangeError::io("create replacement", &temp, error))?;
+    let (mut file, original_permissions) =
+        copy_file_exclusive(target, &temp, "stage replacement metadata")?;
+    file.set_len(0)
+        .map_err(|error| ChangeError::io("truncate staged replacement", &temp, error))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| ChangeError::io("rewind staged replacement", &temp, error))?;
     file.write_all(content.as_bytes())
         .map_err(|error| ChangeError::io("write replacement", &temp, error))?;
+    file.set_permissions(original_permissions)
+        .map_err(|error| ChangeError::io("restore replacement metadata", &temp, error))?;
     file.sync_all()
         .map_err(|error| ChangeError::io("sync replacement", &temp, error))?;
-    remove_file_durable(target, directory_sync, "remove replaced file")?;
+    remove_file_durable_allowing_readonly(target, directory_sync, "remove replaced file")?;
     rename_durable(&temp, target, directory_sync, "publish replacement")
 }
 
@@ -1594,7 +1689,11 @@ fn compensate(
             require_missing(&restore)?;
             copy_file_durable(backup, &restore, directory_sync, "stage restored file")?;
             if actual != "missing" {
-                remove_file_durable(target, directory_sync, "remove replacement")?;
+                remove_file_durable_allowing_readonly(
+                    target,
+                    directory_sync,
+                    "remove replacement",
+                )?;
             }
             rename_durable(&restore, target, directory_sync, "restore replaced file")?;
             verify_fingerprint(target, expected_original)?;
@@ -1617,7 +1716,7 @@ fn remove_expected_file_if_present_durable(
 ) -> Result<()> {
     match fingerprint(path)? {
         actual if actual == expected_fingerprint => {
-            remove_file_durable(path, directory_sync, action)
+            remove_file_durable_allowing_readonly(path, directory_sync, action)
         }
         actual if actual == "missing" => {
             sync_parent_directory(path, directory_sync, "sync absent recovery file parent")
@@ -2758,6 +2857,131 @@ mod tests {
         let undone = undo(&applied.receipt).unwrap();
         assert_eq!(undone.receipt.status, ReceiptStatus::Undone);
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_and_undo_preserve_private_and_executable_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for mode in [0o600, 0o500] {
+            assert_replace_and_undo_preserves_permissions(fs::Permissions::from_mode(mode));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_and_undo_preserve_readonly_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let probe = temp.path().join("permissions-probe");
+        fs::write(&probe, "probe").unwrap();
+        let mut permissions = fs::metadata(&probe).unwrap().permissions();
+        permissions.set_readonly(true);
+        assert_replace_and_undo_preserves_permissions(permissions);
+    }
+
+    fn assert_replace_and_undo_preserves_permissions(original_permissions: fs::Permissions) {
+        let (_temp, root, state) = fixture();
+        let target = root.join("replace.txt");
+        fs::write(&target, "before").unwrap();
+        fs::set_permissions(&target, original_permissions.clone()).unwrap();
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "replace_file",
+                "target": target,
+                "content": "after",
+                "expected_fingerprint": fingerprint(&target).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+
+        let applied = apply(&plan).unwrap();
+
+        assert!(
+            applied.verification_passed,
+            "Apply failed: {:?}",
+            applied.receipt.error
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "after");
+        assert_permissions_equal(&target, &original_permissions);
+
+        let undone = undo(&applied.receipt).unwrap();
+
+        assert!(undone.verification_passed);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert_permissions_equal(&target, &original_permissions);
+        #[cfg(windows)]
+        {
+            let mut writable = original_permissions;
+            writable.set_readonly(false);
+            fs::set_permissions(&target, writable).unwrap();
+        }
+    }
+
+    #[test]
+    fn replacement_staging_failure_leaves_original_content_and_permissions() {
+        let (_temp, root, _state) = fixture();
+        let target = root.join("replace.txt");
+        fs::write(&target, "before").unwrap();
+        let permissions = fs::metadata(&target).unwrap().permissions();
+        let receipt_id = "receipt_fixture";
+        let staged = root.join(format!(".replace.txt.skillroster-replace-{receipt_id}-0"));
+        fs::write(&staged, "must not be overwritten").unwrap();
+
+        let error =
+            replace_file(&target, "after", receipt_id, 0, &SystemDirectorySync).unwrap_err();
+
+        assert_eq!(error.code, "target_exists");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert_permissions_equal(&target, &permissions);
+        assert_eq!(
+            fs::read_to_string(staged).unwrap(),
+            "must not be overwritten"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_copy_never_exposes_private_source_under_wider_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("private-source");
+        let staged = temp.path().join("visible-staging");
+        fs::write(&source, "private contents").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_file, permissions) =
+            copy_file_exclusive(&source, &staged, "stage private file").unwrap();
+
+        assert_eq!(permissions.mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::metadata(&staged).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "private contents");
+    }
+
+    fn assert_permissions_equal(path: &Path, expected: &fs::Permissions) {
+        let actual = fs::metadata(path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(actual.mode() & 0o7777, expected.mode() & 0o7777);
+        }
+        #[cfg(windows)]
+        assert_eq!(actual.readonly(), expected.readonly());
     }
 
     #[test]

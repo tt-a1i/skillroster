@@ -156,6 +156,14 @@ Agent callers never need to parse the human message.
 
 Apply fails closed when paths, fingerprints, links, or configuration have drifted. Every successful mutation writes a Receipt. `undo <receipt-id>` is bounded to that Receipt and refuses ambiguous restoration. Canonical deletion is outside normal Apply, requires separate confirmation, and should prefer recoverable archive.
 
+File replacement copies the original through an exclusively created staging
+handle and restores its platform permissions before publication. Unix
+permission bits and Windows file attributes, including readonly, must therefore
+survive both Apply and Undo, including an originally non-writable file. Windows
+removal uses a handle-bound disposition that ignores readonly without first
+weakening the original path's attributes. SkillRoster does not claim portable
+preservation of owner, ACLs, or extended attributes.
+
 ### 4.5 Source updates
 
 SkillRoster records source, revision, and content hash when available. A source-update request submitted through `plan --stdin` first produces a diff and Plan; there is no silent update path. Local modifications stop automatic replacement and require an explicit choice to retain local content, adopt upstream content, or preserve both.
