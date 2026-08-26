@@ -147,8 +147,21 @@ pub struct StateStore {
 
 impl StateStore {
     pub fn requires_migration(path: impl AsRef<Path>) -> StorageResult<bool> {
-        if !path.as_ref().exists() {
-            return Ok(true);
+        let path = path.as_ref();
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => state_security::secure_file(path).map_err(|error| {
+                StorageError::InvalidData(format!(
+                    "cannot secure state database {}: {error}",
+                    path.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(StorageError::InvalidData(format!(
+                    "cannot inspect state database {}: {error}",
+                    path.display()
+                )));
+            }
         }
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -185,13 +198,13 @@ impl StateStore {
             })?;
         }
         let path = path.as_ref();
-        let connection = Connection::open(path)?;
-        state_security::secure_file(path).map_err(|error| {
+        state_security::prepare_private_file(path).map_err(|error| {
             StorageError::InvalidData(format!(
-                "cannot secure state database {}: {error}",
+                "cannot prepare state database {}: {error}",
                 path.display()
             ))
         })?;
+        let connection = Connection::open(path)?;
         let store = Self::initialize(connection)?;
         for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
             state_security::secure_optional_file(&sidecar).map_err(|error| {

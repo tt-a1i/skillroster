@@ -427,17 +427,12 @@ fn write_source_confirmation_detail(state_dir: &Path, complete: Value) -> Result
     let path = directory.join(format!("{id}.json"));
     let temporary_path = directory.join(format!(".{id}.tmp"));
     let bytes = serde_json::to_vec(&complete)?;
-    let mut options = std::fs::OpenOptions::new();
+    let mut options = crate::state_security::private_file_options();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     let mut file = options
         .open(&temporary_path)
         .with_context(|| format!("cannot create {}", temporary_path.display()))?;
-    crate::state_security::secure_file(&temporary_path)
+    crate::state_security::secure_opened_file(&file)
         .with_context(|| format!("cannot secure {}", temporary_path.display()))?;
     let write_result = (|| -> Result<()> {
         file.write_all(&bytes)

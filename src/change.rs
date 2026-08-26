@@ -1968,12 +1968,6 @@ fn create_recovery_dir(
         .map_err(|error| ChangeError::io("secure recovery directory", &root, error))?;
     state_security::secure_directory(&directory)
         .map_err(|error| ChangeError::io("secure recovery directory", &directory, error))?;
-    directory_sync
-        .sync_directory(&root)
-        .map_err(|error| ChangeError::io("sync secured recovery directory", &root, error))?;
-    directory_sync
-        .sync_directory(&directory)
-        .map_err(|error| ChangeError::io("sync secured recovery directory", &directory, error))?;
     Ok(directory)
 }
 
@@ -1986,9 +1980,6 @@ fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectoryS
     create_dir_all_durable(&directory, directory_sync)?;
     state_security::secure_directory(&directory)
         .map_err(|e| ChangeError::io("secure receipt directory", &directory, e))?;
-    directory_sync
-        .sync_directory(&directory)
-        .map_err(|e| ChangeError::io("sync secured receipt directory", &directory, e))?;
     let path = directory.join(format!("{}.json", receipt.id));
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
@@ -1996,11 +1987,10 @@ fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectoryS
     let mut options = state_security::private_file_options();
     let mut file = options
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(&temp)
         .map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
-    state_security::secure_file(&temp)
+    state_security::secure_opened_file(&file)
         .map_err(|e| ChangeError::io("secure receipt journal", &temp, e))?;
     file.write_all(&bytes)
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
@@ -2150,7 +2140,7 @@ impl StateLock {
             .truncate(false)
             .open(&path)
             .map_err(|e| ChangeError::io("open state lock", &path, e))?;
-        state_security::secure_file(&path)
+        state_security::secure_opened_file(&file)
             .map_err(|e| ChangeError::io("secure state lock", &path, e))?;
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)

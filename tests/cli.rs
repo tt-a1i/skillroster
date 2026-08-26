@@ -130,6 +130,72 @@ fn local_state_is_private_even_with_a_permissive_umask() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn lifecycle_delete_refuses_a_symlink_state_root_without_touching_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), "keep").unwrap();
+    let state = temp.path().join("state");
+    symlink(&outside, &state).unwrap();
+    let output = run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+            "lifecycle",
+            "delete",
+            "--confirm",
+            "DELETE-LOCAL-STATE",
+        ],
+        None,
+    );
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(outside.join("sentinel")).unwrap(),
+        "keep"
+    );
+    assert!(!outside.join("skillroster.db").exists());
+    assert!(!outside.join("write.lock").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_refuses_database_and_lock_symlinks_before_opening_them() {
+    use std::os::unix::fs::symlink;
+
+    for name in ["skillroster.db", "write.lock"] {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let outside = temp.path().join(format!("outside-{name}"));
+        symlink(&outside, state.join(name)).unwrap();
+
+        let output = run(
+            &[
+                "--home",
+                home.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--json",
+                "status",
+            ],
+            None,
+        );
+
+        assert!(!output.status.success(), "{name} symlink was accepted");
+        assert!(!outside.exists(), "{name} symlink target was created");
+    }
+}
+
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
     let mut argv = vec![
         "skillroster".to_owned(),

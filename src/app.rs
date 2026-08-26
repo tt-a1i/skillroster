@@ -180,6 +180,10 @@ pub fn run(cli: Cli) -> Result<Output> {
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
+    state_security::prepare_state_root(&state_dir)
+        .with_context(|| format!("cannot secure state root {}", state_dir.display()))?;
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
     if let Some(Command::Lifecycle(args)) = &cli.command {
         if let LifecycleCommand::Delete(args) = &args.command {
             if args.confirm != "DELETE-LOCAL-STATE" {
@@ -204,8 +208,6 @@ pub fn run(cli: Cli) -> Result<Output> {
             });
         }
     }
-    state_security::prepare_state_root(&state_dir)
-        .with_context(|| format!("cannot secure state root {}", state_dir.display()))?;
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
     let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
@@ -1706,8 +1708,6 @@ fn lifecycle_purge_command(
 }
 
 fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Value> {
-    std::fs::create_dir_all(state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
     let _write_lock = change::WriteLock::acquire(state_dir)?;
     let existed = database_path.exists();
     let journals = change::journals(state_dir)?;
