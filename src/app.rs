@@ -17,6 +17,7 @@ use crate::cli::{
     Cli, Command, LifecycleCommand, ModifiedBootstrapChoice, ReportCategory, ReportSeverity,
     SourceRootCommand,
 };
+use crate::durable_fs::{DirectorySync, SystemDirectorySync};
 use crate::harness::{self, AgentKind};
 use crate::model::{
     AgentId, AgentRecord, ApiError, EvidenceId, EvidenceKind, EvidenceQuality, EvidenceRecord,
@@ -653,6 +654,9 @@ fn owned_source_confirmation_control_file(
     name: &std::ffi::OsStr,
     file: &mut std::fs::File,
 ) -> std::io::Result<bool> {
+    if owned_source_confirmation_temp_name(name) {
+        return Ok(true);
+    }
     let path = Path::new(name);
     if path.extension().and_then(|value| value.to_str()) != Some("json") {
         return Ok(false);
@@ -667,6 +671,17 @@ fn owned_source_confirmation_control_file(
         return Ok(false);
     };
     Ok(recognized_source_confirmation_detail(&detail))
+}
+
+fn owned_source_confirmation_temp_name(name: &std::ffi::OsStr) -> bool {
+    let Some(id) = name
+        .to_str()
+        .and_then(|name| name.strip_prefix('.'))
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    ulid::Ulid::from_string(id).is_ok()
 }
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
@@ -1815,10 +1830,16 @@ fn source_confirmation_detail_paths(state_dir: &Path) -> Result<Vec<PathBuf>> {
         let entry = entry?;
         let path = entry.path();
         let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || path.extension().and_then(|value| value.to_str()) != Some("json")
-        {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "refusing invalid source-confirmation detail: {}",
+                path.display()
+            );
+        }
+        if owned_source_confirmation_temp_name(&entry.file_name()) {
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
             bail!(
                 "refusing invalid source-confirmation detail: {}",
                 path.display()
@@ -2014,11 +2035,31 @@ fn remove_source_confirmation_details(state_dir: &Path) -> Result<u64> {
     for path in &paths {
         std::fs::remove_file(path).with_context(|| format!("cannot delete {}", path.display()))?;
     }
+    let mut removed_temps = 0_u64;
+    if directory.is_dir() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if !owned_source_confirmation_temp_name(&entry.file_name()) {
+                bail!(
+                    "refusing invalid source-confirmation detail: {}",
+                    entry.path().display()
+                );
+            }
+            std::fs::remove_file(entry.path())?;
+            removed_temps += 1;
+        }
+        SystemDirectorySync
+            .sync_directory(&directory)
+            .with_context(|| format!("cannot sync {}", directory.display()))?;
+    }
     if std::fs::symlink_metadata(&directory).is_ok() {
         std::fs::remove_dir(&directory)
             .with_context(|| format!("cannot delete {}", directory.display()))?;
+        SystemDirectorySync
+            .sync_directory(state_dir)
+            .with_context(|| format!("cannot sync {}", state_dir.display()))?;
     }
-    Ok(paths.len() as u64)
+    Ok(paths.len() as u64 + removed_temps)
 }
 
 fn remove_receipt_journals(state_dir: &Path) -> Result<u64> {

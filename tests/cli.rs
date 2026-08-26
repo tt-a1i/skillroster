@@ -4280,6 +4280,44 @@ fn explicit_roots_preserve_all_eight_agent_identities() {
 }
 
 #[test]
+fn source_confirmation_crash_temp_does_not_block_lifecycle_cleanup() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let details = state.join("source-confirmation");
+    fs::create_dir_all(&details).unwrap();
+    let interrupted = details.join(format!(".{}.tmp", ulid::Ulid::new()));
+    fs::write(&interrupted, b"incomplete").unwrap();
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(
+        status["result"]["retention"]["source_confirmation_details"]["count"],
+        0
+    );
+    assert!(interrupted.is_file());
+
+    let purged = json_output(&run(
+        &[
+            &common[..],
+            &["lifecycle", "purge", "--source-confirmation"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(purged["result"]["removed_source_confirmation_details"], 1);
+    assert!(!details.exists());
+}
+
+#[test]
 fn lifecycle_exclusion_and_database_delete_preserve_user_files() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
