@@ -5,26 +5,15 @@ use anyhow::{Result, anyhow, bail};
 
 use crate::change::RosterChange;
 use crate::harness::AgentKind;
-use crate::model::{FindingCategory, FindingRecord};
+#[cfg(test)]
+use crate::model::FindingCategory;
+use crate::model::FindingRecord;
 use crate::scan::{EvidenceQuality, ScanResult, UsageStage};
 
 pub const MAX_CORE_BUDGET: usize = 50;
-pub const LARGE_ROSTER_FINDING_KIND: &str = "large_default_roster";
-pub const LARGE_ROSTER_FINDING_TITLE: &str = "Large default Rosters need review";
-
-pub fn finding_kind(category: &FindingCategory, title: &str) -> Option<&'static str> {
-    (*category == FindingCategory::Exposure && title == LARGE_ROSTER_FINDING_TITLE)
-        .then_some(LARGE_ROSTER_FINDING_KIND)
-}
 
 pub fn is_large_roster_finding(finding: &FindingRecord) -> bool {
-    finding
-        .details
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        == Some(LARGE_ROSTER_FINDING_KIND)
-        || (finding.details.get("kind").is_none()
-            && finding_kind(&finding.category, &finding.title).is_some())
+    crate::query::stored_finding_is(finding, crate::query::FindingKind::LargeDefaultRoster)
 }
 
 #[derive(Clone, Debug)]

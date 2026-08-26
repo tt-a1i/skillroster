@@ -352,7 +352,10 @@ pub fn confirm_source_root(
     snapshot: &ScanResult,
     requested: &Path,
 ) -> anyhow::Result<ConfirmOutcome> {
-    if finding.title != ESCAPING_LINK_FINDING_TITLE {
+    if !crate::query::stored_finding_is(
+        finding,
+        crate::query::FindingKind::EscapingLinkSourceConfirmation,
+    ) {
         return Err(SourceRootPolicyError::NotEscapingLinkFinding {
             finding_id: finding.id.as_str().to_owned(),
         }
