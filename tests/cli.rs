@@ -1662,6 +1662,7 @@ fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
             |row| row.get(0),
         )
         .unwrap();
+
     let mut legacy: Value = serde_json::from_str(&encoded).unwrap();
     legacy["content_identity_algorithm"] = json!("sha256-content-v1");
     legacy
@@ -6886,6 +6887,48 @@ fn apply_rejects_a_legacy_ready_plan_without_mutation() {
             "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
             [snapshot],
             |row| row.get(0),
+        )
+        .unwrap();
+
+    for (payload, reason) in [
+        (
+            {
+                let mut payload: Value = serde_json::from_str(&encoded).unwrap();
+                payload["content_identity_algorithm"] = json!("sha256-content-v1");
+                payload
+            },
+            "legacy_snapshot_requires_rescan",
+        ),
+        (
+            {
+                let mut payload: Value = serde_json::from_str(&encoded).unwrap();
+                payload["identity_path_coverage"] = json!("incomplete");
+                payload["non_unicode_identity_paths_skipped"] = json!(1);
+                payload
+            },
+            "non_unicode_identity_coverage_incomplete",
+        ),
+    ] {
+        database
+            .execute(
+                "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+                rusqlite::params![payload.to_string(), snapshot],
+            )
+            .unwrap();
+        let rejected = run(&[&common[..], &["apply", plan_id]].concat(), None);
+        assert!(!rejected.status.success());
+        let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(
+            rejected["error"]["code"],
+            "content_identity_rescan_required"
+        );
+        assert_eq!(rejected["error"]["details"]["reason"], reason);
+    }
+
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            rusqlite::params![&encoded, snapshot],
         )
         .unwrap();
     let mut legacy: Value = serde_json::from_str(&encoded).unwrap();

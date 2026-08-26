@@ -8135,6 +8135,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
         }
         .into());
     }
+    require_content_identity(&scan)?;
     validate_governance_fingerprint_completeness(&prepared, &scan)?;
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;

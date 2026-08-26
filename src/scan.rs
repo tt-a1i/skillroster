@@ -4023,10 +4023,19 @@ enabled = true
         use std::os::unix::ffi::OsStringExt;
 
         let root = temp_directory("non-unicode-session-file");
-        fs::write(root.join("empty.json"), b"").unwrap();
+        for index in 0..MAX_SESSION_FILES_PER_ROOT {
+            fs::write(root.join(format!("session-{index:03}.json")), b"").unwrap();
+        }
         let mut invalid_name = vec![0x80];
         invalid_name.extend_from_slice(b".json");
-        fs::write(root.join(OsString::from_vec(invalid_name)), b"{}\n").unwrap();
+        let invalid_path = root.join(OsString::from_vec(invalid_name));
+        fs::write(&invalid_path, b"{}\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&invalid_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
         let mut result = ScanResult {
             content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
             identity_path_coverage: IdentityPathCoverage::Complete,
