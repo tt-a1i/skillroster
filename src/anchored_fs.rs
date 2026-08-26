@@ -185,6 +185,21 @@ impl AnchoredFs {
         anchor.dir.remove_file(relative)
     }
 
+    pub(crate) fn remove_symlink(&self, path: &Path) -> io::Result<()> {
+        let (anchor, relative) = self.resolve(path)?;
+        #[cfg(unix)]
+        {
+            anchor.dir.remove_file(relative)
+        }
+        #[cfg(windows)]
+        {
+            match anchor.dir.remove_file(&relative) {
+                Ok(()) => Ok(()),
+                Err(file_error) => anchor.dir.remove_dir(relative).or(Err(file_error)),
+            }
+        }
+    }
+
     pub(crate) fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let (from_anchor, from_relative) = self.resolve(from)?;
         let (to_anchor, to_relative) = self.resolve(to)?;

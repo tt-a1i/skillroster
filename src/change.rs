@@ -1353,7 +1353,7 @@ fn execute(
                 .read_link(target)
                 .map_err(|e| ChangeError::io("read symlink", target, e))?;
             anchored
-                .remove_file(target)
+                .remove_symlink(target)
                 .map_err(|e| ChangeError::io("remove symlink", target, e))?;
             Ok(Some(Compensation::RestoreSymlink {
                 path: target.clone(),
