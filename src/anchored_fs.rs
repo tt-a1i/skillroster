@@ -36,9 +36,9 @@ impl AnchoredFs {
         let mut anchors = Vec::with_capacity(paths.len());
         for path in paths {
             let dir = Dir::open_ambient_dir(&path, ambient_authority())?;
-            let opened = dir.dir_metadata()?;
+            let opened = dir.try_clone()?.into_std_file();
             let entry = fs::symlink_metadata(&path)?;
-            if entry.file_type().is_symlink() || !same_directory(&opened, &entry) {
+            if entry.file_type().is_symlink() || !same_directory(&opened, &path)? {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -61,14 +61,14 @@ impl AnchoredFs {
 
     pub(crate) fn fingerprint(&self, path: &Path) -> io::Result<String> {
         let (anchor, relative) = self.resolve(path)?;
-        match self.fingerprint_relative(anchor, &relative) {
+        match Self::fingerprint_relative(anchor, &relative) {
             Ok(value) => Ok(value),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("missing".into()),
             Err(error) => Err(error),
         }
     }
 
-    fn fingerprint_relative(&self, anchor: &Anchor, relative: &Path) -> io::Result<String> {
+    fn fingerprint_relative(anchor: &Anchor, relative: &Path) -> io::Result<String> {
         let metadata = anchor.dir.symlink_metadata(relative)?;
         if metadata.is_symlink() {
             let target = anchor.dir.read_link_contents(relative)?;
@@ -100,10 +100,7 @@ impl AnchoredFs {
             let mut hash = Sha256::new();
             for name in entries {
                 hash.update(name.as_encoded_bytes());
-                hash.update(
-                    self.fingerprint_relative(anchor, &relative.join(&name))?
-                        .as_bytes(),
-                );
+                hash.update(Self::fingerprint_relative(anchor, &relative.join(&name))?.as_bytes());
             }
             return Ok(format!("directory:sha256:{}", hex::encode(hash.finalize())));
         }
@@ -189,7 +186,7 @@ impl AnchoredFs {
     pub(crate) fn copy_tree(&self, source: &Path, target: &Path) -> io::Result<()> {
         let (source_anchor, source_relative) = self.resolve(source)?;
         let (target_anchor, target_relative) = self.resolve(target)?;
-        self.copy_tree_relative(
+        Self::copy_tree_relative(
             source_anchor,
             &source_relative,
             target_anchor,
@@ -198,7 +195,6 @@ impl AnchoredFs {
     }
 
     fn copy_tree_relative(
-        &self,
         source_anchor: &Anchor,
         source: &Path,
         target_anchor: &Anchor,
@@ -228,7 +224,7 @@ impl AnchoredFs {
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<io::Result<Vec<_>>>()?;
         for name in entries {
-            self.copy_tree_relative(
+            Self::copy_tree_relative(
                 source_anchor,
                 &source.join(&name),
                 target_anchor,
@@ -269,20 +265,58 @@ impl AnchoredFs {
 }
 
 #[cfg(unix)]
-fn same_directory(opened: &cap_std::fs::Metadata, entry: &fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
+fn same_directory(opened: &fs::File, path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt as _;
 
-    opened.dev() == entry.dev() && opened.ino() == entry.ino()
+    let opened = opened.metadata()?;
+    let entry = fs::symlink_metadata(path)?;
+    Ok(opened.dev() == entry.dev() && opened.ino() == entry.ino())
 }
 
 #[cfg(windows)]
-fn same_directory(opened: &cap_std::fs::Metadata, entry: &fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-    use std::os::windows::fs::MetadataExt as _;
+fn same_directory(opened: &fs::File, path: &Path) -> io::Result<bool> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
 
-    opened.volume_serial_number() == entry.volume_serial_number()
-        && opened.file_index() == entry.file_index()
-        && opened.volume_serial_number().is_some()
-        && opened.file_index().is_some()
+    fn identity(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<(u32, u32, u32)> {
+        let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((
+            information.dwVolumeSerialNumber,
+            information.nFileIndexHigh,
+            information.nFileIndexLow,
+        ))
+    }
+
+    let opened_identity = identity(opened.as_raw_handle())?;
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let entry = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if entry == INVALID_HANDLE_VALUE || entry.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let entry_identity = identity(entry);
+    unsafe { CloseHandle(entry) };
+    Ok(opened_identity == entry_identity?)
 }
