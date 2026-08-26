@@ -66,6 +66,20 @@ immutable payloads rather than stale projection rows.
 
 Skill-root discovery and package fingerprints carry explicit completeness facts. A configured root whose depth limit was reached remains Included but is marked discovery-incomplete, making structural coverage unreliable. Each placement fingerprint is `complete`, `bounded`, `unreadable`, or `unknown`; payloads created before this contract default to `unknown`. Only a complete package fingerprint may support an exact-duplicate Finding or any Library/Roster Plan that relies on exact content. Bounded or unreadable packages remain inventory facts and require a new complete Scan before governance. Apply repeats this check so a Ready Plan created by an older binary cannot bypass the boundary.
 
+The current Snapshot schema accepts only Unicode identity-bearing paths. A
+non-Unicode configured root fails the Scan with `non_unicode_identity_path`;
+discovered non-Unicode Skill directories are skipped and make that root's
+structural coverage incomplete. A Unicode Skill containing a non-Unicode
+package member remains an inventory fact with an `unreadable` fingerprint and
+cannot authorize exact load or governance. SkillRoster never hashes lossy path
+text or persists a replacement-character identity. Snapshots record typed
+`identity_path_coverage` plus an exact skipped-path count; any unverified or
+incomplete value blocks Find, Report, Plan, Apply, and other exact-identity
+decisions until a complete rescan. The `sha256-content-unicode-v2` presence
+marker prevents pre-contract Snapshots from being reused even when every
+currently visible path is Unicode. A future raw-byte or UTF-16 path encoding
+requires an explicit versioned schema migration.
+
 Scan records two deliberately separate hashes in one bounded traversal. The complete package fingerprint covers every retained package file, including `.gitignore`, and remains the only hash used for drift checks, exact load, Plan, Apply, Receipt, Undo, and recovery. The versioned routing content identity excludes only the package-root `.gitignore`; it is used for unsourced logical identity and same-name variant grouping because source-control metadata is not Agent Skills payload. `SKILL.md`, scripts, references, assets, and symlink targets remain identity-bearing. A legacy Snapshot without the current content-identity algorithm must be rescanned; the CLI never backfills or infers equality from old package fingerprints.
 
 One routing identity may therefore have multiple complete package fingerprints. Existing Core placements may remain unchanged, but any Roster mutation, migration, retarget, or new exposure that would require choosing one package as canonical fails closed with the affected placement IDs and fingerprint count. Routing equivalence never authorizes package consolidation or metadata loss.
