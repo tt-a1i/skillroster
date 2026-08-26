@@ -26,14 +26,18 @@ pub(crate) fn prepare_state_root(path: &Path) -> io::Result<()> {
     secure_directory(path)
 }
 
+#[cfg(unix)]
 pub(crate) fn private_file_options() -> OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(STATE_FILE_MODE);
-    }
+    options.mode(STATE_FILE_MODE);
     options
+}
+
+#[cfg(not(unix))]
+pub(crate) fn private_file_options() -> OpenOptions {
+    OpenOptions::new()
 }
 
 pub(crate) fn secure_file(path: &Path) -> io::Result<()> {
@@ -174,7 +178,7 @@ fn secure_path(path: &Path, directory: bool) -> io::Result<()> {
         ));
     }
 
-    let mut token = 0;
+    let mut token: HANDLE = null_mut();
     // SAFETY: token points to writable storage and GetCurrentProcess returns a pseudo-handle.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
@@ -256,12 +260,11 @@ fn secure_path(path: &Path, _directory: bool) -> io::Result<()> {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[cfg(unix)]
     #[test]
     fn narrows_existing_state_directory_and_file() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -292,7 +295,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn refuses_a_symlink_state_root() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -312,7 +314,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn narrows_existing_control_layout_and_sidecars() {
         use std::os::unix::fs::PermissionsExt;
