@@ -19,8 +19,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    name: Validate exact release SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Record exact release SHA
+        shell: bash
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          [[ "$actual_sha" == "$GITHUB_SHA" ]] || {
+            echo "Checked out $actual_sha instead of event SHA $GITHUB_SHA" >&2
+            exit 1
+          }
+          echo "Validated release SHA: \`$actual_sha\`" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Install Rust 1.85
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.85.0
+
+      - name: Set up Node.js 24 for harness checks
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Run strict repository checks
+        shell: bash
+        run: bash scripts/ci-full-check.sh
+
   build:
     name: ${{ matrix.target }}
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -44,9 +81,14 @@ jobs:
       TARGET: ${{ matrix.target }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify exact release SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - name: Install Rust 1.85
         shell: bash
@@ -72,6 +114,9 @@ jobs:
             "$cargo_version"|"$cargo_version"-*) ;;
             *) echo "Version $version does not match Cargo package $cargo_version" >&2; exit 1 ;;
           esac
+
+      - name: Run portability tests at release SHA
+        run: cargo test --locked --all-targets --all-features
 
       - name: Build locked release binary
         run: cargo build --release --locked --target "${{ matrix.target }}"
@@ -108,7 +153,7 @@ jobs:
         run: scripts/release/package-windows.ps1 -Target $env:TARGET -Version ($env:RELEASE_VERSION -replace '^v', '')
 
       - name: Upload release candidate
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: skillroster-${{ matrix.target }}
           path: dist/*
@@ -122,12 +167,13 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out smoke test
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download Linux release artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: skillroster-x86_64-unknown-linux-gnu
           path: dist
