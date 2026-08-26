@@ -164,6 +164,13 @@ removal uses a handle-bound disposition that ignores readonly without first
 weakening the original path's attributes. SkillRoster does not claim portable
 preservation of owner, ACLs, or extended attributes.
 
+Apply, compensation, and Undo open approved roots and the private state root as
+directory capabilities before mutation. Filesystem paths are resolved relative
+to those retained handles for fingerprinting, copy, rename, replacement, and
+link operations. If an opened root and its directory entry no longer identify
+the same directory, or if an ancestor symlink would escape the handle, the
+operation fails closed without touching the escaped target.
+
 ### 4.5 Source updates
 
 SkillRoster records source, revision, and content hash when available. A source-update request submitted through `plan --stdin` first produces a diff and Plan; there is no silent update path. Local modifications stop automatic replacement and require an explicit choice to retain local content, adopt upstream content, or preserve both.

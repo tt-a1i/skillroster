@@ -4,18 +4,34 @@
 //! fingerprints, and every apply/undo obtains the same process write lock.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::durable_fs::{DirectorySync, SystemDirectorySync};
-use crate::state_security;
+use crate::anchored_fs::AnchoredFs;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MUTATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_before_mutation_hook() {
+    BEFORE_MUTATION_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_before_mutation_hook() {}
 
 #[derive(Debug)]
 pub struct ChangeError {
@@ -126,7 +142,7 @@ pub struct RosterChange {
     pub state: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationInput {
     CreateDirectory {
@@ -307,8 +323,6 @@ pub enum Compensation {
         target: PathBuf,
         expected_original: String,
         expected_replacement: String,
-        #[serde(default)]
-        staged_replacement: Option<PathBuf>,
     },
 }
 
@@ -504,16 +518,10 @@ pub fn apply(plan: &PreparedPlan) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn apply_locked(plan: &PreparedPlan) -> Result<ApplyOutcome> {
-    apply_locked_with(plan, &SystemDirectorySync)
-}
-
-fn apply_locked_with(
-    plan: &PreparedPlan,
-    directory_sync: &dyn DirectorySync,
-) -> Result<ApplyOutcome> {
     validate_prepared_plan(plan)?;
     reject_unresolved_recovery(&plan.state_dir)?;
     validate_operation_sequence(&plan.operations, &plan.approved_roots)?;
+    let anchored = open_anchored_fs(&plan.approved_roots, &plan.state_dir)?;
 
     let receipt_id = format!("receipt_{}", ulid::Ulid::new());
     let mut receipt = ChangeReceipt {
@@ -528,7 +536,8 @@ fn apply_locked_with(
         reverses_receipt_id: None,
         operation_results: Vec::new(),
     };
-    persist_journal_with(&receipt, directory_sync)?;
+    persist_journal(&receipt)?;
+    run_before_mutation_hook();
 
     for (index, operation) in plan.operations.iter().enumerate() {
         receipt.operation_results.push(JournalOperationResult {
@@ -537,28 +546,18 @@ fn apply_locked_with(
             action: operation_kind(operation).to_owned(),
             target: operation.target().to_path_buf(),
             status: "applying".to_owned(),
-            before_fingerprint: fingerprint(operation.target()).ok(),
+            before_fingerprint: anchored.fingerprint(operation.target()).ok(),
             after_fingerprint: None,
             error: None,
         });
-        persist_journal_with(&receipt, directory_sync)?;
-        if let Some(compensation) = stage_compensation(
-            operation,
-            &receipt.id,
-            index,
-            &plan.state_dir,
-            directory_sync,
-        )? {
+        persist_journal(&receipt)?;
+        if let Some(compensation) =
+            stage_compensation(operation, &receipt.id, index, &plan.state_dir, &anchored)?
+        {
             receipt.compensations.push(compensation);
-            persist_journal_with(&receipt, directory_sync)?;
+            persist_journal(&receipt)?;
         }
-        match execute(
-            operation,
-            &receipt.id,
-            index,
-            &plan.approved_roots,
-            directory_sync,
-        ) {
+        match execute(operation, &receipt.id, index, &anchored) {
             Ok(compensation) => {
                 receipt.changed_paths.push(operation.target().to_path_buf());
                 if let Some(compensation) = compensation {
@@ -566,17 +565,17 @@ fn apply_locked_with(
                 }
                 if let Some(result) = receipt.operation_results.last_mut() {
                     result.status = "applied".to_owned();
-                    result.after_fingerprint = fingerprint(operation.target()).ok();
+                    result.after_fingerprint = anchored.fingerprint(operation.target()).ok();
                 }
-                if let Err(journal_error) = persist_journal_with(&receipt, directory_sync) {
+                if let Err(journal_error) = persist_journal(&receipt) {
                     receipt.error = Some(journal_error.to_string());
-                    let rollback = compensate_all(&receipt, directory_sync);
+                    let rollback = compensate_all(&receipt, &anchored);
                     receipt.status = if rollback.is_ok() {
                         ReceiptStatus::FailedRolledBack
                     } else {
                         ReceiptStatus::RecoveryRequired
                     };
-                    finalize_rollback_results(&mut receipt, rollback.is_ok());
+                    finalize_rollback_results(&mut receipt, rollback.is_ok(), &anchored);
                     if let Err(rollback_error) = rollback {
                         receipt.error = Some(format!(
                             "{journal_error}; compensation failed: {rollback_error}"
@@ -584,7 +583,7 @@ fn apply_locked_with(
                     }
                     // Best effort: if storage remains unavailable, the last durable
                     // journal stays Applying and therefore blocks future writes.
-                    let _ = persist_journal_with(&receipt, directory_sync);
+                    let _ = persist_journal(&receipt);
                     return Ok(ApplyOutcome {
                         receipt,
                         verification_passed: false,
@@ -594,43 +593,51 @@ fn apply_locked_with(
             Err(error) => {
                 if let Some(result) = receipt.operation_results.last_mut() {
                     result.status = "failed".to_owned();
-                    result.after_fingerprint = fingerprint(operation.target()).ok();
+                    result.after_fingerprint = anchored.fingerprint(operation.target()).ok();
                     result.error = Some(error.to_string());
                 }
                 receipt.error = Some(error.to_string());
-                // A durability barrier can fail after the directory entry changed.
-                // Record the concrete recovery action before compensating so the
-                // mutation is never reported as a clean rollback.
-                match partial_operation_compensation(operation, &receipt.id, index) {
-                    Ok(Some(compensation)) => {
-                        receipt.compensations.push(compensation);
-                        receipt.changed_paths.push(operation.target().to_path_buf());
-                        let _ = persist_journal_with(&receipt, directory_sync);
-                    }
-                    Ok(None) => {}
-                    Err(fingerprint_error) => {
-                        receipt.status = ReceiptStatus::RecoveryRequired;
-                        receipt.error = Some(format!(
-                            "{error}; partial target could not be fingerprinted: {fingerprint_error}"
-                        ));
-                        let _ = persist_journal_with(&receipt, directory_sync);
-                        return Ok(ApplyOutcome {
-                            receipt,
-                            verification_passed: false,
-                        });
+                // Recursive copy can fail after creating a partial target. Record
+                // the concrete artifact before compensating so a partial copy is
+                // never reported as a clean rollback.
+                if operation_creates_missing_target(operation)
+                    && anchored
+                        .fingerprint(operation.target())
+                        .is_ok_and(|value| value != "missing")
+                {
+                    match anchored.fingerprint(operation.target()) {
+                        Ok(expected_fingerprint) => {
+                            receipt.compensations.push(Compensation::StashCreated {
+                                path: operation.target().to_path_buf(),
+                                expected_fingerprint,
+                            });
+                            receipt.changed_paths.push(operation.target().to_path_buf());
+                            let _ = persist_journal(&receipt);
+                        }
+                        Err(fingerprint_error) => {
+                            receipt.status = ReceiptStatus::RecoveryRequired;
+                            receipt.error = Some(format!(
+                                "{error}; partial target could not be fingerprinted: {fingerprint_error}"
+                            ));
+                            let _ = persist_journal(&receipt);
+                            return Ok(ApplyOutcome {
+                                receipt,
+                                verification_passed: false,
+                            });
+                        }
                     }
                 }
-                let rollback = compensate_all(&receipt, directory_sync);
+                let rollback = compensate_all(&receipt, &anchored);
                 receipt.status = if rollback.is_ok() {
                     ReceiptStatus::FailedRolledBack
                 } else {
                     ReceiptStatus::RecoveryRequired
                 };
-                finalize_rollback_results(&mut receipt, rollback.is_ok());
+                finalize_rollback_results(&mut receipt, rollback.is_ok(), &anchored);
                 if let Err(rollback_error) = rollback {
                     receipt.error = Some(format!("{error}; compensation failed: {rollback_error}"));
                 }
-                persist_journal_with(&receipt, directory_sync)?;
+                persist_journal(&receipt)?;
                 return Ok(ApplyOutcome {
                     receipt,
                     verification_passed: false,
@@ -640,12 +647,12 @@ fn apply_locked_with(
     }
 
     receipt.status = ReceiptStatus::Applied;
-    if let Err(error) = persist_journal_with(&receipt, directory_sync) {
+    if let Err(error) = persist_journal(&receipt) {
         receipt.status = ReceiptStatus::RecoveryRequired;
         receipt.error = Some(format!(
             "changes were applied but the final receipt could not be persisted: {error}"
         ));
-        let _ = persist_journal_with(&receipt, directory_sync);
+        let _ = persist_journal(&receipt);
         return Ok(ApplyOutcome {
             receipt,
             verification_passed: false,
@@ -669,13 +676,6 @@ pub fn undo(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn undo_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
-    undo_locked_with(receipt, &SystemDirectorySync)
-}
-
-fn undo_locked_with(
-    receipt: &ChangeReceipt,
-    directory_sync: &dyn DirectorySync,
-) -> Result<ApplyOutcome> {
     if receipt.status != ReceiptStatus::Applied {
         return Err(ChangeError::new(
             "receipt_not_undoable",
@@ -689,6 +689,7 @@ fn undo_locked_with(
             format!("receipt {} has already been undone", receipt.id),
         ));
     }
+    let anchored = open_anchored_fs(&receipt.approved_roots, &receipt.state_dir)?;
 
     let mut undo_receipt = ChangeReceipt {
         id: format!("receipt_{}", ulid::Ulid::new()),
@@ -709,22 +710,22 @@ fn undo_locked_with(
                 action: format!("undo_{}", original.action),
                 target: original.target.clone(),
                 status: "applying".to_owned(),
-                before_fingerprint: fingerprint(&original.target).ok(),
+                before_fingerprint: anchored.fingerprint(&original.target).ok(),
                 after_fingerprint: None,
                 error: None,
             })
             .collect(),
     };
-    persist_journal_with(&undo_receipt, directory_sync)?;
-    match compensate_all(receipt, directory_sync) {
+    persist_journal(&undo_receipt)?;
+    match compensate_all(receipt, &anchored) {
         Ok(()) => {
             for result in &mut undo_receipt.operation_results {
                 result.status = "undone".to_owned();
-                result.after_fingerprint = fingerprint(&result.target).ok();
+                result.after_fingerprint = anchored.fingerprint(&result.target).ok();
             }
             undo_receipt.status = ReceiptStatus::Undone;
             undo_receipt.changed_paths = receipt.changed_paths.clone();
-            persist_journal_with(&undo_receipt, directory_sync)?;
+            persist_journal(&undo_receipt)?;
             Ok(ApplyOutcome {
                 receipt: undo_receipt,
                 verification_passed: true,
@@ -733,12 +734,12 @@ fn undo_locked_with(
         Err(error) => {
             for result in &mut undo_receipt.operation_results {
                 result.status = "failed".to_owned();
-                result.after_fingerprint = fingerprint(&result.target).ok();
+                result.after_fingerprint = anchored.fingerprint(&result.target).ok();
                 result.error = Some(error.to_string());
             }
             undo_receipt.status = ReceiptStatus::RecoveryRequired;
             undo_receipt.error = Some(error.to_string());
-            persist_journal_with(&undo_receipt, directory_sync)?;
+            persist_journal(&undo_receipt)?;
             Ok(ApplyOutcome {
                 receipt: undo_receipt,
                 verification_passed: false,
@@ -762,28 +763,22 @@ pub fn rollback_apply(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
 }
 
 pub(crate) fn rollback_apply_locked(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
-    rollback_apply_locked_with(receipt, &SystemDirectorySync)
-}
-
-fn rollback_apply_locked_with(
-    receipt: &ChangeReceipt,
-    directory_sync: &dyn DirectorySync,
-) -> Result<ApplyOutcome> {
     if receipt.status != ReceiptStatus::Applied {
         return Err(ChangeError::new(
             "receipt_not_rollbackable",
             "only an applied receipt can be rolled back",
         ));
     }
+    let anchored = open_anchored_fs(&receipt.approved_roots, &receipt.state_dir)?;
     let mut rolled_back = receipt.clone();
-    match compensate_all(receipt, directory_sync) {
+    match compensate_all(receipt, &anchored) {
         Ok(()) => {
             rolled_back.status = ReceiptStatus::FailedRolledBack;
             for result in &mut rolled_back.operation_results {
                 result.status = "failed_rolled_back".to_owned();
-                result.after_fingerprint = fingerprint(&result.target).ok();
+                result.after_fingerprint = anchored.fingerprint(&result.target).ok();
             }
-            persist_journal_with(&rolled_back, directory_sync)?;
+            persist_journal(&rolled_back)?;
             Ok(ApplyOutcome {
                 receipt: rolled_back,
                 verification_passed: true,
@@ -794,10 +789,10 @@ fn rollback_apply_locked_with(
             rolled_back.error = Some(error.to_string());
             for result in &mut rolled_back.operation_results {
                 result.status = "recovery_required".to_owned();
-                result.after_fingerprint = fingerprint(&result.target).ok();
+                result.after_fingerprint = anchored.fingerprint(&result.target).ok();
                 result.error = Some(error.to_string());
             }
-            persist_journal_with(&rolled_back, directory_sync)?;
+            persist_journal(&rolled_back)?;
             Ok(ApplyOutcome {
                 receipt: rolled_back,
                 verification_passed: false,
@@ -818,210 +813,9 @@ fn operation_kind(operation: &Operation) -> &'static str {
     }
 }
 
-fn sync_parent_directory(
-    path: &Path,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| ChangeError::new("unsafe_path", path.display().to_string()))?;
-    directory_sync
-        .sync_directory(parent)
-        .map_err(|error| ChangeError::io(action, parent, error))
-}
-
-fn sync_rename_directories(
-    source: &Path,
-    target: &Path,
-    directory_sync: &dyn DirectorySync,
-) -> Result<()> {
-    let source_parent = source
-        .parent()
-        .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
-    let target_parent = target
-        .parent()
-        .ok_or_else(|| ChangeError::new("unsafe_path", target.display().to_string()))?;
-    let source_result = directory_sync
-        .sync_directory(source_parent)
-        .map_err(|error| ChangeError::io("sync renamed source directory", source_parent, error));
-    let target_result = if source_parent == target_parent {
-        Ok(())
-    } else {
-        directory_sync
-            .sync_directory(target_parent)
-            .map_err(|error| ChangeError::io("sync renamed target directory", target_parent, error))
-    };
-    source_result.and(target_result)
-}
-
-fn create_dir_all_durable(path: &Path, directory_sync: &dyn DirectorySync) -> Result<()> {
-    let mut missing = Vec::new();
-    let mut cursor = path;
-    loop {
-        match fs::symlink_metadata(cursor) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
-            Ok(_) => {
-                return Err(ChangeError::new(
-                    "unsafe_path",
-                    format!("{} is not a regular directory", cursor.display()),
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                missing.push(cursor.to_path_buf());
-                cursor = cursor
-                    .parent()
-                    .ok_or_else(|| ChangeError::new("unsafe_path", path.display().to_string()))?;
-            }
-            Err(error) => {
-                return Err(ChangeError::io("inspect directory", cursor, error));
-            }
-        }
-    }
-    for directory in missing.iter().rev() {
-        fs::create_dir(directory)
-            .map_err(|error| ChangeError::io("create directory", directory, error))?;
-        sync_parent_directory(directory, directory_sync, "sync created directory parent")?;
-    }
-    Ok(())
-}
-
-fn create_dir_durable(path: &Path, directory_sync: &dyn DirectorySync) -> Result<()> {
-    fs::create_dir(path).map_err(|error| ChangeError::io("create directory", path, error))?;
-    sync_parent_directory(path, directory_sync, "sync created directory parent")
-}
-
-fn rename_durable(
-    source: &Path,
-    target: &Path,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    fs::rename(source, target).map_err(|error| ChangeError::io(action, source, error))?;
-    sync_rename_directories(source, target, directory_sync)
-}
-
-fn remove_file_durable(
-    path: &Path,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    fs::remove_file(path).map_err(|error| ChangeError::io(action, path, error))?;
-    sync_parent_directory(path, directory_sync, "sync removed file parent")
-}
-
-fn remove_file_durable_allowing_readonly(
-    path: &Path,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    #[cfg(not(windows))]
-    return remove_file_durable(path, directory_sync, action);
-
-    #[cfg(windows)]
-    {
-        remove_file_ignoring_readonly(path, action)?;
-        sync_parent_directory(path, directory_sync, "sync removed file parent")
-    }
-}
-
-#[cfg(windows)]
-fn remove_file_ignoring_readonly(path: &Path, action: &str) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        FILE_DISPOSITION_INFO_EX, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfoEx, SetFileInformationByHandle,
-    };
-
-    let file = OpenOptions::new()
-        .access_mode(DELETE)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|error| ChangeError::io("open file for removal", path, error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| ChangeError::io("inspect file for removal", path, error))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(ChangeError::new(
-            "not_a_regular_file",
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let disposition = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-    };
-    let removed = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfoEx,
-            (&raw const disposition).cast(),
-            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        )
-    };
-    if removed == 0 {
-        return Err(ChangeError::io(action, path, io::Error::last_os_error()));
-    }
-    drop(file);
-    Ok(())
-}
-
-fn copy_file_durable(
-    source: &Path,
-    target: &Path,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    let (file, original_permissions) = copy_file_exclusive(source, target, action)?;
-    file.set_permissions(original_permissions)
-        .map_err(|error| ChangeError::io("restore copied file metadata", target, error))?;
-    file.sync_all()
-        .map_err(|error| ChangeError::io("sync copied file", target, error))?;
-    sync_parent_directory(target, directory_sync, "sync copied file parent")
-}
-
-fn copy_file_exclusive(
-    source: &Path,
-    target: &Path,
-    action: &str,
-) -> Result<(File, fs::Permissions)> {
-    let mut source_file = File::open(source)
-        .map_err(|error| ChangeError::io("open copied file source", source, error))?;
-    let permissions = source_file
-        .metadata()
-        .map_err(|error| ChangeError::io("inspect copied file source", source, error))?
-        .permissions();
-    let mut target_options = OpenOptions::new();
-    target_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        // The staging entry is visible as soon as it is created. Start it no
-        // wider than the source instead of exposing copied bytes under the
-        // process's default creation mode until set_permissions runs.
-        target_options.mode(permissions.mode() & 0o7777);
-    }
-    let mut target_file = match target_options.open(target) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(ChangeError::new(
-                "target_exists",
-                format!("{} already exists", target.display()),
-            ));
-        }
-        Err(error) => return Err(ChangeError::io(action, target, error)),
-    };
-    io::copy(&mut source_file, &mut target_file)
-        .map_err(|error| ChangeError::io(action, target, error))?;
-    Ok((target_file, permissions))
-}
-
-fn finalize_rollback_results(receipt: &mut ChangeReceipt, recovered: bool) {
+fn finalize_rollback_results(receipt: &mut ChangeReceipt, recovered: bool, anchored: &AnchoredFs) {
     for result in &mut receipt.operation_results {
-        result.after_fingerprint = fingerprint(&result.target).ok();
+        result.after_fingerprint = anchored.fingerprint(&result.target).ok();
         result.status = if recovered {
             if result.status == "failed" {
                 "failed_rolled_back".to_owned()
@@ -1043,51 +837,6 @@ fn operation_creates_missing_target(operation: &Operation) -> bool {
             | Operation::Copy { .. }
             | Operation::MoveRecoverable { .. }
     )
-}
-
-fn move_backup_path(source: &Path, receipt_id: &str, index: usize) -> Result<PathBuf> {
-    let file_name = source
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
-    Ok(source.with_file_name(format!(
-        ".{file_name}.skillroster-backup-{receipt_id}-{index}"
-    )))
-}
-
-fn partial_operation_compensation(
-    operation: &Operation,
-    receipt_id: &str,
-    index: usize,
-) -> Result<Option<Compensation>> {
-    if !operation_creates_missing_target(operation)
-        || fs::symlink_metadata(operation.target()).is_err()
-    {
-        return Ok(None);
-    }
-    let expected_fingerprint = fingerprint(operation.target())?;
-    if let Operation::MoveRecoverable { target, source, .. } = operation {
-        let backup = move_backup_path(source, receipt_id, index)?;
-        if fs::symlink_metadata(source).is_err() && fs::symlink_metadata(&backup).is_ok() {
-            return Ok(Some(Compensation::RestoreBackup {
-                backup,
-                original: source.clone(),
-                created: target.clone(),
-                expected_created: expected_fingerprint,
-            }));
-        }
-        if fs::symlink_metadata(source).is_err() {
-            return Ok(Some(Compensation::RenameBack {
-                from: target.clone(),
-                to: source.clone(),
-                expected_fingerprint,
-            }));
-        }
-    }
-    Ok(Some(Compensation::StashCreated {
-        path: operation.target().to_path_buf(),
-        expected_fingerprint,
-    }))
 }
 
 fn normalize_operation(
@@ -1400,91 +1149,156 @@ fn project_operation(
     }
 }
 
+fn open_anchored_fs(roots: &[PathBuf], state_dir: &Path) -> Result<AnchoredFs> {
+    AnchoredFs::open(roots, state_dir)
+        .map_err(|error| ChangeError::io("open approved root handles", state_dir, error))
+}
+
+fn validate_anchored_current_state(operation: &Operation, anchored: &AnchoredFs) -> Result<()> {
+    let (path, expected) = match operation {
+        Operation::CreateDirectory {
+            target,
+            expected_fingerprint,
+        }
+        | Operation::CreateSymlink {
+            target,
+            expected_fingerprint,
+            ..
+        }
+        | Operation::WriteFile {
+            target,
+            expected_fingerprint,
+            ..
+        }
+        | Operation::ReplaceFile {
+            target,
+            expected_fingerprint,
+            ..
+        }
+        | Operation::RemoveSymlink {
+            target,
+            expected_fingerprint,
+        } => (target, expected_fingerprint),
+        Operation::Copy {
+            source,
+            expected_fingerprint,
+            ..
+        }
+        | Operation::MoveRecoverable {
+            source,
+            expected_fingerprint,
+            ..
+        } => (source, expected_fingerprint),
+    };
+    let actual = anchored
+        .fingerprint(path)
+        .map_err(|error| ChangeError::io("inspect through approved root handle", path, error))?;
+    if &actual != expected {
+        return Err(ChangeError::new(
+            "plan_drifted",
+            format!("{} expected {expected}, found {actual}", path.display()),
+        ));
+    }
+    if let Operation::CreateSymlink {
+        source,
+        expected_source_fingerprint,
+        ..
+    } = operation
+    {
+        let actual = anchored.fingerprint(source).map_err(|error| {
+            ChangeError::io(
+                "inspect link source through approved root handle",
+                source,
+                error,
+            )
+        })?;
+        if &actual != expected_source_fingerprint {
+            return Err(ChangeError::new(
+                "plan_drifted",
+                format!(
+                    "{} expected {expected_source_fingerprint}, found {actual}",
+                    source.display()
+                ),
+            ));
+        }
+    }
+    if let Operation::Copy { target, .. } | Operation::MoveRecoverable { target, .. } = operation {
+        let target_fingerprint = anchored.fingerprint(target).map_err(|error| {
+            ChangeError::io("inspect target through approved root handle", target, error)
+        })?;
+        if target_fingerprint != "missing" {
+            return Err(ChangeError::new(
+                "target_exists",
+                format!("{} already exists", target.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn stage_compensation(
     operation: &Operation,
     receipt_id: &str,
     index: usize,
     state_dir: &Path,
-    directory_sync: &dyn DirectorySync,
+    anchored: &AnchoredFs,
 ) -> Result<Option<Compensation>> {
-    match operation {
-        Operation::ReplaceFile {
-            target,
-            content,
-            expected_fingerprint,
-        } => {
-            verify_fingerprint(target, expected_fingerprint)?;
-            let directory = create_recovery_dir(state_dir, receipt_id, directory_sync)?;
-            let backup = directory.join(format!("replace-{index}.backup"));
-            require_missing(&backup)?;
-            copy_file_durable(
-                target,
-                &backup,
-                directory_sync,
-                "persist replacement backup",
-            )?;
-            let backup_fingerprint = fingerprint(&backup)?;
-            if backup_fingerprint != *expected_fingerprint {
-                return Err(ChangeError::new(
-                    "backup_verification_failed",
-                    format!(
-                        "backup for {} does not match its precondition",
-                        target.display()
-                    ),
-                ));
-            }
-            Ok(Some(Compensation::RestoreReplacedFile {
-                backup,
-                target: target.clone(),
-                expected_original: expected_fingerprint.clone(),
-                expected_replacement: file_content_fingerprint(content.as_bytes()),
-                staged_replacement: Some(replacement_temp_path(target, receipt_id, index)?),
-            }))
-        }
-        Operation::RemoveSymlink { target, .. } => {
-            let link_target = fs::read_link(target)
-                .map_err(|error| ChangeError::io("read symlink", target, error))?;
-            Ok(Some(Compensation::RestoreSymlink {
-                path: target.clone(),
-                target: link_target,
-            }))
-        }
-        _ => Ok(None),
+    let Operation::ReplaceFile {
+        target,
+        content,
+        expected_fingerprint,
+    } = operation
+    else {
+        return Ok(None);
+    };
+    verify_anchored_fingerprint(anchored, target, expected_fingerprint)?;
+    let directory = recovery_dir(state_dir, receipt_id);
+    anchored
+        .create_dir_all(&directory)
+        .map_err(|error| ChangeError::io("create recovery directory", &directory, error))?;
+    let backup = directory.join(format!("replace-{index}.backup"));
+    require_anchored_missing(anchored, &backup)?;
+    anchored
+        .copy_file(target, &backup)
+        .map_err(|error| ChangeError::io("persist replacement backup", target, error))?;
+    let backup_fingerprint = anchored
+        .fingerprint(&backup)
+        .map_err(|error| ChangeError::io("verify replacement backup", &backup, error))?;
+    if backup_fingerprint != *expected_fingerprint {
+        return Err(ChangeError::new(
+            "backup_verification_failed",
+            format!(
+                "backup for {} does not match its precondition",
+                target.display()
+            ),
+        ));
     }
+    Ok(Some(Compensation::RestoreReplacedFile {
+        backup,
+        target: target.clone(),
+        expected_original: expected_fingerprint.clone(),
+        expected_replacement: file_content_fingerprint(content.as_bytes()),
+    }))
 }
 
 fn replace_file(
+    anchored: &AnchoredFs,
     target: &Path,
     content: &str,
     receipt_id: &str,
     index: usize,
-    directory_sync: &dyn DirectorySync,
 ) -> Result<()> {
-    let temp = replacement_temp_path(target, receipt_id, index)?;
-    let (mut file, original_permissions) =
-        copy_file_exclusive(target, &temp, "stage replacement metadata")?;
-    file.set_len(0)
-        .map_err(|error| ChangeError::io("truncate staged replacement", &temp, error))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|error| ChangeError::io("rewind staged replacement", &temp, error))?;
-    file.write_all(content.as_bytes())
-        .map_err(|error| ChangeError::io("write replacement", &temp, error))?;
-    file.set_permissions(original_permissions)
-        .map_err(|error| ChangeError::io("restore replacement metadata", &temp, error))?;
-    file.sync_all()
-        .map_err(|error| ChangeError::io("sync replacement", &temp, error))?;
-    remove_file_durable_allowing_readonly(target, directory_sync, "remove replaced file")?;
-    rename_durable(&temp, target, directory_sync, "publish replacement")
-}
-
-fn replacement_temp_path(target: &Path, receipt_id: &str, index: usize) -> Result<PathBuf> {
     let file_name = target
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| ChangeError::new("unsafe_path", target.display().to_string()))?;
-    Ok(target.with_file_name(format!(
+    let temp = target.with_file_name(format!(
         ".{file_name}.skillroster-replace-{receipt_id}-{index}"
-    )))
+    ));
+    require_anchored_missing(anchored, &temp)?;
+    anchored
+        .replace_file(target, &temp, content.as_bytes())
+        .map_err(|error| ChangeError::io("publish replacement", target, error))
 }
 
 fn file_content_fingerprint(content: &[u8]) -> String {
@@ -1495,66 +1309,70 @@ fn execute(
     operation: &Operation,
     receipt_id: &str,
     index: usize,
-    roots: &[PathBuf],
-    directory_sync: &dyn DirectorySync,
+    anchored: &AnchoredFs,
 ) -> Result<Option<Compensation>> {
+    validate_anchored_current_state(operation, anchored)?;
     match operation {
         Operation::CreateDirectory { target, .. } => {
-            create_dir_durable(target, directory_sync)?;
+            anchored
+                .create_dir(target)
+                .map_err(|e| ChangeError::io("create directory", target, e))?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
-                expected_fingerprint: fingerprint(target)?,
+                expected_fingerprint: anchored_fingerprint(anchored, target)?,
             }))
         }
         Operation::CreateSymlink { target, source, .. } => {
-            create_symlink(source, target)?;
-            sync_parent_directory(target, directory_sync, "sync created symlink parent")?;
+            anchored
+                .create_symlink(source, target)
+                .map_err(|e| ChangeError::io("create symlink", target, e))?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
-                expected_fingerprint: fingerprint(target)?,
+                expected_fingerprint: anchored_fingerprint(anchored, target)?,
             }))
         }
         Operation::WriteFile {
             target, content, ..
         } => {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(target)
+            anchored
+                .create_file(target, content.as_bytes())
                 .map_err(|e| ChangeError::io("create file", target, e))?;
-            file.write_all(content.as_bytes())
-                .map_err(|e| ChangeError::io("write file", target, e))?;
-            file.sync_all()
-                .map_err(|e| ChangeError::io("sync file", target, e))?;
-            sync_parent_directory(target, directory_sync, "sync created file parent")?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
-                expected_fingerprint: fingerprint(target)?,
+                expected_fingerprint: anchored_fingerprint(anchored, target)?,
             }))
         }
         Operation::ReplaceFile {
             target, content, ..
         } => {
-            replace_file(target, content, receipt_id, index, directory_sync)?;
+            replace_file(anchored, target, content, receipt_id, index)?;
             Ok(None)
         }
         Operation::RemoveSymlink { target, .. } => {
-            remove_symlink(target)?;
-            sync_parent_directory(target, directory_sync, "sync removed symlink parent")?;
-            Ok(None)
+            let link_target = anchored
+                .read_link(target)
+                .map_err(|e| ChangeError::io("read symlink", target, e))?;
+            anchored
+                .remove_file(target)
+                .map_err(|e| ChangeError::io("remove symlink", target, e))?;
+            Ok(Some(Compensation::RestoreSymlink {
+                path: target.clone(),
+                target: link_target,
+            }))
         }
         Operation::Copy { target, source, .. } => {
-            copy_tree(source, target, roots, directory_sync)?;
+            anchored
+                .copy_tree(source, target)
+                .map_err(|e| ChangeError::io("copy path", source, e))?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
-                expected_fingerprint: fingerprint(target)?,
+                expected_fingerprint: anchored_fingerprint(anchored, target)?,
             }))
         }
         Operation::MoveRecoverable { target, source, .. } => {
-            let expected = fingerprint(source)?;
-            match fs::rename(source, target) {
+            let expected = anchored_fingerprint(anchored, source)?;
+            match anchored.rename(source, target) {
                 Ok(()) => {
-                    sync_rename_directories(source, target, directory_sync)?;
                     return Ok(Some(Compensation::RenameBack {
                         from: target.clone(),
                         to: source.clone(),
@@ -1566,10 +1384,20 @@ fn execute(
             }
             // Cross-device recovery must remain on the source filesystem, so the
             // original can be hidden atomically after the destination copy lands.
-            let backup = move_backup_path(source, receipt_id, index)?;
-            require_missing(&backup)?;
-            copy_tree(source, target, roots, directory_sync)?;
-            rename_durable(source, &backup, directory_sync, "move source to recovery")?;
+            let file_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| ChangeError::new("unsafe_path", source.display().to_string()))?;
+            let backup = source.with_file_name(format!(
+                ".{file_name}.skillroster-backup-{receipt_id}-{index}"
+            ));
+            require_anchored_missing(anchored, &backup)?;
+            anchored
+                .copy_tree(source, target)
+                .map_err(|e| ChangeError::io("copy path", source, e))?;
+            if let Err(error) = anchored.rename(source, &backup) {
+                return Err(ChangeError::io("move source to recovery", source, error));
+            }
             Ok(Some(Compensation::RestoreBackup {
                 backup,
                 original: source.clone(),
@@ -1580,7 +1408,7 @@ fn execute(
     }
 }
 
-fn compensate_all(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
+fn compensate_all(receipt: &ChangeReceipt, anchored: &AnchoredFs) -> Result<()> {
     for (index, compensation) in receipt.compensations.iter().enumerate().rev() {
         compensate(
             compensation,
@@ -1588,7 +1416,7 @@ fn compensate_all(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -
             index,
             &receipt.approved_roots,
             &receipt.state_dir,
-            directory_sync,
+            anchored,
         )?;
     }
     Ok(())
@@ -1600,35 +1428,42 @@ fn compensate(
     index: usize,
     roots: &[PathBuf],
     state_dir: &Path,
-    directory_sync: &dyn DirectorySync,
+    anchored: &AnchoredFs,
 ) -> Result<()> {
     match compensation {
         Compensation::StashCreated {
             path,
             expected_fingerprint,
         } => {
-            verify_fingerprint(path, expected_fingerprint)?;
+            verify_anchored_fingerprint(anchored, path, expected_fingerprint)?;
             normalize_target(path, roots)?;
-            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
-                .join(format!("undo-{index}"));
-            rename_durable(path, &stash, directory_sync, "stash created path")?;
+            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-{index}"));
+            anchored
+                .create_dir_all(stash.parent().expect("stash has parent"))
+                .map_err(|e| ChangeError::io("create recovery directory", state_dir, e))?;
+            anchored
+                .rename(path, &stash)
+                .map_err(|e| ChangeError::io("stash created path", path, e))?;
         }
         Compensation::RestoreSymlink { path, target } => {
-            require_missing(path)?;
+            require_anchored_missing(anchored, path)?;
             normalize_target(path, roots)?;
-            create_symlink(target, path)?;
-            sync_parent_directory(path, directory_sync, "sync restored symlink parent")?;
+            anchored
+                .create_symlink(target, path)
+                .map_err(|e| ChangeError::io("restore symlink", path, e))?;
         }
         Compensation::RenameBack {
             from,
             to,
             expected_fingerprint,
         } => {
-            verify_fingerprint(from, expected_fingerprint)?;
-            require_missing(to)?;
+            verify_anchored_fingerprint(anchored, from, expected_fingerprint)?;
+            require_anchored_missing(anchored, to)?;
             normalize_target(from, roots)?;
             normalize_target(to, roots)?;
-            rename_durable(from, to, directory_sync, "restore moved path")?;
+            anchored
+                .rename(from, to)
+                .map_err(|e| ChangeError::io("restore moved path", from, e))?;
         }
         Compensation::RestoreBackup {
             backup,
@@ -1636,38 +1471,29 @@ fn compensate(
             created,
             expected_created,
         } => {
-            verify_fingerprint(created, expected_created)?;
-            require_missing(original)?;
+            verify_anchored_fingerprint(anchored, created, expected_created)?;
+            require_anchored_missing(anchored, original)?;
             normalize_target(created, roots)?;
             normalize_target(original, roots)?;
-            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
-                .join(format!("undo-created-{index}"));
-            rename_durable(created, &stash, directory_sync, "stash copied destination")?;
-            rename_durable(backup, original, directory_sync, "restore source backup")?;
+            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-created-{index}"));
+            anchored
+                .rename(created, &stash)
+                .map_err(|e| ChangeError::io("stash copied destination", created, e))?;
+            anchored
+                .rename(backup, original)
+                .map_err(|e| ChangeError::io("restore source backup", backup, e))?;
         }
         Compensation::RestoreReplacedFile {
             backup,
             target,
             expected_original,
             expected_replacement,
-            staged_replacement,
         } => {
-            if let Some(staged_replacement) = staged_replacement {
-                remove_expected_file_if_present_durable(
-                    staged_replacement,
-                    expected_replacement,
-                    directory_sync,
-                    "remove staged replacement",
-                )?;
-            }
-            let actual = fingerprint(target)?;
+            let actual = anchored_fingerprint(anchored, target)?;
             if actual == *expected_original {
-                remove_expected_file_if_present_durable(
-                    backup,
-                    expected_original,
-                    directory_sync,
-                    "remove unused backup",
-                )?;
+                anchored
+                    .remove_file(backup)
+                    .map_err(|error| ChangeError::io("remove unused backup", backup, error))?;
                 return Ok(());
             }
             if actual != "missing" && actual != *expected_replacement {
@@ -1686,49 +1512,25 @@ fn compensate(
                     .and_then(|name| name.to_str())
                     .unwrap_or("file")
             ));
-            require_missing(&restore)?;
-            copy_file_durable(backup, &restore, directory_sync, "stage restored file")?;
+            require_anchored_missing(anchored, &restore)?;
+            anchored
+                .copy_file(backup, &restore)
+                .map_err(|error| ChangeError::io("stage restored file", backup, error))?;
             if actual != "missing" {
-                remove_file_durable_allowing_readonly(
-                    target,
-                    directory_sync,
-                    "remove replacement",
-                )?;
+                anchored
+                    .remove_file(target)
+                    .map_err(|error| ChangeError::io("remove replacement", target, error))?;
             }
-            rename_durable(&restore, target, directory_sync, "restore replaced file")?;
-            verify_fingerprint(target, expected_original)?;
-            remove_expected_file_if_present_durable(
-                backup,
-                expected_original,
-                directory_sync,
-                "remove consumed backup",
-            )?;
+            anchored
+                .rename(&restore, target)
+                .map_err(|error| ChangeError::io("restore replaced file", target, error))?;
+            verify_anchored_fingerprint(anchored, target, expected_original)?;
+            anchored
+                .remove_file(backup)
+                .map_err(|error| ChangeError::io("remove consumed backup", backup, error))?;
         }
     }
     Ok(())
-}
-
-fn remove_expected_file_if_present_durable(
-    path: &Path,
-    expected_fingerprint: &str,
-    directory_sync: &dyn DirectorySync,
-    action: &str,
-) -> Result<()> {
-    match fingerprint(path)? {
-        actual if actual == expected_fingerprint => {
-            remove_file_durable_allowing_readonly(path, directory_sync, action)
-        }
-        actual if actual == "missing" => {
-            sync_parent_directory(path, directory_sync, "sync absent recovery file parent")
-        }
-        actual => Err(ChangeError::new(
-            "undo_drifted",
-            format!(
-                "{} expected {expected_fingerprint} or missing, found {actual}",
-                path.display()
-            ),
-        )),
-    }
 }
 
 fn validate_prepared_plan(plan: &PreparedPlan) -> Result<()> {
@@ -1806,48 +1608,6 @@ pub fn fingerprint(path: &Path) -> Result<String> {
         "unsupported_file_type",
         format!("{} is not a file, directory, or symlink", path.display()),
     ))
-}
-
-fn copy_tree(
-    source: &Path,
-    target: &Path,
-    roots: &[PathBuf],
-    directory_sync: &dyn DirectorySync,
-) -> Result<()> {
-    normalize_source(source, roots)?;
-    normalize_target(target, roots)?;
-    require_missing(target)?;
-    let metadata =
-        fs::symlink_metadata(source).map_err(|e| ChangeError::io("inspect source", source, e))?;
-    if metadata.file_type().is_symlink() {
-        return Err(ChangeError::new(
-            "unsupported_copy_symlink",
-            format!("refusing to recursively copy symlink {}", source.display()),
-        ));
-    }
-    if metadata.is_file() {
-        copy_file_durable(source, target, directory_sync, "copy file")?;
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Err(ChangeError::new(
-            "unsupported_file_type",
-            source.display().to_string(),
-        ));
-    }
-    create_dir_durable(target, directory_sync)?;
-    for entry in
-        fs::read_dir(source).map_err(|e| ChangeError::io("read source directory", source, e))?
-    {
-        let entry = entry.map_err(|e| ChangeError::io("read source directory", source, e))?;
-        copy_tree(
-            &entry.path(),
-            &target.join(entry.file_name()),
-            roots,
-            directory_sync,
-        )?;
-    }
-    Ok(())
 }
 
 fn normalize_roots(roots: &[PathBuf], state_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -2003,6 +1763,34 @@ fn nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn anchored_fingerprint(anchored: &AnchoredFs, path: &Path) -> Result<String> {
+    anchored
+        .fingerprint(path)
+        .map_err(|error| ChangeError::io("inspect through approved root handle", path, error))
+}
+
+fn require_anchored_missing(anchored: &AnchoredFs, path: &Path) -> Result<()> {
+    let actual = anchored_fingerprint(anchored, path)?;
+    if actual != "missing" {
+        return Err(ChangeError::new(
+            "target_exists",
+            format!("{} already exists", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_anchored_fingerprint(anchored: &AnchoredFs, path: &Path, expected: &str) -> Result<()> {
+    let actual = anchored_fingerprint(anchored, path)?;
+    if actual != expected {
+        return Err(ChangeError::new(
+            "undo_drifted",
+            format!("{} expected {expected}, found {actual}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn require_missing(path: &Path) -> Result<()> {
     if fs::symlink_metadata(path).is_ok() {
         return Err(ChangeError::new(
@@ -2013,24 +1801,13 @@ fn require_missing(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_fingerprint(path: &Path, expected: &str) -> Result<()> {
-    let actual = fingerprint(path)?;
-    if actual != expected {
-        return Err(ChangeError::new(
-            "undo_drifted",
-            format!("{} expected {expected}, found {actual}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn create_symlink(source: &Path, target: &Path) -> Result<()> {
     std::os::unix::fs::symlink(source, target)
         .map_err(|e| ChangeError::io("create symlink", target, e))
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn create_symlink(source: &Path, target: &Path) -> Result<()> {
     let metadata =
         fs::metadata(source).map_err(|e| ChangeError::io("inspect symlink source", source, e))?;
@@ -2042,85 +1819,30 @@ fn create_symlink(source: &Path, target: &Path) -> Result<()> {
     result.map_err(|e| ChangeError::io("create symlink", target, e))
 }
 
-#[cfg(unix)]
-fn remove_symlink(path: &Path) -> Result<()> {
-    fs::remove_file(path).map_err(|error| ChangeError::io("remove symlink", path, error))
-}
-
-#[cfg(windows)]
-fn remove_symlink(path: &Path) -> Result<()> {
-    let result = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir(path),
-        _ => fs::remove_file(path),
-    };
-    result.map_err(|error| ChangeError::io("remove symlink", path, error))
-}
-
-fn create_recovery_dir(
-    state_dir: &Path,
-    receipt_id: &str,
-    directory_sync: &dyn DirectorySync,
-) -> Result<PathBuf> {
-    let root = state_dir.join("recovery");
-    let directory = root.join(receipt_id);
-    create_dir_all_durable(&directory, directory_sync)?;
-    state_security::secure_directory(&root)
-        .map_err(|error| ChangeError::io("secure recovery directory", &root, error))?;
-    state_security::secure_directory(&directory)
-        .map_err(|error| ChangeError::io("secure recovery directory", &directory, error))?;
-    Ok(directory)
+fn recovery_dir(state_dir: &Path, receipt_id: &str) -> PathBuf {
+    state_dir.join("recovery").join(receipt_id)
 }
 
 fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
-    persist_journal_with(receipt, &SystemDirectorySync)
-}
-
-fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
     let directory = receipt.state_dir.join("receipts");
-    create_dir_all_durable(&directory, directory_sync)?;
-    state_security::secure_directory(&directory)
-        .map_err(|e| ChangeError::io("secure receipt directory", &directory, e))?;
+    fs::create_dir_all(&directory)
+        .map_err(|e| ChangeError::io("create receipt directory", &directory, e))?;
     let path = directory.join(format!("{}.json", receipt.id));
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|e| ChangeError::new("receipt_encoding_failed", e.to_string()))?;
-    let mut file = state_security::open_private_file_for_replace(&temp)
-        .map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
+    let mut file =
+        File::create(&temp).map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
     file.write_all(&bytes)
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
     file.sync_all()
         .map_err(|e| ChangeError::io("sync receipt journal", &temp, e))?;
-    rename_durable(&temp, &path, directory_sync, "publish receipt journal")
+    fs::rename(&temp, &path).map_err(|e| ChangeError::io("publish receipt journal", &path, e))?;
+    Ok(())
 }
 
 pub(crate) fn persist_journal_state(receipt: &ChangeReceipt) -> Result<()> {
     persist_journal(receipt)
-}
-
-pub(crate) fn owned_receipt_control_file(name: &OsStr, file: &mut File) -> io::Result<bool> {
-    let Some(name) = name.to_str() else {
-        return Ok(false);
-    };
-    if let Some(id) = name
-        .strip_prefix('.')
-        .and_then(|name| name.strip_suffix(".tmp"))
-        .and_then(|name| name.strip_prefix("receipt_"))
-    {
-        return Ok(ulid::Ulid::from_string(id).is_ok());
-    }
-    let Some(id) = name
-        .strip_suffix(".json")
-        .and_then(|name| name.strip_prefix("receipt_"))
-    else {
-        return Ok(false);
-    };
-    if ulid::Ulid::from_string(id).is_err() {
-        return Ok(false);
-    }
-    let Ok(receipt) = serde_json::from_reader::<_, ChangeReceipt>(file) else {
-        return Ok(false);
-    };
-    Ok(receipt.id == name.trim_end_matches(".json"))
 }
 
 /// Loads the durable filesystem journal without changing it. Invalid entries are
@@ -2252,16 +1974,13 @@ impl StateLock {
 
     fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
         let path = state_dir.join("write.lock");
-        let mut options = state_security::private_file_options();
-        let file = options
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .map_err(|e| ChangeError::io("open state lock", &path, e))?;
-        state_security::secure_opened_file(&file)
-            .map_err(|e| ChangeError::io("secure state lock", &path, e))?;
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)
         } else {
@@ -2301,32 +2020,7 @@ impl WriteLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use tempfile::TempDir;
-
-    struct FailOnceDirectorySync {
-        path: PathBuf,
-        failed: Cell<bool>,
-    }
-
-    impl FailOnceDirectorySync {
-        fn new(path: PathBuf) -> Self {
-            Self {
-                path,
-                failed: Cell::new(false),
-            }
-        }
-    }
-
-    impl DirectorySync for FailOnceDirectorySync {
-        fn sync_directory(&self, path: &Path) -> io::Result<()> {
-            if path == self.path && !self.failed.replace(true) {
-                Err(io::Error::other("injected directory sync failure"))
-            } else {
-                SystemDirectorySync.sync_directory(path)
-            }
-        }
-    }
 
     fn fixture() -> (TempDir, PathBuf, PathBuf) {
         let temp = TempDir::new().unwrap();
@@ -2388,6 +2082,56 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code, "path_escapes_through_symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_cannot_follow_an_ancestor_swapped_after_root_handles_open() {
+        let (temp, root, state) = fixture();
+        let ancestor = root.join("mutable");
+        let held_ancestor = root.join("held-mutable");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&ancestor).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let target = ancestor.join("written.txt");
+        let external_target = outside.join("written.txt");
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": target,
+                "content": "must stay contained",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root.clone()],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let hook_ancestor = ancestor.clone();
+        let hook_held = held_ancestor.clone();
+        let hook_outside = outside.clone();
+        BEFORE_MUTATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::rename(&hook_ancestor, &hook_held).unwrap();
+                std::os::unix::fs::symlink(&hook_outside, &hook_ancestor).unwrap();
+            }));
+        });
+
+        let outcome = apply(&plan).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert!(!external_target.exists());
+        assert!(!held_ancestor.join("written.txt").exists());
+        fs::remove_file(&ancestor).unwrap();
+        fs::rename(&held_ancestor, &ancestor).unwrap();
     }
 
     #[test]
@@ -2527,245 +2271,6 @@ mod tests {
     }
 
     #[test]
-    fn journal_directory_sync_failure_precedes_governed_mutation() {
-        let (_temp, root, state) = fixture();
-        let target = root.join("not-created.md");
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "write_file",
-                "target": target,
-                "content": "must not be published",
-                "expected_fingerprint": "missing"
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root],
-                state_dir: state.clone(),
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-        let directory_sync = FailOnceDirectorySync::new(plan.state_dir.join("receipts"));
-
-        let error = apply_locked_with(&plan, &directory_sync).unwrap_err();
-
-        assert_eq!(error.code, "filesystem_error");
-        assert!(error.message.contains("sync renamed source directory"));
-        assert!(directory_sync.failed.get());
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn journal_reuses_an_owned_temp_left_by_an_interrupted_write() {
-        let (_temp, root, state) = fixture();
-        let receipt = ChangeReceipt {
-            id: format!("receipt_{}", ulid::Ulid::new()),
-            plan_id: "plan_retry".to_owned(),
-            status: ReceiptStatus::Applying,
-            changed_paths: Vec::new(),
-            compensations: Vec::new(),
-            approved_roots: vec![root],
-            state_dir: state.clone(),
-            error: None,
-            reverses_receipt_id: None,
-            operation_results: Vec::new(),
-        };
-        let receipts = state.join("receipts");
-        fs::create_dir(&receipts).unwrap();
-        let temp = receipts.join(format!(".{}.tmp", receipt.id));
-        fs::write(&temp, b"incomplete").unwrap();
-
-        persist_journal(&receipt).unwrap();
-
-        assert!(!temp.exists());
-        let published = receipts.join(format!("{}.json", receipt.id));
-        let decoded: ChangeReceipt = serde_json::from_slice(&fs::read(published).unwrap()).unwrap();
-        assert_eq!(decoded.id, receipt.id);
-        assert_eq!(decoded.status, ReceiptStatus::Applying);
-    }
-
-    #[test]
-    fn owned_receipt_validation_has_no_smaller_limit_than_receipt_creation() {
-        let (_temp, root, state) = fixture();
-        let receipt = ChangeReceipt {
-            id: format!("receipt_{}", ulid::Ulid::new()),
-            plan_id: "plan_large_receipt".to_owned(),
-            status: ReceiptStatus::RecoveryRequired,
-            changed_paths: Vec::new(),
-            compensations: Vec::new(),
-            approved_roots: vec![root],
-            state_dir: state.clone(),
-            error: Some("x".repeat(9 * 1024 * 1024)),
-            reverses_receipt_id: None,
-            operation_results: Vec::new(),
-        };
-        let name = format!("{}.json", receipt.id);
-        let path = state.join(&name);
-        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-        let mut file = File::open(path).unwrap();
-
-        assert!(owned_receipt_control_file(OsStr::new(&name), &mut file).unwrap());
-    }
-
-    #[test]
-    fn target_directory_sync_failure_is_not_reported_as_success() {
-        let (_temp, root, state) = fixture();
-        let target = root.join("rolled-back.md");
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "write_file",
-                "target": target,
-                "content": "published before injected barrier failure",
-                "expected_fingerprint": "missing"
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root.clone()],
-                state_dir: state,
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
-
-        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
-
-        assert!(!outcome.verification_passed);
-        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
-        assert!(directory_sync.failed.get());
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn moved_path_sync_failure_restores_the_source() {
-        let (_temp, root, state) = fixture();
-        let source = root.join("source");
-        let target = root.join("target");
-        fs::write(&source, "original").unwrap();
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "move_recoverable",
-                "source": source,
-                "target": target,
-                "expected_fingerprint": fingerprint(&source).unwrap()
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root],
-                state_dir: state,
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
-
-        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
-
-        assert!(!outcome.verification_passed);
-        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
-        assert_eq!(fs::read_to_string(&source).unwrap(), "original");
-        assert!(!target.exists());
-    }
-
-    #[test]
-    fn removed_symlink_sync_failure_restores_the_link() {
-        let (_temp, root, state) = fixture();
-        let source = root.join("source");
-        let target = root.join("link");
-        fs::write(&source, "original").unwrap();
-        create_symlink(&source, &target).unwrap();
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "remove_symlink",
-                "target": target,
-                "expected_fingerprint": fingerprint(&target).unwrap()
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root],
-                state_dir: state,
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
-
-        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
-
-        assert!(!outcome.verification_passed);
-        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
-        assert_eq!(fs::read_link(&target).unwrap(), source);
-    }
-
-    #[test]
-    fn replaced_file_sync_failure_restores_original_content() {
-        let (_temp, root, state) = fixture();
-        let target = root.join("replace.txt");
-        fs::write(&target, "before").unwrap();
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "replace_file",
-                "target": target,
-                "content": "after",
-                "expected_fingerprint": fingerprint(&target).unwrap()
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root.clone()],
-                state_dir: state,
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-        let directory_sync = FailOnceDirectorySync::new(plan.approved_roots[0].clone());
-
-        let outcome = apply_locked_with(&plan, &directory_sync).unwrap();
-
-        assert!(!outcome.verification_passed);
-        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
-        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
-        let remaining = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(remaining, vec![target.file_name().unwrap()]);
-        assert!(outcome.receipt.compensations.iter().any(|compensation| {
-            matches!(
-                compensation,
-                Compensation::RestoreReplacedFile {
-                    staged_replacement: Some(_),
-                    ..
-                }
-            )
-        }));
-    }
-
-    #[test]
     fn apply_and_undo_round_trip_created_symlink() {
         let (_temp, root, state) = fixture();
         let source = root.join("source");
@@ -2829,27 +2334,12 @@ mod tests {
             &input,
             &PrepareContext {
                 approved_roots: vec![root],
-                state_dir: state.clone(),
+                state_dir: state,
                 operation_policy: OperationPolicy::TestOnly,
             },
         )
         .unwrap();
         let applied = apply(&plan).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let receipts = state.join("receipts");
-            let journal = receipts.join(format!("{}.json", applied.receipt.id));
-            assert_eq!(
-                fs::metadata(receipts).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(journal).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "---\nname: test\n---\n"
@@ -2857,131 +2347,6 @@ mod tests {
         let undone = undo(&applied.receipt).unwrap();
         assert_eq!(undone.receipt.status, ReceiptStatus::Undone);
         assert!(!target.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replace_and_undo_preserve_private_and_executable_modes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        for mode in [0o600, 0o500] {
-            assert_replace_and_undo_preserves_permissions(fs::Permissions::from_mode(mode));
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn replace_and_undo_preserve_readonly_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let probe = temp.path().join("permissions-probe");
-        fs::write(&probe, "probe").unwrap();
-        let mut permissions = fs::metadata(&probe).unwrap().permissions();
-        permissions.set_readonly(true);
-        assert_replace_and_undo_preserves_permissions(permissions);
-    }
-
-    fn assert_replace_and_undo_preserves_permissions(original_permissions: fs::Permissions) {
-        let (_temp, root, state) = fixture();
-        let target = root.join("replace.txt");
-        fs::write(&target, "before").unwrap();
-        fs::set_permissions(&target, original_permissions.clone()).unwrap();
-        let input = serde_json::json!({
-            "schema_version": 1,
-            "scan_id": "scan_1",
-            "operations": [{
-                "kind": "replace_file",
-                "target": target,
-                "content": "after",
-                "expected_fingerprint": fingerprint(&target).unwrap()
-            }]
-        })
-        .to_string();
-        let plan = prepare(
-            &input,
-            &PrepareContext {
-                approved_roots: vec![root],
-                state_dir: state,
-                operation_policy: OperationPolicy::TestOnly,
-            },
-        )
-        .unwrap();
-
-        let applied = apply(&plan).unwrap();
-
-        assert!(
-            applied.verification_passed,
-            "Apply failed: {:?}",
-            applied.receipt.error
-        );
-        assert_eq!(fs::read_to_string(&target).unwrap(), "after");
-        assert_permissions_equal(&target, &original_permissions);
-
-        let undone = undo(&applied.receipt).unwrap();
-
-        assert!(undone.verification_passed);
-        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
-        assert_permissions_equal(&target, &original_permissions);
-        #[cfg(windows)]
-        {
-            let mut writable = original_permissions;
-            writable.set_readonly(false);
-            fs::set_permissions(&target, writable).unwrap();
-        }
-    }
-
-    #[test]
-    fn replacement_staging_failure_leaves_original_content_and_permissions() {
-        let (_temp, root, _state) = fixture();
-        let target = root.join("replace.txt");
-        fs::write(&target, "before").unwrap();
-        let permissions = fs::metadata(&target).unwrap().permissions();
-        let receipt_id = "receipt_fixture";
-        let staged = root.join(format!(".replace.txt.skillroster-replace-{receipt_id}-0"));
-        fs::write(&staged, "must not be overwritten").unwrap();
-
-        let error =
-            replace_file(&target, "after", receipt_id, 0, &SystemDirectorySync).unwrap_err();
-
-        assert_eq!(error.code, "target_exists");
-        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
-        assert_permissions_equal(&target, &permissions);
-        assert_eq!(
-            fs::read_to_string(staged).unwrap(),
-            "must not be overwritten"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exclusive_copy_never_exposes_private_source_under_wider_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("private-source");
-        let staged = temp.path().join("visible-staging");
-        fs::write(&source, "private contents").unwrap();
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
-
-        let (_file, permissions) =
-            copy_file_exclusive(&source, &staged, "stage private file").unwrap();
-
-        assert_eq!(permissions.mode() & 0o7777, 0o600);
-        assert_eq!(
-            fs::metadata(&staged).unwrap().permissions().mode() & 0o077,
-            0
-        );
-        assert_eq!(fs::read_to_string(&staged).unwrap(), "private contents");
-    }
-
-    fn assert_permissions_equal(path: &Path, expected: &fs::Permissions) {
-        let actual = fs::metadata(path).unwrap().permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(actual.mode() & 0o7777, expected.mode() & 0o7777);
-        }
-        #[cfg(windows)]
-        assert_eq!(actual.readonly(), expected.readonly());
     }
 
     #[test]
