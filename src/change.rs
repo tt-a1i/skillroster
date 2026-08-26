@@ -4,6 +4,7 @@
 //! fingerprints, and every apply/undo obtains the same process write lock.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1984,14 +1985,8 @@ fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectoryS
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|e| ChangeError::new("receipt_encoding_failed", e.to_string()))?;
-    let mut options = state_security::private_file_options();
-    let mut file = options
-        .write(true)
-        .create_new(true)
-        .open(&temp)
+    let mut file = state_security::open_private_file_for_replace(&temp)
         .map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
-    state_security::secure_opened_file(&file)
-        .map_err(|e| ChangeError::io("secure receipt journal", &temp, e))?;
     file.write_all(&bytes)
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
     file.sync_all()
@@ -2001,6 +1996,39 @@ fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectoryS
 
 pub(crate) fn persist_journal_state(receipt: &ChangeReceipt) -> Result<()> {
     persist_journal(receipt)
+}
+
+pub(crate) fn owned_receipt_control_file(name: &OsStr, file: &mut File) -> io::Result<bool> {
+    const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
+
+    let Some(name) = name.to_str() else {
+        return Ok(false);
+    };
+    if let Some(id) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .and_then(|name| name.strip_prefix("receipt_"))
+    {
+        return Ok(ulid::Ulid::from_string(id).is_ok());
+    }
+    let Some(id) = name
+        .strip_suffix(".json")
+        .and_then(|name| name.strip_prefix("receipt_"))
+    else {
+        return Ok(false);
+    };
+    if ulid::Ulid::from_string(id).is_err() {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Ok(false);
+    }
+    let Ok(receipt) = serde_json::from_slice::<ChangeReceipt>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(receipt.id == name.trim_end_matches(".json"))
 }
 
 /// Loads the durable filesystem journal without changing it. Invalid entries are
@@ -2438,6 +2466,35 @@ mod tests {
         assert!(error.message.contains("sync renamed source directory"));
         assert!(directory_sync.failed.get());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn journal_reuses_an_owned_temp_left_by_an_interrupted_write() {
+        let (_temp, root, state) = fixture();
+        let receipt = ChangeReceipt {
+            id: format!("receipt_{}", ulid::Ulid::new()),
+            plan_id: "plan_retry".to_owned(),
+            status: ReceiptStatus::Applying,
+            changed_paths: Vec::new(),
+            compensations: Vec::new(),
+            approved_roots: vec![root],
+            state_dir: state.clone(),
+            error: None,
+            reverses_receipt_id: None,
+            operation_results: Vec::new(),
+        };
+        let receipts = state.join("receipts");
+        fs::create_dir(&receipts).unwrap();
+        let temp = receipts.join(format!(".{}.tmp", receipt.id));
+        fs::write(&temp, b"incomplete").unwrap();
+
+        persist_journal(&receipt).unwrap();
+
+        assert!(!temp.exists());
+        let published = receipts.join(format!("{}.json", receipt.id));
+        let decoded: ChangeReceipt = serde_json::from_slice(&fs::read(published).unwrap()).unwrap();
+        assert_eq!(decoded.id, receipt.id);
+        assert_eq!(decoded.status, ReceiptStatus::Applying);
     }
 
     #[test]

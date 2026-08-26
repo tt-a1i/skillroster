@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::de::DeserializeOwned;
@@ -13,6 +13,33 @@ use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermissio
 use crate::state_security;
 
 const SCHEMA_VERSION: i64 = 10;
+
+fn sqlite_nofollow_path(path: &Path) -> StorageResult<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        StorageError::InvalidData(format!(
+            "state database path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        StorageError::InvalidData(format!(
+            "state database path has no file name: {}",
+            path.display()
+        ))
+    })?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = parent.canonicalize().map_err(|error| {
+        StorageError::InvalidData(format!(
+            "cannot resolve state database directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    Ok(parent.join(name))
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct LifecycleCounts {
@@ -163,7 +190,10 @@ impl StateStore {
                 )));
             }
         }
-        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let connection = Connection::open_with_flags(
+            sqlite_nofollow_path(path)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         Ok(version != SCHEMA_VERSION)
     }
@@ -204,7 +234,10 @@ impl StateStore {
                 path.display()
             ))
         })?;
-        let connection = Connection::open(path)?;
+        let connection = Connection::open_with_flags(
+            sqlite_nofollow_path(path)?,
+            OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         let store = Self::initialize(connection)?;
         for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
             state_security::secure_optional_file(&sidecar).map_err(|error| {

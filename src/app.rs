@@ -184,6 +184,7 @@ pub fn run(cli: Cli) -> Result<Output> {
         .with_context(|| format!("cannot secure state root {}", state_dir.display()))?;
     state_security::secure_state_layout(&state_dir)
         .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
+    secure_owned_control_files(&state_dir)?;
     if let Some(Command::Lifecycle(args)) = &cli.command {
         if let LifecycleCommand::Delete(args) = &args.command {
             if args.confirm != "DELETE-LOCAL-STATE" {
@@ -632,6 +633,47 @@ pub fn run(cli: Cli) -> Result<Output> {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
     })
+}
+
+fn secure_owned_control_files(state_dir: &Path) -> Result<()> {
+    state_security::secure_control_directory(
+        &state_dir.join("receipts"),
+        change::owned_receipt_control_file,
+    )
+    .with_context(|| "cannot validate and secure Receipt journals")?;
+    state_security::secure_control_directory(
+        &state_dir.join("source-confirmation"),
+        owned_source_confirmation_control_file,
+    )
+    .with_context(|| "cannot validate and secure source-confirmation details")?;
+    Ok(())
+}
+
+fn owned_source_confirmation_control_file(
+    name: &std::ffi::OsStr,
+    file: &mut std::fs::File,
+) -> std::io::Result<bool> {
+    const MAX_DETAIL_BYTES: u64 = 8 * 1024 * 1024;
+
+    let path = Path::new(name);
+    if path.extension().and_then(|value| value.to_str()) != Some("json") {
+        return Ok(false);
+    }
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return Ok(false);
+    };
+    if ulid::Ulid::from_string(stem).is_err() {
+        return Ok(false);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DETAIL_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DETAIL_BYTES {
+        return Ok(false);
+    }
+    let Ok(detail) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(recognized_source_confirmation_detail(&detail))
 }
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {

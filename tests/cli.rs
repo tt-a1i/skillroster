@@ -196,6 +196,50 @@ fn startup_refuses_database_and_lock_symlinks_before_opening_them() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn startup_leaves_unrecognized_control_files_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cases = [
+        ("receipts", "notes.txt", "user note"),
+        (
+            "source-confirmation",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV.json",
+            "{}",
+        ),
+    ];
+    for (directory, name, content) in cases {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let control = state.join(directory);
+        fs::create_dir_all(&control).unwrap();
+        let unknown = control.join(name);
+        fs::write(&unknown, content).unwrap();
+        fs::set_permissions(&unknown, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let output = run(
+            &[
+                "--home",
+                home.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--json",
+                "status",
+            ],
+            None,
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(fs::read_to_string(&unknown).unwrap(), content);
+        assert_eq!(
+            fs::metadata(&unknown).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+}
+
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
     let mut argv = vec![
         "skillroster".to_owned(),

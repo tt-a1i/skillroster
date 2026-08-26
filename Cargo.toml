@@ -10,6 +10,8 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = "1.0"
 aho-corasick = "1.1"
+cap-primitives = "4.0"
+cap-std = "4.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 directories = "6.0"

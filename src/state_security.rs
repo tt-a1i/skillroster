@@ -4,11 +4,14 @@
 //! original metadata must survive Undo. Control files are additionally narrowed
 //! to owner-only access so copied or inspected artifacts keep the same boundary.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+#[cfg(unix)]
 const STATE_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
 const STATE_FILE_MODE: u32 = 0o600;
 
 pub(crate) fn prepare_state_root(path: &Path) -> io::Result<()> {
@@ -76,17 +79,33 @@ pub(crate) fn prepare_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
+pub(crate) fn open_private_file_for_replace(path: &Path) -> io::Result<File> {
+    let mut options = private_file_options();
+    let file = options
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    secure_opened_file(&file)?;
+    file.set_len(0)?;
+    Ok(file)
+}
+
 pub(crate) fn secure_state_layout(state_dir: &Path) -> io::Result<()> {
     prepare_state_root(state_dir)?;
-    for name in ["recovery", "plan-backups", "library"] {
+    for name in [
+        "receipts",
+        "recovery",
+        "source-confirmation",
+        "plan-backups",
+        "library",
+    ] {
         let path = state_dir.join(name);
         match secure_directory(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             result => result?,
         }
-    }
-    for name in ["receipts", "source-confirmation"] {
-        secure_control_directory(&state_dir.join(name))?;
     }
     for name in [
         "skillroster.db",
@@ -99,16 +118,68 @@ pub(crate) fn secure_state_layout(state_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn secure_control_directory(path: &Path) -> io::Result<()> {
-    match secure_directory(path) {
+pub(crate) fn secure_control_directory(
+    path: &Path,
+    mut validate: impl FnMut(&OsStr, &mut File) -> io::Result<bool>,
+) -> io::Result<()> {
+    use cap_primitives::fs::FollowSymlinks;
+    use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
+
+    let directory = match open_directory(path) {
+        Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        result => result?,
+        Err(error) => return Err(error),
+    };
+    validate_opened_path(&directory, true)?;
+    let dir = Dir::from_std_file(directory.try_clone()?);
+    let mut entries = dir.read_dir(".")?.collect::<io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut owned_files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry.file_name();
+        let mut options = CapOpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        let mut file = entry.open_with(&options)?.into_std();
+        validate_opened_path(&file, false)?;
+        if !validate(&name, &mut file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("unrecognized control file: {}", name.to_string_lossy()),
+            ));
+        }
+        owned_files.push(file);
     }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        secure_file(&entry.path())?;
+
+    secure_opened_path(&directory, true)?;
+    for file in &owned_files {
+        secure_opened_file(file)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_directory(path: &Path) -> io::Result<File> {
+    open_windows_path(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_directory(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private state permissions are unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -147,7 +218,20 @@ pub(crate) fn secure_opened_file(file: &File) -> io::Result<()> {
 
 #[cfg(unix)]
 fn secure_opened_path(file: &File, directory: bool) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+
+    validate_opened_path(file, directory)?;
+    let mode = if directory {
+        STATE_DIRECTORY_MODE
+    } else {
+        STATE_FILE_MODE
+    };
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(unix)]
+fn validate_opened_path(file: &File, directory: bool) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
     let valid_kind = if directory {
@@ -169,29 +253,30 @@ fn secure_opened_path(file: &File, directory: bool) -> io::Result<()> {
             "opened state path is not owned by the current user",
         ));
     }
-    let mode = if directory {
-        STATE_DIRECTORY_MODE
-    } else {
-        STATE_FILE_MODE
-    };
-    file.set_permissions(fs::Permissions::from_mode(mode))
+    Ok(())
 }
 
 #[cfg(windows)]
 fn secure_path(path: &Path, directory: bool) -> io::Result<()> {
+    let file = open_windows_path(path)?;
+    secure_opened_path(&file, directory)
+}
+
+#[cfg(windows)]
+fn open_windows_path(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
+        WRITE_DAC,
     };
 
     let mut options = OpenOptions::new();
     options
-        .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+        .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
-    secure_windows_file(&file, directory)
+    options.open(path)
 }
 
 #[cfg(windows)]
@@ -220,7 +305,14 @@ pub(crate) fn secure_opened_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn secure_windows_file(file: &File, directory: bool) -> io::Result<()> {
+fn validate_opened_path(file: &File, directory: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    validate_windows_handle(file.as_raw_handle().cast(), directory).map(|_| ())
+}
+
+#[cfg(windows)]
+fn secure_opened_path(file: &File, directory: bool) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     secure_windows_handle(file.as_raw_handle().cast(), directory)
@@ -242,16 +334,76 @@ fn secure_windows_handle(
     handle: windows_sys::Win32::Foundation::HANDLE,
     directory: bool,
 ) -> io::Result<()> {
-    use std::mem::{size_of, zeroed};
+    use std::mem::size_of;
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::GENERIC_ALL;
-    use windows_sys::Win32::Security::Authorization::{
-        GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    };
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE,
-        DACL_SECURITY_INFORMATION, GetLengthSid, InitializeAcl, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+        DACL_SECURITY_INFORMATION, InitializeAcl, OBJECT_INHERIT_ACE,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let current_sid = validate_windows_handle(handle, directory)?;
+
+    let acl_length =
+        size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + current_sid.len();
+    let acl_length =
+        u32::try_from(acl_length).map_err(|_| io::Error::other("state ACL is too large"))?;
+    let word_count = (acl_length as usize).div_ceil(size_of::<u32>());
+    let mut acl_buffer = vec![0_u32; word_count];
+    let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
+    // SAFETY: acl_buffer is aligned and writable for at least acl_length bytes.
+    if unsafe { InitializeAcl(acl, acl_length, ACL_REVISION) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let inheritance = if directory {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    // SAFETY: the ACL is initialized and current_sid remains live during the call.
+    if unsafe {
+        AddAccessAllowedAceEx(
+            acl,
+            ACL_REVISION,
+            inheritance,
+            GENERIC_ALL,
+            current_sid.as_ptr().cast_mut().cast(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: handle names the validated object; the ACL remains live during the call.
+    let status = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            acl,
+            null(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    directory: bool,
+) -> io::Result<Vec<u8>> {
+    use std::mem::{size_of, zeroed};
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        CheckTokenMembership, GetLengthSid, OWNER_SECURITY_INFORMATION, PSID,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
@@ -310,59 +462,29 @@ fn secure_windows_handle(
         // SAFETY: both SIDs were returned by Windows and are live for this comparison.
         && unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), owner_length) }
             == current_sid.as_slice();
-    if !owner_matches {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "state path is not owned by the current user",
-        ));
-    }
-
-    let acl_length =
-        size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + current_sid.len();
-    let acl_length =
-        u32::try_from(acl_length).map_err(|_| io::Error::other("state ACL is too large"))?;
-    let word_count = (acl_length as usize).div_ceil(size_of::<u32>());
-    let mut acl_buffer = vec![0_u32; word_count];
-    let acl = acl_buffer.as_mut_ptr().cast::<ACL>();
-    // SAFETY: acl_buffer is aligned and writable for at least acl_length bytes.
-    if unsafe { InitializeAcl(acl, acl_length, ACL_REVISION) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let inheritance = if directory {
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    // Windows may assign a newly created object to an enabled owner group such
+    // as Administrators rather than directly to the token's user SID. Treat
+    // that as locally controlled, while rejecting owners outside the effective
+    // token. The replacement DACL below still grants access only to the user.
+    let owner_is_controlled = if owner_matches {
+        true
     } else {
-        0
-    };
-    // SAFETY: the ACL is initialized and current_sid remains live during the call.
-    if unsafe {
-        AddAccessAllowedAceEx(
-            acl,
-            ACL_REVISION,
-            inheritance,
-            GENERIC_ALL,
-            current_sid.as_ptr().cast_mut().cast(),
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: handle names the validated object; the ACL remains live during the call.
-    let status = unsafe {
-        SetSecurityInfo(
-            handle,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            acl,
-            null(),
-        )
+        let mut is_member = 0;
+        // SAFETY: owner belongs to the live descriptor and a null token asks
+        // Windows to check the effective token for the current thread/process.
+        if unsafe { CheckTokenMembership(null_mut(), owner, &mut is_member) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        is_member != 0
     };
     drop(descriptor);
-    if status == 0 {
-        Ok(())
+    if !owner_is_controlled {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "state path is not controlled by the current user",
+        ))
     } else {
-        Err(io::Error::from_raw_os_error(status as i32))
+        Ok(current_sid)
     }
 }
 
@@ -434,6 +556,22 @@ fn secure_path(path: &Path, _directory: bool) -> io::Result<()> {
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) fn secure_opened_file(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private state permissions are unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn validate_opened_path(_file: &File, _directory: bool) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private state permissions are unsupported on this platform",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn secure_opened_path(_file: &File, _directory: bool) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "private state permissions are unsupported on this platform",
@@ -533,6 +671,8 @@ mod tests {
         }
 
         secure_state_layout(&state).unwrap();
+        secure_control_directory(&state.join("receipts"), |_, _| Ok(true)).unwrap();
+        secure_control_directory(&state.join("source-confirmation"), |_, _| Ok(true)).unwrap();
 
         for name in [
             "receipts",
@@ -588,7 +728,7 @@ mod tests {
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&outside, receipts.join("receipt.json")).unwrap();
 
-        secure_state_layout(&state).unwrap_err();
+        secure_control_directory(&receipts, |_, _| Ok(true)).unwrap_err();
 
         assert_eq!(
             fs::metadata(&outside).unwrap().permissions().mode() & 0o777,
