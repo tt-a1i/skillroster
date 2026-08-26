@@ -28,6 +28,7 @@ use crate::model::{
 };
 use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
+use crate::state_security;
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
 const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
@@ -203,8 +204,8 @@ pub fn run(cli: Cli) -> Result<Output> {
             });
         }
     }
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("cannot create {}", state_dir.display()))?;
+    state_security::prepare_state_root(&state_dir)
+        .with_context(|| format!("cannot secure state root {}", state_dir.display()))?;
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
     let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
@@ -219,6 +220,8 @@ pub fn run(cli: Cli) -> Result<Output> {
         }
     };
     let store = StateStore::open(&database_path)?;
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
 
     let (command, mut result, warnings, actions) = match cli.command {
         None => ("home", home_result(&store, &state_dir)?, vec![], vec![]),
@@ -617,6 +620,8 @@ pub fn run(cli: Cli) -> Result<Output> {
     };
 
     action_context.apply_result(command, &mut result);
+    state_security::secure_state_layout(&state_dir)
+        .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
     let mut envelope = JsonEnvelope::success(command, result.clone());
     envelope.warnings = warnings;
     envelope.suggested_actions = actions;

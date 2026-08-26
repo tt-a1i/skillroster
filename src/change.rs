@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::durable_fs::{DirectorySync, SystemDirectorySync};
+use crate::state_security;
 
 #[derive(Debug)]
 pub struct ChangeError {
@@ -1319,8 +1320,7 @@ fn stage_compensation(
             expected_fingerprint,
         } => {
             verify_fingerprint(target, expected_fingerprint)?;
-            let directory = recovery_dir(state_dir, receipt_id);
-            create_dir_all_durable(&directory, directory_sync)?;
+            let directory = create_recovery_dir(state_dir, receipt_id, directory_sync)?;
             let backup = directory.join(format!("replace-{index}.backup"));
             require_missing(&backup)?;
             copy_file_durable(
@@ -1513,8 +1513,8 @@ fn compensate(
         } => {
             verify_fingerprint(path, expected_fingerprint)?;
             normalize_target(path, roots)?;
-            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-{index}"));
-            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
+                .join(format!("undo-{index}"));
             rename_durable(path, &stash, directory_sync, "stash created path")?;
         }
         Compensation::RestoreSymlink { path, target } => {
@@ -1544,8 +1544,8 @@ fn compensate(
             require_missing(original)?;
             normalize_target(created, roots)?;
             normalize_target(original, roots)?;
-            let stash = recovery_dir(state_dir, receipt_id).join(format!("undo-created-{index}"));
-            create_dir_all_durable(stash.parent().expect("stash has parent"), directory_sync)?;
+            let stash = create_recovery_dir(state_dir, receipt_id, directory_sync)?
+                .join(format!("undo-created-{index}"));
             rename_durable(created, &stash, directory_sync, "stash copied destination")?;
             rename_durable(backup, original, directory_sync, "restore source backup")?;
         }
@@ -1956,8 +1956,25 @@ fn remove_symlink(path: &Path) -> Result<()> {
     result.map_err(|error| ChangeError::io("remove symlink", path, error))
 }
 
-fn recovery_dir(state_dir: &Path, receipt_id: &str) -> PathBuf {
-    state_dir.join("recovery").join(receipt_id)
+fn create_recovery_dir(
+    state_dir: &Path,
+    receipt_id: &str,
+    directory_sync: &dyn DirectorySync,
+) -> Result<PathBuf> {
+    let root = state_dir.join("recovery");
+    let directory = root.join(receipt_id);
+    create_dir_all_durable(&directory, directory_sync)?;
+    state_security::secure_directory(&root)
+        .map_err(|error| ChangeError::io("secure recovery directory", &root, error))?;
+    state_security::secure_directory(&directory)
+        .map_err(|error| ChangeError::io("secure recovery directory", &directory, error))?;
+    directory_sync
+        .sync_directory(&root)
+        .map_err(|error| ChangeError::io("sync secured recovery directory", &root, error))?;
+    directory_sync
+        .sync_directory(&directory)
+        .map_err(|error| ChangeError::io("sync secured recovery directory", &directory, error))?;
+    Ok(directory)
 }
 
 fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
@@ -1967,12 +1984,24 @@ fn persist_journal(receipt: &ChangeReceipt) -> Result<()> {
 fn persist_journal_with(receipt: &ChangeReceipt, directory_sync: &dyn DirectorySync) -> Result<()> {
     let directory = receipt.state_dir.join("receipts");
     create_dir_all_durable(&directory, directory_sync)?;
+    state_security::secure_directory(&directory)
+        .map_err(|e| ChangeError::io("secure receipt directory", &directory, e))?;
+    directory_sync
+        .sync_directory(&directory)
+        .map_err(|e| ChangeError::io("sync secured receipt directory", &directory, e))?;
     let path = directory.join(format!("{}.json", receipt.id));
     let temp = directory.join(format!(".{}.tmp", receipt.id));
     let bytes = serde_json::to_vec_pretty(receipt)
         .map_err(|e| ChangeError::new("receipt_encoding_failed", e.to_string()))?;
-    let mut file =
-        File::create(&temp).map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
+    let mut options = state_security::private_file_options();
+    let mut file = options
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp)
+        .map_err(|e| ChangeError::io("create receipt journal", &temp, e))?;
+    state_security::secure_file(&temp)
+        .map_err(|e| ChangeError::io("secure receipt journal", &temp, e))?;
     file.write_all(&bytes)
         .map_err(|e| ChangeError::io("write receipt journal", &temp, e))?;
     file.sync_all()
@@ -2113,13 +2142,16 @@ impl StateLock {
 
     fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
         let path = state_dir.join("write.lock");
-        let file = OpenOptions::new()
+        let mut options = state_security::private_file_options();
+        let file = options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .map_err(|e| ChangeError::io("open state lock", &path, e))?;
+        state_security::secure_file(&path)
+            .map_err(|e| ChangeError::io("secure state lock", &path, e))?;
         let result = if exclusive {
             FileExt::try_lock_exclusive(&file)
         } else {
@@ -2635,12 +2667,27 @@ mod tests {
             &input,
             &PrepareContext {
                 approved_roots: vec![root],
-                state_dir: state,
+                state_dir: state.clone(),
                 operation_policy: OperationPolicy::TestOnly,
             },
         )
         .unwrap();
         let applied = apply(&plan).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let receipts = state.join("receipts");
+            let journal = receipts.join(format!("{}.json", applied.receipt.id));
+            assert_eq!(
+                fs::metadata(receipts).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(journal).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "---\nname: test\n---\n"

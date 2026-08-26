@@ -10,6 +10,7 @@ use crate::model::{
     RosterEntry, ScanId, ScanRun, SkillId, SkillRecord, UsageEvent,
 };
 use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermission};
+use crate::state_security;
 
 const SCHEMA_VERSION: i64 = 10;
 
@@ -176,15 +177,31 @@ impl StateStore {
 
     pub fn open(path: impl AsRef<Path>) -> StorageResult<Self> {
         if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
+            state_security::prepare_state_root(parent).map_err(|error| {
                 StorageError::InvalidData(format!(
-                    "cannot create state directory {}: {error}",
+                    "cannot secure state directory {}: {error}",
                     parent.display()
                 ))
             })?;
         }
+        let path = path.as_ref();
         let connection = Connection::open(path)?;
-        Self::initialize(connection)
+        state_security::secure_file(path).map_err(|error| {
+            StorageError::InvalidData(format!(
+                "cannot secure state database {}: {error}",
+                path.display()
+            ))
+        })?;
+        let store = Self::initialize(connection)?;
+        for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
+            state_security::secure_optional_file(&sidecar).map_err(|error| {
+                StorageError::InvalidData(format!(
+                    "cannot secure state database sidecar {}: {error}",
+                    sidecar.display()
+                ))
+            })?;
+        }
+        Ok(store)
     }
 
     pub fn open_in_memory() -> StorageResult<Self> {

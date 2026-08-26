@@ -4,6 +4,16 @@ SkillRoster keeps governance state in `~/.skillroster/skillroster.db`. It reads
 supported Agent sessions in place and stores only derived evidence summaries;
 exports do not contain raw prompts or responses.
 
+The state root is private by default. On Unix, SkillRoster creates and repairs
+the root and control directories to `0700` and control files such as SQLite,
+its sidecars, locks, Receipts, and source-confirmation details to `0600`. It
+opens existing paths without following a final symlink and refuses paths not
+owned by the current user. On Windows, the state root receives a protected,
+inheritable DACL for the current user. Existing installations are tightened on
+the next command; a path that cannot be secured is rejected before the command
+uses the state store. Recovery objects that must retain original metadata stay
+protected by the private state-root ancestor.
+
 Exact source-root read permissions are also local SQLite policy. Each record
 keeps the confirmed canonical directory, bound Finding/Snapshot, approval and
 optional revocation time, and stable filesystem identity. Use

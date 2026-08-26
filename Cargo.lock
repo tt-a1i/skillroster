@@ -762,6 +762,7 @@ dependencies = [
  "directories",
  "fs2",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

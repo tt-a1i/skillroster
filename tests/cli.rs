@@ -11,6 +11,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 fn run(args: &[&str], stdin: Option<&str>) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_skillroster"));
     command.args(args);
@@ -33,6 +36,21 @@ fn run(args: &[&str], stdin: Option<&str>) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+#[cfg(unix)]
+fn run_with_umask(args: &[&str], umask: libc::mode_t) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_skillroster"));
+    command.args(args);
+    // SAFETY: this callback runs after fork and before exec, calls only the
+    // async-signal-safe umask syscall, and captures a Copy integer.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
 fn json_output(output: &std::process::Output) -> Value {
     assert!(
         output.status.success(),
@@ -47,6 +65,69 @@ fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(output["result"]["bootstrap_content_version"], "1.8.28");
     assert_eq!(output["result"]["bootstrap_version"], "1.8.28");
+}
+
+#[cfg(unix)]
+#[test]
+fn local_state_is_private_even_with_a_permissive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let args = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+        "status",
+    ];
+
+    json_output(&run_with_umask(&args, 0));
+
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in ["skillroster.db", "write.lock"] {
+        assert_eq!(
+            fs::metadata(state.join(name)).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "unexpected permissions for {name}"
+        );
+    }
+
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(
+        state.join("skillroster.db"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    fs::set_permissions(state.join("write.lock"), fs::Permissions::from_mode(0o644)).unwrap();
+
+    json_output(&run(&args, None));
+
+    assert_eq!(
+        fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(state.join("skillroster.db"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(state.join("write.lock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
 
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
