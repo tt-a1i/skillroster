@@ -22,7 +22,7 @@ jobs:
       full: ${{ steps.scope.outputs.full }}
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -61,7 +61,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -71,35 +71,19 @@ jobs:
           rustup toolchain install 1.85.0 --profile minimal --component clippy --component rustfmt
           rustup default 1.85.0
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked --all-targets --all-features
-
       - name: Set up Node.js 24 for harness checks
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
 
-      - name: Check cold-routing harnesses
+      - name: Run strict repository checks
         shell: bash
-        run: |
-          node --check tests/harness/pi-cold-routing/bounds.mjs
-          node --check tests/harness/pi-cold-routing/runner.mjs
-          node --check tests/harness/codex-cold-routing/driver.mjs
-          node --check tests/harness/byte-ledger/ledger.mjs
-          node --check scripts/byte-ledger.mjs
-          node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
-          node --test tests/harness/pi-cold-routing/*.test.mjs tests/harness/codex-cold-routing/*.test.mjs tests/harness/byte-ledger/*.test.mjs
+        run: bash scripts/ci-full-check.sh
 
   portability:
     name: ${{ matrix.name }}
     needs: changes
-    if: needs.changes.outputs.full == 'true' && github.event_name != 'push'
+    if: needs.changes.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +98,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -129,21 +113,14 @@ jobs:
 
       - name: Set up Node.js 24 for harness checks
         if: runner.os == 'Windows'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
 
       - name: Check cold-routing harnesses
         if: runner.os == 'Windows'
         shell: bash
-        run: |
-          node --check tests/harness/pi-cold-routing/bounds.mjs
-          node --check tests/harness/pi-cold-routing/runner.mjs
-          node --check tests/harness/codex-cold-routing/driver.mjs
-          node --check tests/harness/byte-ledger/ledger.mjs
-          node --check scripts/byte-ledger.mjs
-          node --experimental-strip-types --check tests/harness/pi-cold-routing/gate.ts
-          node --test tests/harness/pi-cold-routing/*.test.mjs tests/harness/codex-cold-routing/*.test.mjs tests/harness/byte-ledger/*.test.mjs
+        run: bash scripts/ci-node-harness.sh
 
   gate:
     name: CI gate
@@ -152,7 +129,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     env:
-      EVENT_NAME: ${{ github.event_name }}
       FULL: ${{ needs.changes.outputs.full }}
       LINUX_RESULT: ${{ needs.linux.result }}
       PORTABILITY_RESULT: ${{ needs.portability.result }}
@@ -164,7 +140,5 @@ jobs:
           [[ "$SCOPE_RESULT" == "success" ]] || exit 1
           if [[ "$FULL" == "true" ]]; then
             [[ "$LINUX_RESULT" == "success" ]] || exit 1
-            if [[ "$EVENT_NAME" != "push" ]]; then
-              [[ "$PORTABILITY_RESULT" == "success" ]] || exit 1
-            fi
+            [[ "$PORTABILITY_RESULT" == "success" ]] || exit 1
           fi
