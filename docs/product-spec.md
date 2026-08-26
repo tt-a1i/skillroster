@@ -72,8 +72,13 @@ discovered non-Unicode Skill directories are skipped and make that root's
 structural coverage incomplete. A Unicode Skill containing a non-Unicode
 package member remains an inventory fact with an `unreadable` fingerprint and
 cannot authorize exact load or governance. SkillRoster never hashes lossy path
-text or persists a replacement-character identity. A future raw-byte or UTF-16
-path encoding requires an explicit versioned schema migration.
+text or persists a replacement-character identity. Snapshots record typed
+`identity_path_coverage` plus an exact skipped-path count; any unverified or
+incomplete value blocks Find, Report, Plan, Apply, and other exact-identity
+decisions until a complete rescan. The `sha256-content-unicode-v2` presence
+marker prevents pre-contract Snapshots from being reused even when every
+currently visible path is Unicode. A future raw-byte or UTF-16 path encoding
+requires an explicit versioned schema migration.
 
 Scan records two deliberately separate hashes in one bounded traversal. The complete package fingerprint covers every retained package file, including `.gitignore`, and remains the only hash used for drift checks, exact load, Plan, Apply, Receipt, Undo, and recovery. The versioned routing content identity excludes only the package-root `.gitignore`; it is used for unsourced logical identity and same-name variant grouping because source-control metadata is not Agent Skills payload. `SKILL.md`, scripts, references, assets, and symlink targets remain identity-bearing. A legacy Snapshot without the current content-identity algorithm must be rescanned; the CLI never backfills or infers equality from old package fingerprints.
 

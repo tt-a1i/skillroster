@@ -713,10 +713,7 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
-    if error
-        .downcast_ref::<ContentIdentityRescanRequired>()
-        .is_some()
-    {
+    if let Some(rescan) = error.downcast_ref::<ContentIdentityRescanRequired>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
             ApiError {
@@ -726,7 +723,7 @@ pub fn error_json_with_context(
                 relevant_ids: Vec::new(),
                 paths: Vec::new(),
                 details: Some(json!({
-                    "reason": "legacy_snapshot_requires_rescan",
+                    "reason": rescan.reason,
                     "required_algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
                     "files_changed": false,
                     "state_files_changed": false,
@@ -6135,7 +6132,7 @@ fn verified_top_skill_load(
     if !before.is_file() || !allowed_roots.iter().any(|root| before.starts_with(root)) {
         return Err(blocked(
             "entrypoint_escapes_approved_roots",
-            Some(path),
+            Some(path.clone()),
             Some(expected_entrypoint_digest),
             None,
         )
@@ -8902,7 +8899,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
 
     let mut root_ids = std::collections::BTreeMap::new();
     for root in &scan.roots {
-        let path = root.path.to_string_lossy().into_owned();
+        let path = scan::unicode_identity_path(&root.path)?.to_owned();
         let root_id = stable_id(
             "root",
             &format!(
@@ -8956,7 +8953,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             .placements
             .iter()
             .find(|placement| placement.skill_id == skill.id)
-            .map(|placement| placement.directory.to_string_lossy().into_owned());
+            .map(|placement| scan::unicode_identity_path(&placement.directory).map(str::to_owned))
+            .transpose()?;
         let declared_revision = skill
             .metadata
             .version
@@ -9039,8 +9037,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
     }
 
     for placement in &scan.placements {
-        let path = placement.entrypoint.to_string_lossy().into_owned();
-        let root_path = placement.root.to_string_lossy().into_owned();
+        let path = scan::unicode_identity_path(&placement.entrypoint)?.to_owned();
+        let root_path = scan::unicode_identity_path(&placement.root)?.to_owned();
         let root_key = (placement.agent, root_path.clone());
         let root_id = root_ids
             .get(&root_key)
@@ -9068,7 +9066,8 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             symlink_target: placement
                 .link_target
                 .as_ref()
-                .map(|target| target.to_string_lossy().into_owned()),
+                .map(|target| scan::unicode_identity_path(target).map(str::to_owned))
+                .transpose()?,
             fingerprint: placement.content_digest.clone(),
             exposed: placement.default_exposed,
         })?;
@@ -9080,7 +9079,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             EvidenceQuality::Observed,
             "placement",
             placement_id.as_str(),
-            Some(path),
+            Some(path.clone()),
             Some(placement.content_digest.clone()),
             json!({
                 "skill_id": skill_id,
@@ -9106,7 +9105,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             EvidenceQuality::Observed,
             "placement",
             placement_id.as_str(),
-            Some(placement.entrypoint.to_string_lossy().into_owned()),
+            Some(path),
             Some(placement.content_digest.clone()),
             json!({
                 "algorithm": "sha256-v1",
@@ -9619,15 +9618,22 @@ fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
 }
 
 #[derive(Debug)]
-struct ContentIdentityRescanRequired;
+struct ContentIdentityRescanRequired {
+    reason: &'static str,
+}
 
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "latest Snapshot has no {} content identity; run skillroster scan",
-            scan::CONTENT_IDENTITY_ALGORITHM
-        )
+        match self.reason {
+            "non_unicode_identity_coverage_incomplete" => formatter.write_str(
+                "latest Snapshot excluded non-Unicode identity paths; resolve them and run skillroster scan",
+            ),
+            _ => write!(
+                formatter,
+                "latest Snapshot has no {} content identity; run skillroster scan",
+                scan::CONTENT_IDENTITY_ALGORITHM
+            ),
+        }
     }
 }
 
@@ -9635,7 +9641,16 @@ impl std::error::Error for ContentIdentityRescanRequired {}
 
 fn require_content_identity(scan: &ScanResult) -> Result<()> {
     if scan.content_identity_algorithm.as_deref() != Some(scan::CONTENT_IDENTITY_ALGORITHM) {
-        return Err(ContentIdentityRescanRequired.into());
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_snapshot_requires_rescan",
+        }
+        .into());
+    }
+    if scan.identity_path_coverage != scan::IdentityPathCoverage::Complete {
+        return Err(ContentIdentityRescanRequired {
+            reason: "non_unicode_identity_coverage_incomplete",
+        }
+        .into());
     }
     Ok(())
 }
@@ -9721,19 +9736,16 @@ fn plan_record(
         .operations
         .iter()
         .enumerate()
-        .map(|(position, operation)| PlanOperation {
-            id: OperationId::new(),
-            position: position as u32,
-            target_path: operation.target().to_string_lossy().into_owned(),
-            expected_fingerprint: Some(expected_fingerprint(operation).into()),
-            action: match operation {
+        .map(|(position, operation)| -> Result<PlanOperation> {
+            let target_path = scan::unicode_identity_path(operation.target())?.to_owned();
+            let action = match operation {
                 Operation::CreateDirectory { .. } => OperationAction::CreateDirectory,
                 Operation::CreateSymlink {
                     source,
                     expected_source_fingerprint,
                     ..
                 } => OperationAction::CreateSymlink {
-                    source: source.to_string_lossy().into_owned(),
+                    source: scan::unicode_identity_path(source)?.to_owned(),
                     expected_source_fingerprint: expected_source_fingerprint.clone(),
                 },
                 Operation::WriteFile { content, .. } => OperationAction::WriteFile {
@@ -9744,14 +9756,21 @@ fn plan_record(
                 },
                 Operation::RemoveSymlink { .. } => OperationAction::RemoveSymlink,
                 Operation::Copy { source, .. } => OperationAction::Copy {
-                    source: source.to_string_lossy().into_owned(),
+                    source: scan::unicode_identity_path(source)?.to_owned(),
                 },
                 Operation::MoveRecoverable { source, .. } => OperationAction::MoveRecoverable {
-                    source: source.to_string_lossy().into_owned(),
+                    source: scan::unicode_identity_path(source)?.to_owned(),
                 },
-            },
+            };
+            Ok(PlanOperation {
+                id: OperationId::new(),
+                position: position as u32,
+                target_path,
+                expected_fingerprint: Some(expected_fingerprint(operation).into()),
+                action,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(PlanRecord {
         id: PlanId::parse(prepared.id.clone())?,
         scan_id: ScanId::parse(prepared.scan_id.clone())?,
@@ -10709,6 +10728,58 @@ mod recovery_tests {
             ("non_unicode_identity_path", false)
         );
         assert!(!error.to_string().contains('\u{fffd}'));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn non_unicode_skill_paths_never_reach_sqlite_identity_rows() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("skills");
+        let valid = root.join("valid");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join("SKILL.md"), "---\nname: valid\n---\n").unwrap();
+        for bytes in [vec![0x80], vec![0x81]] {
+            let directory = root.join(OsString::from_vec(bytes));
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::write(directory.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+        }
+        let mut options = ScanOptions::for_home(temp.path().join("home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root,
+        });
+        options.include_session_evidence = false;
+        let result = scan::scan(&options).unwrap();
+        assert_eq!(result.placements.len(), 1);
+
+        let database_path = temp.path().join("state/skillroster.db");
+        let store = StateStore::open(&database_path).unwrap();
+        let scan_id = ScanId::new();
+        store
+            .save_scan(&ScanRun {
+                id: scan_id.clone(),
+                started_at: 1,
+                completed_at: Some(2),
+                status: ScanStatus::Completed,
+                coverage_notes: Vec::new(),
+            })
+            .unwrap();
+        persist_index(&store, &scan_id, &result).unwrap();
+
+        let database = rusqlite::Connection::open(database_path).unwrap();
+        let (count, path): (u64, String) = database
+            .query_row(
+                "SELECT COUNT(*), MIN(path) FROM placements WHERE scan_id = ?1",
+                [scan_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(path.ends_with("/valid/SKILL.md"));
+        assert!(!path.contains('\u{fffd}'));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::time::UNIX_EPOCH;
 
 const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
-pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-v1";
+pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-unicode-v2";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_ROOT: usize = 10_000;
 const MAX_SESSION_FILES_PER_ROOT: usize = 250;
@@ -453,6 +453,13 @@ pub struct ScanResult {
     /// legacy Snapshot must be rescanned before identity grouping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_identity_algorithm: Option<String>,
+    /// Whether every identity-bearing path observed by this Snapshot was
+    /// representable without lossy conversion. Legacy payloads are unverified.
+    #[serde(default)]
+    pub identity_path_coverage: IdentityPathCoverage,
+    /// Exact number of non-Unicode paths excluded from identity-bearing facts.
+    #[serde(default)]
+    pub non_unicode_identity_paths_skipped: u64,
     /// Durable source-root read permissions frozen before this Scan. Drifted
     /// permissions remain typed facts but are excluded from approved roots.
     #[serde(default)]
@@ -461,6 +468,15 @@ pub struct ScanResult {
     /// drift, even if a later path check appears active again.
     #[serde(default)]
     pub durable_read_drifted_permission_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityPathCoverage {
+    #[default]
+    Unverified,
+    Complete,
+    Incomplete,
 }
 
 #[derive(Clone, Debug)]
@@ -510,17 +526,19 @@ struct DiscoveryState {
 #[derive(Clone, Copy, Default)]
 struct SkillDiscoveryOutcome {
     depth_bounded: bool,
-    non_unicode_skipped: bool,
+    non_unicode_skipped: u64,
 }
 
 impl SkillDiscoveryOutcome {
     fn merge(&mut self, other: Self) {
         self.depth_bounded |= other.depth_bounded;
-        self.non_unicode_skipped |= other.non_unicode_skipped;
+        self.non_unicode_skipped = self
+            .non_unicode_skipped
+            .saturating_add(other.non_unicode_skipped);
     }
 
     fn is_complete(self) -> bool {
-        !self.depth_bounded && !self.non_unicode_skipped
+        !self.depth_bounded && self.non_unicode_skipped == 0
     }
 }
 
@@ -901,6 +919,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     require_unicode_scan_options(options)?;
     let mut result = ScanResult {
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
+        identity_path_coverage: IdentityPathCoverage::Complete,
         ..ScanResult::default()
     };
     let known = known_agent_roots(&options.home);
@@ -908,13 +927,13 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     // These paths are already an explicit trust decision from the caller.
     // Inventory and link-containment decisions use the resolved physical
     // sources so an alias and its canonical path have identical semantics.
-    let confirmed_source_roots = normalized_confirmed_source_roots(&options.explicit_source_roots);
+    let confirmed_source_roots = normalized_confirmed_source_roots(&options.explicit_source_roots)?;
     let mut shared_roots = vec![
         options.home.join(".agents_skills"),
         options.home.join(".skillroster/library"),
     ];
     shared_roots.extend(options.managed_source_roots.iter().cloned());
-    let shared_roots = normalized_confirmed_source_roots(&shared_roots);
+    let shared_roots = normalized_confirmed_source_roots(&shared_roots)?;
     let approved_roots = known
         .iter()
         .flat_map(|roots| roots.skill_roots.iter().cloned())
@@ -929,7 +948,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         .chain(options.explicit_source_roots.iter().cloned())
         .chain(confirmed_source_roots.iter().cloned())
         .collect::<Vec<_>>();
-    let approved_roots = normalized_confirmed_source_roots(&approved_roots);
+    let approved_roots = normalized_confirmed_source_roots(&approved_roots)?;
     // Durable paths were already canonicalized and identity-frozen by the
     // caller. Never canonicalize them again here: a post-freeze retarget must
     // not become an approved root.
@@ -1098,18 +1117,20 @@ fn require_unicode_scan_options(options: &ScanOptions) -> io::Result<()> {
     if paths.into_iter().all(|path| path.to_str().is_some()) {
         Ok(())
     } else {
-        Err(non_unicode_identity_error())
+        Err(non_unicode_identity_error(1))
     }
 }
 
-fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut normalized = roots
-        .iter()
-        .map(|root| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
-        .collect::<Vec<_>>();
+fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+    let mut normalized = Vec::with_capacity(roots.len());
+    for root in roots {
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        unicode_identity_path(&root)?;
+        normalized.push(root);
+    }
     normalized.sort();
     normalized.dedup();
-    normalized
+    Ok(normalized)
 }
 
 fn observe_excluded_session_roots(
@@ -1172,11 +1193,15 @@ fn observe_skill_root(
             if outcome.depth_bounded {
                 details.push(format!("Skill discovery was bounded at depth {max_depth}"));
             }
-            if outcome.non_unicode_skipped {
-                details.push(
-                    "Skill discovery skipped a non-Unicode path that cannot have stable identity"
-                        .to_owned(),
-                );
+            if outcome.non_unicode_skipped > 0 {
+                result.identity_path_coverage = IdentityPathCoverage::Incomplete;
+                result.non_unicode_identity_paths_skipped = result
+                    .non_unicode_identity_paths_skipped
+                    .saturating_add(outcome.non_unicode_skipped);
+                details.push(format!(
+                    "Skill discovery skipped {} non-Unicode path(s) that cannot have stable identity",
+                    outcome.non_unicode_skipped
+                ));
             }
             let detail = details.join("; ");
             result.warnings.push(format!(
@@ -1304,7 +1329,7 @@ fn discover_entrypoints(
     if depth > max_depth {
         return Ok(SkillDiscoveryOutcome {
             depth_bounded: true,
-            non_unicode_skipped: false,
+            non_unicode_skipped: 0,
         });
     }
     let mut outcome = SkillDiscoveryOutcome::default();
@@ -1335,7 +1360,7 @@ fn discover_entrypoints(
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
             let Some(child_name) = file_name.to_str() else {
-                outcome.non_unicode_skipped = true;
+                outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
                 continue;
             };
             let child_state = state.descend(policy.agent, child_name, directory_has_skill);
@@ -1354,7 +1379,7 @@ fn discover_entrypoints(
             let linked_entrypoint = path.join("SKILL.md");
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
             let Some(child_name) = file_name.to_str() else {
-                outcome.non_unicode_skipped = true;
+                outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
                 continue;
             };
             if linked_entrypoint.exists() || status != LinkStatus::Valid {
@@ -1610,13 +1635,20 @@ fn observe_physical_skill_package(
             fingerprint.executable_relative_files,
         ),
         Err(error) => {
-            let completeness = if is_non_unicode_identity_error(&error) {
+            let non_unicode_paths = non_unicode_identity_error_count(&error);
+            let completeness = if non_unicode_paths.is_some() {
                 FingerprintCompleteness::Unreadable
             } else if error.kind() == io::ErrorKind::InvalidData {
                 FingerprintCompleteness::Bounded
             } else {
                 FingerprintCompleteness::Unreadable
             };
+            if let Some(count) = non_unicode_paths {
+                result.identity_path_coverage = IdentityPathCoverage::Incomplete;
+                result.non_unicode_identity_paths_skipped = result
+                    .non_unicode_identity_paths_skipped
+                    .saturating_add(count);
+            }
             result.warnings.push(format!(
                 "could not completely fingerprint Skill package {}: {error}",
                 display_directory.display()
@@ -2182,7 +2214,9 @@ struct PackageFingerprint {
 const NON_UNICODE_IDENTITY_DETAIL: &str = "non-Unicode path cannot participate in stable identity";
 
 #[derive(Debug)]
-struct NonUnicodeIdentityPath;
+struct NonUnicodeIdentityPath {
+    count: u64,
+}
 
 impl std::fmt::Display for NonUnicodeIdentityPath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2192,16 +2226,27 @@ impl std::fmt::Display for NonUnicodeIdentityPath {
 
 impl std::error::Error for NonUnicodeIdentityPath {}
 
-fn non_unicode_identity_error() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, NonUnicodeIdentityPath)
+fn non_unicode_identity_error(count: u64) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, NonUnicodeIdentityPath { count })
+}
+
+pub(crate) fn unicode_identity_path(path: &Path) -> io::Result<&str> {
+    path.to_str().ok_or_else(|| non_unicode_identity_error(1))
 }
 
 pub(crate) fn is_non_unicode_identity_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::InvalidData
-        && error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<NonUnicodeIdentityPath>())
-            .is_some()
+    non_unicode_identity_error_count(error).is_some()
+}
+
+fn non_unicode_identity_error_count(error: &io::Error) -> Option<u64> {
+    (error.kind() == io::ErrorKind::InvalidData)
+        .then(|| {
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<NonUnicodeIdentityPath>())
+                .map(|error| error.count)
+        })
+        .flatten()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2224,50 +2269,54 @@ enum PackageFileKind {
 fn package_file_checkpoints(
     files: &[(PathBuf, PathBuf, fs::FileType)],
 ) -> io::Result<Vec<PackageFileCheckpoint>> {
-    files
-        .iter()
-        .map(|(relative_path, path, _)| {
-            if relative_path.to_str().is_none() {
-                return Err(non_unicode_identity_error());
-            }
-            let metadata = fs::symlink_metadata(path)?;
-            let file_type = metadata.file_type();
-            let symlink_target = file_type
-                .is_symlink()
-                .then(|| fs::read_link(path))
-                .transpose()?;
-            if symlink_target
-                .as_deref()
-                .is_some_and(|target| target.to_str().is_none())
-            {
-                return Err(non_unicode_identity_error());
-            }
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode()
-            };
-            #[cfg(not(unix))]
-            let mode = 0;
-            Ok(PackageFileCheckpoint {
-                relative_path: relative_path.clone(),
-                kind: if file_type.is_symlink() {
-                    PackageFileKind::Symlink
-                } else {
-                    PackageFileKind::File
-                },
-                len: metadata.len(),
-                modified_nanos: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| duration.as_nanos()),
-                readonly: metadata.permissions().readonly(),
-                mode,
-                symlink_target,
-            })
-        })
-        .collect()
+    let mut checkpoints = Vec::with_capacity(files.len());
+    let mut non_unicode_paths = 0_u64;
+    for (relative_path, path, _) in files {
+        if relative_path.to_str().is_none() {
+            non_unicode_paths = non_unicode_paths.saturating_add(1);
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        let file_type = metadata.file_type();
+        let symlink_target = file_type
+            .is_symlink()
+            .then(|| fs::read_link(path))
+            .transpose()?;
+        if symlink_target
+            .as_deref()
+            .is_some_and(|target| target.to_str().is_none())
+        {
+            non_unicode_paths = non_unicode_paths.saturating_add(1);
+        }
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let mode = 0;
+        checkpoints.push(PackageFileCheckpoint {
+            relative_path: relative_path.clone(),
+            kind: if file_type.is_symlink() {
+                PackageFileKind::Symlink
+            } else {
+                PackageFileKind::File
+            },
+            len: metadata.len(),
+            modified_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos()),
+            readonly: metadata.permissions().readonly(),
+            mode,
+            symlink_target,
+        });
+    }
+    if non_unicode_paths > 0 {
+        Err(non_unicode_identity_error(non_unicode_paths))
+    } else {
+        Ok(checkpoints)
+    }
 }
 
 fn package_checkpoint(directory: &Path) -> io::Result<Option<Vec<PackageFileCheckpoint>>> {
@@ -2335,7 +2384,9 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
         }
         if file_type.is_symlink() {
             let target = fs::read_link(path)?;
-            let target = target.to_str().ok_or_else(non_unicode_identity_error)?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| non_unicode_identity_error(1))?;
             digest.update(b"symlink\0");
             digest.update(target.as_bytes());
             if !is_source_control_metadata {
@@ -2499,6 +2550,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     let mut events = BTreeMap::<(String, UsageStage, String, Option<u64>), UsageEvidence>::new();
     let mut bytes_observed = 0_u64;
     let mut lines_observed = 0_usize;
+    let mut non_unicode_files_skipped = 0_u64;
 
     for root in roots {
         let status = match fs::read_dir(root) {
@@ -2653,12 +2705,16 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             }
             let Some(file_identity) = file.to_str() else {
                 coverage.files_skipped += 1;
+                non_unicode_files_skipped = non_unicode_files_skipped.saturating_add(1);
+                result.identity_path_coverage = IdentityPathCoverage::Incomplete;
+                result.non_unicode_identity_paths_skipped =
+                    result.non_unicode_identity_paths_skipped.saturating_add(1);
                 record_session_limitation(
                     &mut limitations,
                     SessionCoverageLimitationCode::FilePathNotUnicode,
                     SessionCoverageScope::File,
                     SessionCoverageCountKind::Exact,
-                    Some(coverage.files_skipped as u64),
+                    Some(non_unicode_files_skipped),
                     None,
                     SessionCoverageLimitationSource::SessionSampling,
                 );
@@ -3842,6 +3898,33 @@ enabled = true
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn unicode_root_alias_to_non_unicode_physical_path_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_directory("non-unicode-root-target");
+        let physical = parent.join(OsString::from_vec(vec![0x80]));
+        fs::create_dir(&physical).unwrap();
+        fs::write(physical.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+        let alias = parent.join("unicode-alias");
+        symlink(&physical, &alias).unwrap();
+        let mut options = ScanOptions::for_home(parent.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: alias,
+        });
+        options.include_session_evidence = false;
+
+        let error = scan(&options).unwrap_err();
+
+        assert!(is_non_unicode_identity_error(&error));
+        assert_eq!(error.to_string(), NON_UNICODE_IDENTITY_DETAIL);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn scan_skips_distinct_non_unicode_skill_paths_without_identity_collision() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -3867,6 +3950,11 @@ enabled = true
         assert_eq!(result.placements.len(), 1);
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].name, "valid");
+        assert_eq!(
+            result.identity_path_coverage,
+            IdentityPathCoverage::Incomplete
+        );
+        assert_eq!(result.non_unicode_identity_paths_skipped, 2);
         let observed = result.roots.iter().find(|seen| seen.path == root).unwrap();
         assert!(!observed.discovery_complete);
         assert!(
@@ -3918,8 +4006,50 @@ enabled = true
             Some(NON_UNICODE_IDENTITY_DETAIL)
         );
         assert!(first.skills[0].content_identity_digest.is_none());
+        assert_eq!(
+            first.identity_path_coverage,
+            IdentityPathCoverage::Incomplete
+        );
+        assert_eq!(first.non_unicode_identity_paths_skipped, 2);
         assert!(serde_json::to_string(&first).is_ok());
         assert!(inspect_skill_identity(&skill.join("SKILL.md")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_unicode_session_limitation_counts_only_its_own_skips() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_directory("non-unicode-session-file");
+        fs::write(root.join("empty.json"), b"").unwrap();
+        let mut invalid_name = vec![0x80];
+        invalid_name.extend_from_slice(b".json");
+        fs::write(root.join(OsString::from_vec(invalid_name)), b"{}\n").unwrap();
+        let mut result = ScanResult {
+            content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
+            identity_path_coverage: IdentityPathCoverage::Complete,
+            ..ScanResult::default()
+        };
+
+        scan_sessions(AgentKind::Codex, std::slice::from_ref(&root), &mut result);
+
+        let coverage = &result.coverage[0];
+        assert_eq!(coverage.files_skipped, 2);
+        let path_limit = coverage
+            .limitations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|limit| limit.code == SessionCoverageLimitationCode::FilePathNotUnicode)
+            .unwrap();
+        assert_eq!(path_limit.observed, Some(1));
+        assert_eq!(
+            result.identity_path_coverage,
+            IdentityPathCoverage::Incomplete
+        );
+        assert_eq!(result.non_unicode_identity_paths_skipped, 1);
         fs::remove_dir_all(root).unwrap();
     }
 

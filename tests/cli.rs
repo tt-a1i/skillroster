@@ -1663,10 +1663,15 @@ fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
         )
         .unwrap();
     let mut legacy: Value = serde_json::from_str(&encoded).unwrap();
+    legacy["content_identity_algorithm"] = json!("sha256-content-v1");
     legacy
         .as_object_mut()
         .unwrap()
-        .remove("content_identity_algorithm");
+        .remove("identity_path_coverage");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("non_unicode_identity_paths_skipped");
     for skill in legacy["skills"].as_array_mut().unwrap() {
         skill
             .as_object_mut()
@@ -1693,7 +1698,7 @@ fn legacy_snapshot_requires_typed_rescan_before_find_or_report() {
         );
         assert_eq!(
             rejected["error"]["details"]["required_algorithm"],
-            "sha256-content-v1"
+            "sha256-content-unicode-v2"
         );
         assert_eq!(rejected["error"]["details"]["files_changed"], false);
         assert_eq!(
@@ -8446,6 +8451,58 @@ fn find_rejects_content_drift_and_requests_rescan() {
         unreadable["error"]["details"]["next_action"],
         "repair_local_read_access_then_scan"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_unicode_identity_coverage_blocks_exact_snapshot_consumers() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let valid = root.join("valid");
+    fs::create_dir_all(&valid).unwrap();
+    fs::write(
+        valid.join("SKILL.md"),
+        "---\nname: valid\ndescription: exact unicode fixture\n---\n",
+    )
+    .unwrap();
+    let invalid = root.join(OsString::from_vec(vec![0x80]));
+    fs::create_dir(&invalid).unwrap();
+    fs::write(invalid.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+    let explicit_root = format!("codex={}", root.display());
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--root",
+        &explicit_root,
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    for (tail, stdin) in [
+        (vec!["find", "exact unicode fixture", "--load"], None),
+        (vec!["report", "--summary"], None),
+        (vec!["plan", "--stdin"], Some("{}")),
+    ] {
+        let rejected = run(&[&common[..], &tail].concat(), stdin);
+        assert!(!rejected.status.success());
+        let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(
+            rejected["error"]["code"],
+            "content_identity_rescan_required"
+        );
+        assert_eq!(
+            rejected["error"]["details"]["reason"],
+            "non_unicode_identity_coverage_incomplete"
+        );
+    }
 }
 
 #[test]
