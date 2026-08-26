@@ -35,13 +35,12 @@ jobs:
           HEAD_SHA: ${{ github.sha }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          bash scripts/ci-change-scope.sh --self-test
           full=true
           if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
             git diff --check "$BASE_SHA" "$HEAD_SHA"
-            changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-            if [[ -n "$changed" ]] && ! grep -Evq '(\.md$|^LICENSE$)' <<<"$changed"; then
-              full=false
-            fi
+            changed="$(git -c core.quotePath=true diff --name-status --no-renames "$BASE_SHA" "$HEAD_SHA")"
+            full="$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | bash scripts/ci-change-scope.sh --null)"
             {
               echo "### Change scope"
               echo
