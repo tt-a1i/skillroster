@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
 const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 3;
 
-use crate::change::{self, LibraryChangeAction, RosterChange};
+use crate::change::{self, LibraryChangeAction, OperationInput, RosterChange};
 use crate::harness::AgentKind;
 use crate::model::RosterState;
 use crate::scan::{
@@ -17,7 +17,7 @@ use crate::scan::{
 
 #[derive(Debug)]
 pub struct DerivedRosterPlan {
-    pub operations: Vec<Value>,
+    pub operations: Vec<OperationInput>,
     pub implicit_library_changes: Vec<LibraryChangeAction>,
     pub impact: Value,
 }
@@ -829,12 +829,11 @@ pub fn derive(
             needs_library_root |= !library_root.exists();
             let canonical_source = physical_mutation_path(canonical);
             let canonical_fingerprint = change::fingerprint(&canonical_source)?;
-            operations.push(json!({
-                "kind": "move_recoverable",
-                "source": canonical_source,
-                "target": library_path,
-                "expected_fingerprint": canonical_fingerprint
-            }));
+            operations.push(OperationInput::MoveRecoverable {
+                source: canonical_source,
+                target: library_path.clone(),
+                expected_fingerprint: canonical_fingerprint.clone(),
+            });
             *operation_groups.entry("host_canonical").or_default() += 1;
             source = Some(library_path.clone());
             source_fingerprint = Some(canonical_fingerprint);
@@ -901,22 +900,20 @@ pub fn derive(
                     affected_agents.insert(agent.id().to_owned());
                 }
                 retargeted_placements.insert(placement.id.clone());
-                operations.push(json!({
-                    "kind": "move_recoverable",
-                    "source": placement.directory,
-                    "target": backup_root.join(format!("{nonce}-{}", placement.id)),
-                    "expected_fingerprint": change::fingerprint(&placement.directory)?
-                }));
+                operations.push(OperationInput::MoveRecoverable {
+                    source: placement.directory.clone(),
+                    target: backup_root.join(format!("{nonce}-{}", placement.id)),
+                    expected_fingerprint: change::fingerprint(&placement.directory)?,
+                });
                 *operation_groups
                     .entry("preserve_dependent_link")
                     .or_default() += 1;
-                operations.push(json!({
-                    "kind": "create_symlink",
-                    "source": source,
-                    "target": placement.directory,
-                    "expected_fingerprint": "missing",
-                    "expected_source_fingerprint": source_fingerprint
-                }));
+                operations.push(OperationInput::CreateSymlink {
+                    source: source.clone(),
+                    target: placement.directory.clone(),
+                    expected_fingerprint: "missing".into(),
+                    expected_source_fingerprint: source_fingerprint.clone(),
+                });
                 *operation_groups
                     .entry("retarget_dependent_link")
                     .or_default() += 1;
@@ -938,12 +935,11 @@ pub fn derive(
             needs_backup_root |= !backup_root.exists();
             let backup = backup_root.join(format!("{nonce}-{}", placement.id));
             let expected_fingerprint = change::fingerprint(&physical_source)?;
-            operations.push(json!({
-                "kind": "move_recoverable",
-                "source": physical_source,
-                "target": backup,
-                "expected_fingerprint": expected_fingerprint
-            }));
+            operations.push(OperationInput::MoveRecoverable {
+                source: physical_source,
+                target: backup,
+                expected_fingerprint,
+            });
             *operation_groups.entry("remove_exposure").or_default() += 1;
         }
 
@@ -1003,25 +999,23 @@ pub fn derive(
             for placement in existing {
                 needs_backup_root |= !backup_root.exists();
                 affected_placements.insert(placement.id.clone());
-                operations.push(json!({
-                    "kind": "move_recoverable",
-                    "source": placement.directory,
-                    "target": backup_root.join(format!("{nonce}-{}", placement.id)),
-                    "expected_fingerprint": change::fingerprint(&placement.directory)?
-                }));
+                operations.push(OperationInput::MoveRecoverable {
+                    source: placement.directory.clone(),
+                    target: backup_root.join(format!("{nonce}-{}", placement.id)),
+                    expected_fingerprint: change::fingerprint(&placement.directory)?,
+                });
                 *operation_groups
                     .entry("replace_invalid_exposure")
                     .or_default() += 1;
             }
             let target_root = agent_root(scan, requested_agent)?;
             let target = target_root.join(safe_name(&skill.name)?);
-            operations.push(json!({
-                "kind": "create_symlink",
-                "source": source,
-                "target": target,
-                "expected_fingerprint": "missing",
-                "expected_source_fingerprint": source_fingerprint
-            }));
+            operations.push(OperationInput::CreateSymlink {
+                source,
+                target,
+                expected_fingerprint: "missing".into(),
+                expected_source_fingerprint: source_fingerprint,
+            });
             *operation_groups.entry("add_core_exposure").or_default() += 1;
             after_exposure += 1;
         }
@@ -1035,22 +1029,20 @@ pub fn derive(
     if needs_backup_root {
         operations.insert(
             0,
-            json!({
-                "kind": "create_directory",
-                "target": backup_root,
-                "expected_fingerprint": "missing"
-            }),
+            OperationInput::CreateDirectory {
+                target: backup_root,
+                expected_fingerprint: "missing".into(),
+            },
         );
         *operation_groups.entry("create_backup_root").or_default() += 1;
     }
     if needs_library_root {
         operations.insert(
             0,
-            json!({
-                "kind": "create_directory",
-                "target": library_root,
-                "expected_fingerprint": "missing"
-            }),
+            OperationInput::CreateDirectory {
+                target: library_root,
+                expected_fingerprint: "missing".into(),
+            },
         );
         *operation_groups.entry("create_library").or_default() += 1;
     }
@@ -1170,15 +1162,23 @@ fn read_only_placements_on_physical_removal<'a>(
     })
 }
 
-fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
+fn ensure_unique_operation_paths(operations: &[OperationInput]) -> Result<()> {
     let mut move_sources = BTreeSet::new();
     let mut targets = BTreeMap::<PathBuf, &str>::new();
     for operation in operations {
-        if operation["kind"] == "move_recoverable" {
-            let source = operation["source"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Roster move operation has no source"))?;
-            let source = physical_operation_path(Path::new(source));
+        let (kind, target, move_source) = match operation {
+            OperationInput::CreateDirectory { target, .. } => ("create_directory", target, None),
+            OperationInput::CreateSymlink { target, .. } => ("create_symlink", target, None),
+            OperationInput::WriteFile { target, .. } => ("write_file", target, None),
+            OperationInput::ReplaceFile { target, .. } => ("replace_file", target, None),
+            OperationInput::RemoveSymlink { target, .. } => ("remove_symlink", target, None),
+            OperationInput::Copy { target, .. } => ("copy", target, None),
+            OperationInput::MoveRecoverable { source, target, .. } => {
+                ("move_recoverable", target, Some(source))
+            }
+        };
+        if let Some(source) = move_source {
+            let source = physical_operation_path(source);
             if !move_sources.insert(source.clone()) {
                 return Err(RosterOperationConflict {
                     identity_role: "source",
@@ -1188,11 +1188,7 @@ fn ensure_unique_operation_paths(operations: &[Value]) -> Result<()> {
                 .into());
             }
         }
-        let Some(target) = operation["target"].as_str() else {
-            continue;
-        };
-        let target = physical_operation_path(Path::new(target));
-        let kind = operation["kind"].as_str().unwrap_or("unknown");
+        let target = physical_operation_path(target);
         if let Some(first_kind) = targets.insert(target.clone(), kind) {
             return Err(RosterOperationConflict {
                 identity_role: "target",
@@ -1333,6 +1329,55 @@ mod tests {
 
     use super::*;
     use crate::scan::{ScanOptions, scan};
+
+    #[test]
+    fn typed_operation_serializes_to_the_public_plan_shape() {
+        let source = PathBuf::from("library/example");
+        let target = PathBuf::from("agent/example");
+        let operation = OperationInput::CreateSymlink {
+            source: source.clone(),
+            target: target.clone(),
+            expected_fingerprint: "missing".into(),
+            expected_source_fingerprint: "directory:sha256:fixture".into(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(operation).unwrap(),
+            json!({
+                "kind": "create_symlink",
+                "source": source,
+                "target": target,
+                "expected_fingerprint": "missing",
+                "expected_source_fingerprint": "directory:sha256:fixture"
+            })
+        );
+    }
+
+    #[test]
+    fn typed_operations_reject_conflicting_targets_without_json_reparsing() {
+        let target = PathBuf::from("/agent/example");
+        let operations = vec![
+            OperationInput::CreateDirectory {
+                target: target.clone(),
+                expected_fingerprint: "missing".into(),
+            },
+            OperationInput::CreateSymlink {
+                source: PathBuf::from("/library/example"),
+                target: target.clone(),
+                expected_fingerprint: "missing".into(),
+                expected_source_fingerprint: "directory:sha256:fixture".into(),
+            },
+        ];
+
+        let error = ensure_unique_operation_paths(&operations).unwrap_err();
+        let conflict = error.downcast_ref::<RosterOperationConflict>().unwrap();
+        assert_eq!(conflict.identity_role, "target");
+        assert_eq!(
+            conflict.operation_kinds,
+            ["create_directory", "create_symlink"]
+        );
+        assert_eq!(conflict.path, physical_operation_path(&target));
+    }
 
     #[test]
     fn roster_planning_types_bounded_root_discovery() {
@@ -1519,14 +1564,14 @@ mod tests {
         let moves = plan
             .operations
             .iter()
-            .filter(|operation| operation["kind"] == "move_recoverable")
+            .filter_map(|operation| match operation {
+                OperationInput::MoveRecoverable { source, .. } => Some(source),
+                _ => None,
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(moves.len(), 1);
-        assert_eq!(
-            moves[0]["source"],
-            json!(fs::canonicalize(shared_skill).unwrap())
-        );
+        assert_eq!(moves[0], &fs::canonicalize(shared_skill).unwrap());
         assert_eq!(plan.impact["before_default_exposure"], 3);
         assert_eq!(plan.impact["after_default_exposure"], 0);
         assert_eq!(
@@ -2093,10 +2138,11 @@ mod tests {
             }],
         )
         .unwrap();
-        assert!(plan.operations.iter().any(|operation| {
-            operation["kind"] == "create_symlink"
-                && operation["target"] == codex_root.join("shared").to_string_lossy().as_ref()
-        }));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            OperationInput::CreateSymlink { target, .. }
+                if target == &codex_root.join("shared")
+        )));
     }
 
     #[test]
@@ -2175,9 +2221,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(plan.operations.iter().any(|operation| {
-            operation["kind"] == "move_recoverable" && operation["source"] == json!(claude)
-        }));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            OperationInput::MoveRecoverable { source, .. } if source == &claude
+        )));
         assert_eq!(plan.impact["before_default_exposure"], 2);
         assert_eq!(plan.impact["after_default_exposure"], 1);
 
@@ -2225,11 +2272,11 @@ mod tests {
             fs::canonicalize(&claude).unwrap(),
             fs::canonicalize(codex).unwrap()
         );
-        assert!(plan.operations.iter().any(|operation| {
-            operation["kind"] == "create_symlink"
-                && operation["target"] == json!(claude)
-                && operation["source"] == json!(state.join("library/shared"))
-        }));
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            OperationInput::CreateSymlink { source, target, .. }
+                if target == &claude && source == &state.join("library/shared")
+        )));
     }
 
     #[test]
