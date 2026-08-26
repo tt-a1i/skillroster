@@ -653,8 +653,6 @@ fn owned_source_confirmation_control_file(
     name: &std::ffi::OsStr,
     file: &mut std::fs::File,
 ) -> std::io::Result<bool> {
-    const MAX_DETAIL_BYTES: u64 = 8 * 1024 * 1024;
-
     let path = Path::new(name);
     if path.extension().and_then(|value| value.to_str()) != Some("json") {
         return Ok(false);
@@ -665,12 +663,7 @@ fn owned_source_confirmation_control_file(
     if ulid::Ulid::from_string(stem).is_err() {
         return Ok(false);
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_DETAIL_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_DETAIL_BYTES {
-        return Ok(false);
-    }
-    let Ok(detail) = serde_json::from_slice::<Value>(&bytes) else {
+    let Ok(detail) = serde_json::from_reader::<_, Value>(file) else {
         return Ok(false);
     };
     Ok(recognized_source_confirmation_detail(&detail))

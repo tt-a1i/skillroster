@@ -1999,8 +1999,6 @@ pub(crate) fn persist_journal_state(receipt: &ChangeReceipt) -> Result<()> {
 }
 
 pub(crate) fn owned_receipt_control_file(name: &OsStr, file: &mut File) -> io::Result<bool> {
-    const MAX_RECEIPT_BYTES: u64 = 8 * 1024 * 1024;
-
     let Some(name) = name.to_str() else {
         return Ok(false);
     };
@@ -2020,12 +2018,7 @@ pub(crate) fn owned_receipt_control_file(name: &OsStr, file: &mut File) -> io::R
     if ulid::Ulid::from_string(id).is_err() {
         return Ok(false);
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_RECEIPT_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-        return Ok(false);
-    }
-    let Ok(receipt) = serde_json::from_slice::<ChangeReceipt>(&bytes) else {
+    let Ok(receipt) = serde_json::from_reader::<_, ChangeReceipt>(file) else {
         return Ok(false);
     };
     Ok(receipt.id == name.trim_end_matches(".json"))
@@ -2495,6 +2488,29 @@ mod tests {
         let decoded: ChangeReceipt = serde_json::from_slice(&fs::read(published).unwrap()).unwrap();
         assert_eq!(decoded.id, receipt.id);
         assert_eq!(decoded.status, ReceiptStatus::Applying);
+    }
+
+    #[test]
+    fn owned_receipt_validation_has_no_smaller_limit_than_receipt_creation() {
+        let (_temp, root, state) = fixture();
+        let receipt = ChangeReceipt {
+            id: format!("receipt_{}", ulid::Ulid::new()),
+            plan_id: "plan_large_receipt".to_owned(),
+            status: ReceiptStatus::RecoveryRequired,
+            changed_paths: Vec::new(),
+            compensations: Vec::new(),
+            approved_roots: vec![root],
+            state_dir: state.clone(),
+            error: Some("x".repeat(9 * 1024 * 1024)),
+            reverses_receipt_id: None,
+            operation_results: Vec::new(),
+        };
+        let name = format!("{}.json", receipt.id);
+        let path = state.join(&name);
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let mut file = File::open(path).unwrap();
+
+        assert!(owned_receipt_control_file(OsStr::new(&name), &mut file).unwrap());
     }
 
     #[test]

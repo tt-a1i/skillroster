@@ -148,14 +148,100 @@ pub(crate) fn secure_control_directory(
                 format!("unrecognized control file: {}", name.to_string_lossy()),
             ));
         }
-        owned_files.push(file);
+        owned_files.push((name, opened_path_identity(&file)?));
     }
 
     secure_opened_path(&directory, true)?;
-    for file in &owned_files {
-        secure_opened_file(file)?;
+    for (name, expected_identity) in owned_files {
+        let mut options = CapOpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        let mut file = dir.open_with(&name, &options)?.into_std();
+        validate_opened_path(&file, false)?;
+        if opened_path_identity(&file)? != expected_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file identity changed during validation: {}",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
+        if !validate(&name, &mut file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "control file changed during validation: {}",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
+        secure_opened_file(&file)?;
     }
     Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedPathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn opened_path_identity(file: &File) -> io::Result<OpenedPathIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(OpenedPathIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedPathIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
+
+#[cfg(windows)]
+fn opened_path_identity(file: &File) -> io::Result<OpenedPathIdentity> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    // SAFETY: info is valid writable storage for the requested information class.
+    let mut info: FILE_ID_INFO = unsafe { zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OpenedPathIdentity {
+        volume: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenedPathIdentity;
+
+#[cfg(not(any(unix, windows)))]
+fn opened_path_identity(_file: &File) -> io::Result<OpenedPathIdentity> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "state file identity is unsupported on this platform",
+    ))
 }
 
 #[cfg(unix)]
