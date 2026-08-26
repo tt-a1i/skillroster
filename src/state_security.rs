@@ -79,19 +79,6 @@ pub(crate) fn prepare_private_file(path: &Path) -> io::Result<()> {
     }
 }
 
-pub(crate) fn open_private_file_for_replace(path: &Path) -> io::Result<File> {
-    let mut options = private_file_options();
-    let file = options
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    secure_opened_file(&file)?;
-    file.set_len(0)?;
-    Ok(file)
-}
-
 pub(crate) fn secure_state_layout(state_dir: &Path) -> io::Result<()> {
     prepare_state_root(state_dir)?;
     for name in [

@@ -4,14 +4,20 @@
 //! The containing directory must also be flushed before the mutation can be
 //! treated as recoverable after a crash.
 
+use std::fs::File;
 use std::io;
 use std::path::Path;
 
-#[cfg(unix)]
-use std::fs::File;
-
 pub(crate) trait DirectorySync {
     fn sync_directory(&self, path: &Path) -> io::Result<()>;
+
+    /// Flush an already-open directory capability. The diagnostic path is
+    /// supplied separately so tests can inject failures without making
+    /// production durability depend on ambient path resolution.
+    fn sync_directory_handle(&self, directory: &File, path: &Path) -> io::Result<()> {
+        let _ = directory;
+        self.sync_directory(path)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -20,6 +26,10 @@ pub(crate) struct SystemDirectorySync;
 impl DirectorySync for SystemDirectorySync {
     fn sync_directory(&self, path: &Path) -> io::Result<()> {
         sync_directory(path)
+    }
+
+    fn sync_directory_handle(&self, directory: &File, _path: &Path) -> io::Result<()> {
+        directory.sync_all()
     }
 }
 
