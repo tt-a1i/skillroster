@@ -2866,10 +2866,10 @@ fn report_command(
         let mut details = stored.details.clone();
         if let Some(object) = details.as_object_mut() {
             object.insert("report_id".into(), json!(stored.report_id));
-            if object.get("kind").and_then(Value::as_str).is_none() {
+            if object.get("kind").is_none_or(Value::is_null) {
                 object.insert(
                     "kind".into(),
-                    json!(stable_finding_kind(&stored.category, &stored.title)),
+                    json!(crate::query::stored_finding_kind(&stored)),
                 );
             }
             object.insert("files_changed".into(), json!(false));
@@ -2930,7 +2930,10 @@ fn report_command(
                 .filter_map(|placement| placement.link_target.as_ref())
                 .map(|path| path.display().to_string())
                 .collect::<BTreeSet<_>>();
-            let ordered_evidence = if stored.title == "Five-stage usage evidence" {
+            let ordered_evidence = if crate::query::stored_finding_is(
+                &stored,
+                crate::query::FindingKind::FiveStageUsageEvidence,
+            ) {
                 let mut evidence = store.finding_evidence(&id)?;
                 for record in &mut evidence {
                     if record.kind == EvidenceKind::Coverage {
@@ -3214,8 +3217,13 @@ fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
         .into_iter()
         .flatten()
         .all(|finding| {
-            finding["title"] != crate::source_policy::ESCAPING_LINK_FINDING_TITLE
-                || finding["kind"] == crate::source_policy::ESCAPING_LINK_FINDING_KIND
+            let legacy_kind = crate::query::finding_kind_from_stored_value(
+                None,
+                finding.get("title").and_then(Value::as_str).unwrap_or(""),
+            );
+            legacy_kind != Some(crate::query::FindingKind::EscapingLinkSourceConfirmation)
+                || finding.get("kind").and_then(Value::as_str)
+                    == Some(crate::query::FindingKind::EscapingLinkSourceConfirmation.as_str())
         })
 }
 
@@ -3504,9 +3512,11 @@ fn add_semantic_overlap_comparison(
     scan: &ScanResult,
     state_dir: &Path,
 ) -> Result<()> {
-    if object.get("title").and_then(Value::as_str)
-        != Some(crate::query::SEMANTIC_OVERLAP_FINDING_TITLE)
-    {
+    let kind = crate::query::finding_kind_from_stored_value(
+        object.get("kind"),
+        object.get("title").and_then(Value::as_str).unwrap_or(""),
+    );
+    if kind != Some(crate::query::FindingKind::SemanticOverlapCandidate) {
         return Ok(());
     }
     let affected_skill_ids = object
@@ -4764,6 +4774,7 @@ fn compact_finding_summary(finding: &Value) -> Value {
 }
 
 struct FindingRollup {
+    kind: String,
     category: String,
     severity: String,
     title: String,
@@ -4775,16 +4786,18 @@ struct FindingRollup {
 fn finding_rollups(findings: &[Value]) -> Vec<Value> {
     let mut rollups = Vec::<FindingRollup>::new();
     for finding in findings {
+        let kind = finding_family_kind(finding);
         let category = finding["category"].as_str().unwrap_or("unknown");
         let severity = finding["severity"].as_str().unwrap_or("unknown");
         let title = finding["title"].as_str().unwrap_or("Unknown Finding");
         let index = rollups
             .iter()
             .position(|rollup| {
-                rollup.category == category && rollup.severity == severity && rollup.title == title
+                rollup.kind == kind && rollup.category == category && rollup.severity == severity
             })
             .unwrap_or_else(|| {
                 rollups.push(FindingRollup {
+                    kind,
                     category: category.to_owned(),
                     severity: severity.to_owned(),
                     title: title.to_owned(),
@@ -4826,6 +4839,21 @@ fn finding_rollups(findings: &[Value]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn finding_family_kind(finding: &Value) -> String {
+    crate::query::finding_kind_from_stored_value(
+        finding.get("kind"),
+        finding.get("title").and_then(Value::as_str).unwrap_or(""),
+    )
+    .map(|kind| kind.as_str().to_owned())
+    .or_else(|| {
+        finding
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+    .unwrap_or_else(|| "unknown".into())
 }
 
 fn report_finding_rollups(report: &Value) -> Value {
@@ -4905,18 +4933,18 @@ fn paged_finding_report(
 }
 
 fn interleave_finding_families(findings: Vec<&Value>) -> Vec<&Value> {
-    let mut families = Vec::<((&str, &str, &str), Vec<&Value>)>::new();
-    let mut family_indices = BTreeMap::<(&str, &str, &str), usize>::new();
+    let mut families = Vec::<((String, String, String), Vec<&Value>)>::new();
+    let mut family_indices = BTreeMap::<(String, String, String), usize>::new();
     for finding in findings {
         let key = (
-            finding["category"].as_str().unwrap_or("unknown"),
-            finding["severity"].as_str().unwrap_or("unknown"),
-            finding["title"].as_str().unwrap_or("Unknown Finding"),
+            finding_family_kind(finding),
+            finding["category"].as_str().unwrap_or("unknown").to_owned(),
+            finding["severity"].as_str().unwrap_or("unknown").to_owned(),
         );
         if let Some(index) = family_indices.get(&key).copied() {
             families[index].1.push(finding);
         } else {
-            family_indices.insert(key, families.len());
+            family_indices.insert(key.clone(), families.len());
             families.push((key, vec![finding]));
         }
     }
@@ -4977,11 +5005,9 @@ fn finding_json(
     evidence_ids: &[EvidenceId],
     scan: &ScanResult,
 ) -> Value {
-    let category = finding_category(finding.category);
-    let kind = stable_finding_kind(&category, &finding.title);
     let mut value = json!({
         "id": id,
-        "kind": kind,
+        "kind": finding.kind,
         "category": finding.category,
         "severity": finding.severity,
         "title": finding.title,
@@ -4994,26 +5020,10 @@ fn finding_json(
         "coverage": finding_coverage(finding, scan),
         "files_changed": false
     });
-    if finding.category == crate::query::FindingCategory::Usage
-        && finding.title == "Five-stage usage evidence"
-    {
+    if finding.kind == crate::query::FindingKind::FiveStageUsageEvidence {
         value["usage_overview"] = json!(crate::query::usage_overview(scan));
     }
     value
-}
-
-fn stable_finding_kind(category: &FindingCategory, title: &str) -> Option<&'static str> {
-    crate::roster_recommendation::finding_kind(category, title).or_else(|| {
-        if *category != FindingCategory::Layout {
-            None
-        } else if title == crate::query::SAME_NAME_DIVERGENT_FINDING_TITLE {
-            Some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
-        } else if title == crate::source_policy::ESCAPING_LINK_FINDING_TITLE {
-            Some(crate::source_policy::ESCAPING_LINK_FINDING_KIND)
-        } else {
-            None
-        }
-    })
 }
 
 fn finding_impact(finding: &crate::query::Finding) -> Value {
@@ -5070,17 +5080,21 @@ fn stored_finding_coverage_basis(
 
     // Records written before coverage dimensions were introduced have no typed basis.
     // Reconstruct only those legacy records from the stable Finding identity.
-    Ok(match finding.category {
-        FindingCategory::Usage => crate::query::FindingCoverageBasis::SessionUsage,
-        FindingCategory::Lifecycle
-            if matches!(
-                finding.title.as_str(),
-                crate::query::STALE_ARCHIVE_FINDING_TITLE
-                    | crate::query::UNKNOWN_ARCHIVE_FINDING_TITLE
-            ) =>
-        {
-            crate::query::FindingCoverageBasis::SessionUsage
+    let kind = crate::query::finding_kind_from_stored_value(details.get("kind"), &finding.title);
+    if kind.is_none() && details.get("kind").is_some_and(|value| !value.is_null()) {
+        return Err(StoredFindingCoverageInvalid {
+            finding_id: finding.id.clone(),
+            reason: "unsupported_finding_kind",
         }
+        .into());
+    }
+    Ok(match kind {
+        Some(
+            crate::query::FindingKind::FiveStageUsageEvidence
+            | crate::query::FindingKind::UsageCoverageIncomplete
+            | crate::query::FindingKind::StaleArchiveCandidates
+            | crate::query::FindingKind::ArchiveCandidacyUnknown,
+        ) => crate::query::FindingCoverageBasis::SessionUsage,
         _ => crate::query::FindingCoverageBasis::SkillRootScan,
     })
 }
@@ -7078,7 +7092,12 @@ fn exact_duplicate_finding_scope(
     finding: &FindingRecord,
     scan: &ScanResult,
 ) -> Result<(String, Vec<String>)> {
-    if finding.category != FindingCategory::Overlap {
+    if finding.category != FindingCategory::Overlap
+        || !crate::query::stored_finding_is(
+            finding,
+            crate::query::FindingKind::ExactDuplicatePlacements,
+        )
+    {
         bail!("Finding {} is not an exact-duplicate Finding", finding.id);
     }
     let object = finding
@@ -10150,6 +10169,7 @@ mod recovery_tests {
     fn coverage_finding(basis: crate::query::FindingCoverageBasis) -> crate::query::Finding {
         crate::query::Finding {
             id: "finding_coverage".into(),
+            kind: crate::query::FindingKind::ExactDuplicatePlacements,
             category: crate::query::FindingCategory::Overlap,
             severity: crate::query::Severity::Medium,
             title: "Exact duplicate Skill placements".into(),
@@ -10453,6 +10473,7 @@ mod recovery_tests {
                 "unsupported_coverage_basis",
             ),
             (json!({"coverage": []}), "malformed_coverage"),
+            (json!({"kind": "future_kind"}), "unsupported_finding_kind"),
         ] {
             let error =
                 stored_finding_coverage_basis(&finding, invalid.as_object().unwrap()).unwrap_err();
@@ -10467,6 +10488,26 @@ mod recovery_tests {
             assert_eq!(output["error"]["details"]["files_changed"], false);
             assert_eq!(output["error"]["details"]["next_action"], "scan");
         }
+    }
+
+    #[test]
+    fn legacy_escaping_link_report_requires_a_typed_kind_before_reuse() {
+        let mut report = ReportRecord {
+            id: ReportId::new(),
+            scan_id: ScanId::new(),
+            created_at: 0,
+            summary: json!({
+                "findings": [{
+                    "kind": null,
+                    "title": crate::source_policy::ESCAPING_LINK_FINDING_TITLE
+                }]
+            }),
+        };
+
+        assert!(!report_supports_source_confirmation_kind(&report));
+        report.summary["findings"][0]["kind"] =
+            json!(crate::query::FindingKind::EscapingLinkSourceConfirmation);
+        assert!(report_supports_source_confirmation_kind(&report));
     }
 
     #[test]
@@ -10787,6 +10828,7 @@ mod recovery_tests {
     fn finding_rollups_count_unique_affected_subjects() {
         let findings = vec![
             json!({
+                "kind": "exact_duplicate_placements",
                 "category": "overlap",
                 "severity": "medium",
                 "title": "Exact duplicate Skill placements",
@@ -10794,9 +10836,10 @@ mod recovery_tests {
                 "affected_placement_ids": ["placement_a", "placement_b"]
             }),
             json!({
+                "kind": "exact_duplicate_placements",
                 "category": "overlap",
                 "severity": "medium",
-                "title": "Exact duplicate Skill placements",
+                "title": "Copy-edited duplicate placement title",
                 "affected_skill_ids": ["skill_a", "skill_b"],
                 "affected_placement_ids": ["placement_b", "placement_c"]
             }),
@@ -10812,9 +10855,10 @@ mod recovery_tests {
 
     #[test]
     fn finding_pages_interleave_families_without_losing_instances() {
-        let finding = |id: &str, category: &str, title: &str| {
+        let finding = |id: &str, category: &str, kind: &str, title: &str| {
             json!({
                 "id": id,
+                "kind": kind,
                 "category": category,
                 "severity": "medium",
                 "title": title,
@@ -10824,12 +10868,12 @@ mod recovery_tests {
         };
         let report = json!({
             "findings": [
-                finding("a1", "overlap", "family-a"),
-                finding("a2", "overlap", "family-a"),
-                finding("a3", "overlap", "family-a"),
-                finding("b1", "overlap", "family-b"),
-                finding("b2", "overlap", "family-b"),
-                finding("c1", "usage", "family-c")
+                finding("a1", "overlap", "exact_duplicate_placements", "family-a"),
+                finding("a2", "overlap", "exact_duplicate_placements", "edited-a"),
+                finding("a3", "overlap", "exact_duplicate_placements", "edited-again-a"),
+                finding("b1", "overlap", "semantic_overlap_candidate", "family-b"),
+                finding("b2", "overlap", "semantic_overlap_candidate", "edited-b"),
+                finding("c1", "usage", "usage_coverage_incomplete", "family-c")
             ]
         });
 
@@ -11161,12 +11205,24 @@ mod recovery_tests {
             title: "Exact duplicate".into(),
             summary: String::new(),
             details: json!({
+                "kind": "exact_duplicate_placements",
                 "affected_skill_ids": ["skill_shared"],
                 "affected_placement_ids": ["placement_agent", "placement_plugin"]
             }),
             evidence_ids: vec![EvidenceId::parse("evidence_external-duplicate").unwrap()],
         };
         let scan_id = ScanId::parse("scan_external-duplicate").unwrap();
+
+        for wrong_kind in [
+            json!("semantic_overlap_candidate"),
+            json!("future_kind"),
+            json!(7),
+        ] {
+            let mut wrong = finding.clone();
+            wrong.details["kind"] = wrong_kind;
+            assert!(exact_duplicate_finding_scope(&wrong, &scan).is_err());
+            assert!(finding_library_planning(&wrong, &scan_id, &scan_id, &scan).is_none());
+        }
 
         let planning = finding_library_planning(&finding, &scan_id, &scan_id, &scan).unwrap();
 

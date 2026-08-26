@@ -1,4 +1,5 @@
 use crate::harness::AgentKind;
+use crate::model::FindingRecord;
 use crate::scan::{
     EvidenceQuality, LinkStatus, ScanResult, ScannedSkill, UsageStage, agents_with_usage,
     placements_by_skill, skill_search_text,
@@ -87,6 +88,116 @@ pub enum FindingCategory {
     Lifecycle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingKind {
+    ConfiguredRootsInaccessible,
+    ConfiguredRootsBounded,
+    IncompletePackageFingerprints,
+    BrokenSkillLinks,
+    EscapingLinkSourceConfirmation,
+    SameNameDivergentContent,
+    DeclaredIdentityDivergentContent,
+    DeclaredNameDirectoryMismatch,
+    LargeDefaultRoster,
+    FiveStageUsageEvidence,
+    UsageCoverageIncomplete,
+    ExactDuplicatePlacements,
+    SemanticOverlapCandidate,
+    MissingRoutingMetadata,
+    ExecutableScriptsPresent,
+    UnknownProvenance,
+    UpstreamDriftUnverified,
+    SourceVersionDivergence,
+    ManagementStateReview,
+    StaleArchiveCandidates,
+    ArchiveCandidacyUnknown,
+}
+
+impl FindingKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfiguredRootsInaccessible => "configured_roots_inaccessible",
+            Self::ConfiguredRootsBounded => "configured_roots_bounded",
+            Self::IncompletePackageFingerprints => "incomplete_package_fingerprints",
+            Self::BrokenSkillLinks => "broken_skill_links",
+            Self::EscapingLinkSourceConfirmation => "escaping_link_source_confirmation",
+            Self::SameNameDivergentContent => "same_name_divergent_content",
+            Self::DeclaredIdentityDivergentContent => "declared_identity_divergent_content",
+            Self::DeclaredNameDirectoryMismatch => "declared_name_directory_mismatch",
+            Self::LargeDefaultRoster => "large_default_roster",
+            Self::FiveStageUsageEvidence => "five_stage_usage_evidence",
+            Self::UsageCoverageIncomplete => "usage_coverage_incomplete",
+            Self::ExactDuplicatePlacements => "exact_duplicate_placements",
+            Self::SemanticOverlapCandidate => "semantic_overlap_candidate",
+            Self::MissingRoutingMetadata => "missing_routing_metadata",
+            Self::ExecutableScriptsPresent => "executable_scripts_present",
+            Self::UnknownProvenance => "unknown_provenance",
+            Self::UpstreamDriftUnverified => "upstream_drift_unverified",
+            Self::SourceVersionDivergence => "source_version_divergence",
+            Self::ManagementStateReview => "management_state_review",
+            Self::StaleArchiveCandidates => "stale_archive_candidates",
+            Self::ArchiveCandidacyUnknown => "archive_candidacy_unknown",
+        }
+    }
+
+    fn from_legacy_title(title: &str) -> Option<Self> {
+        match title {
+            "Some configured roots were inaccessible" => Some(Self::ConfiguredRootsInaccessible),
+            "Some configured roots had bounded discovery" => Some(Self::ConfiguredRootsBounded),
+            "Some Skill package fingerprints are incomplete" => {
+                Some(Self::IncompletePackageFingerprints)
+            }
+            "Broken Skill links" => Some(Self::BrokenSkillLinks),
+            crate::source_policy::ESCAPING_LINK_FINDING_TITLE => {
+                Some(Self::EscapingLinkSourceConfirmation)
+            }
+            SAME_NAME_DIVERGENT_FINDING_TITLE => Some(Self::SameNameDivergentContent),
+            "Declared identity has divergent local content" => {
+                Some(Self::DeclaredIdentityDivergentContent)
+            }
+            "Declared Skill names differ from placement directories" => {
+                Some(Self::DeclaredNameDirectoryMismatch)
+            }
+            "Large default Rosters need review" => Some(Self::LargeDefaultRoster),
+            "Five-stage usage evidence" => Some(Self::FiveStageUsageEvidence),
+            "Usage coverage is incomplete" => Some(Self::UsageCoverageIncomplete),
+            "Exact duplicate Skill placements" => Some(Self::ExactDuplicatePlacements),
+            SEMANTIC_OVERLAP_FINDING_TITLE => Some(Self::SemanticOverlapCandidate),
+            "Skills lack routing metadata" => Some(Self::MissingRoutingMetadata),
+            "Skill packages contain executable scripts" => Some(Self::ExecutableScriptsPresent),
+            "Skill provenance is unknown" => Some(Self::UnknownProvenance),
+            "Upstream update drift is not verified" => Some(Self::UpstreamDriftUnverified),
+            "Declared source has version divergence" => Some(Self::SourceVersionDivergence),
+            "Management state needs review" => Some(Self::ManagementStateReview),
+            STALE_ARCHIVE_FINDING_TITLE => Some(Self::StaleArchiveCandidates),
+            UNKNOWN_ARCHIVE_FINDING_TITLE => Some(Self::ArchiveCandidacyUnknown),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn finding_kind_from_stored_value(
+    stored_kind: Option<&serde_json::Value>,
+    legacy_title: &str,
+) -> Option<FindingKind> {
+    match stored_kind {
+        Some(serde_json::Value::String(stored)) => {
+            serde_json::from_value(serde_json::Value::String(stored.clone())).ok()
+        }
+        None | Some(serde_json::Value::Null) => FindingKind::from_legacy_title(legacy_title),
+        Some(_) => None,
+    }
+}
+
+pub fn stored_finding_kind(finding: &FindingRecord) -> Option<FindingKind> {
+    finding_kind_from_stored_value(finding.details.get("kind"), &finding.title)
+}
+
+pub fn stored_finding_is(finding: &FindingRecord, kind: FindingKind) -> bool {
+    stored_finding_kind(finding) == Some(kind)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingCoverageBasis {
@@ -107,6 +218,7 @@ pub enum Severity {
 #[derive(Clone, Debug, Serialize)]
 pub struct Finding {
     pub id: String,
+    pub kind: FindingKind,
     pub category: FindingCategory,
     pub severity: Severity,
     pub title: String,
@@ -431,7 +543,7 @@ fn prioritize_report_findings(findings: &mut Vec<Finding>, first_view_limit: usi
                     .len()
                     .cmp(&left.affected_skill_ids.len())
             })
-            .then_with(|| left.title.cmp(&right.title))
+            .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
             .then_with(|| left.id.cmp(&right.id))
     });
     if first_view_limit == 0 || findings.is_empty() {
@@ -498,6 +610,7 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !unavailable.is_empty() {
         push_finding(
             findings,
+            FindingKind::ConfiguredRootsInaccessible,
             FindingCategory::Inventory,
             Severity::Medium,
             "Some configured roots were inaccessible",
@@ -530,6 +643,7 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !bounded.is_empty() {
         push_finding(
             findings,
+            FindingKind::ConfiguredRootsBounded,
             FindingCategory::Inventory,
             Severity::Medium,
             "Some configured roots had bounded discovery",
@@ -567,6 +681,7 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !incomplete_fingerprints.is_empty() {
         push_finding(
             findings,
+            FindingKind::IncompletePackageFingerprints,
             FindingCategory::Inventory,
             Severity::Medium,
             "Some Skill package fingerprints are incomplete",
@@ -592,10 +707,16 @@ fn inventory_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
 }
 
 fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
-    for (status, title, severity) in [
-        (LinkStatus::Broken, "Broken Skill links", Severity::High),
+    for (status, kind, title, severity) in [
+        (
+            LinkStatus::Broken,
+            FindingKind::BrokenSkillLinks,
+            "Broken Skill links",
+            Severity::High,
+        ),
         (
             LinkStatus::EscapesRoot,
+            FindingKind::EscapingLinkSourceConfirmation,
             crate::source_policy::ESCAPING_LINK_FINDING_TITLE,
             Severity::High,
         ),
@@ -608,6 +729,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         if !placements.is_empty() {
             push_finding(
                 findings,
+                kind,
                 FindingCategory::Layout,
                 severity,
                 title,
@@ -657,6 +779,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
                 .collect::<Vec<_>>();
             push_finding(
                 findings,
+                FindingKind::SameNameDivergentContent,
                 FindingCategory::Layout,
                 Severity::Medium,
                 SAME_NAME_DIVERGENT_FINDING_TITLE,
@@ -695,6 +818,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             let skill_name = skill.name.as_str();
             push_finding(
                 findings,
+                FindingKind::DeclaredIdentityDivergentContent,
                 FindingCategory::Layout,
                 Severity::High,
                 "Declared identity has divergent local content",
@@ -729,6 +853,7 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !mismatches.is_empty() {
         push_finding(
             findings,
+            FindingKind::DeclaredNameDirectoryMismatch,
             FindingCategory::Layout,
             Severity::Low,
             "Declared Skill names differ from placement directories",
@@ -779,6 +904,7 @@ fn exposure_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     // This is a review threshold, not a claim that any Skill is useless.
     push_finding(
         findings,
+        FindingKind::LargeDefaultRoster,
         FindingCategory::Exposure,
         Severity::Medium,
         "Large default Rosters need review",
@@ -1064,6 +1190,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let coverage = &overview.coverage;
     push_session_finding(
         findings,
+        FindingKind::FiveStageUsageEvidence,
         FindingCategory::Usage,
         Severity::Info,
         "Five-stage usage evidence",
@@ -1109,6 +1236,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if incomplete_count != 0 {
         push_session_finding(
             findings,
+            FindingKind::UsageCoverageIncomplete,
             FindingCategory::Usage,
             Severity::Info,
             "Usage coverage is incomplete",
@@ -1160,6 +1288,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             }
             push_finding(
                 findings,
+                FindingKind::ExactDuplicatePlacements,
                 FindingCategory::Overlap,
                 Severity::Medium,
                 "Exact duplicate Skill placements",
@@ -1229,6 +1358,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     for (similarity, left, right) in candidates.into_iter().take(25) {
         push_finding(
             findings,
+            FindingKind::SemanticOverlapCandidate,
             FindingCategory::Overlap,
             Severity::Low,
             SEMANTIC_OVERLAP_FINDING_TITLE,
@@ -1301,6 +1431,7 @@ fn routing_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !weak.is_empty() {
         push_finding(
             findings,
+            FindingKind::MissingRoutingMetadata,
             FindingCategory::Routing,
             Severity::Low,
             "Skills lack routing metadata",
@@ -1329,6 +1460,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             .sum::<usize>();
         push_finding(
             findings,
+            FindingKind::ExecutableScriptsPresent,
             FindingCategory::Lifecycle,
             Severity::Info,
             "Skill packages contain executable scripts",
@@ -1360,6 +1492,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !unknown_source.is_empty() {
         push_finding(
             findings,
+            FindingKind::UnknownProvenance,
             FindingCategory::Lifecycle,
             Severity::Low,
             "Skill provenance is unknown",
@@ -1402,6 +1535,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             .join(", ");
         push_finding(
             findings,
+            FindingKind::UpstreamDriftUnverified,
             FindingCategory::Lifecycle,
             Severity::Info,
             "Upstream update drift is not verified",
@@ -1446,6 +1580,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         }
         push_finding(
             findings,
+            FindingKind::SourceVersionDivergence,
             FindingCategory::Lifecycle,
             Severity::Medium,
             "Declared source has version divergence",
@@ -1467,6 +1602,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !multi_placement.is_empty() {
         push_finding(
             findings,
+            FindingKind::ManagementStateReview,
             FindingCategory::Lifecycle,
             Severity::Low,
             "Management state needs review",
@@ -1527,6 +1663,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     if !stale_candidates.is_empty() {
         push_session_finding(
             findings,
+            FindingKind::StaleArchiveCandidates,
             FindingCategory::Lifecycle,
             Severity::Low,
             STALE_ARCHIVE_FINDING_TITLE,
@@ -1548,6 +1685,7 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     } else if reliable_agents.len() < AgentKind::ALL.len() {
         push_session_finding(
             findings,
+            FindingKind::ArchiveCandidacyUnknown,
             FindingCategory::Lifecycle,
             Severity::Info,
             UNKNOWN_ARCHIVE_FINDING_TITLE,
@@ -1588,6 +1726,7 @@ fn evidence_paths_for_skills(scan: &ScanResult, skills: &[&ScannedSkill]) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn push_finding(
     findings: &mut Vec<Finding>,
+    kind: FindingKind,
     category: FindingCategory,
     severity: Severity,
     title: impl Into<String>,
@@ -1599,6 +1738,7 @@ fn push_finding(
 ) {
     push_finding_with_coverage(
         findings,
+        kind,
         category,
         severity,
         title,
@@ -1614,6 +1754,7 @@ fn push_finding(
 #[allow(clippy::too_many_arguments)]
 fn push_session_finding(
     findings: &mut Vec<Finding>,
+    kind: FindingKind,
     category: FindingCategory,
     severity: Severity,
     title: impl Into<String>,
@@ -1625,6 +1766,7 @@ fn push_session_finding(
 ) {
     push_finding_with_coverage(
         findings,
+        kind,
         category,
         severity,
         title,
@@ -1640,6 +1782,7 @@ fn push_session_finding(
 #[allow(clippy::too_many_arguments)]
 fn push_finding_with_coverage(
     findings: &mut Vec<Finding>,
+    kind: FindingKind,
     category: FindingCategory,
     severity: Severity,
     title: impl Into<String>,
@@ -1660,12 +1803,13 @@ fn push_finding_with_coverage(
     let id_basis = format!(
         "{}\0{}\0{}\0{}",
         category_name(category),
-        title,
+        kind.as_str(),
         affected_skill_ids.join(","),
         affected_placement_ids.join(",")
     );
     findings.push(Finding {
         id: format!("finding_{}", fnv1a64(id_basis.as_bytes())),
+        kind,
         category,
         severity,
         title,
@@ -2369,6 +2513,61 @@ fn fnv1a64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_identity_and_behavior_do_not_depend_on_display_title() {
+        let mut findings = Vec::new();
+        for title in ["Original title", "Copy-edited title"] {
+            push_finding(
+                &mut findings,
+                FindingKind::ExactDuplicatePlacements,
+                FindingCategory::Overlap,
+                Severity::Medium,
+                title,
+                "same facts",
+                vec!["skill_one".into()],
+                vec!["placement_one".into()],
+                Vec::new(),
+                EvidenceQuality::Observed,
+            );
+        }
+
+        assert_eq!(findings[0].id, findings[1].id);
+        assert_eq!(findings[0].kind, findings[1].kind);
+        assert_ne!(findings[0].title, findings[1].title);
+    }
+
+    #[test]
+    fn stored_finding_kind_prefers_typed_details_and_bounds_legacy_title_fallback() {
+        let mut finding = FindingRecord {
+            id: crate::model::FindingId::new(),
+            report_id: crate::model::ReportId::new(),
+            category: crate::model::FindingCategory::Exposure,
+            severity: crate::model::Severity::Warning,
+            title: "A translated display title".into(),
+            summary: String::new(),
+            details: serde_json::json!({"kind": "large_default_roster"}),
+            evidence_ids: Vec::new(),
+        };
+
+        assert!(stored_finding_is(&finding, FindingKind::LargeDefaultRoster));
+        finding.details = serde_json::json!({"kind": null});
+        finding.title = "Large default Rosters need review".into();
+        assert!(stored_finding_is(&finding, FindingKind::LargeDefaultRoster));
+        finding.details = serde_json::json!({"kind": 7});
+        assert!(!stored_finding_is(
+            &finding,
+            FindingKind::LargeDefaultRoster
+        ));
+        finding.details = serde_json::json!({});
+        finding.title = "A translated display title".into();
+        assert!(!stored_finding_is(
+            &finding,
+            FindingKind::LargeDefaultRoster
+        ));
+        finding.title = "Large default Rosters need review".into();
+        assert!(stored_finding_is(&finding, FindingKind::LargeDefaultRoster));
+    }
 
     fn matched(name: &str, rank: usize, reasons: &[&str]) -> FindMatch {
         FindMatch {
@@ -3485,6 +3684,7 @@ mod tests {
         ) -> Finding {
             Finding {
                 id: format!("finding_{title}"),
+                kind: FindingKind::ManagementStateReview,
                 category,
                 severity,
                 title: title.into(),

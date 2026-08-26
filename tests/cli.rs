@@ -624,6 +624,28 @@ fn semantic_overlap_detail_is_decision_complete_for_agent_comparison() {
         .unwrap()["id"]
         .as_str()
         .unwrap();
+    {
+        let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+        let encoded: String = database
+            .query_row(
+                "SELECT details_json FROM findings WHERE id = ?1",
+                [finding_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut details: Value = serde_json::from_str(&encoded).unwrap();
+        details["title"] = json!("Copy-edited semantic comparison title");
+        database
+            .execute(
+                "UPDATE findings SET title = ?1, details_json = ?2 WHERE id = ?3",
+                (
+                    "Copy-edited semantic comparison title",
+                    details.to_string(),
+                    finding_id,
+                ),
+            )
+            .unwrap();
+    }
     let compact = json_output(&run(
         &[
             &common[..],
