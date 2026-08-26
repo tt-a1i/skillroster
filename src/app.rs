@@ -31,6 +31,8 @@ use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
 use crate::sqlite::StateStore;
 use crate::state_security;
 
+pub use crate::action_context::ActionContext;
+
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
 const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
     "snapshot_id",
@@ -50,126 +52,6 @@ const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
 /// Agent tool-result transport bound, deliberately narrower than the 2 MiB
 /// inventory parser bound. Larger Skills should disclose references on demand.
 const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
-
-/// Global discovery and state options that a suggested action must retain to
-/// operate on the same local analysis context as the command that produced it.
-#[derive(Clone, Debug, Default)]
-pub struct ActionContext {
-    argv: Vec<String>,
-    argv_without_source_roots: Vec<String>,
-}
-
-impl ActionContext {
-    pub fn from_cli(cli: &Cli) -> Result<Self> {
-        let mut argv = Vec::new();
-        if let Some(state_dir) = &cli.state_dir {
-            let state_dir = if state_dir.is_absolute() {
-                state_dir.clone()
-            } else {
-                std::path::absolute(state_dir).with_context(|| {
-                    format!("cannot resolve --state-dir {}", state_dir.display())
-                })?
-            };
-            argv.extend([
-                "--state-dir".to_owned(),
-                action_path(&state_dir, "--state-dir")?,
-            ]);
-        }
-        if let Some(home) = &cli.home {
-            argv.extend(["--home".to_owned(), action_path(home, "--home")?]);
-        }
-        for root in &cli.roots {
-            argv.extend(["--root".to_owned(), root.clone()]);
-        }
-        let argv_without_source_roots = argv.clone();
-        for source_root in &cli.source_roots {
-            argv.extend([
-                "--source-root".to_owned(),
-                action_path(source_root, "--source-root")?,
-            ]);
-        }
-        Ok(Self {
-            argv,
-            argv_without_source_roots,
-        })
-    }
-
-    fn apply(&self, actions: &mut [SuggestedAction]) {
-        if self.argv.is_empty() {
-            return;
-        }
-        for action in actions {
-            let context = if action.action == "scan"
-                && action.reason_code == "source_root_permission_recorded"
-            {
-                &self.argv_without_source_roots
-            } else {
-                &self.argv
-            };
-            let insertion =
-                usize::from(action.argv.first().is_some_and(|arg| arg == "skillroster"));
-            action.argv.splice(insertion..insertion, context.clone());
-        }
-    }
-
-    fn argv(&self) -> &[String] {
-        &self.argv
-    }
-
-    fn apply_json_argv(&self, argv: &mut Value) {
-        apply_json_argv_context(argv, &self.argv);
-    }
-
-    fn apply_result(&self, command: &str, result: &mut Value) {
-        match command {
-            "find" => {
-                if let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) {
-                    for found in matches {
-                        if let Some(argv) = found.pointer_mut("/variant_finding/argv") {
-                            self.apply_json_argv(argv);
-                        }
-                    }
-                }
-            }
-            "report" => {
-                for pointer in [
-                    "/resolution/after_confirmation/argv_template",
-                    "/resolution/permission_paths/temporary_one_scan/argv_template",
-                ] {
-                    if let Some(argv) = result.pointer_mut(pointer) {
-                        self.apply_json_argv(argv);
-                    }
-                }
-                if let Some(argv) = result.pointer_mut(
-                    "/resolution/permission_paths/durable_permission/next/argv_template",
-                ) {
-                    apply_json_argv_context(argv, &self.argv_without_source_roots);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn apply_json_argv_context(argv: &mut Value, context: &[String]) {
-    let Some(values) = argv.as_array_mut() else {
-        return;
-    };
-    if context.is_empty() {
-        return;
-    }
-    let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
-    values.splice(
-        insertion..insertion,
-        context.iter().cloned().map(Value::String),
-    );
-}
-
-fn action_path(path: &Path, option: &str) -> Result<String> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("{option} path must be valid Unicode for suggested action argv"))
-}
 
 pub struct Output {
     pub json: String,
