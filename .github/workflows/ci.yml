@@ -39,8 +39,8 @@ jobs:
           full=true
           if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
             git diff --check "$BASE_SHA" "$HEAD_SHA"
-            changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-            full="$(printf '%s\n' "$changed" | bash scripts/ci-change-scope.sh)"
+            changed="$(git -c core.quotePath=true diff --name-status --no-renames "$BASE_SHA" "$HEAD_SHA")"
+            full="$(git diff --name-only --no-renames -z "$BASE_SHA" "$HEAD_SHA" | bash scripts/ci-change-scope.sh --null)"
             {
               echo "### Change scope"
               echo

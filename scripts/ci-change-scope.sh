@@ -2,10 +2,14 @@
 set -euo pipefail
 
 classify_paths() {
+  local -a read_options=(-r)
+  if [[ "${1:-}" == '--null' ]]; then
+    read_options+=(-d '')
+  fi
   local full=false
   local saw_path=false
   local path
-  while IFS= read -r path; do
+  while IFS= read "${read_options[@]}" path; do
     [[ -z "$path" ]] && continue
     saw_path=true
     case "$path" in
@@ -41,6 +45,10 @@ self_test() {
 
   actual="$(printf '%s\n' 'README.md' 'src/lib.rs' | classify_paths)"
   [[ "$actual" == true ]]
+  actual="$(printf '%s\0' 'skill/skillroster/SKILL.md' 'docs/renamed.md' | classify_paths --null)"
+  [[ "$actual" == true ]]
+  actual="$(printf '%s\0' 'README.md' 'docs/product-spec.md' 'LICENSE' | classify_paths --null)"
+  [[ "$actual" == false ]]
   actual="$(printf '' | classify_paths)"
   [[ "$actual" == true ]]
 }
@@ -50,4 +58,4 @@ if [[ "${1:-}" == '--self-test' ]]; then
   exit 0
 fi
 
-classify_paths
+classify_paths "${1:-}"
