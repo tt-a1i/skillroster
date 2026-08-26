@@ -1,3 +1,4 @@
+mod anchored_fs;
 pub mod app;
 mod bootstrap;
 pub mod change;

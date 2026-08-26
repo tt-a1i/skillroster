@@ -212,7 +212,7 @@ pub fn run(cli: Cli) -> Result<Output> {
     }
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
-    let _state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
+    let state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
         change::StateLock::acquire_exclusive(&state_dir)?
     } else {
         let shared = change::StateLock::acquire_shared(&state_dir)?;
@@ -486,7 +486,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 }
             }
             let progress = crate::present::ProgressGuard::start("apply", cli.json);
-            let result = apply_command(&store, &args.id)?;
+            let result = apply_command(&store, &args.id, &state_lock)?;
             progress.finish();
             let id = result["receipt_id"]
                 .as_str()
@@ -516,7 +516,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 }
             }
             let progress = crate::present::ProgressGuard::start("undo", cli.json);
-            let result = undo_command(&store, &args.id)?;
+            let result = undo_command(&store, &args.id, &state_lock)?;
             progress.finish();
             ("undo", result, vec![], vec![])
         }
@@ -567,6 +567,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                     lifecycle_purge_command(
                         &store,
                         &state_dir,
+                        &state_lock,
                         args.raw_days,
                         args.plans_receipts,
                         args.source_confirmation,
@@ -1695,10 +1696,14 @@ fn lifecycle_exclude_command(store: &StateStore, agent: &str, remove: bool) -> R
 fn lifecycle_purge_command(
     store: &StateStore,
     state_dir: &Path,
+    state_lock: &change::StateLock,
     raw_days: Option<u16>,
     plans_receipts: bool,
     source_confirmation: bool,
 ) -> Result<Value> {
+    if plans_receipts {
+        ensure_no_outstanding_external_recovery_artifacts(state_dir, state_lock)?;
+    }
     if plans_receipts && recovery_text(store, state_dir)? == "required" {
         bail!("recovery is required before Plans and Receipts can be purged");
     }
@@ -1758,9 +1763,10 @@ fn lifecycle_purge_command(
 }
 
 fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Value> {
-    let _write_lock = change::WriteLock::acquire(state_dir)?;
+    let state_lock = change::StateLock::acquire_exclusive(state_dir)?;
+    ensure_no_outstanding_external_recovery_artifacts(state_dir, &state_lock)?;
     let existed = database_path.exists();
-    let journals = change::journals(state_dir)?;
+    let journals = change::journals_locked(state_dir, &state_lock)?;
     source_confirmation_detail_paths(state_dir)?;
     if existed {
         let store = StateStore::open(database_path)?;
@@ -1808,6 +1814,18 @@ fn lifecycle_delete_command(database_path: &Path, state_dir: &Path) -> Result<Va
         "library_files_changed": false,
         "files_changed": files_changed,
     }))
+}
+
+fn ensure_no_outstanding_external_recovery_artifacts(
+    state_dir: &Path,
+    state_lock: &change::StateLock,
+) -> Result<()> {
+    if change::has_external_recovery_material(state_dir, state_lock)? {
+        bail!(
+            "Receipt-owned recovery material remains outside local state; Undo it before purging or deleting Plans and Receipts"
+        );
+    }
+    Ok(())
 }
 
 fn source_confirmation_detail_paths(state_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -8132,7 +8150,7 @@ fn prepare_plan(
     Ok(summary)
 }
 
-fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
+fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before Apply can continue");
     }
@@ -8169,7 +8187,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
         bail!("Plan {id} is stale; Library governance state has drifted");
     }
     store.update_plan_status(&id, PlanStatus::Applying)?;
-    let mut outcome = match change::apply_locked(&prepared) {
+    let mut outcome = match change::apply_locked(&prepared, state_lock) {
         Ok(outcome) => outcome,
         Err(error) => {
             let next = if journal_issues(store, &prepared.state_dir)?.is_empty() {
@@ -8194,7 +8212,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
                 restore_roster_state(store, &Value::Array(roster_before.clone())).is_ok();
             let library_restored =
                 restore_library_state(store, &Value::Array(library_before.clone())).is_ok();
-            let filesystem_rollback = change::rollback_apply_locked(&outcome.receipt)?;
+            let filesystem_rollback = change::rollback_apply_locked(&outcome.receipt, state_lock)?;
             let recovered =
                 roster_restored && library_restored && filesystem_rollback.verification_passed;
             outcome.receipt = filesystem_rollback.receipt;
@@ -8212,7 +8230,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
             };
         }
     }
-    change::persist_journal_state(&outcome.receipt)?;
+    change::persist_journal_state(&outcome.receipt, state_lock)?;
     let receipt = receipt_record(
         &outcome.receipt,
         &record
@@ -8254,7 +8272,7 @@ fn apply_command(store: &StateStore, id: &str) -> Result<Value> {
     Ok(mutation_result(&outcome, &receipt, None))
 }
 
-fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
+fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -> Result<Value> {
     let id = ReceiptId::parse(id.to_string())?;
     let record = store
         .get_receipt(&id)?
@@ -8268,7 +8286,7 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
     let original: ChangeReceipt =
         serde_json::from_value(record.verification["change_receipt"].clone())?;
     require_clear_journals(store, &original.state_dir)?;
-    let mut outcome = change::undo_locked(&original)?;
+    let mut outcome = change::undo_locked(&original, state_lock)?;
     if outcome.verification_passed {
         if let Err(error) =
             restore_roster_state(store, &record.verification["roster_state"]["before"]).and_then(
@@ -8280,7 +8298,7 @@ fn undo_command(store: &StateStore, id: &str) -> Result<Value> {
             outcome.verification_passed = false;
         }
     }
-    change::persist_journal_state(&outcome.receipt)?;
+    change::persist_journal_state(&outcome.receipt, state_lock)?;
     let receipt = receipt_record(
         &outcome.receipt,
         &record
@@ -11798,14 +11816,17 @@ mod recovery_tests {
             upgrade["targets"][0]["installed_version"],
             "previous-complete-fixture"
         );
-        let applied = apply_command(&store, upgrade["plan_id"].as_str().unwrap()).unwrap();
+        let state_lock = change::StateLock::acquire_exclusive(&state).unwrap();
+        let applied =
+            apply_command(&store, upgrade["plan_id"].as_str().unwrap(), &state_lock).unwrap();
         for (relative_path, _, content) in &current {
             assert_eq!(
                 std::fs::read_to_string(package.join(relative_path)).unwrap(),
                 *content
             );
         }
-        let undone = undo_command(&store, applied["receipt_id"].as_str().unwrap()).unwrap();
+        let undone =
+            undo_command(&store, applied["receipt_id"].as_str().unwrap(), &state_lock).unwrap();
         assert_eq!(undone["verification"], "passed");
         for ((relative_path, _, _), content) in current.iter().zip(&previous) {
             assert_eq!(
@@ -11928,6 +11949,138 @@ mod recovery_tests {
                 .join(format!("{}.json", receipt.id))
                 .is_file()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_keeps_external_symlink_recovery_material_until_undo() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("agent-root");
+        let state_dir = temp.path().join("state");
+        let source = root.join("source");
+        let link = root.join("installed-link");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        symlink(&source, &link).unwrap();
+        let root = root.canonicalize().unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+        let input = json!({
+            "schema_version": 1,
+            "scan_id": "scan_lifecycle_recovery_material",
+            "operations": [{
+                "kind": "remove_symlink",
+                "target": link,
+                "expected_fingerprint": change::fingerprint(&link).unwrap(),
+            }],
+        })
+        .to_string();
+        let plan = change::prepare(
+            &input,
+            &change::PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state_dir.clone(),
+                operation_policy: change::OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let applied = change::apply(&plan).unwrap();
+        assert_eq!(applied.receipt.status, change::ReceiptStatus::Applied);
+
+        let store = StateStore::open_in_memory().unwrap();
+        let state_lock = change::StateLock::acquire_exclusive(&state_dir).unwrap();
+        let purge_error =
+            lifecycle_purge_command(&store, &state_dir, &state_lock, None, true, false)
+                .unwrap_err();
+        assert!(
+            purge_error
+                .to_string()
+                .contains("recovery material remains outside local state")
+        );
+        drop(state_lock);
+
+        let database_path = state_dir.join("skillroster.db");
+        drop(StateStore::open(&database_path).unwrap());
+        let delete_error = lifecycle_delete_command(&database_path, &state_dir).unwrap_err();
+        assert!(
+            delete_error
+                .to_string()
+                .contains("recovery material remains outside local state")
+        );
+        assert!(database_path.is_file());
+        assert!(!link.exists());
+
+        let undone = change::undo(&applied.receipt).unwrap();
+        assert_eq!(undone.receipt.status, change::ReceiptStatus::Undone);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let state_lock = change::StateLock::acquire_exclusive(&state_dir).unwrap();
+        ensure_no_outstanding_external_recovery_artifacts(&state_dir, &state_lock).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_fails_closed_when_active_external_recovery_material_is_missing() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("agent-root");
+        let state_dir = temp.path().join("state");
+        let source = root.join("source");
+        let link = root.join("installed-link");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        symlink(&source, &link).unwrap();
+        let root = root.canonicalize().unwrap();
+        let state_dir = state_dir.canonicalize().unwrap();
+        let plan = change::prepare(
+            &json!({
+                "schema_version": 1,
+                "scan_id": "scan_missing_recovery_material",
+                "operations": [{
+                    "kind": "remove_symlink",
+                    "target": link,
+                    "expected_fingerprint": change::fingerprint(&link).unwrap(),
+                }],
+            })
+            .to_string(),
+            &change::PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state_dir.clone(),
+                operation_policy: change::OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let applied = change::apply(&plan).unwrap();
+        let backup = applied
+            .receipt
+            .compensations
+            .iter()
+            .find_map(|compensation| match compensation {
+                change::Compensation::RestoreRemovedSymlink { from, .. } => Some(from.clone()),
+                _ => None,
+            })
+            .unwrap();
+        std::fs::remove_file(backup).unwrap();
+
+        let store = StateStore::open_in_memory().unwrap();
+        let state_lock = change::StateLock::acquire_exclusive(&state_dir).unwrap();
+        let error = lifecycle_purge_command(&store, &state_dir, &state_lock, None, true, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("recovery material is missing"));
+        drop(state_lock);
+
+        let database_path = state_dir.join("skillroster.db");
+        drop(StateStore::open(&database_path).unwrap());
+        let error = lifecycle_delete_command(&database_path, &state_dir).unwrap_err();
+        assert!(error.to_string().contains("recovery material is missing"));
+        assert!(database_path.is_file());
+        assert!(!change::journals(&state_dir).unwrap().is_empty());
     }
 
     #[test]
@@ -12205,7 +12358,10 @@ mod recovery_tests {
         )
         .unwrap();
 
-        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), true, false).is_err());
+        let state_lock = change::StateLock::acquire_exclusive(&state_dir).unwrap();
+        assert!(
+            lifecycle_purge_command(&store, &state_dir, &state_lock, Some(0), true, false).is_err()
+        );
         let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
     }
@@ -12246,7 +12402,10 @@ mod recovery_tests {
             )
             .unwrap();
 
-        assert!(lifecycle_purge_command(&store, &state_dir, Some(0), false, true).is_err());
+        let state_lock = change::StateLock::acquire_exclusive(&state_dir).unwrap();
+        assert!(
+            lifecycle_purge_command(&store, &state_dir, &state_lock, Some(0), false, true).is_err()
+        );
 
         let (_, payload): (ScanId, Value) = store.latest_scan_payload().unwrap().unwrap();
         assert_eq!(payload["usage"].as_array().unwrap().len(), 1);
