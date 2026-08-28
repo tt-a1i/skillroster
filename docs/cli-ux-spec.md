@@ -136,6 +136,9 @@ Show ranked matches with Skill name, current Roster state, source, concise match
 reasons, and same-name variant count. Preserve the original task separately
 from repeatable `--hint` retrieval text. A CJK task without hints receives an
 actionable lexical-retrieval warning when English metadata may be missed.
+The canonical Agent argv puts all Find options before `--` and the verbatim
+task after it. Generated continuations use the same shape, so a task beginning
+with `-` or matching an option name is never reinterpreted as CLI syntax.
 Hints describe the desired surface, object, operation, and state. Results below
 the deterministic confidence floor are omitted instead of filling the first
 view with incidental body-token matches. Empty results are calm, successful

@@ -372,8 +372,8 @@ test("SkillRoster seam uses the real envelope and global-option ordering", () =>
   assert.throws(() => parseFindEnvelope(JSON.stringify({ schema_version: 1, ok: true, command: "find", result: { ranking_strategy: "single_lexical_channel", matches: [] } })), /reciprocal_rank_fusion/u);
   const paths = { home: "/tmp/home", state: "/tmp/state" }; const task = { prompt: "完整任务", hint: "agent hint" };
   assert.deepEqual(skillRosterScanArgs(paths, "/tmp/source"), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "scan", "--source-root", "/tmp/source"]);
-  assert.deepEqual(skillRosterFindArgs(paths, task), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "完整任务", "--hint", "agent hint"]);
-  assert.deepEqual(skillRosterFindArgs(paths, { ...task, one_call_load: true }), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "完整任务", "--hint", "agent hint", "--load", "--limit", "1"]);
+  assert.deepEqual(skillRosterFindArgs(paths, task), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "--hint", "agent hint", "--", "完整任务"]);
+  assert.deepEqual(skillRosterFindArgs(paths, { ...task, one_call_load: true }), ["--home", "/tmp/home", "--state-dir", "/tmp/state", "--json", "find", "--hint", "agent hint", "--load", "--limit", "1", "--", "完整任务"]);
 });
 
 test("Find audit preserves exact argument mismatch and retry classification", async () => {

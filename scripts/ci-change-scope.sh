@@ -13,7 +13,7 @@ classify_paths() {
     [[ -z "$path" ]] && continue
     saw_path=true
     case "$path" in
-      skill/skillroster/*)
+      skill/skillroster/*|tests/fixtures/*)
         full=true
         ;;
       LICENSE|*.md)
@@ -38,6 +38,7 @@ self_test() {
     'skill/skillroster/SKILL.md' \
     'skill/skillroster/references/routing.md' \
     'skill/skillroster/manifest.json' \
+    'tests/fixtures/bootstrap-v1.8.23.md' \
     'src/bootstrap.rs'; do
     actual="$(printf '%s\n' "$runtime_path" | classify_paths)"
     [[ "$actual" == true ]]

@@ -163,7 +163,7 @@ skillroster scan --summary --json
 skillroster report --findings --limit 20 --json
 
 # Retrieve one complete, fingerprint-verified Skill
-skillroster find "review this pull request" --load --limit 1 --json
+skillroster find --load --limit 1 --json -- "review this pull request"
 
 # Preview bootstrap installation across detected agents
 skillroster setup --json

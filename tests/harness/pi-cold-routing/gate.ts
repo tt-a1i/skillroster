@@ -164,9 +164,14 @@ export function parseFindCommand(command: string): { task: string; hints: string
     throw new Error("only the literal skillroster find command is allowed");
   }
 
-  const positional: string[] = [];
+  const separator = words.indexOf("--", 2);
+  if (separator !== -1 && separator !== words.length - 2) {
+    throw new Error("find requires exactly one task after --");
+  }
+  const optionEnd = separator === -1 ? words.length : separator;
+  const positional: string[] = separator === -1 ? [] : [words[separator + 1]];
   const hints: string[] = [];
-  for (let index = 2; index < words.length; index += 1) {
+  for (let index = 2; index < optionEnd; index += 1) {
     const value = words[index];
     if (value === "--json") continue;
     if (value === "--hint") {
@@ -177,6 +182,7 @@ export function parseFindCommand(command: string): { task: string; hints: string
       continue;
     }
     if (value.startsWith("--")) throw new Error(`unsupported find option: ${value}`);
+    if (separator !== -1) throw new Error("task must follow the -- boundary");
     positional.push(value);
   }
   if (positional.length !== 1 || positional[0].length === 0) {

@@ -201,6 +201,7 @@ impl ReportSeverity {
 
 #[derive(Debug, Args)]
 pub struct FindArgs {
+    #[arg(allow_hyphen_values = true, value_parser = parse_non_empty_task)]
     pub task: String,
 
     /// Add an Agent-authored lexical retrieval hint while preserving TASK. Repeatable.
@@ -224,6 +225,14 @@ pub struct FindArgs {
 }
 
 pub const MAX_FIND_RESULTS: u16 = 100;
+
+fn parse_non_empty_task(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("TASK must not be empty".into())
+    } else {
+        Ok(value.to_owned())
+    }
+}
 
 #[derive(Debug, Args)]
 pub struct PlanArgs {

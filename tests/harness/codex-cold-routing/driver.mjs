@@ -960,7 +960,7 @@ function parseEnvelope(stdout, command) {
 }
 
 export function skillRosterScanArgs(paths, sourceRoot) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "scan", "--source-root", sourceRoot]; }
-export function skillRosterFindArgs(paths, task) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "find", task.prompt, "--hint", task.hint, ...(task.one_call_load ? ["--load", "--limit", "1"] : [])]; }
+export function skillRosterFindArgs(paths, task) { return ["--home", paths.home, "--state-dir", paths.state, "--json", "find", "--hint", task.hint, ...(task.one_call_load ? ["--load", "--limit", "1"] : []), "--", task.prompt]; }
 
 export function findWrapperSource(oneCallLoad = false) {
   return `#!/usr/bin/env node
@@ -970,15 +970,15 @@ import { resolve } from "node:path";
 import { realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 const sha = (value) => createHash("sha256").update(value).digest("hex");
-const args = process.argv.slice(2); const separator = args.indexOf("--hint");
-const task = args[0] === "find" ? (args[1] ?? "") : "";
+const args = process.argv.slice(2); const separator = args.indexOf("--");
+const task = args[0] === "find" && separator === args.length - 2 ? (args[separator + 1] ?? "") : "";
 const hints = []; for (let i = 0; i < args.length; i += 1) if (args[i] === "--hint" && args[i + 1] !== undefined) hints.push(args[i + 1]);
 const oneCallLoad = ${JSON.stringify(oneCallLoad)};
-let result = { status: 64, stdout: "", stderr: oneCallLoad ? "wrapper permits only: skillroster find TASK --hint HINT --load --limit 1 --json\\n" : "wrapper permits only: skillroster find TASK --hint HINT --json\\n" };
+let result = { status: 64, stdout: "", stderr: oneCallLoad ? "wrapper permits only: skillroster find --hint HINT --load --limit 1 --json -- TASK\\n" : "wrapper permits only: skillroster find --hint HINT --json -- TASK\\n" };
 const argvShapeValid = oneCallLoad
-  ? args.length === 8 && args[0] === "find" && args[2] === "--hint" && args[4] === "--load" && args[5] === "--limit" && args[6] === "1" && args[7] === "--json"
-  : args.length === 5 && args[0] === "find" && args[2] === "--hint" && args[4] === "--json";
-if (argvShapeValid) result = spawnSync(process.env.SKILLROSTER_REAL_CLI, ["--home", process.env.SKILLROSTER_TEST_HOME, "--state-dir", process.env.SKILLROSTER_TEST_STATE, "--json", ...args.slice(0, oneCallLoad ? 7 : 4)], { encoding: "utf8", shell: false });
+  ? args.length === 9 && args[0] === "find" && args[1] === "--hint" && args[3] === "--load" && args[4] === "--limit" && args[5] === "1" && args[6] === "--json" && args[7] === "--" && task.length > 0
+  : args.length === 6 && args[0] === "find" && args[1] === "--hint" && args[3] === "--json" && args[4] === "--" && task.length > 0;
+if (argvShapeValid) result = spawnSync(process.env.SKILLROSTER_REAL_CLI, ["--home", process.env.SKILLROSTER_TEST_HOME, "--state-dir", process.env.SKILLROSTER_TEST_STATE, "--json", ...args], { encoding: "utf8", shell: false });
 let top1 = {}; let envelopeValid = false; let loadedContentComplete = false; let loadedContentSha256 = null; try { const value = JSON.parse(result.stdout ?? ""); envelopeValid = value?.schema_version === 1 && value?.ok === true && value?.command === "find" && value?.result?.ranking_strategy === "task_hint_reciprocal_rank_fusion"; const top = envelopeValid ? value?.result?.matches?.[0] ?? {} : {}; top1 = { skill: top.name ?? null, path: top.paths?.[0] ?? null }; const loaded = value?.result?.loaded_skill; loadedContentComplete = !oneCallLoad || (loaded?.selection?.rank === 1 && loaded?.content?.complete === true && typeof loaded?.content?.text === "string" && loaded?.content?.byte_length === Buffer.byteLength(loaded.content.text, "utf8") && loaded?.content?.sha256 === sha(loaded.content.text) && loaded?.verification?.identity_matches_snapshot === true && loaded?.verification?.entrypoint_digest_matches_snapshot === true && loaded?.verification?.package_fingerprint_matches_snapshot === true && loaded?.verification?.package_fingerprint_complete === true && loaded?.task_success === "not_evaluated"); loadedContentSha256 = loadedContentComplete && oneCallLoad ? sha(loaded.content.text) : null; envelopeValid = envelopeValid && (!oneCallLoad || loadedContentComplete); } catch {}
 let canonicalTopPath = null; try { canonicalTopPath = top1.path ? realpathSync(top1.path) : null; } catch { canonicalTopPath = top1.path ? resolve(top1.path) : null; }
 appendFileSync(process.env.SKILLROSTER_FIND_AUDIT, JSON.stringify({ kind: "find_call", argv_count: args.length, argv_shape_valid: argvShapeValid, envelope_valid: envelopeValid, task_sha256: sha(task), hint_count: hints.length, hint_nonempty: hints.length > 0 && hints.every((hint) => hint.trim().length > 0), hint_sha256: hints.map(sha), separator_index: separator, exit_code: result.status, top1_skill: top1.skill ?? null, top1_path_sha256: canonicalTopPath ? sha(canonicalTopPath) : null, loaded_content_complete: loadedContentComplete, loaded_content_sha256: loadedContentSha256 }) + "\\n", { mode: 0o600 });

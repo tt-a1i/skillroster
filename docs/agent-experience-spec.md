@@ -232,7 +232,9 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 
 - route a task through `skillroster find` before acting when its required
   specialized instructions are not already visible, using `--load --limit 1`
-  to receive the selected complete verified `SKILL.md` in the same result;
+  to receive the selected complete verified `SKILL.md` in the same result, and
+  place every Find option before a `--` boundary with the verbatim task as the
+  final argv value so option-shaped user text remains opaque;
 - invoke commands with explicit `--json`;
 - validate `schema_version` and `ok` before reading `result`;
 - set `schema_version: 1` on every declarative Plan request;
