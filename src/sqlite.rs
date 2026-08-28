@@ -58,6 +58,18 @@ pub struct LifecycleCounts {
     pub source_root_permissions: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotInvalidationKind {
+    AppliedReceipt,
+    UndoReceipt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotInvalidation {
+    pub receipt_id: ReceiptId,
+    pub kind: SnapshotInvalidationKind,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PurgeCounts {
     pub aggregated_raw_usage_rows: u64,
@@ -516,10 +528,10 @@ impl StateStore {
     pub fn snapshot_invalidating_receipt(
         &self,
         scan_id: &ScanId,
-    ) -> StorageResult<Option<ReceiptId>> {
+    ) -> StorageResult<Option<SnapshotInvalidation>> {
         self.connection
             .query_row(
-                "SELECT r.id FROM snapshot_invalidations i
+                "SELECT r.id, r.reverses_receipt_id IS NOT NULL FROM snapshot_invalidations i
                  JOIN receipts r ON r.id = i.receipt_id
                  WHERE i.snapshot_id = ?1
                    AND ((r.reverses_receipt_id IS NULL AND r.status = 'applied')
@@ -527,10 +539,19 @@ impl StateStore {
                  ORDER BY i.created_at DESC, i.rowid DESC
                  LIMIT 1",
                 [scan_id.as_str()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
             )
             .optional()?
-            .map(|id| ReceiptId::parse(id).map_err(invalid_id))
+            .map(|(id, is_undo)| {
+                Ok(SnapshotInvalidation {
+                    receipt_id: ReceiptId::parse(id).map_err(invalid_id)?,
+                    kind: if is_undo {
+                        SnapshotInvalidationKind::UndoReceipt
+                    } else {
+                        SnapshotInvalidationKind::AppliedReceipt
+                    },
+                })
+            })
             .transpose()
     }
 
@@ -3266,11 +3287,14 @@ mod tests {
         store
             .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
             .unwrap();
+        let applied_invalidation = store
+            .snapshot_invalidating_receipt(&original_scan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied_invalidation.receipt_id, original.id.clone());
         assert_eq!(
-            store
-                .snapshot_invalidating_receipt(&original_scan.id)
-                .unwrap(),
-            Some(original.id.clone())
+            applied_invalidation.kind,
+            SnapshotInvalidationKind::AppliedReceipt
         );
         let newer_scan = scan();
         store.save_scan(&newer_scan).unwrap();
@@ -3300,9 +3324,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let undo_invalidation = store
+            .snapshot_invalidating_receipt(&newer_scan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(undo_invalidation.receipt_id, reverse.id);
         assert_eq!(
-            store.snapshot_invalidating_receipt(&newer_scan.id).unwrap(),
-            Some(reverse.id)
+            undo_invalidation.kind,
+            SnapshotInvalidationKind::UndoReceipt
         );
         let post_undo_scan = scan();
         store.save_scan(&post_undo_scan).unwrap();

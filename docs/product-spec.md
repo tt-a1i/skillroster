@@ -170,6 +170,12 @@ Snapshot and returns its own required Scan continuation. Failed-and-compensated
 Apply never invalidates a Snapshot; recovery-required state keeps its existing
 recovery boundary.
 
+When Home or Status resumes an ordinary invalidated-Snapshot state, the
+read-only Scan remains the primary `next_action`. An original, still-Applied
+invalidating Receipt also supplies its exact Undo as a secondary suggested
+action; an Undo Receipt cannot itself be undone and keeps only the Scan.
+Recovery-required state suppresses both behind lifecycle recovery inspection.
+
 File replacement copies the original through an exclusively created staging
 handle and restores its platform permissions before publication. Unix
 permission bits and Windows file attributes, including readonly, must therefore
