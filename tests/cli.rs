@@ -857,6 +857,7 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     );
 
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
     let healthy = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert!(healthy["result"]["latest_snapshot_id"].is_string());
     assert_eq!(healthy["result"]["recovery_state"], "clear");
@@ -933,6 +934,76 @@ fn home_and_status_share_the_missing_snapshot_scan_continuation() {
 }
 
 #[test]
+fn home_and_status_resume_the_first_value_flow_until_the_current_report_exists() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home with spaces");
+    let state = temp.path().join("state with spaces");
+    fs::create_dir_all(home.join(".codex/skills/example")).unwrap();
+    fs::write(
+        home.join(".codex/skills/example/SKILL.md"),
+        "---\nname: example\ndescription: Example Skill\n---\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let initial = json_output(&run(&common, None));
+    assert_eq!(initial["result"]["state"], "no_snapshot");
+    assert_eq!(
+        initial["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+    );
+    let scan = json_output(&run_suggested_action(&initial["suggested_actions"][0]));
+    assert_eq!(scan["result"]["files_changed"], false);
+
+    let resumed_home = json_output(&run(&common, None));
+    let resumed_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let expected_report = context_action_argv(&home, &state, &["report", "--json"]);
+    assert_eq!(resumed_home["result"]["state"], "report_required");
+    assert_eq!(resumed_status["result"]["state"], "report_required");
+    assert_eq!(
+        resumed_home["suggested_actions"],
+        resumed_status["suggested_actions"]
+    );
+    assert_eq!(
+        resumed_home["suggested_actions"][0]["argv"],
+        expected_report
+    );
+    assert_eq!(resumed_home["suggested_actions"][0]["mutates"], false);
+    assert_eq!(resumed_home["result"]["files_changed"], false);
+    assert_eq!(resumed_status["result"]["files_changed"], false);
+
+    let report = json_output(&run_suggested_action(&resumed_home["suggested_actions"][0]));
+    assert_eq!(
+        report["result"]["snapshot_id"],
+        scan["result"]["snapshot_id"]
+    );
+    assert_eq!(report["result"]["files_changed"], false);
+    let complete = json_output(&run(&common, None));
+    assert_eq!(complete["result"]["state"], "ready");
+    assert_eq!(complete["suggested_actions"], json!([]));
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    database
+        .execute("UPDATE scan_payloads SET updated_at = updated_at + 1", [])
+        .unwrap();
+    drop(database);
+    let payload_changed = json_output(&run(&common, None));
+    assert_eq!(payload_changed["result"]["state"], "report_required");
+    json_output(&run_suggested_action(
+        &payload_changed["suggested_actions"][0],
+    ));
+    let rebuilt = json_output(&run(&common, None));
+    assert_eq!(rebuilt["result"]["state"], "ready");
+    assert_eq!(rebuilt["suggested_actions"], json!([]));
+}
+
+#[test]
 fn home_routes_a_current_snapshot_only_when_a_ready_plan_exists() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -947,10 +1018,8 @@ fn home_routes_a_current_snapshot_only_when_a_ready_plan_exists() {
     ];
 
     json_output(&run(&[&common[..], &["scan"]].concat(), None));
-    let healthy = json_output(&run(&common, None));
-    assert_eq!(healthy["result"]["state"], "ready");
-    assert_eq!(healthy["result"]["snapshot_state"], "current");
-    assert_eq!(healthy["suggested_actions"], json!([]));
+    let report_required = json_output(&run(&common, None));
+    assert_eq!(report_required["result"]["state"], "report_required");
 
     let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));

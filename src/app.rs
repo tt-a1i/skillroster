@@ -258,18 +258,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 parse_source_roots(&cli.source_roots)?,
                 args.summary,
             )?;
-            (
-                "scan",
-                result,
-                warnings,
-                vec![action(
-                    "report",
-                    &["report", "--json"],
-                    false,
-                    false,
-                    "scan_complete",
-                )],
-            )
+            ("scan", result, warnings, vec![report_action()])
         }
         Some(Command::Report(args)) => {
             let request = if let Some(id) = args.finding.as_deref() {
@@ -720,6 +709,7 @@ enum ReadinessState {
     NoSnapshot,
     RescanRequired,
     PlanReady,
+    ReportRequired,
     Ready,
 }
 
@@ -730,6 +720,7 @@ impl ReadinessState {
             Self::NoSnapshot => "no_snapshot",
             Self::RescanRequired => "rescan_required",
             Self::PlanReady => "plan_ready",
+            Self::ReportRequired => "report_required",
             Self::Ready => "ready",
         }
     }
@@ -806,6 +797,12 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
                 "pending_plan_requires_review",
             )),
         )
+    } else if !latest_scan_id
+        .map(|scan_id| store.report_exists_for_scan(scan_id))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        (ReadinessState::ReportRequired, Some(report_action()))
     } else {
         (ReadinessState::Ready, None)
     };
@@ -862,6 +859,7 @@ fn status_result(
     });
     let lifecycle = store.lifecycle_counts()?;
     Ok(json!({
+        "state": readiness.state.as_str(),
         "database_path": database_path,
         "schema_version": store.schema_version()?,
         "latest_snapshot_id": readiness.latest_snapshot.as_ref().map(|scan| scan.id.to_string()),
@@ -9461,6 +9459,16 @@ fn action(
     }
 }
 
+fn report_action() -> SuggestedAction {
+    action(
+        "report",
+        &["report", "--json"],
+        false,
+        false,
+        "scan_complete",
+    )
+}
+
 fn snapshot_rescan_action() -> SuggestedAction {
     action(
         "scan",
@@ -10059,6 +10067,7 @@ mod recovery_tests {
                 coverage_notes: Vec::new(),
             })
             .unwrap();
+        store.save_scan_payload(&scan_id, &json!({})).unwrap();
         let roster = source_reference_fixture_roster(&report_id);
         let escaping = source_reference_fixture_finding(
             "finding_197_source",
@@ -10110,6 +10119,7 @@ mod recovery_tests {
                 })
                 .unwrap();
         }
+        store.save_scan_payload(&scan_id, &json!({})).unwrap();
         let roster = source_reference_fixture_roster(&report_id);
         let first = source_reference_fixture_finding(
             "finding_197_source_a",
