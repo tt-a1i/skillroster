@@ -1609,8 +1609,28 @@ fn inspect_link(
             return (Some(normalized_target), status);
         }
     };
+    let linked_entrypoint = path.file_name().is_some_and(|name| name == "SKILL.md");
+    let expected_target_kind = if linked_entrypoint {
+        resolved_target.is_file()
+    } else {
+        resolved_target.is_dir()
+    };
+    if !expected_target_kind {
+        return (Some(resolved_target), LinkStatus::Broken);
+    }
     if !is_within_resolved_root(&resolved_target, approved_roots) {
-        return (Some(normalized_target), LinkStatus::EscapesRoot);
+        // `inspect_link` handles both linked Skill directories and a linked
+        // SKILL.md entrypoint. Source-root permission is directory-scoped, so
+        // bind a linked entrypoint to its resolved package directory.
+        let source_directory = if linked_entrypoint {
+            resolved_target
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or(resolved_target)
+        } else {
+            resolved_target
+        };
+        return (Some(source_directory), LinkStatus::EscapesRoot);
     }
     if fs::metadata(path).is_err() {
         return (Some(normalized_target), LinkStatus::Broken);

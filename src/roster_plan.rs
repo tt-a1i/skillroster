@@ -2082,6 +2082,7 @@ mod tests {
             "---\nname: external\n---\nfixture\n",
         )
         .unwrap();
+        let canonical_outside = fs::canonicalize(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("external")).unwrap();
         let snapshot = scan(&ScanOptions::for_home(&home)).unwrap();
         let skill_id = snapshot.placements[0].skill_id.clone();
@@ -2106,7 +2107,7 @@ mod tests {
         );
         assert_eq!(
             supported.exclusions[0].observed_source_target.as_deref(),
-            Some(outside.as_path())
+            Some(canonical_outside.as_path())
         );
     }
 
