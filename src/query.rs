@@ -310,6 +310,12 @@ pub struct Report {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RankingAdjustment {
+    ProtectedOriginalTaskMatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FindMatch {
     pub rank: usize,
     pub skill_id: String,
@@ -338,6 +344,9 @@ pub struct FindMatch {
     pub task_channel_rank: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub augmented_channel_rank: Option<usize>,
+    /// Policy adjustments applied after reciprocal-rank fusion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ranking_adjustments: Vec<RankingAdjustment>,
     pub evidence_quality: EvidenceQuality,
     /// Same declared name with distinct Skill identities is one ambiguous capability result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2082,6 +2091,7 @@ pub(crate) fn find_matching(
                 match_reasons: reasons,
                 task_channel_rank: None,
                 augmented_channel_rank: None,
+                ranking_adjustments: Vec::new(),
                 evidence_quality: if observed_usage {
                     EvidenceQuality::Observed
                 } else {
@@ -2265,6 +2275,9 @@ pub(crate) fn fuse_retrieval_channels(
         if index > protected_rank_index {
             let matched = fused.remove(index);
             fused.insert(protected_rank_index, matched);
+            fused[protected_rank_index]
+                .ranking_adjustments
+                .push(RankingAdjustment::ProtectedOriginalTaskMatch);
         }
     }
     fused.truncate(limit);
@@ -2586,6 +2599,7 @@ mod tests {
             match_reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
             task_channel_rank: None,
             augmented_channel_rank: None,
+            ranking_adjustments: Vec::new(),
             evidence_quality: EvidenceQuality::Inferred,
             variant_skill_ids: Vec::new(),
             variants: Vec::new(),
@@ -3427,6 +3441,16 @@ mod tests {
         assert_eq!(fused[0].name, "native-task");
         assert_eq!(fused[0].task_channel_rank, Some(1));
         assert_eq!(fused[0].augmented_channel_rank, Some(3));
+        assert!(matches!(
+            fused[0].ranking_adjustments.as_slice(),
+            [RankingAdjustment::ProtectedOriginalTaskMatch]
+        ));
+        assert_eq!(
+            serde_json::to_value(&fused[0]).unwrap()["ranking_adjustments"],
+            serde_json::json!(["protected_original_task_match"])
+        );
+        assert!(fused[1].ranking_adjustments.is_empty());
+        assert!(fused[2].ranking_adjustments.is_empty());
     }
 
     #[test]

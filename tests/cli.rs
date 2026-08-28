@@ -1293,6 +1293,7 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
     assert_eq!(native["rank"], 1);
     assert_eq!(native["task_channel_rank"], 1);
     assert!(native["augmented_channel_rank"].is_number());
+    assert!(native.get("ranking_adjustments").is_none());
     assert_eq!(
         hinted["result"]["ranking_strategy"],
         "task_hint_reciprocal_rank_fusion"
