@@ -571,6 +571,18 @@ impl StateStore {
             .transpose()
     }
 
+    pub fn report_exists_for_scan(&self, id: &ScanId) -> StorageResult<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM reports r
+                JOIN scan_payloads p ON p.scan_id = r.scan_id
+                WHERE r.scan_id = ?1 AND r.created_at >= p.updated_at
+            )",
+            [id.as_str()],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn save_agent(&self, agent: &AgentRecord) -> StorageResult<AgentId> {
         let kind = enum_text(&agent.kind)?;
         if let Some(id) = self

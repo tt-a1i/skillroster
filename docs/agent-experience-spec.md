@@ -64,9 +64,10 @@ The Agent never manufactures a problem so that an Apply action exists.
 
 The default no-subcommand Home is the Agent's bounded readiness router. It and
 Status share one action-priority decision: recovery, missing-Snapshot Scan,
-invalidated-Snapshot Scan, Ready Plan inspection, then no required
-continuation. Home never calls a stale Snapshot ready, and its human surface
-prints the same exact argv returned in the JSON suggested action.
+invalidated-Snapshot Scan, Ready Plan inspection, missing current-Snapshot
+Report, then no required continuation. Home never calls a stale or unanalyzed
+Snapshot ready, and its human surface prints the same exact argv returned in
+the JSON suggested action.
 
 ## 4. First-screen information
 
