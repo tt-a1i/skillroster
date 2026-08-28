@@ -812,6 +812,8 @@ fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_succes
         None,
     );
     assert_eq!(applied["result"]["verification"], "passed");
+    let refreshed = cli_json(&home, &state, &["scan", "--summary"], None);
+    assert_eq!(refreshed["result"]["placement_count"], names.len());
 
     let (after_routed, after_succeeded) = evaluate_capabilities(&home, &state, &routes);
     assert_eq!(

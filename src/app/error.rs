@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::action;
+use super::{action, snapshot_rescan_action};
 use crate::action_context::ActionContext;
-use crate::model::{ApiError, FindingId, JsonEnvelope, PlanId, ScanId};
+use crate::model::{ApiError, FindingId, JsonEnvelope, PlanId, ReceiptId, ScanId};
 use crate::scan;
 
 /// Agent tool-result transport bound, deliberately narrower than the 2 MiB
@@ -77,6 +77,24 @@ impl std::fmt::Display for ContentIdentityRescanRequired {
 
 impl std::error::Error for ContentIdentityRescanRequired {}
 
+#[derive(Debug)]
+pub(super) struct SnapshotRescanRequired {
+    pub(super) snapshot_id: ScanId,
+    pub(super) receipt_id: ReceiptId,
+}
+
+impl std::fmt::Display for SnapshotRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Snapshot {} predates verified Receipt {}; run skillroster scan --summary --json before using current inventory facts",
+            self.snapshot_id, self.receipt_id
+        )
+    }
+}
+
+impl std::error::Error for SnapshotRescanRequired {}
+
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
     error_json_with_context(command, error, &ActionContext::default())
 }
@@ -86,6 +104,33 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(required) = error.downcast_ref::<SnapshotRescanRequired>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "snapshot_rescan_required".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids: vec![
+                    required.snapshot_id.to_string(),
+                    required.receipt_id.to_string(),
+                ],
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "verified_mutation_after_snapshot",
+                    "snapshot_id": required.snapshot_id,
+                    "receipt_id": required.receipt_id,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![snapshot_rescan_action()];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(changed) = error.downcast_ref::<FindSnapshotChanged>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,

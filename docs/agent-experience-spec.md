@@ -155,11 +155,25 @@ The precise wording adapts to the user's language and the host Agent, but the fa
 - 验证：目标、链接和索引均符合方案
 - Receipt：rcpt_01M...
 - Canonical Skill 删除：0
+- 当前事实：需执行返回的只读 Scan 后再使用 Report 或 Find
 
-如需恢复，回复“撤销这次整理”。
+先执行返回的 Scan 刷新事实；如需恢复，Receipt 的撤销入口仍然可用。
 ```
 
 If Apply failed but compensation succeeded, say that no planned state remains and identify the Receipt. If recovery is required, lead with that state, list the unresolved target, and do not offer another Apply.
+
+After a verified Apply, the Agent follows the returned read-only Scan action
+before using Report, Find, Plan, Setup, or another current-inventory decision.
+It does not hide this required continuation or infer it from prose. Status and
+the exact Receipt Undo remain usable. If exact Undo verifies before a new Scan,
+the original Snapshot becomes current again. If a newer Scan already observed
+the applied state, Undo returns another required Scan before current-inventory
+decisions resume.
+
+While facts are invalid, Status names `snapshot_state: rescan_required`, binds
+the invalidating Receipt ID, and returns the same read-only Scan continuation.
+The Agent follows recovery first when required, then stale-fact refresh, then
+ordinary pending-Plan inspection.
 
 ## 7. Drill-down behavior
 
@@ -199,6 +213,8 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 - require one explicit user confirmation for Apply or Undo;
 - never use `--force`, `--yes`, hidden shell writes, or direct filesystem substitutes;
 - preserve the same report/Snapshot across follow-up questions;
+- after verified Apply, follow the returned Scan before using current inventory
+  facts; keep the exact Receipt Undo available while that Snapshot is stale;
 - state whether files changed in every final response;
 - stop when drift, ambiguity, unsupported scope, or recovery-required state appears.
 

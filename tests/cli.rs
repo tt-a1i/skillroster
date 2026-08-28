@@ -3268,6 +3268,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert!(routing.contains("find_snapshot_changed"));
     assert!(routing.contains("rerun_find_on_latest_snapshot"));
     assert!(routing.contains("Do not reconstruct or rerun Find"));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
     assert!(current["result"]["plan_id"].is_null());
@@ -3351,6 +3352,7 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
             fs::read_to_string(&bootstrap).unwrap(),
             include_str!("../skill/skillroster/SKILL.md").replace("\r\n", "\n")
         );
+        json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
         let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
         assert_eq!(current["result"]["state"], "up_to_date");
 
@@ -3444,6 +3446,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
             expected.replace("\r\n", "\n")
         );
     }
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
     assert_eq!(
@@ -3487,6 +3490,7 @@ fn setup_manages_the_fixed_bootstrap_package_and_preserves_unmanaged_files() {
         .concat(),
         None,
     ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let package = root.join("skillroster");
     let routing = package.join("references/routing.md");
     let unmanaged = package.join("notes.local.md");
@@ -3530,6 +3534,7 @@ fn setup_manages_the_fixed_bootstrap_package_and_preserves_unmanaged_files() {
         include_str!("../skill/skillroster/references/routing.md").replace("\r\n", "\n")
     );
     assert_eq!(fs::read_to_string(&unmanaged).unwrap(), "keep me\n");
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let healthy = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(healthy["result"]["state"], "up_to_date");
     assert_eq!(healthy["result"]["targets"][0]["managed_file_count"], 4);
@@ -3574,6 +3579,7 @@ fn setup_does_not_report_a_package_with_a_missing_reference_as_current() {
         .concat(),
         None,
     ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     fs::remove_file(root.join("skillroster/references/governance.md")).unwrap();
 
     let result = json_output(&run(&[&common[..], &["setup"]].concat(), None));
@@ -3699,6 +3705,7 @@ fn setup_rejects_a_symlinked_managed_reference() {
         .concat(),
         None,
     ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let routing = root.join("skillroster/references/routing.md");
     fs::remove_file(&routing).unwrap();
     symlink(root.join("skillroster/SKILL.md"), &routing).unwrap();
@@ -4169,6 +4176,236 @@ fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert!(!skill_root.exists());
     assert!(sessions.is_dir());
+}
+
+#[test]
+fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let original_scan = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    assert_eq!(original_scan["result"]["placement_count"], 0);
+    let pre_apply_report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let finding_id = pre_apply_report["result"]["findings"]
+        .as_array()
+        .and_then(|findings| findings.first())
+        .and_then(|finding| finding["id"].as_str())
+        .expect("the known-missing-root Snapshot exposes a Finding")
+        .to_owned();
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let plan_id = setup["result"]["plan_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let immutable: String = database
+        .query_row(
+            "SELECT immutable_json FROM plans WHERE id = ?1",
+            [plan_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut alternative: Value = serde_json::from_str(&immutable).unwrap();
+    alternative["id"] = json!("plan_alternative_ready");
+    database
+        .execute(
+            "INSERT INTO plans
+                (id, scan_id, report_id, created_at, status, input_json, fingerprint, immutable_json)
+             SELECT 'plan_alternative_ready', scan_id, report_id, created_at + 1,
+                    status, input_json, fingerprint, ?1
+             FROM plans WHERE id = ?2",
+            rusqlite::params![alternative.to_string(), plan_id],
+        )
+        .unwrap();
+    let ready_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(ready_status["result"]["pending_plan_count"], 2);
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert_eq!(applied["result"]["rescan_required"], true);
+    assert_eq!(applied["suggested_actions"].as_array().unwrap().len(), 2);
+    assert_eq!(applied["suggested_actions"][0]["action"], "scan");
+    assert_eq!(
+        applied["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+    );
+    assert_eq!(applied["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        applied["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+    assert_eq!(applied["suggested_actions"][1]["action"], "undo");
+
+    for command in [
+        vec!["report", "--summary"],
+        vec!["find", "help me govern skills", "--load", "--limit", "1"],
+        vec!["setup"],
+    ] {
+        let blocked = run(&[&common[..], &command].concat(), None);
+        assert!(!blocked.status.success());
+        let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert_eq!(blocked["error"]["code"], "snapshot_rescan_required");
+        assert_eq!(blocked["error"]["retryable"], true);
+        assert_eq!(
+            blocked["error"]["details"]["reason"],
+            "verified_mutation_after_snapshot"
+        );
+        assert_eq!(
+            blocked["error"]["details"]["snapshot_id"],
+            original_scan["result"]["snapshot_id"]
+        );
+        assert_eq!(blocked["error"]["details"]["files_changed"], false);
+        assert_eq!(blocked["suggested_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(blocked["suggested_actions"][0]["action"], "scan");
+        assert_eq!(
+            blocked["suggested_actions"][0]["argv"],
+            context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+        );
+    }
+    let blocked_plan = run(&[&common[..], &["plan", "--stdin"]].concat(), Some("{}"));
+    assert!(!blocked_plan.status.success());
+    let blocked_plan: Value = serde_json::from_slice(&blocked_plan.stdout).unwrap();
+    assert_eq!(blocked_plan["error"]["code"], "snapshot_rescan_required");
+    assert_eq!(blocked_plan["suggested_actions"][0]["action"], "scan");
+    let blocked_finding = run(
+        &[&common[..], &["report", "--finding", &finding_id]].concat(),
+        None,
+    );
+    assert!(!blocked_finding.status.success());
+    let blocked_finding: Value = serde_json::from_slice(&blocked_finding.stdout).unwrap();
+    assert_eq!(blocked_finding["error"]["code"], "snapshot_rescan_required");
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["recovery_state"], "clear");
+    assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_receipt_id"],
+        applied["result"]["receipt_id"]
+    );
+    assert_eq!(status["result"]["pending_plan_count"], 0);
+    assert_eq!(status["result"]["pending_plans"], json!([]));
+    assert_eq!(status["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(status["suggested_actions"][0]["action"], "scan");
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    let restored = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        restored["result"]["snapshot_id"],
+        original_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(restored["result"]["placement_count"], 0);
+}
+
+#[test]
+fn suggested_scan_refreshes_inventory_after_verified_apply() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let original_scan = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+
+    let refreshed = json_output(&run_suggested_action(&applied["suggested_actions"][0]));
+    assert_ne!(
+        refreshed["result"]["snapshot_id"],
+        original_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(refreshed["result"]["placement_count"], 1);
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        report["result"]["snapshot_id"],
+        refreshed["result"]["snapshot_id"]
+    );
+    assert_eq!(report["result"]["placement_count"], 1);
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &["find", "help me govern skills", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["loaded_skill"]["selection"]["rank"], 1);
+    assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
+}
+
+#[test]
+fn exact_undo_invalidates_a_newer_post_apply_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let post_apply_scan = json_output(&run_suggested_action(&applied["suggested_actions"][0]));
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(undone["result"]["rescan_required"], true);
+    assert_eq!(undone["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(undone["suggested_actions"][0]["action"], "scan");
+    let blocked = run(&[&common[..], &["report", "--summary"]].concat(), None);
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "snapshot_rescan_required");
+    assert_eq!(
+        blocked["error"]["details"]["snapshot_id"],
+        post_apply_scan["result"]["snapshot_id"]
+    );
+
+    let refreshed = json_output(&run_suggested_action(&undone["suggested_actions"][0]));
+    assert_eq!(refreshed["result"]["placement_count"], 0);
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    assert_eq!(report["result"]["placement_count"], 0);
 }
 
 #[test]
@@ -5290,6 +5527,7 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         )
         .unwrap();
     assert_eq!(governance_state, "hosted");
+    let hosted_rescan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let hosted_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
     assert_eq!(
         hosted_find["result"]["matches"][0]["roster_state"],
@@ -5305,7 +5543,6 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .any(|path| fs::canonicalize(path.as_str().unwrap())
                 .is_ok_and(|actual| actual == expected_library_entry))
     );
-    let hosted_rescan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let hosted_snapshot = hosted_rescan["result"]["snapshot_id"].as_str().unwrap();
     let hosted_payload: String = database
         .query_row(
@@ -5347,6 +5584,7 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
     assert!(!state.join("plan-backups").exists());
     assert!(codex_skill.join("SKILL.md").is_file());
     assert!(claude_skill.join("SKILL.md").is_file());
+    let restored_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let restored_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
     assert_find_paths_are_readable(&restored_find);
     assert!(
@@ -5357,7 +5595,6 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
             .all(|path| !path.as_str().unwrap().contains("/library/"))
     );
 
-    let restored_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let restored_snapshot = restored_scan["result"]["snapshot_id"].as_str().unwrap();
     let restored_evidence_id: String = database
         .query_row(
@@ -7865,6 +8102,7 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     ));
     assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
     assert_eq!(fs::read_dir(state.join("library")).unwrap().count(), 101);
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let governed_find = json_output(&run(&[&common[..], &["find", "skill-000"]].concat(), None));
     assert_eq!(
         governed_find["result"]["matches"][0]["roster_state"],
@@ -7894,6 +8132,7 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     for index in 0..101 {
         assert!(root.join(format!("skill-{index:03}/SKILL.md")).is_file());
     }
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let restored_find = json_output(&run(&[&common[..], &["find", "skill-000"]].concat(), None));
     assert_eq!(
         restored_find["result"]["matches"][0]["roster_state"],
@@ -7971,6 +8210,7 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
         fs::canonicalize(&linked).unwrap(),
         fs::canonicalize(&canonical).unwrap()
     );
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let core_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
     assert_eq!(core_find["result"]["matches"][0]["roster_state"], "core");
     assert_find_paths_are_readable(&core_find);
@@ -7992,6 +8232,7 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
     assert_eq!(undone["result"]["verification"], "passed");
     assert!(!linked.exists());
     assert!(canonical.join("SKILL.md").is_file());
+    let restored_scan = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let restored_find = json_output(&run(&[&common[..], &["find", "shared"]].concat(), None));
     assert_eq!(
         restored_find["result"]["matches"][0]["roster_state"],
@@ -8006,9 +8247,20 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
             .all(|path| path != linked.join("SKILL.md").to_str().unwrap())
     );
 
+    let restored_snapshot = restored_scan["result"]["snapshot_id"].as_str().unwrap();
+    let restored_evidence_id: String = database
+        .query_row(
+            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
+            [restored_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut drift_request = request.clone();
+    drift_request["scan_id"] = json!(restored_snapshot);
+    drift_request["evidence_ids"] = json!([restored_evidence_id]);
     let drift_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
-        Some(&request.to_string()),
+        Some(&drift_request.to_string()),
     ));
     fs::write(
         canonical.join("SKILL.md"),
@@ -8092,6 +8344,7 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
         .concat(),
         None,
     ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let archived = json_output(&run(
         &[&common[..], &["find", "phosphorescent reconciliation"]].concat(),
         None,
@@ -8130,6 +8383,7 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
         .concat(),
         None,
     ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
     let restored = json_output(&run(
         &[&common[..], &["find", "phosphorescent reconciliation"]].concat(),
         None,
@@ -8310,6 +8564,8 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         .concat(),
         None,
     ));
+
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
 
     let after = json_output(&run(
         &[&common[..], &["find", "active search marker"]].concat(),

@@ -156,6 +156,20 @@ Agent callers never need to parse the human message.
 
 Apply fails closed when paths, fingerprints, links, or configuration have drifted. Every successful mutation writes a Receipt. `undo <receipt-id>` is bounded to that Receipt and refuses ambiguous restoration. Canonical deletion is outside normal Apply, requires separate confirmation, and should prefer recoverable archive.
 
+A verified Applied Receipt invalidates the completed Snapshot on which its Plan
+was based because the mutation changed inventory facts after that observation.
+Until a newer Scan completes, commands that require current inventory facts
+fail with typed `snapshot_rescan_required` details and one read-only Scan
+continuation. Apply returns `rescan_required: true` and keeps both the required
+Scan and exact Receipt Undo actions visible. Status, lifecycle recovery, and
+Undo remain available while facts are stale. If no newer Scan completed after
+Apply, verified exact Undo consumes the Applied Receipt and restores the
+pre-Apply state, so that original Snapshot is current again without a redundant
+Scan. If a newer Scan observed the applied state, Undo invalidates that newer
+Snapshot and returns its own required Scan continuation. Failed-and-compensated
+Apply never invalidates a Snapshot; recovery-required state keeps its existing
+recovery boundary.
+
 File replacement copies the original through an exclusively created staging
 handle and restores its platform permissions before publication. Unix
 permission bits and Windows file attributes, including readonly, must therefore
@@ -461,17 +475,29 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 - Plans and Receipts remain until explicitly purged.
 - Overflow source-confirmation details are versioned local artifacts retained until explicitly purged or local state is deleted.
 - `status` exposes storage location, retention state, and retained source-confirmation artifact counts and bytes.
+- `status` remains read-only and available when current inventory facts are
+  invalid. It exposes typed `snapshot_state`, the invalidating Receipt ID, and
+  the required Scan continuation. Recovery inspection remains higher priority;
+  stale-Snapshot refresh remains higher priority than inspecting another Ready
+  Plan derived from those stale facts.
+- The v11 migration backfills mutation invalidations from legacy second-resolution
+  timestamps. When a legacy Undo and the latest Scan completed in the same
+  second, their exact order is unknowable; migration fails closed and requires
+  one fresh Scan. New v11 mutations persist the exact invalidation relation and
+  do not use this timestamp inference.
 - `status.pending_plans` contains only actionable Ready Plans for the latest
   Snapshot plus any Applying or Recovery-required Plans. Ready Plans from older
   Snapshots remain inspectable history but are not presented as pending work.
   The total count remains exact while the returned list is capped and reports
   whether additional pending Plans were truncated.
-- When pending work exists, `status` routes the Agent to inspect the first Plan
-  from that deterministic bounded ordering before considering a new Scan.
-  Recovery inspection remains higher priority, and the action is read-only.
-- `status` suggests Scan only when no completed Snapshot exists. A healthy
-  state with a Snapshot exposes its timestamp and leaves refresh judgment to
-  the Agent instead of creating an unconditional Status-to-Scan loop.
+- When `snapshot_state == current` and pending work exists, `status` routes the
+  Agent to inspect the first Plan from that deterministic bounded ordering
+  before considering a new Scan. Recovery inspection remains higher priority,
+  and the action is read-only.
+- When `snapshot_state == current`, `status` does not suggest an unconditional
+  Scan. A healthy state exposes the Snapshot timestamp and leaves refresh
+  judgment to the Agent. Missing or invalidated Snapshots instead expose the
+  required Scan continuation described above.
 - Users can inspect, export, purge, or delete retained local state and rebuild inventory by scanning again.
 
 Reports may identify structural and provenance risks—unknown source, changed content, executable scripts, declaration mismatch, and escaping links—but must not claim malware detection or runtime safety.
