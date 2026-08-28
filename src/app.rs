@@ -3843,6 +3843,21 @@ fn finding_roster_planning(
     ) {
         Ok(recommendation) => recommendation,
         Err(error) => {
+            if let Some(required) = error.downcast_ref::<
+                crate::roster_recommendation::PhysicalMutationIdentityRescanRequired,
+            >() {
+                return Ok(Some(json!({
+                    "supported": false,
+                    "reason": "physical_mutation_identity_rescan_required",
+                    "reason_code": "snapshot_missing_physical_mutation_identity",
+                    "snapshot_id": scan_id,
+                    "placement_id": required.placement_id,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan",
+                    "action": physical_identity_rescan_action()
+                })));
+            }
             return Ok(Some(json!({
                 "supported": false,
                 "reason": "automatic_roster_selection_unavailable",
@@ -9514,6 +9529,16 @@ fn snapshot_rescan_action() -> SuggestedAction {
     )
 }
 
+fn physical_identity_rescan_action() -> SuggestedAction {
+    action(
+        "scan",
+        &["scan", "--summary", "--json"],
+        false,
+        false,
+        "snapshot_missing_physical_mutation_identity",
+    )
+}
+
 fn receipt_undo_action(receipt_id: &str) -> SuggestedAction {
     action(
         "undo",
@@ -12161,6 +12186,55 @@ mod recovery_tests {
         assert_eq!(output["error"]["details"]["identity_role"], "target");
         assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
         assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn shared_physical_core_budget_exposes_a_typed_no_change_blocker() {
+        let error = crate::roster_recommendation::SharedPhysicalCoreBudgetExceeded {
+            agent: AgentKind::ClaudeCode,
+            core_count: 51,
+            core_budget: 50,
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_shared_core_budget_exceeded"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "shared_physical_forced_core_exceeds_budget"
+        );
+        assert_eq!(output["error"]["details"]["agent"], "claude-code");
+        assert_eq!(output["error"]["details"]["core_count"], 51);
+        assert_eq!(output["error"]["details"]["core_budget"], 50);
+        assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn missing_snapshot_physical_identity_exposes_a_typed_scan_action() {
+        let error = crate::roster_recommendation::PhysicalMutationIdentityRescanRequired {
+            placement_id: "placement_legacy".into(),
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_physical_identity_rescan_required"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "snapshot_missing_physical_mutation_identity"
+        );
+        assert_eq!(output["error"]["details"]["next_action"], "scan");
+        assert_eq!(output["error"]["details"]["files_changed"], false);
+        assert_eq!(output["suggested_actions"][0]["action"], "scan");
+        assert_eq!(
+            output["suggested_actions"][0]["argv"],
+            json!(["skillroster", "scan", "--summary", "--json"])
+        );
     }
 
     #[test]

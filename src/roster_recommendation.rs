@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 
@@ -11,6 +12,44 @@ use crate::model::FindingRecord;
 use crate::scan::{EvidenceQuality, ScanResult, UsageStage};
 
 pub const MAX_CORE_BUDGET: usize = 50;
+
+#[derive(Debug)]
+pub struct SharedPhysicalCoreBudgetExceeded {
+    pub agent: AgentKind,
+    pub core_count: usize,
+    pub core_budget: usize,
+}
+
+impl std::fmt::Display for SharedPhysicalCoreBudgetExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "shared physical Core propagation gives Agent {} {} Core Skills; core_budget {} is too small",
+            self.agent.id(),
+            self.core_count,
+            self.core_budget
+        )
+    }
+}
+
+impl std::error::Error for SharedPhysicalCoreBudgetExceeded {}
+
+#[derive(Debug)]
+pub struct PhysicalMutationIdentityRescanRequired {
+    pub placement_id: String,
+}
+
+impl std::fmt::Display for PhysicalMutationIdentityRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Snapshot has no observed physical mutation identity for Placement {}; run skillroster scan",
+            self.placement_id
+        )
+    }
+}
+
+impl std::error::Error for PhysicalMutationIdentityRescanRequired {}
 
 pub fn is_large_roster_finding(finding: &FindingRecord) -> bool {
     crate::query::stored_finding_is(finding, crate::query::FindingKind::LargeDefaultRoster)
@@ -249,17 +288,10 @@ pub fn recommend(
         }
     }
 
-    let mut changes = Vec::new();
-    let mut agents = Vec::new();
-    for (agent, candidates) in by_agent {
-        let before_default_exposure = scan
-            .placements
-            .iter()
-            .filter(|placement| placement.agent == Some(agent) && placement.default_exposed)
-            .count();
-        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+    let mut core_by_agent = BTreeMap::new();
+    for (agent, candidates) in &by_agent {
         let forced_count = candidates
-            .iter()
+            .values()
             .filter(|candidate| candidate.is_forced_core())
             .count();
         if forced_count > request.core_budget {
@@ -269,21 +301,53 @@ pub fn recommend(
                 request.core_budget
             );
         }
-        candidates.sort_by(candidate_order);
-        let core_ids = candidates
+        let mut ranked = candidates.values().collect::<Vec<_>>();
+        ranked.sort_by(|left, right| candidate_order(left, right));
+        core_by_agent.insert(
+            *agent,
+            ranked
+                .iter()
+                .take(request.core_budget)
+                .map(|candidate| candidate.skill_id.clone())
+                .collect::<BTreeSet<_>>(),
+        );
+    }
+    let shared_core_agents =
+        reconcile_shared_physical_states(scan, &by_agent, &mut core_by_agent, request.core_budget)?;
+
+    let mut changes = Vec::new();
+    let mut agents = Vec::new();
+    for (agent, candidates) in by_agent {
+        let before_default_exposure = scan
+            .placements
             .iter()
-            .take(request.core_budget)
-            .map(|candidate| candidate.skill_id.as_str())
-            .collect::<BTreeSet<_>>();
+            .filter(|placement| placement.agent == Some(agent) && placement.default_exposed)
+            .count();
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(candidate_order);
+        let core_ids = &core_by_agent[&agent];
         let core_selections = candidates
             .iter()
-            .take(request.core_budget)
+            .filter(|candidate| core_ids.contains(&candidate.skill_id))
             .map(|candidate| CoreSelection {
                 skill_id: candidate.skill_id.clone(),
                 name: candidate.name.clone(),
-                reason: candidate.reason(),
-                evidence_scope: candidate.evidence_scope(),
-                evidence_agents: candidate.evidence_agents(),
+                reason: if shared_core_agents.contains_key(&(agent, candidate.skill_id.clone())) {
+                    "shared_physical_forced_core"
+                } else {
+                    candidate.reason()
+                },
+                evidence_scope: if shared_core_agents
+                    .contains_key(&(agent, candidate.skill_id.clone()))
+                {
+                    "forced"
+                } else {
+                    candidate.evidence_scope()
+                },
+                evidence_agents: shared_core_agents
+                    .get(&(agent, candidate.skill_id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| candidate.evidence_agents()),
             })
             .collect::<Vec<_>>();
         let positive_signal_count = candidates
@@ -332,6 +396,113 @@ pub fn recommend(
     changes
         .sort_by(|left, right| (&left.agent, &left.skill_id).cmp(&(&right.agent, &right.skill_id)));
     Ok(RosterRecommendation { changes, agents })
+}
+
+fn reconcile_shared_physical_states(
+    scan: &ScanResult,
+    candidates: &BTreeMap<AgentKind, BTreeMap<String, Candidate>>,
+    core_by_agent: &mut BTreeMap<AgentKind, BTreeSet<String>>,
+    core_budget: usize,
+) -> Result<BTreeMap<(AgentKind, String), Vec<String>>> {
+    let mut physical_groups = BTreeMap::<(String, PathBuf), BTreeSet<AgentKind>>::new();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| placement.default_exposed)
+    {
+        let Some(agent) = placement.agent else {
+            continue;
+        };
+        let physical_identity = match scan.observed_physical_mutation_path(placement) {
+            Some(path) => path.to_path_buf(),
+            None => {
+                return Err(PhysicalMutationIdentityRescanRequired {
+                    placement_id: placement.id.clone(),
+                }
+                .into());
+            }
+        };
+        physical_groups
+            .entry((placement.skill_id.clone(), physical_identity))
+            .or_default()
+            .insert(agent);
+    }
+
+    let mut groups_by_skill = BTreeMap::<String, Vec<BTreeSet<AgentKind>>>::new();
+    for ((skill_id, _), agents) in physical_groups
+        .into_iter()
+        .filter(|(_, agents)| agents.len() > 1)
+    {
+        let components = groups_by_skill.entry(skill_id).or_default();
+        let mut merged = agents;
+        let mut index = 0;
+        while index < components.len() {
+            if components[index].is_disjoint(&merged) {
+                index += 1;
+            } else {
+                merged.extend(components.remove(index));
+                index = 0;
+            }
+        }
+        components.push(merged);
+    }
+
+    let mut shared_core_agents = BTreeMap::new();
+    for (skill_id, components) in groups_by_skill {
+        for agents in components {
+            let states = agents
+                .iter()
+                .map(|agent| {
+                    core_by_agent
+                        .get(agent)
+                        .is_none_or(|core| core.contains(&skill_id))
+                })
+                .collect::<BTreeSet<_>>();
+            if states.len() == 1 {
+                continue;
+            }
+            let forced_agents = agents
+                .iter()
+                .filter(|agent| {
+                    candidates
+                        .get(agent)
+                        .and_then(|items| items.get(&skill_id))
+                        .is_some_and(Candidate::is_forced_core)
+                })
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let choose_core = !forced_agents.is_empty()
+                || agents.iter().any(|agent| !candidates.contains_key(agent));
+            let mut evidence_agents = agents
+                .iter()
+                .map(|agent| agent.id().to_owned())
+                .collect::<Vec<_>>();
+            evidence_agents.sort();
+            for agent in agents.iter().filter(|agent| candidates.contains_key(agent)) {
+                let core = core_by_agent
+                    .get_mut(agent)
+                    .expect("candidate Agent has a Core selection");
+                if choose_core {
+                    core.insert(skill_id.clone());
+                    shared_core_agents.insert((*agent, skill_id.clone()), evidence_agents.clone());
+                } else {
+                    core.remove(&skill_id);
+                }
+            }
+        }
+    }
+    for (agent, core) in core_by_agent {
+        if core.len() > core_budget {
+            return Err(SharedPhysicalCoreBudgetExceeded {
+                agent: *agent,
+                core_count: core.len(),
+                core_budget,
+            }
+            .into());
+        }
+    }
+
+    Ok(shared_core_agents)
 }
 
 fn exposure_finding_scope<'a>(
@@ -471,13 +642,17 @@ const fn stage_rank(stage: UsageStage) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use serde_json::json;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::model::{EvidenceId, FindingId, ReportId, Severity};
-    use crate::scan::{LinkStatus, ScannedSkill, SkillMetadata, SkillPlacement, UsageEvidence};
+    use crate::scan::{
+        LinkStatus, ScanOptions, ScannedSkill, SkillMetadata, SkillPlacement, UsageEvidence, scan,
+    };
 
     #[test]
     fn recommendation_keeps_only_forced_and_evidence_ranked_core_skills() {
@@ -722,6 +897,355 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_physical_rank_divergence_reconciles_to_on_demand() {
+        let mut scan = shared_oversized_scan(51);
+        scan.usage.push(usage(
+            AgentKind::Codex,
+            "skill_050",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        scan.usage.push(usage(
+            AgentKind::ClaudeCode,
+            "skill_049",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            recommendation
+                .changes
+                .iter()
+                .all(|change| change.state == "on_demand")
+        );
+        assert!(recommendation.agents.iter().all(|agent| {
+            agent.core_count == 0 && agent.on_demand_count == 51 && agent.core_selections.is_empty()
+        }));
+    }
+
+    #[test]
+    fn shared_physical_forced_core_propagates_and_recomputes_summaries() {
+        let scan = shared_oversized_scan(51);
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::from([(AgentKind::Codex, "skill_050".into())]),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        for agent in &recommendation.agents {
+            assert_eq!(agent.core_count, 1);
+            assert_eq!(agent.on_demand_count, 50);
+            assert_eq!(agent.core_selections.len(), 1);
+            assert_eq!(agent.core_selections[0].skill_id, "skill_050");
+            assert_eq!(
+                agent.core_selections[0].reason,
+                "shared_physical_forced_core"
+            );
+            assert_eq!(agent.core_selections[0].evidence_scope, "forced");
+            assert_eq!(
+                agent.core_selections[0].evidence_agents,
+                ["claude-code", "codex"]
+            );
+        }
+        assert!(recommendation.changes.iter().all(|change| {
+            (change.skill_id == "skill_050" && change.state == "core")
+                || (change.skill_id != "skill_050" && change.state == "on_demand")
+        }));
+    }
+
+    #[test]
+    fn shared_physical_forced_core_propagation_respects_each_agent_budget() {
+        let scan = shared_oversized_scan(51);
+        let error = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::from([
+                (AgentKind::Codex, "skill_050".into()),
+                (AgentKind::ClaudeCode, "skill_049".into()),
+            ]),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<SharedPhysicalCoreBudgetExceeded>()
+                .is_some()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("shared physical Core propagation gives Agent")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("2 Core Skills; core_budget 1 is too small")
+        );
+    }
+
+    #[test]
+    fn shared_physical_out_of_scope_exposure_is_retained_or_fails_budget() {
+        let mut scan = oversized_scan(51);
+        let shared = scan.placements.last_mut().unwrap();
+        shared.physical_directory = Some(PathBuf::from("/tmp/home/.shared/skill_050"));
+        let mut claude = shared.clone();
+        claude.id = "claude_shared".into();
+        claude.agent = Some(AgentKind::ClaudeCode);
+        claude.root = PathBuf::from("/tmp/home/.claude/skills");
+        claude.directory = claude.root.join("skill_050");
+        claude.entrypoint = claude.directory.join("SKILL.md");
+        scan.placements.push(claude);
+        scan.freeze_observed_physical_mutation_paths();
+        let mut roster_finding = finding(&scan);
+        roster_finding.details["affected_placement_ids"] = json!(
+            scan.placements
+                .iter()
+                .filter(|placement| placement.agent == Some(AgentKind::Codex))
+                .map(|placement| placement.id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let error = recommend(
+            &roster_finding,
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 50,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap_err();
+
+        let exceeded = error
+            .downcast_ref::<SharedPhysicalCoreBudgetExceeded>()
+            .unwrap();
+        assert_eq!(exceeded.agent, AgentKind::Codex);
+        assert_eq!(exceeded.core_count, 51);
+        assert_eq!(exceeded.core_budget, 50);
+    }
+
+    #[test]
+    fn shared_physical_forced_core_does_not_spill_into_an_independent_component() {
+        let scan = two_component_shared_scan(51);
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::from([(AgentKind::Codex, "skill_050".into())]),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        let selected = recommendation
+            .agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent.agent,
+                    (
+                        agent.core_selections[0].skill_id.as_str(),
+                        agent.core_selections[0].reason,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            selected[&AgentKind::Codex],
+            ("skill_050", "shared_physical_forced_core")
+        );
+        assert_eq!(
+            selected[&AgentKind::ClaudeCode],
+            ("skill_050", "shared_physical_forced_core")
+        );
+        assert_eq!(
+            selected[&AgentKind::Hermes],
+            ("skill_000", "stable_fallback")
+        );
+        assert_eq!(
+            selected[&AgentKind::Cursor],
+            ("skill_000", "stable_fallback")
+        );
+    }
+
+    #[test]
+    fn shared_physical_demotion_does_not_spill_into_an_independent_component() {
+        let mut scan = two_component_shared_scan(51);
+        scan.usage.push(usage(
+            AgentKind::Codex,
+            "skill_050",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        scan.usage.push(usage(
+            AgentKind::ClaudeCode,
+            "skill_049",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        let recommendation = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        for agent in [AgentKind::Codex, AgentKind::ClaudeCode] {
+            let summary = recommendation
+                .agents
+                .iter()
+                .find(|summary| summary.agent == agent)
+                .unwrap();
+            assert_eq!(summary.core_count, 0);
+            assert!(summary.core_selections.is_empty());
+        }
+        let independent = [AgentKind::Hermes, AgentKind::Cursor].map(|agent| {
+            recommendation
+                .agents
+                .iter()
+                .find(|summary| summary.agent == agent)
+                .unwrap()
+        });
+        assert!(independent.iter().all(|summary| summary.core_count == 1));
+        assert_eq!(
+            independent[0].core_selections[0].skill_id,
+            independent[1].core_selections[0].skill_id
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliased_roots_with_a_shared_symlink_entry_produce_a_ready_plan() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let shared_root = home.join(".shared-skills");
+        let linked_store = shared_root.join(".store/skill-050");
+        fs::create_dir_all(&linked_store).unwrap();
+        fs::write(
+            linked_store.join("SKILL.md"),
+            "---\nname: skill-050\n---\nshared linked fixture\n",
+        )
+        .unwrap();
+        for index in 0..50 {
+            let skill = shared_root.join(format!("skill-{index:03}"));
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+            )
+            .unwrap();
+        }
+        symlink(".store/skill-050", shared_root.join("skill-050")).unwrap();
+        for root in [home.join(".codex/skills"), home.join(".claude/skills")] {
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            symlink(&shared_root, root).unwrap();
+        }
+
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let mut snapshot = scan(&options).unwrap();
+        let ids = snapshot
+            .skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let skill_049 = ids["skill-049"].clone();
+        let skill_050 = ids["skill-050"].clone();
+        snapshot.usage.push(usage(
+            AgentKind::Codex,
+            &skill_050,
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        snapshot.usage.push(usage(
+            AgentKind::ClaudeCode,
+            &skill_049,
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+
+        let recommendation = recommend(
+            &finding(&snapshot),
+            &snapshot,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        for skill_id in [&skill_049, &skill_050] {
+            assert_eq!(
+                recommendation
+                    .changes
+                    .iter()
+                    .filter(|change| &change.skill_id == skill_id)
+                    .map(|change| change.state.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                1
+            );
+        }
+
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let plan = crate::roster_plan::derive(&snapshot, &state, &recommendation.changes).unwrap();
+        assert!(!plan.operations.is_empty());
+        assert!(shared_root.join("skill-050").is_symlink());
+
+        let replacement_root = home.join(".replacement-skills");
+        fs::create_dir(&replacement_root).unwrap();
+        let claude_root = home.join(".claude/skills");
+        fs::remove_file(&claude_root).unwrap();
+        symlink(&replacement_root, &claude_root).unwrap();
+        let after_retarget = recommend(
+            &finding(&snapshot),
+            &snapshot,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_retarget.changes).unwrap(),
+            serde_json::to_value(&recommendation.changes).unwrap()
+        );
+        assert!(
+            crate::roster_plan::derive(&snapshot, &state, &after_retarget.changes).is_err(),
+            "Plan must independently reject current filesystem drift"
+        );
+    }
+
     fn oversized_scan(count: usize) -> ScanResult {
         let skills = (0..count)
             .map(|index| ScannedSkill {
@@ -764,11 +1288,66 @@ mod tests {
                 declared_name_matches_directory: Some(true),
             })
             .collect();
-        ScanResult {
+        let mut scan = ScanResult {
             skills,
             placements,
             ..ScanResult::default()
+        };
+        scan.freeze_observed_physical_mutation_paths();
+        scan
+    }
+
+    fn shared_oversized_scan(count: usize) -> ScanResult {
+        let mut scan = oversized_scan(count);
+        for placement in &mut scan.placements {
+            placement.physical_directory = Some(PathBuf::from(format!(
+                "/tmp/home/.shared/{}",
+                placement.skill_id
+            )));
         }
+        let claude = scan
+            .placements
+            .iter()
+            .cloned()
+            .map(|mut placement| {
+                placement.id = format!("claude_{}", placement.id);
+                placement.agent = Some(AgentKind::ClaudeCode);
+                placement.root = PathBuf::from("/tmp/home/.claude/skills");
+                placement.directory = placement.root.join(&placement.skill_id);
+                placement.entrypoint = placement.directory.join("SKILL.md");
+                placement
+            })
+            .collect::<Vec<_>>();
+        scan.placements.extend(claude);
+        scan.freeze_observed_physical_mutation_paths();
+        scan
+    }
+
+    fn two_component_shared_scan(count: usize) -> ScanResult {
+        let mut scan = shared_oversized_scan(count);
+        let source = scan
+            .placements
+            .iter()
+            .filter(|placement| placement.agent == Some(AgentKind::Codex))
+            .cloned()
+            .collect::<Vec<_>>();
+        for agent in [AgentKind::Hermes, AgentKind::Cursor] {
+            scan.placements
+                .extend(source.iter().cloned().map(|mut placement| {
+                    placement.id = format!("{}_{}", agent.id(), placement.id);
+                    placement.agent = Some(agent);
+                    placement.root = PathBuf::from(format!("/tmp/home/.{}/skills", agent.id()));
+                    placement.directory = placement.root.join(&placement.skill_id);
+                    placement.entrypoint = placement.directory.join("SKILL.md");
+                    placement.physical_directory = Some(PathBuf::from(format!(
+                        "/tmp/home/.other-shared/{}",
+                        placement.skill_id
+                    )));
+                    placement
+                }));
+        }
+        scan.freeze_observed_physical_mutation_paths();
+        scan
     }
 
     fn usage(
@@ -791,6 +1370,15 @@ mod tests {
     }
 
     fn finding(scan: &ScanResult) -> FindingRecord {
+        let mut counts = BTreeMap::new();
+        for agent in scan
+            .placements
+            .iter()
+            .filter(|placement| placement.default_exposed)
+            .filter_map(|placement| placement.agent)
+        {
+            *counts.entry(agent).or_insert(0_usize) += 1;
+        }
         FindingRecord {
             id: FindingId::parse("finding_large-roster").unwrap(),
             report_id: ReportId::parse("report_large-roster").unwrap(),
@@ -802,6 +1390,13 @@ mod tests {
                 "affected_placement_ids": scan
                     .placements
                     .iter()
+                    .filter(|placement| placement.default_exposed)
+                    .filter(|placement| {
+                        placement
+                            .agent
+                            .and_then(|agent| counts.get(&agent))
+                            .is_some_and(|count| *count > MAX_CORE_BUDGET)
+                    })
                     .map(|placement| placement.id.as_str())
                     .collect::<Vec<_>>()
             }),

@@ -73,6 +73,14 @@ with `--full`. Only after the user confirms a full choice with
 `plan_request_template_available: true` may you replay its exact Plan request.
 That choice keeps the blocked Skills Core while mutable placements are
 right-sized; it never makes provider or durable-read-only placements mutable.
+When a selection reason is `shared_physical_forced_core`, explain that several
+Agent placements share one physical Skill. It is a consistency constraint, not
+usage evidence for every Agent. Trust the reconciled Core counts. If Plan
+returns `roster_shared_core_budget_exceeded`, ask for a higher budget or fewer
+forced Core Skills; do not submit incompatible direct states to bypass it.
+If Report or Plan returns `roster_physical_identity_rescan_required`, run the
+provided read-only Scan action. Never reconstruct the missing Snapshot fact
+from current paths.
 
 For an escaping Skill link, show the observed target, obtain confirmation, and
 choose exactly one typed `permission_paths` continuation:

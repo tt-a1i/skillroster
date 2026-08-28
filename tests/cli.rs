@@ -8560,6 +8560,136 @@ fn large_roster_plan_uses_exact_cross_agent_usage_before_fallback() {
 }
 
 #[test]
+fn legacy_large_roster_snapshot_requests_a_typed_physical_identity_rescan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for index in 0..51 {
+        let skill = root.join(format!("skill-{index:03}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "large_default_roster")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+        let encoded: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut payload: Value = serde_json::from_str(&encoded).unwrap();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_physical_mutation_paths");
+        database
+            .execute(
+                "UPDATE scan_payloads SET payload_json = ?1",
+                rusqlite::params![payload.to_string()],
+            )
+            .unwrap();
+    }
+
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", &finding_id, "--full"]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], false);
+    assert_eq!(
+        planning["reason"],
+        "physical_mutation_identity_rescan_required"
+    );
+    assert_eq!(
+        planning["reason_code"],
+        "snapshot_missing_physical_mutation_identity"
+    );
+    assert_eq!(planning["next_action"], "scan");
+    assert_eq!(planning["action"]["action"], "scan");
+    assert_eq!(
+        planning["action"]["reason_code"],
+        "snapshot_missing_physical_mutation_identity"
+    );
+    assert_eq!(
+        planning["action"]["argv"],
+        json!([
+            "skillroster",
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "scan",
+            "--summary",
+            "--json"
+        ])
+    );
+
+    let request = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["code"],
+        "roster_physical_identity_rescan_required"
+    );
+    assert_eq!(blocked["error"]["details"]["next_action"], "scan");
+    assert_eq!(blocked["suggested_actions"][0]["action"], "scan");
+    assert_eq!(
+        blocked["suggested_actions"][0]["reason_code"],
+        "snapshot_missing_physical_mutation_identity"
+    );
+    assert_eq!(
+        blocked["suggested_actions"][0]["argv"],
+        planning["action"]["argv"]
+    );
+
+    let replay_argv = planning["action"]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    let replay = json_output(&run(&replay_argv, None));
+    assert_eq!(replay["ok"], true);
+}
+
+#[test]
 #[cfg(unix)]
 fn roster_plan_keeps_summary_detail_and_confirmation_scope_consistent() {
     let temp = TempDir::new().unwrap();

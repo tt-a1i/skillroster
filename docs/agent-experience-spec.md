@@ -118,6 +118,15 @@ present a `protect_blocked_skills_as_core` Plan template when
 `plan_request_template_available` is true, and require user confirmation
 before replaying it. This keeps read-only Skills unchanged; it does not make
 their placements mutable.
+Large-Roster selection may report `shared_physical_forced_core` when multiple
+Agent roots expose one physical Skill. Treat that as a filesystem consistency
+constraint, not evidence that every named Agent used the Skill. The final
+per-Agent Core counts already include this reconciliation. A typed
+`roster_shared_core_budget_exceeded` requires a new budget or fewer forced Core
+choices; never bypass it with divergent direct Roster changes.
+`roster_physical_identity_rescan_required` means the latest legacy Snapshot
+does not contain the immutable physical identity needed for selection. Run its
+typed read-only Scan action; do not infer identity from current paths.
 When `planning.reason` is `trusted_canonical_sources_required`, follow its
 same-Report/Snapshot `source_confirmation_finding` reference through the
 read-only `view_source_confirmation_finding` action when available. The

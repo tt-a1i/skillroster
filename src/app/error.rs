@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::{action, snapshot_rescan_action};
+use super::{action, physical_identity_rescan_action, snapshot_rescan_action};
 use crate::action_context::ActionContext;
 use crate::model::{ApiError, FindingId, JsonEnvelope, PlanId, ReceiptId, ScanId};
 use crate::scan;
@@ -104,6 +104,31 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(required) =
+        error.downcast_ref::<crate::roster_recommendation::PhysicalMutationIdentityRescanRequired>()
+    {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "roster_physical_identity_rescan_required".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids: vec![required.placement_id.clone()],
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "snapshot_missing_physical_mutation_identity",
+                    "placement_id": required.placement_id,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![physical_identity_rescan_action()];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(required) = error.downcast_ref::<SnapshotRescanRequired>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -618,6 +643,22 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "agents": conflict.agents,
                 "files_changed": false,
                 "next_action": "request_consistent_exposure_or_separate_shared_roots"
+            })),
+        };
+    }
+    if let Some(exceeded) =
+        error.downcast_ref::<crate::roster_recommendation::SharedPhysicalCoreBudgetExceeded>()
+    {
+        return ClassifiedError {
+            code: "roster_shared_core_budget_exceeded",
+            retryable: false,
+            details: Some(json!({
+                "reason": "shared_physical_forced_core_exceeds_budget",
+                "agent": exceeded.agent.id(),
+                "core_count": exceeded.core_count,
+                "core_budget": exceeded.core_budget,
+                "files_changed": false,
+                "next_action": "raise_core_budget_or_reduce_forced_core_skills"
             })),
         };
     }

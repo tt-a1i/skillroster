@@ -238,6 +238,15 @@ impl SkillPlacement {
             .unwrap_or(&self.directory)
     }
 
+    pub(crate) fn current_physical_mutation_path(&self) -> PathBuf {
+        if fs::symlink_metadata(&self.directory)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return physical_entry_path(&self.directory);
+        }
+        self.physical_directory_or_logical().to_path_buf()
+    }
+
     pub fn validated_physical_directory(
         &self,
     ) -> std::result::Result<PathBuf, PhysicalDirectoryDrift> {
@@ -261,6 +270,18 @@ impl SkillPlacement {
         }
         Ok(expected)
     }
+}
+
+pub(crate) fn physical_entry_path(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    fs::canonicalize(parent)
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(name)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -446,6 +467,11 @@ pub struct ScanResult {
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
     pub placements: Vec<SkillPlacement>,
+    /// Physical mutation identities frozen while this Snapshot was scanned.
+    /// Recommendation consumes only these immutable facts; Plan independently
+    /// revalidates current filesystem identities before deriving operations.
+    #[serde(default)]
+    pub observed_physical_mutation_paths: BTreeMap<String, PathBuf>,
     pub usage: Vec<UsageEvidence>,
     pub coverage: Vec<SessionCoverage>,
     pub warnings: Vec<String>,
@@ -468,6 +494,32 @@ pub struct ScanResult {
     /// drift, even if a later path check appears active again.
     #[serde(default)]
     pub durable_read_drifted_permission_ids: BTreeSet<String>,
+}
+
+impl ScanResult {
+    pub(crate) fn observed_physical_mutation_path(
+        &self,
+        placement: &SkillPlacement,
+    ) -> Option<&Path> {
+        self.observed_physical_mutation_paths
+            .get(&placement.id)
+            .map(PathBuf::as_path)
+    }
+
+    pub(crate) fn freeze_observed_physical_mutation_paths(&mut self) {
+        self.observed_physical_mutation_paths = self
+            .placements
+            .iter()
+            .map(|placement| {
+                let path = if placement.link_status != LinkStatus::NotLink {
+                    physical_entry_path(&placement.directory)
+                } else {
+                    placement.physical_directory_or_logical().to_path_buf()
+                };
+                (placement.id.clone(), path)
+            })
+            .collect();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1068,6 +1120,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         &confirmed_source_roots,
         &mut result,
     );
+    result.freeze_observed_physical_mutation_paths();
 
     if options.include_session_evidence {
         for roots in &known {
