@@ -45,10 +45,18 @@ receipt_id="$(printf '%s' "$apply" | sed -n 's/.*"receipt_id":"\([^"]*\)".*/\1/p
 }
 
 undo="$(run_json undo "$receipt_id")"
-[[ "$undo" == *'"verification":"passed"'* && ! -e "$skill_root/skillroster" ]] || {
-  echo "release Undo did not restore the synthetic Agent root" >&2
+[[ "$undo" == *'"verification":"passed"'* ]] || {
+  echo "release Undo receipt did not report verification passed: $undo" >&2
   exit 1
 }
+if [[ -e "$skill_root/skillroster" || -L "$skill_root/skillroster" ]]; then
+  echo "release Undo left the synthetic bootstrap path in place" >&2
+  # The fixture is generated entirely by this script, so bounded metadata is
+  # safe to print and makes cross-runtime release failures actionable.
+  ls -ld "$skill_root/skillroster" >&2 || true
+  find "$skill_root/skillroster" -print 2>&1 | head -n 50 >&2 || true
+  exit 1
+fi
 
 status="$(run_json status)"
 [[ "$status" == *'"recovery_state":"clear"'* ]] || {
