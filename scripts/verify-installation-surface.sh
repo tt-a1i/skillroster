@@ -46,7 +46,7 @@ require_literal "$installation" "The current public release is **v${published_ve
 require_literal "$installation" "SKILLROSTER_VERSION=${published_version}"
 require_literal "$installation" "--tag v${published_version} skillroster"
 require_literal "$installation" "Published CLI v${published_version} bundles Bootstrap content version ${published_version}."
-require_literal "$installation" "source-tree candidate is **v${candidate_version}**"
+require_literal "$installation" "The source tree is **v${candidate_version}**."
 require_literal "$installation" "Its bundled Bootstrap content version is ${bootstrap_version}."
 
 require_literal "$website" "CURRENT RELEASE v${published_version}"
