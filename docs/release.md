@@ -18,7 +18,7 @@ other user data.
 4. Download all four workflow artifacts and verify every adjacent `.sha256`
    file. The workflow smoke-tests `skillroster --version` and a fixture-backed
    Plan/Apply/Undo cycle on each operating system, then runs the Linux archive
-   inside checksum-pinned Ubuntu WSL. Unix packaging also runs the staged
+   inside checksum-pinned Ubuntu WSL2. Unix packaging also runs the staged
    archive binary through the synthetic retained-ID collision regression before
    the archive is created. Review all five successful jobs.
 

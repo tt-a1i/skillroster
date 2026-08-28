@@ -9,6 +9,10 @@ candidate before publication; candidate identity is not an installable tag.
 The examples below deliberately remain on the public release until its Formula,
 tag, archives, and checksums are all available.
 
+WSL users need WSL2 and should use the Linux archive. WSL1 lacks the atomic
+no-replace rename primitive required for safe Apply and Undo, so mutation fails
+closed there instead of falling back to a race-prone path operation.
+
 ## GitHub Release binaries
 
 Download the archive and matching `.sha256` file for your platform from the

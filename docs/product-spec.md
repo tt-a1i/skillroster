@@ -26,7 +26,11 @@ The first complete release directly supports:
 - Gemini CLI
 - GitHub Copilot
 
-Supported platforms are macOS, Linux, and Windows. WSL is treated as Linux. A platform or Agent is not declared supported until its adapter passes fixtures and a real-environment acceptance run.
+Supported platforms are macOS, Linux, and Windows. WSL2 is treated as Linux;
+WSL1 mutation fails closed because it does not provide the no-replace rename
+primitive required by SkillRoster's handle-bound recovery model. A platform or
+Agent is not declared supported until its adapter passes fixtures and a
+real-environment acceptance run.
 
 SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
 

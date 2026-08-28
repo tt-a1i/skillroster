@@ -636,6 +636,9 @@ fn apply_locked_with_anchored(
     run_before_sequence_validation_hook();
     validate_operation_sequence_anchored(&plan.operations, &anchored)?;
     reject_unresolved_recovery_except(&anchored, &plan.state_dir, "")?;
+    anchored
+        .require_atomic_noreplace_rename()
+        .map_err(|error| ChangeError::io("validate mutation filesystem", &plan.state_dir, error))?;
 
     let receipt_id = format!("receipt_{}", ulid::Ulid::new());
     let mut receipt = ChangeReceipt {
@@ -826,6 +829,11 @@ fn undo_locked_with_anchored(
         ));
     }
     reject_unresolved_recovery_except(&anchored, &receipt.state_dir, &receipt.id)?;
+    anchored
+        .require_atomic_noreplace_rename()
+        .map_err(|error| {
+            ChangeError::io("validate mutation filesystem", &receipt.state_dir, error)
+        })?;
     if reverse_receipt_exists(&anchored, &receipt.state_dir, &receipt.id)? {
         return Err(ChangeError::new(
             "receipt_already_undone",
@@ -3292,6 +3300,25 @@ mod tests {
         assert_eq!(error.code, "filesystem_error");
         assert!(directory_sync.failed.get());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn unsupported_atomic_rename_is_rejected_before_mutation_or_receipt() {
+        let (_temp, root, state) = fixture();
+        let target = root.join("not-created.md");
+        let plan = prepared_write(&root, &state, &target);
+        crate::anchored_fs::force_atomic_noreplace_unsupported_once();
+
+        let error = apply(&plan).unwrap_err();
+
+        assert_eq!(error.code, "filesystem_error");
+        assert!(
+            error
+                .message
+                .contains("atomic no-replace rename is unavailable")
+        );
+        assert!(!target.exists());
+        assert!(!state.join("receipts").exists());
     }
 
     #[test]
