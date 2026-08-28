@@ -36,6 +36,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           bash scripts/verify-readme-value.sh
+          bash scripts/verify-installation-surface.sh
           bash scripts/ci-change-scope.sh --self-test
           full=true
           if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
