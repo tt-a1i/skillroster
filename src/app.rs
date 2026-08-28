@@ -116,14 +116,15 @@ pub fn run(cli: Cli) -> Result<Output> {
 
     let (command, mut result, warnings, mut actions) = match cli.command {
         None => {
-            let status = status_result(&store, &database_path, &state_dir)?;
-            let actions = status_actions(&status);
-            let result = home_result(&status, actions.first());
+            let readiness = readiness_decision(&store, &state_dir)?;
+            let actions = readiness.continuation.clone().into_iter().collect();
+            let result = home_result(&readiness);
             ("home", result, vec![], actions)
         }
         Some(Command::Status) => {
-            let result = status_result(&store, &database_path, &state_dir)?;
-            let actions = status_actions(&result);
+            let readiness = readiness_decision(&store, &state_dir)?;
+            let actions = readiness.continuation.clone().into_iter().collect();
+            let result = status_result(&store, &database_path, &state_dir, &readiness)?;
             ("status", result, vec![], actions)
         }
         Some(Command::SourceRoot(args)) => match args.command {
@@ -696,87 +697,157 @@ fn parse_agent_kind(value: &str) -> Result<AgentKind> {
         .ok_or_else(|| anyhow!("unsupported Agent: {value}"))
 }
 
-fn home_result(status: &Value, next_action: Option<&SuggestedAction>) -> Value {
-    let state = match next_action.map(|action| action.reason_code.as_str()) {
-        Some("recovery_required") => "recovery_required",
-        Some("snapshot_required") => "no_snapshot",
-        Some("verified_mutation_requires_rescan") => "rescan_required",
-        Some("pending_plan_requires_review") => "plan_ready",
-        Some(_) | None => "ready",
-    };
-    json!({
-        "state": state,
-        "snapshot_state": status["snapshot_state"],
-        "latest_snapshot_id": status["latest_snapshot_id"],
-        "snapshot_invalidated_by_receipt_id": status["snapshot_invalidated_by_receipt_id"],
-        "pending_plan_count": status["pending_plan_count"],
-        "recovery_state": status["recovery_state"],
-        "files_changed": false
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotState {
+    Missing,
+    Current,
+    RescanRequired,
 }
 
-fn status_actions(result: &Value) -> Vec<SuggestedAction> {
-    if result["recovery_state"] == "required" {
-        vec![action(
-            "inspect_recovery",
-            &["lifecycle", "recovery", "--json"],
-            false,
-            false,
-            "recovery_required",
-        )]
-    } else if result["latest_snapshot_id"].is_null() {
-        vec![action(
-            "scan",
-            &["scan", "--summary", "--json"],
-            false,
-            false,
-            "snapshot_required",
-        )]
-    } else if result["snapshot_state"] == "rescan_required" {
-        vec![snapshot_rescan_action()]
-    } else if let Some(plan_id) = result["pending_plans"]
-        .as_array()
-        .and_then(|plans| plans.first())
-        .and_then(|plan| plan["plan_id"].as_str())
-    {
-        vec![action(
-            "inspect_pending_plan",
-            &["plan", "--show", plan_id, "--json"],
-            false,
-            false,
-            "pending_plan_requires_review",
-        )]
-    } else {
-        Vec::new()
+impl SnapshotState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Current => "current",
+            Self::RescanRequired => "rescan_required",
+        }
     }
 }
 
-fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> Result<Value> {
-    let latest = store.latest_completed_scan()?;
-    let latest_scan_id = latest.as_ref().map(|scan| &scan.id);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadinessState {
+    RecoveryRequired,
+    NoSnapshot,
+    RescanRequired,
+    PlanReady,
+    Ready,
+}
+
+impl ReadinessState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RecoveryRequired => "recovery_required",
+            Self::NoSnapshot => "no_snapshot",
+            Self::RescanRequired => "rescan_required",
+            Self::PlanReady => "plan_ready",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+struct ReadinessDecision {
+    state: ReadinessState,
+    snapshot_state: SnapshotState,
+    latest_snapshot: Option<ScanRun>,
+    invalidating_receipt_id: Option<ReceiptId>,
+    pending_plan_count: usize,
+    pending_plans: Vec<PlanRecord>,
+    recovery_required: bool,
+    journal_issues: Vec<Value>,
+    continuation: Option<SuggestedAction>,
+}
+
+fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessDecision> {
+    let latest_snapshot = store.latest_completed_scan()?;
+    let latest_scan_id = latest_snapshot.as_ref().map(|scan| &scan.id);
     let invalidating_receipt_id = latest_scan_id
         .map(|scan_id| store.snapshot_invalidating_receipt(scan_id))
         .transpose()?
         .flatten();
     let snapshot_state = if latest_scan_id.is_none() {
-        "missing"
+        SnapshotState::Missing
     } else if invalidating_receipt_id.is_some() {
-        "rescan_required"
+        SnapshotState::RescanRequired
     } else {
-        "current"
+        SnapshotState::Current
     };
-    let actionable_scan_id = (snapshot_state == "current")
+    let actionable_scan_id = (snapshot_state == SnapshotState::Current)
         .then_some(latest_scan_id)
         .flatten();
     let (pending_plan_count, pending_plans) =
         store.pending_plans(actionable_scan_id, STATUS_PENDING_PLAN_LIMIT)?;
-    let pending_plans = pending_plans
-        .into_iter()
+    let journal_issues = journal_issues(store, state_dir)?;
+    let recovery_required = store.recovery_required()? || !journal_issues.is_empty();
+    let (state, continuation) = if recovery_required {
+        (
+            ReadinessState::RecoveryRequired,
+            Some(action(
+                "inspect_recovery",
+                &["lifecycle", "recovery", "--json"],
+                false,
+                false,
+                "recovery_required",
+            )),
+        )
+    } else if snapshot_state == SnapshotState::Missing {
+        (
+            ReadinessState::NoSnapshot,
+            Some(action(
+                "scan",
+                &["scan", "--summary", "--json"],
+                false,
+                false,
+                "snapshot_required",
+            )),
+        )
+    } else if snapshot_state == SnapshotState::RescanRequired {
+        (
+            ReadinessState::RescanRequired,
+            Some(snapshot_rescan_action()),
+        )
+    } else if let Some(plan) = pending_plans.first() {
+        (
+            ReadinessState::PlanReady,
+            Some(action(
+                "inspect_pending_plan",
+                &["plan", "--show", plan.id.as_str(), "--json"],
+                false,
+                false,
+                "pending_plan_requires_review",
+            )),
+        )
+    } else {
+        (ReadinessState::Ready, None)
+    };
+    Ok(ReadinessDecision {
+        state,
+        snapshot_state,
+        latest_snapshot,
+        invalidating_receipt_id,
+        pending_plan_count,
+        pending_plans,
+        recovery_required,
+        journal_issues,
+        continuation,
+    })
+}
+
+fn home_result(readiness: &ReadinessDecision) -> Value {
+    json!({
+        "state": readiness.state.as_str(),
+        "snapshot_state": readiness.snapshot_state.as_str(),
+        "latest_snapshot_id": readiness.latest_snapshot.as_ref().map(|scan| scan.id.to_string()),
+        "snapshot_invalidated_by_receipt_id": &readiness.invalidating_receipt_id,
+        "pending_plan_count": readiness.pending_plan_count,
+        "recovery_state": if readiness.recovery_required { "required" } else { "clear" },
+        "files_changed": false
+    })
+}
+
+fn status_result(
+    store: &StateStore,
+    database_path: &Path,
+    state_dir: &Path,
+    readiness: &ReadinessDecision,
+) -> Result<Value> {
+    let pending_plans = readiness
+        .pending_plans
+        .iter()
         .map(|plan| {
             json!({
-                "plan_id": plan.id,
-                "snapshot_id": plan.scan_id,
-                "status": plan.status,
+                "plan_id": &plan.id,
+                "snapshot_id": &plan.scan_id,
+                "status": &plan.status,
                 "created_at": plan.created_at,
             })
         })
@@ -793,17 +864,17 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
     Ok(json!({
         "database_path": database_path,
         "schema_version": store.schema_version()?,
-        "latest_snapshot_id": latest.as_ref().map(|scan| scan.id.to_string()),
-        "latest_snapshot_at": latest.as_ref().and_then(|scan| scan.completed_at),
-        "snapshot_state": snapshot_state,
-        "snapshot_invalidated_by_receipt_id": invalidating_receipt_id,
-        "pending_plan_count": pending_plan_count,
+        "latest_snapshot_id": readiness.latest_snapshot.as_ref().map(|scan| scan.id.to_string()),
+        "latest_snapshot_at": readiness.latest_snapshot.as_ref().and_then(|scan| scan.completed_at),
+        "snapshot_state": readiness.snapshot_state.as_str(),
+        "snapshot_invalidated_by_receipt_id": &readiness.invalidating_receipt_id,
+        "pending_plan_count": readiness.pending_plan_count,
         "pending_plans_returned": pending_plans.len(),
-        "pending_plans_truncated": pending_plan_count > pending_plans.len(),
+        "pending_plans_truncated": readiness.pending_plan_count > pending_plans.len(),
         "pending_plans": pending_plans,
         "last_receipt": last_receipt,
-        "recovery_state": recovery_text(store, state_dir)?,
-        "journal_issues": journal_issues(store, state_dir)?,
+        "recovery_state": if readiness.recovery_required { "required" } else { "clear" },
+        "journal_issues": &readiness.journal_issues,
         "retention": {
             "raw_usage_days": 180,
             "older_usage": "monthly_aggregates_retained",

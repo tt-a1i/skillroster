@@ -36,6 +36,51 @@ fn run(args: &[&str], stdin: Option<&str>) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_with_columns(args: &[&str], columns: usize) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_skillroster"))
+        .args(args)
+        .env("COLUMNS", columns.to_string())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap()
+}
+
+fn continuation_argv(output: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    let mut current = None::<String>;
+    let mut in_continuation = false;
+    for line in output.lines() {
+        if line == "Continue argv:" {
+            in_continuation = true;
+            continue;
+        }
+        if !in_continuation || line.trim().is_empty() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let payload = if let Some(close) = trimmed
+            .strip_prefix('[')
+            .and_then(|line| line.find(']').map(|close| (line, close)))
+        {
+            if let Some(argument) = current.take() {
+                argv.push(argument);
+            }
+            close.0[close.1 + 1..].trim_start()
+        } else if trimmed.starts_with('"') {
+            trimmed
+        } else {
+            break;
+        };
+        let chunk = payload.strip_suffix(" +").unwrap_or(payload);
+        let decoded: String = serde_json::from_str(chunk).unwrap();
+        current.get_or_insert_with(String::new).push_str(&decoded);
+    }
+    if let Some(argument) = current {
+        argv.push(argument);
+    }
+    argv
+}
+
 #[cfg(unix)]
 fn run_with_umask(args: &[&str], umask: libc::mode_t) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_skillroster"));
@@ -849,19 +894,26 @@ fn home_and_status_share_the_missing_snapshot_scan_continuation() {
         false
     );
 
-    let human = run(
+    let human = run_with_columns(
         &[
             "--home",
             home.to_str().unwrap(),
             "--state-dir",
             state.to_str().unwrap(),
         ],
-        None,
+        60,
     );
     assert!(human.status.success());
     let human = String::from_utf8(human.stdout).unwrap();
-    assert!(human.contains(&serde_json::to_string(&expected).unwrap()));
-    let human_status = run(
+    let expected_argv = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|argument| argument.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(continuation_argv(&human), expected_argv);
+    assert!(human.lines().all(|line| line.chars().count() <= 60));
+    let human_status = run_with_columns(
         &[
             "--home",
             home.to_str().unwrap(),
@@ -869,11 +921,15 @@ fn home_and_status_share_the_missing_snapshot_scan_continuation() {
             state.to_str().unwrap(),
             "status",
         ],
-        None,
+        60,
     );
     assert!(human_status.status.success());
     let human_status = String::from_utf8(human_status.stdout).unwrap();
-    assert!(human_status.contains(&serde_json::to_string(&expected).unwrap()));
+    assert_eq!(continuation_argv(&human_status), expected_argv);
+    assert!(
+        human_status.lines().all(|line| line.chars().count() <= 60),
+        "line exceeded 60 columns:\n{human_status}"
+    );
 }
 
 #[test]
@@ -942,18 +998,29 @@ fn home_and_status_prioritize_recovery_over_an_invalidated_snapshot() {
         .concat(),
         None,
     ));
-    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
-    database
-        .execute(
-            "UPDATE receipts SET status = 'recovery_required' WHERE id = ?1",
-            [applied["result"]["receipt_id"].as_str().unwrap()],
-        )
-        .unwrap();
-    drop(database);
+    let applied_receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let applied_journal = state
+        .join("receipts")
+        .join(format!("{applied_receipt_id}.json"));
+    let mut orphan: Value = serde_json::from_slice(&fs::read(applied_journal).unwrap()).unwrap();
+    let orphan_id = "receipt_00000000000000000000000000";
+    orphan["id"] = json!(orphan_id);
+    orphan["status"] = json!("recovery_required");
+    fs::write(
+        state.join("receipts").join(format!("{orphan_id}.json")),
+        serde_json::to_vec_pretty(&orphan).unwrap(),
+    )
+    .unwrap();
 
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     let home_result = json_output(&run(&common, None));
     assert_eq!(home_result["result"]["state"], "recovery_required");
+    assert_eq!(home_result["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_receipt_id"],
+        applied_receipt_id
+    );
     assert_eq!(home_result["result"]["recovery_state"], "required");
     assert_eq!(
         home_result["suggested_actions"],
