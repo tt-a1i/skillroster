@@ -5,12 +5,13 @@
 </p>
 
 <p align="center">
-  <strong>One library. The right roster for every agent.</strong>
+  <strong>Stop giving every agent every Skill.</strong>
 </p>
 
 <p align="center">
-  Local-first Skill governance for AI agents.<br>
-  See what is installed, reduce default exposure, find the right Skill on demand, and make reversible changes.
+  SkillRoster inventories Skills scattered across your agents,<br>
+  keeps the right defaults for each one, and leaves the rest searchable on demand.<br>
+  File changes are previewed first and reversible afterward. One library. The right roster for every agent.
 </p>
 
 <p align="center">
@@ -31,18 +32,25 @@
 
 ---
 
-## Your agents do not need every Skill
+## More Skills should not mean more agent clutter
 
 Skills accumulate across Codex, Claude Code, Pi, OpenCode, Hermes, Cursor,
-Gemini CLI, and GitHub Copilot. Copies drift. Links break. Narrow Skills occupy
-every default context. Usage evidence gets mistaken for certainty.
+Gemini CLI, and GitHub Copilot. The same capability gets copied into several
+directories, versions drift, links break, and identical names hide different
+content. Narrow Skills stay in every default context, making the right capability
+harder to select.
 
-SkillRoster gives your agent a deterministic local CLI for understanding that
-estate before changing it.
+Manual cleanup is risky too. It is hard to distinguish unused Skills from Skills
+whose use was simply not observed, or to know whether a move, replacement, or
+deletion can be recovered. SkillRoster establishes local facts first, then lets
+the agent propose a Plan. It does not change agent files without that complete
+Plan and your confirmation.
 
-| See the whole estate | Right-size each Roster | Change without fear |
+| See clearly | Configure precisely | Change reversibly |
 | --- | --- | --- |
-| Inventory Skills, placements, links, sources, exposure, and bounded usage evidence. | Keep broadly useful Skills in Core and leave narrower ones searchable On-demand. | Preview immutable Plans, require confirmation, record Receipts, and Undo owned changes. |
+| Inventory Skills, placements, links, sources, exposure, and bounded usage evidence. | Keep the right Core Skills for each agent and leave narrower ones searchable On-demand. | Preview immutable Plans, require confirmation, record Receipts, and Undo owned changes. |
+
+> **Core value: turn a multi-agent Skill estate from invisible and uncontrolled into something you can see clearly, configure precisely, and change reversibly.**
 
 It is **not** another marketplace, model, or MCP server. The AI agent interprets
 your intent; SkillRoster supplies bounded facts and executes approved changes.

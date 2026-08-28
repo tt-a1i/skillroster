@@ -5,12 +5,13 @@
 </p>
 
 <p align="center">
-  <strong>一个 Library，为每个 Agent 配好合适的 Roster。</strong>
+  <strong>别把所有 Skill 都塞给每个 Agent。</strong>
 </p>
 
 <p align="center">
-  本地优先的 Agent Skill 治理工具。<br>
-  看清安装情况，缩小默认暴露，需要时找到正确的 Skill，并让每次变更都能撤销。
+  SkillRoster 统一盘点散落在不同 Agent 里的 Skills，<br>
+  为每个 Agent 保留合适的默认能力，其他能力按需查找；文件整理先预览，执行后可撤销。<br>
+  一个 Library，为每个 Agent 配好合适的 Roster。
 </p>
 
 <p align="center">
@@ -31,18 +32,22 @@
 
 ---
 
-## 你的 Agent 不需要看到所有 Skill
+## Skill 越装越多，Agent 不该越用越乱
 
 Codex、Claude Code、Pi、OpenCode、Hermes、Cursor、Gemini CLI 和 GitHub
-Copilot 用久了，Skill 会越装越多。副本会漂移，链接会失效，一些很少用到的
-Skill 仍占着每个 Agent 的默认上下文。更麻烦的是，零散的使用记录很容易被误读成
-确定结论。
+Copilot 用久了，Skill 会散落在不同目录：同一个能力到处复制，版本逐渐不一致，
+链接失效，名字相同但内容不同。与此同时，一些很少用到的 Skill 仍占着每个 Agent
+的默认上下文，真正需要的能力反而更难选中。
 
-SkillRoster 给 Agent 提供一个确定性的本地 CLI。先把情况查清楚，再谈怎么改。
+人工整理同样危险：你很难确定哪些正在使用、哪些只是没有观察到，也很难保证移动、
+替换或删除之后还能恢复。SkillRoster 先用确定性的本地 CLI 把事实查清楚，再让 Agent
+提出方案；没有完整 Plan 和用户确认，就不会修改 Agent 文件。
 
-| 看清现状 | 缩小每个 Roster | 可控变更 |
+| 看得清 | 配得准 | 改得回 |
 | --- | --- | --- |
-| 盘点 Skill、Placement、链接、来源、暴露范围和有边界的使用证据。 | 常用 Skill 留在 Core，较窄的能力转为可检索的 On-demand Skill。 | 先预览不可变 Plan，确认后执行，留下 Receipt，需要时 Undo。 |
+| 盘点 Skill、Placement、链接、来源、暴露范围和有边界的使用证据。 | 为每个 Agent 保留合适的 Core Skill，较窄的能力转为可检索的 On-demand Skill。 | 先预览不可变 Plan，确认后执行，留下 Receipt，需要时 Undo。 |
+
+> **核心价值：让多个 Agent 的 Skill 环境从不可见、不可控，变成看得清、配得准、改得回。**
 
 SkillRoster 不提供 Marketplace，也不调用模型或运行 MCP Server。AI Agent 负责理解
 你的意图；SkillRoster 负责返回有边界的事实，并执行已经批准的变更。
