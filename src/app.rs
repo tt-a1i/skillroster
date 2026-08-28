@@ -10067,6 +10067,7 @@ mod recovery_tests {
                 coverage_notes: Vec::new(),
             })
             .unwrap();
+        store.save_scan_payload(&scan_id, &json!({})).unwrap();
         let roster = source_reference_fixture_roster(&report_id);
         let escaping = source_reference_fixture_finding(
             "finding_197_source",
@@ -10118,6 +10119,7 @@ mod recovery_tests {
                 })
                 .unwrap();
         }
+        store.save_scan_payload(&scan_id, &json!({})).unwrap();
         let roster = source_reference_fixture_roster(&report_id);
         let first = source_reference_fixture_finding(
             "finding_197_source_a",
