@@ -233,9 +233,12 @@ Summary order and bind each stable Finding ID without implying Plan or Apply.
 
 Suggested action argv retains any effective `--state-dir`, `--home`, `--root`,
 and `--source-root` overrides so an Agent can execute the transition against
-the same local Snapshot and explicit read boundary. It never broadens read
-permission, endorses source content, or treats a suggested mutation as
-authorization.
+the same local Snapshot and explicit read boundary. A same-name load recovery
+also carries `--require-snapshot`; if a newer Scan appears before the action
+runs, Find fails closed and offers a read-only retry pinned to the latest
+observed Snapshot instead of silently switching the variant evidence. It never
+broadens read permission, endorses source content, or treats a suggested
+mutation as authorization.
 
 Suggested actions must represent a required or evidence-backed transition.
 Healthy `status` output with a completed Snapshot does not prescribe another
