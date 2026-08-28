@@ -958,7 +958,8 @@ fn home_and_status_resume_the_first_value_flow_until_the_current_report_exists()
         initial["suggested_actions"][0]["argv"],
         context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
-    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    let scan = json_output(&run_suggested_action(&initial["suggested_actions"][0]));
+    assert_eq!(scan["result"]["files_changed"], false);
 
     let resumed_home = json_output(&run(&common, None));
     let resumed_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
@@ -977,7 +978,12 @@ fn home_and_status_resume_the_first_value_flow_until_the_current_report_exists()
     assert_eq!(resumed_home["result"]["files_changed"], false);
     assert_eq!(resumed_status["result"]["files_changed"], false);
 
-    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let report = json_output(&run_suggested_action(&resumed_home["suggested_actions"][0]));
+    assert_eq!(
+        report["result"]["snapshot_id"],
+        scan["result"]["snapshot_id"]
+    );
+    assert_eq!(report["result"]["files_changed"], false);
     let complete = json_output(&run(&common, None));
     assert_eq!(complete["result"]["state"], "ready");
     assert_eq!(complete["suggested_actions"], json!([]));
