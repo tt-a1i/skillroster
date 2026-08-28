@@ -309,7 +309,10 @@ index. Without hints, Find uses one lexical channel. With hints, it ranks the
 original task and the task-plus-hints expansion independently, then applies
 deterministic reciprocal-rank fusion over a bounded candidate pool. The JSON
 `ranking_strategy`, `task_channel_rank`, and `augmented_channel_rank` facts make
-that decision inspectable. Rank position remains discriminating within these
+that decision inspectable. When the post-fusion protection rule moves the
+strongest original-task match, that exact match also carries
+`ranking_adjustments: ["protected_original_task_match"]`; unadjusted matches
+omit the field. Rank position remains discriminating within these
 small candidate pools: a high-ranked Agent hint match outranks weak lexical
 overlap that merely appears in both channels, while the strongest original-task
 match remains within the default top three when it has protectable evidence.

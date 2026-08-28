@@ -9,8 +9,12 @@ guess a Skill name.
 With a hint, require
 `ranking_strategy: task_hint_reciprocal_rank_fusion`. Use `task_channel_rank`
 and `augmented_channel_rank` to distinguish native task evidence from
-hint-expanded evidence. Retry at most once, only for an empty or wrong-domain
-result. Change only the hint; an English task may add one on its retry.
+hint-expanded evidence. A match with
+`ranking_adjustments: ["protected_original_task_match"]` was deliberately moved
+by the documented original-task protection rule after fusion; interpret its
+rank/score order through that adjustment. Retry at most once, only for an empty
+or wrong-domain result. Change only the hint; an English task may add one on its
+retry.
 
 When the blocker reason is `same_name_variants_ambiguous`, execute its returned
 read-only `inspect_same_name_variants` action. Do not reconstruct or rerun Find:
