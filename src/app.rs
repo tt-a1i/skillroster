@@ -5538,6 +5538,7 @@ fn plan_command(
         PlanOrigin::Agent,
         None,
         action_argv_prefix,
+        None,
     )
 }
 
@@ -5944,6 +5945,11 @@ enum PlanOrigin {
     BootstrapSetup,
     SourceUpdate,
     LibraryGovernance,
+}
+
+struct BootstrapPlanScope {
+    anchor_roots: Vec<PathBuf>,
+    missing_skill_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -7142,6 +7148,7 @@ fn prepare_plan(
     origin: PlanOrigin,
     reuse_identity: Option<Value>,
     action_argv_prefix: &[String],
+    bootstrap_scope: Option<&BootstrapPlanScope>,
 ) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
@@ -7196,6 +7203,11 @@ fn prepare_plan(
         &PrepareContext {
             approved_roots: {
                 let mut roots = approved_roots(&scan);
+                roots.extend(
+                    bootstrap_scope
+                        .into_iter()
+                        .flat_map(|scope| scope.anchor_roots.iter().cloned()),
+                );
                 roots.push(canonical_state_dir.join("library"));
                 roots.push(canonical_state_dir.join("plan-backups"));
                 roots
@@ -7204,7 +7216,11 @@ fn prepare_plan(
             operation_policy: match effective_origin {
                 PlanOrigin::Agent => OperationPolicy::GovernanceOnly,
                 PlanOrigin::RosterGovernance => OperationPolicy::LibraryGovernance,
-                PlanOrigin::BootstrapSetup => OperationPolicy::BootstrapSetup,
+                PlanOrigin::BootstrapSetup => OperationPolicy::BootstrapSetup {
+                    missing_skill_roots: bootstrap_scope
+                        .map(|scope| scope.missing_skill_roots.clone())
+                        .unwrap_or_default(),
+                },
                 PlanOrigin::SourceUpdate => OperationPolicy::SourceUpdate,
                 PlanOrigin::LibraryGovernance => OperationPolicy::LibraryGovernance,
             },
@@ -7892,7 +7908,7 @@ fn setup_command_with_manifests<'a>(
 ) -> Result<Value> {
     let bootstrap_content_version = content_version()
         .context("bundled Bootstrap Skill is missing metadata.bootstrap-version")?;
-    let Some(snapshot) = store.latest_completed_scan()? else {
+    let Some((snapshot_id, snapshot)) = store.latest_scan_payload::<ScanResult>()? else {
         return Ok(json!({
             "detected_agents": [],
             "targets": [],
@@ -7927,17 +7943,57 @@ fn setup_command_with_manifests<'a>(
     let mut physical_targets = BTreeSet::new();
     let mut planned_directories = BTreeSet::new();
     let mut planned_files = BTreeSet::new();
+    let mut bootstrap_anchor_roots = BTreeSet::new();
+    let mut bootstrap_missing_skill_roots = BTreeSet::new();
+    let physical_home = std::fs::canonicalize(home)
+        .with_context(|| format!("failed to resolve Home {}", home.display()))?;
+    let session_detected_agents = snapshot
+        .roots
+        .iter()
+        .filter(|root| root.kind == RootKind::Sessions && root.status == scan::RootStatus::Included)
+        .filter_map(|root| root.agent)
+        .collect::<BTreeSet<_>>();
     for roots in harness::known_agent_roots(home) {
-        for root in roots.skill_roots.into_iter().filter(|path| path.is_dir()) {
+        let agent = roots.agent;
+        let detected_by_session = session_detected_agents.contains(&agent);
+        let skill_roots = roots
+            .skill_roots
+            .into_iter()
+            .filter_map(|root| {
+                if root.is_dir() {
+                    return Some((root, "existing_skill_root"));
+                }
+                let missing = std::fs::symlink_metadata(&root)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+                (detected_by_session && missing).then_some((root, "included_session_root"))
+            })
+            .collect::<Vec<_>>();
+        for (root, detection_basis) in skill_roots {
             let directory = root.join("skillroster");
             let entrypoint = directory.join("SKILL.md");
-            let physical_root = std::fs::canonicalize(&root).with_context(|| {
-                format!("failed to resolve Agent Skill root {}", root.display())
-            })?;
+            let root_missing = !root.exists();
+            let physical_root = if root_missing {
+                let relative = root.strip_prefix(home).with_context(|| {
+                    format!("Agent Skill root {} is outside Home", root.display())
+                })?;
+                bootstrap_anchor_roots.insert(home.to_path_buf());
+                physical_home.join(relative)
+            } else {
+                std::fs::canonicalize(&root).with_context(|| {
+                    format!("failed to resolve Agent Skill root {}", root.display())
+                })?
+            };
             let physical_directory = physical_root.join("skillroster");
             let physical_entrypoint = physical_directory.join("SKILL.md");
             physical_targets.insert(physical_directory.clone());
-            detected.push(json!({"agent": roots.agent.id(), "target": entrypoint}));
+            if root_missing {
+                bootstrap_missing_skill_roots.insert(physical_root.clone());
+            }
+            detected.push(json!({
+                "agent": agent.id(),
+                "detection_basis": detection_basis,
+                "target": entrypoint
+            }));
             let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -8010,6 +8066,34 @@ fn setup_command_with_manifests<'a>(
                 || (package_status == "modified"
                     && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
             if should_install {
+                if root_missing {
+                    let mut missing_directories = Vec::new();
+                    let mut cursor = Some(root.as_path());
+                    while let Some(path) = cursor {
+                        if path.exists() {
+                            break;
+                        }
+                        if path == home {
+                            break;
+                        }
+                        missing_directories.push(path.to_path_buf());
+                        cursor = path.parent();
+                    }
+                    missing_directories.reverse();
+                    for target in missing_directories {
+                        let relative = target.strip_prefix(home).with_context(|| {
+                            format!("Bootstrap target {} is outside Home", target.display())
+                        })?;
+                        let physical_target = physical_home.join(relative);
+                        if planned_directories.insert(physical_target) {
+                            operations.push(json!({
+                                "kind": "create_directory",
+                                "target": target,
+                                "expected_fingerprint": "missing"
+                            }));
+                        }
+                    }
+                }
                 if package_missing && planned_directories.insert(physical_directory.clone()) {
                     operations.push(json!({
                         "kind": "create_directory",
@@ -8053,7 +8137,8 @@ fn setup_command_with_manifests<'a>(
                 }
             }
             targets.push(json!({
-                "agent": roots.agent.id(),
+                "agent": agent.id(),
+                "detection_basis": detection_basis,
                 "target": entrypoint,
                 "physical_target": physical_entrypoint,
                 "status": package_status,
@@ -8118,10 +8203,14 @@ fn setup_command_with_manifests<'a>(
         });
         return Ok(result);
     }
+    let bootstrap_scope = BootstrapPlanScope {
+        anchor_roots: bootstrap_anchor_roots.into_iter().collect(),
+        missing_skill_roots: bootstrap_missing_skill_roots.into_iter().collect(),
+    };
     let plan = prepare_plan(
         store,
         state_dir,
-        json!({"schema_version": 1, "scan_id": snapshot.id, "operations": operations}),
+        json!({"schema_version": 1, "scan_id": snapshot_id, "operations": operations}),
         PlanOrigin::BootstrapSetup,
         Some(json!({
             "modified_choice": match modified_choice {
@@ -8131,6 +8220,7 @@ fn setup_command_with_manifests<'a>(
             }
         })),
         &[],
+        Some(&bootstrap_scope),
     )?;
     let operation_count = plan["change_summary"]["operation_count"]
         .as_u64()

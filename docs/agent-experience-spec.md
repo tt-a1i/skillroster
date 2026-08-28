@@ -56,6 +56,7 @@ The Agent selects one primary action from current state:
 | Applied | Show verification and Receipt | 完成 |
 | Undo available | Show reverse impact on request | 撤销上次应用 |
 | Recovery required | Stop unrelated writes | 处理恢复 |
+| Agent detected, first Skill root missing | Show the fixed Bootstrap creation Plan and read-only boundary | 安装 Bootstrap |
 | Bootstrap modified | Show affected targets and ask retain/adopt | 保留本地 or 采用当前版 |
 | Bootstrap target unsupported | Explain the preserved link/non-file | 检查目标 |
 
@@ -276,6 +277,17 @@ After a CLI upgrade, the Agent runs `setup`. Exact official older bootstrap
 content produces a recoverable upgrade Plan. Locally modified content produces
 no Plan until the person explicitly chooses retain or adopt; unsupported
 targets remain untouched.
+
+### First Bootstrap install
+
+When the current Snapshot includes a supported Agent's session root but its
+fixed Skill root is missing, `setup` returns a read-only creation Plan for that
+adapter only and names `included_session_root` as the detection basis. The
+Agent shows the fixed directory and four-file impact before asking for Apply.
+Apply returns a Receipt, and Undo removes the newly created package and empty
+parent directories without touching the observed session root. With no
+included Skill or session root, Setup remains `no_supported_agent` and does not
+invent an Agent installation.
 
 ### Partial Evidence
 

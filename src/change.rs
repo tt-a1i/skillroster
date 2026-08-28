@@ -123,10 +123,12 @@ pub struct PrepareContext {
     pub(crate) operation_policy: OperationPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OperationPolicy {
     GovernanceOnly,
-    BootstrapSetup,
+    BootstrapSetup {
+        missing_skill_roots: Vec<PathBuf>,
+    },
     SourceUpdate,
     LibraryGovernance,
     #[cfg(test)]
@@ -411,14 +413,14 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
             "a plan must contain a filesystem operation or Roster change",
         ));
     }
-    match ctx.operation_policy {
+    match &ctx.operation_policy {
         OperationPolicy::GovernanceOnly if !input.operations.is_empty() => {
             return Err(ChangeError::new(
                 "operations_not_declarative",
                 "Agent-authored Plans may request Roster state changes only; filesystem operations are derived by trusted SkillRoster workflows",
             ));
         }
-        OperationPolicy::BootstrapSetup
+        OperationPolicy::BootstrapSetup { .. }
             if input.operations.iter().any(|operation| {
                 !matches!(
                     operation,
@@ -477,7 +479,11 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     }
 
     let state_dir = canonical_directory(&ctx.state_dir, "state_dir")?;
-    let bootstrap_roots = if matches!(ctx.operation_policy, OperationPolicy::BootstrapSetup) {
+    let roots = normalize_roots(&ctx.approved_roots, &state_dir)?;
+    let bootstrap_roots = if matches!(
+        &ctx.operation_policy,
+        OperationPolicy::BootstrapSetup { .. }
+    ) {
         let roots = ctx
             .approved_roots
             .iter()
@@ -494,8 +500,19 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     } else {
         Vec::new()
     };
-    let roots = normalize_roots(&ctx.approved_roots, &state_dir)?;
-    if roots.iter().any(|root| {
+    let bootstrap_missing_skill_roots = match &ctx.operation_policy {
+        OperationPolicy::BootstrapSetup {
+            missing_skill_roots,
+        } => missing_skill_roots
+            .iter()
+            .map(|root| normalize_target(root, &bootstrap_roots))
+            .collect::<Result<Vec<_>>>()?,
+        _ => Vec::new(),
+    };
+    if !matches!(
+        &ctx.operation_policy,
+        OperationPolicy::BootstrapSetup { .. }
+    ) && roots.iter().any(|root| {
         (state_dir.starts_with(root) || root.starts_with(&state_dir))
             && !is_controlled_state_root(root, &state_dir)
     }) {
@@ -512,10 +529,25 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     let mut projected_fingerprints: HashMap<PathBuf, String> = HashMap::new();
     for raw in input.operations {
         let operation = normalize_operation(raw, &roots, &projected_present)?;
-        if matches!(ctx.operation_policy, OperationPolicy::BootstrapSetup) {
-            validate_bootstrap_operation_target(&operation, &bootstrap_roots)?;
+        if matches!(
+            &ctx.operation_policy,
+            OperationPolicy::BootstrapSetup { .. }
+        ) {
+            validate_bootstrap_operation_target(
+                &operation,
+                &bootstrap_roots,
+                &bootstrap_missing_skill_roots,
+            )?;
         }
         let target = operation.target().to_path_buf();
+        if (state_dir.starts_with(&target) || target.starts_with(&state_dir))
+            && !is_controlled_state_path(&target, &state_dir)
+        {
+            return Err(ChangeError::new(
+                "unsafe_state_directory",
+                "operation target must be separate from the state directory",
+            ));
+        }
         if !targets.insert(target.clone()) {
             return Err(ChangeError::new(
                 "ambiguous_target",
@@ -536,6 +568,19 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
             &mut projected_fingerprints,
         );
         operations.push(operation);
+    }
+    if matches!(
+        &ctx.operation_policy,
+        OperationPolicy::BootstrapSetup { .. }
+    ) && operations
+        .iter()
+        .filter_map(|operation| bootstrap_skill_root(operation.target()))
+        .any(|root| state_dir.starts_with(root) || root.starts_with(&state_dir))
+    {
+        return Err(ChangeError::new(
+            "unsafe_state_directory",
+            "state_dir must be separate from Bootstrap Skill roots",
+        ));
     }
 
     let digest_payload = serde_json::to_vec(&(
@@ -1124,21 +1169,44 @@ fn normalize_operation(
     Ok(normalized)
 }
 
-fn validate_bootstrap_operation_target(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
+fn validate_bootstrap_operation_target(
+    operation: &Operation,
+    roots: &[PathBuf],
+    missing_skill_roots: &[PathBuf],
+) -> Result<()> {
     let allowed = roots.iter().any(|root| {
-        let Ok(relative) = operation.target().strip_prefix(root) else {
+        let target = operation.target();
+        let Ok(relative) = target.strip_prefix(root) else {
             return false;
         };
-        match operation {
+        let package_target_allowed = |relative_to_skill_root: &Path| match operation {
             Operation::CreateDirectory { .. } => {
-                relative == Path::new("skillroster")
-                    || relative == Path::new("skillroster/references")
+                relative_to_skill_root.as_os_str().is_empty()
+                    || relative_to_skill_root == Path::new("skillroster")
+                    || relative_to_skill_root == Path::new("skillroster/references")
             }
             Operation::WriteFile { .. } | Operation::ReplaceFile { .. } => {
-                crate::bootstrap::is_managed_target(relative)
+                crate::bootstrap::is_managed_target(relative_to_skill_root)
             }
             _ => false,
+        };
+        let is_anchor = missing_skill_roots
+            .iter()
+            .any(|skill_root| skill_root != root && skill_root.starts_with(root));
+        if !is_anchor && package_target_allowed(relative) {
+            return true;
         }
+        missing_skill_roots.iter().any(|skill_root| {
+            if matches!(operation, Operation::CreateDirectory { .. })
+                && target != root
+                && skill_root.starts_with(target)
+            {
+                return true;
+            }
+            target
+                .strip_prefix(skill_root)
+                .is_ok_and(package_target_allowed)
+        })
     });
     if !allowed {
         return Err(ChangeError::new(
@@ -1150,6 +1218,13 @@ fn validate_bootstrap_operation_target(operation: &Operation, roots: &[PathBuf])
         ));
     }
     Ok(())
+}
+
+fn bootstrap_skill_root(target: &Path) -> Option<&Path> {
+    target
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(OsStr::new("skillroster")))
+        .and_then(Path::parent)
 }
 
 fn validate_current_state(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
@@ -2015,6 +2090,10 @@ fn normalize_roots(roots: &[PathBuf], state_dir: &Path) -> Result<Vec<PathBuf>> 
 
 fn is_controlled_state_root(root: &Path, state_dir: &Path) -> bool {
     root == state_dir.join("library") || root == state_dir.join("plan-backups")
+}
+
+fn is_controlled_state_path(path: &Path, state_dir: &Path) -> bool {
+    path.starts_with(state_dir.join("library")) || path.starts_with(state_dir.join("plan-backups"))
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf> {
@@ -3005,7 +3084,9 @@ mod tests {
 
     #[test]
     fn bootstrap_setup_accepts_only_fixed_package_targets() {
-        let (_temp, root, state) = fixture();
+        let (_temp, home, state) = fixture();
+        let root = home.join(".codex/skills");
+        fs::create_dir_all(&root).unwrap();
         let library = state.join("library");
         let plan_backups = state.join("plan-backups");
         fs::create_dir(&library).unwrap();
@@ -3013,7 +3094,9 @@ mod tests {
         let context = PrepareContext {
             approved_roots: vec![root.clone(), library.clone(), plan_backups.clone()],
             state_dir: state,
-            operation_policy: OperationPolicy::BootstrapSetup,
+            operation_policy: OperationPolicy::BootstrapSetup {
+                missing_skill_roots: Vec::new(),
+            },
         };
         let allowed = serde_json::json!({
             "schema_version": 1,
@@ -3052,6 +3135,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bootstrap_home_anchor_rejects_state_inside_the_fixed_skill_root() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = home.join(".codex/skills/state");
+        fs::create_dir_all(&state).unwrap();
+        let context = PrepareContext {
+            approved_roots: vec![home.clone()],
+            state_dir: state,
+            operation_policy: OperationPolicy::BootstrapSetup {
+                missing_skill_roots: vec![home.join(".codex/skills")],
+            },
+        };
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": home.join(".codex/skills/skillroster/SKILL.md"),
+                "content": "bootstrap",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            prepare(&input, &context).unwrap_err().code,
+            "unsafe_state_directory"
+        );
+    }
+
+    #[test]
+    fn bootstrap_home_anchor_rejects_an_undetected_agent_root() {
+        let (_temp, home, state) = fixture();
+        let context = PrepareContext {
+            approved_roots: vec![home.clone()],
+            state_dir: state,
+            operation_policy: OperationPolicy::BootstrapSetup {
+                missing_skill_roots: vec![home.join(".codex/skills")],
+            },
+        };
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": home.join(".claude/skills/skillroster/SKILL.md"),
+                "content": "unexpected",
+                "expected_fingerprint": "missing"
+            }]
+        })
+        .to_string();
+
+        assert_eq!(
+            prepare(&input, &context).unwrap_err().code,
+            "invalid_setup_target"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn bootstrap_setup_rejects_agent_root_aliases_to_controlled_state_roots() {
@@ -3069,7 +3211,9 @@ mod tests {
         let context = PrepareContext {
             approved_roots: vec![library_alias.clone(), backups_alias.clone()],
             state_dir: state,
-            operation_policy: OperationPolicy::BootstrapSetup,
+            operation_policy: OperationPolicy::BootstrapSetup {
+                missing_skill_roots: Vec::new(),
+            },
         };
 
         for target in [

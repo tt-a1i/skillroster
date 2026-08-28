@@ -3386,7 +3386,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
         ),
         (
             "references/mutation.md",
-            include_str!("../skill/skillroster/references/mutation.md").to_owned(),
+            include_str!("fixtures/bootstrap-mutation-v1.8.23.md").to_owned(),
         ),
     ];
     for (relative_path, content) in &legacy_files {
@@ -3415,13 +3415,13 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
         preview["result"]["targets"][0]["installed_version"],
         "1.8.23"
     );
-    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 3);
+    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 4);
     assert_eq!(preview["result"]["files_changed"], false);
 
     let plan_id = preview["result"]["plan_id"].as_str().unwrap();
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(applied["result"]["verification"], "passed");
-    assert_eq!(applied["result"]["changed_path_count"], 3);
+    assert_eq!(applied["result"]["changed_path_count"], 4);
     for (relative_path, expected) in [
         ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
         (
@@ -4075,6 +4075,169 @@ fn setup_without_a_snapshot_returns_a_typed_scan_action() {
         output["suggested_actions"][0]["argv"],
         context_action_argv(&home, &state, &["scan", "--summary", "--json"])
     );
+}
+
+#[test]
+fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let sessions = home.join(".codex/sessions");
+    let skill_root = home.join(".codex/skills");
+    fs::create_dir_all(&sessions).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let scan = json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    assert_eq!(scan["result"]["placement_count"], 0);
+    assert_eq!(
+        scan["result"]["root_counts"],
+        json!([
+            {"count": 8, "kind": "skills", "status": "missing"},
+            {"count": 1, "kind": "sessions", "status": "included"},
+            {"count": 7, "kind": "sessions", "status": "missing"}
+        ])
+    );
+    assert!(!skill_root.exists());
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_setup_versions(&setup);
+    assert_eq!(
+        setup["result"]["detected_agents"],
+        json!([{
+            "agent": "codex",
+            "detection_basis": "included_session_root",
+            "target": skill_root.join("skillroster/SKILL.md")
+        }])
+    );
+    assert_eq!(setup["result"]["missing_count"], 1);
+    assert_eq!(setup["result"]["physical_target_count"], 1);
+    assert_eq!(setup["result"]["operation_count"], 7);
+    assert_eq!(setup["result"]["operation_groups"]["create_directory"], 3);
+    assert_eq!(setup["result"]["operation_groups"]["write_file"], 4);
+    assert_eq!(setup["result"]["canonical_deletion_count"], 0);
+    assert_eq!(setup["result"]["files_changed"], false);
+    assert_eq!(setup["result"]["confirmation_required"], true);
+    assert!(!skill_root.exists());
+
+    let plan_id = setup["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    let physical_skill_root = fs::canonicalize(skill_root.parent().unwrap())
+        .unwrap()
+        .join("skills");
+    assert!(
+        detail["result"]["operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|operation| {
+                operation["kind"] == "create_directory"
+                    && operation["target"] == json!(physical_skill_root)
+            })
+    );
+
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert!(skill_root.join("skillroster/SKILL.md").is_file());
+    assert!(
+        skill_root
+            .join("skillroster/references/routing.md")
+            .is_file()
+    );
+    assert!(
+        skill_root
+            .join("skillroster/references/governance.md")
+            .is_file()
+    );
+    assert!(
+        skill_root
+            .join("skillroster/references/mutation.md")
+            .is_file()
+    );
+
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(!skill_root.exists());
+    assert!(sessions.is_dir());
+}
+
+#[test]
+fn setup_builds_only_the_fixed_missing_skill_root_chain_for_a_detected_agent() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let sessions = home.join(".local/share/opencode/storage/session");
+    let config = home.join(".config");
+    let skill_root = config.join("opencode/skills");
+    fs::create_dir_all(&sessions).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_eq!(
+        setup["result"]["detected_agents"],
+        json!([{
+            "agent": "opencode",
+            "detection_basis": "included_session_root",
+            "target": skill_root.join("skillroster/SKILL.md")
+        }])
+    );
+    assert_eq!(setup["result"]["operation_count"], 9);
+    assert_eq!(setup["result"]["operation_groups"]["create_directory"], 5);
+    assert_eq!(setup["result"]["operation_groups"]["write_file"], 4);
+    assert!(!config.exists());
+
+    let plan_id = setup["result"]["plan_id"].as_str().unwrap();
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert!(skill_root.join("skillroster/SKILL.md").is_file());
+
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(!config.exists());
+    assert!(sessions.is_dir());
+}
+
+#[test]
+fn setup_does_not_invent_agent_presence_from_known_missing_roots() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "no_supported_agent");
+    assert_eq!(setup["result"]["detected_agents"], json!([]));
+    assert!(setup["result"]["plan_id"].is_null());
+    assert_eq!(setup["result"]["files_changed"], false);
+    assert_eq!(setup["suggested_actions"], json!([]));
+    assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
 }
 
 #[test]

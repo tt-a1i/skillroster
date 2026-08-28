@@ -8,14 +8,6 @@ package. An exact official older package produces a recoverable Plan. When
 `retain-local` or `adopt-current`; never choose for the user. Unsupported links
 or non-files remain blocked.
 
-Read each target's `detection_basis`. `existing_skill_root` means the fixed
-Agent Skill root already exists. `included_session_root` is current-Snapshot
-evidence that the same Agent is present before its first Skill root exists;
-show the fixed parent-directory and four-file Plan, and do not infer any other
-Agent. `no_supported_agent` means the Snapshot included neither a supported
-Skill root nor session root, so do not invent a target. Setup remains preview
-only until the person confirms the ordinary Apply action.
-
 ## Apply
 
 Before `skillroster apply PLAN_ID --json`, show the complete bounded Plan impact
