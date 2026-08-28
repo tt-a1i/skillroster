@@ -7320,6 +7320,154 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
 
 #[test]
 #[cfg(unix)]
+fn full_roster_finding_can_protect_read_only_skills_and_prepare_a_plan() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let sources = temp.path().join("sources");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&sources).unwrap();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: skill-{index:03}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    let shared = root.join("zzz-shared");
+    fs::create_dir(&shared).unwrap();
+    fs::write(
+        shared.join("SKILL.md"),
+        "---\nname: zzz-shared\n---\nfixture\n",
+    )
+    .unwrap();
+    for agent_root in [home.join(".claude/skills"), home.join(".pi/agent/skills")] {
+        fs::create_dir_all(&agent_root).unwrap();
+        symlink(&shared, agent_root.join("zzz-shared")).unwrap();
+    }
+    let source_paths = (0..6)
+        .map(|index| {
+            let name = format!("zzz-read-only-{index}");
+            let source = sources.join(&name);
+            fs::create_dir(&source).unwrap();
+            fs::write(
+                source.join("SKILL.md"),
+                format!("---\nname: {name}\n---\nfixture\n"),
+            )
+            .unwrap();
+            symlink(&source, root.join(&name)).unwrap();
+            source
+        })
+        .collect::<Vec<_>>();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let finding_id = |report: &Value, kind: &str| {
+        report["result"]["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|finding| finding["kind"] == kind)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let source_finding_id = finding_id(&report, "escaping_link_source_confirmation");
+    for source in &source_paths {
+        json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "source-root",
+                    "confirm",
+                    "--finding",
+                    &source_finding_id,
+                    "--path",
+                    source.to_str().unwrap(),
+                ],
+            ]
+            .concat(),
+            None,
+        ));
+    }
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let roster_finding_id = finding_id(&report, "large_default_roster");
+    let compact = json_output(&run(
+        &[&common[..], &["report", "--finding", &roster_finding_id]].concat(),
+        None,
+    ));
+    let compact_choice = &compact["result"]["planning"]["resolution_choices"][0];
+    assert_eq!(compact_choice["choice"], "protect_blocked_skills_as_core");
+    assert_eq!(compact_choice["available"], false);
+    assert_eq!(
+        compact_choice["unavailable_reason"],
+        "blocked_skill_set_incomplete"
+    );
+    assert_eq!(compact_choice["protected_skill_ids_complete"], false);
+    assert_eq!(compact_choice["plan_request_template_available"], false);
+    assert!(compact_choice.get("plan_request_template").is_none());
+
+    let full = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--finding", &roster_finding_id, "--full"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        full["result"]["planning"]["decision"],
+        "choose_mutable_placements_or_keep_unchanged"
+    );
+    assert_eq!(
+        full["result"]["planning"]["decision_code"],
+        "protect_read_only_skills_or_keep_unchanged"
+    );
+    let full_choice = &full["result"]["planning"]["resolution_choices"][0];
+    assert_eq!(full_choice["choice"], "protect_blocked_skills_as_core");
+    assert_eq!(full_choice["available"], true);
+    assert_eq!(full_choice["protected_skill_ids_complete"], true);
+    assert_eq!(
+        full_choice["protected_skill_ids"].as_array().unwrap().len(),
+        6
+    );
+    assert_eq!(full_choice["plan_request_template_available"], true);
+
+    let request = full_choice["plan_request_template"].clone();
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    ));
+    assert!(plan["result"]["plan_id"].is_string());
+    assert_eq!(plan["result"]["files_changed"], false);
+    assert!(
+        plan["result"]["change_summary"]["roster_change_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    for source in source_paths {
+        assert!(source.join("SKILL.md").is_file());
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn large_roster_finding_reports_a_dependent_source_link_before_planning() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

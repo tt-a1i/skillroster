@@ -3682,6 +3682,77 @@ fn blocked_skill_planning(
     }
 }
 
+fn blocked_core_protection_choice(
+    finding: &FindingRecord,
+    scan: &ScanResult,
+    declared_core: &BTreeSet<(AgentKind, String)>,
+    blocked_skills: &BlockedSkillPlanning,
+) -> Value {
+    let protected_skill_ids = blocked_skills
+        .displayed_skill_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut available = false;
+    let mut unavailable_reason = blocked_skills
+        .truncated
+        .then_some("blocked_skill_set_incomplete");
+    let mut unavailable_detail = None;
+    if !blocked_skills.truncated {
+        match crate::roster_recommendation::recommend(
+            finding,
+            scan,
+            declared_core,
+            &crate::roster_recommendation::RecommendationRequest {
+                core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
+                protected_skill_ids: protected_skill_ids.clone(),
+            },
+        )
+        .and_then(|recommendation| {
+            crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)
+        }) {
+            Ok(supported) if supported.exclusions.is_empty() => {
+                available = true;
+                unavailable_reason = None;
+            }
+            Ok(_) => unavailable_reason = Some("protected_core_validation_unavailable"),
+            Err(error) => {
+                unavailable_reason = Some("protected_core_selection_unavailable");
+                unavailable_detail = Some(error.to_string());
+            }
+        }
+    }
+    let protected_skill_ids = protected_skill_ids.into_iter().collect::<Vec<_>>();
+    let mut choice = json!({
+        "choice": "protect_blocked_skills_as_core",
+        "requires_confirmation": true,
+        "available": available,
+        "unavailable_reason": unavailable_reason,
+        "unavailable_detail": unavailable_detail,
+        "protected_skill_ids": protected_skill_ids,
+        "protected_skill_ids_complete": !blocked_skills.truncated,
+        "plan_request_template_available": available,
+        "next": if blocked_skills.truncated {
+            "open the full Finding before constructing a complete protected-Skill Plan request"
+        } else if !available {
+            "the production Recommendation or Plan preconditions reject this Core protection set"
+        } else {
+            "after user confirmation, retry Plan with these protected Skill identities; another independent blocker may still fail closed"
+        }
+    });
+    if available {
+        choice["plan_request_template"] = json!({
+            "schema_version": 1,
+            "finding_roster_changes": [{
+                "finding_id": finding.id,
+                "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "protected_skill_ids": protected_skill_ids
+            }]
+        });
+    }
+    choice
+}
+
 fn is_untrusted_external_blocker(exclusion: &crate::roster_plan::RosterChangeExclusion) -> bool {
     matches!(
         exclusion.safety_blocker.as_ref(),
@@ -3848,55 +3919,9 @@ fn finding_roster_planning(
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         if source_dependency {
-            let protected_skill_ids = blocked_skills.displayed_skill_ids.clone();
-            let (protection_available, protection_unavailable_reason, protection_detail) =
-                if blocked_skills.truncated {
-                    (false, Some("blocked_skill_set_incomplete"), None)
-                } else {
-                    match crate::roster_recommendation::recommend(
-                        finding,
-                        scan,
-                        &declared_core,
-                        &crate::roster_recommendation::RecommendationRequest {
-                            core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
-                            protected_skill_ids: protected_skill_ids.iter().cloned().collect(),
-                        },
-                    ) {
-                        Ok(_) => (true, None, None),
-                        Err(error) => (
-                            false,
-                            Some("protected_core_selection_unavailable"),
-                            Some(error.to_string()),
-                        ),
-                    }
-                };
-            let mut protect_choice = json!({
-                "choice": "protect_blocked_skills_as_core",
-                "requires_confirmation": true,
-                "available": protection_available,
-                "unavailable_reason": protection_unavailable_reason,
-                "unavailable_detail": protection_detail,
-                "protected_skill_ids": protected_skill_ids,
-                "protected_skill_ids_complete": !blocked_skills.truncated,
-                "plan_request_template_available": protection_available,
-                "next": if blocked_skills.truncated {
-                    "open the full Finding before constructing a complete protected-Skill Plan request"
-                } else if !protection_available {
-                    "the production Recommendation constraints reject this Core protection set; use the source-link preservation choice"
-                } else {
-                    "after user confirmation, retry Plan with these protected Skill identities; another independent blocker may still fail closed"
-                }
-            });
-            if protection_available {
-                protect_choice["plan_request_template"] = json!({
-                    "schema_version": 1,
-                    "finding_roster_changes": [{
-                        "finding_id": finding.id,
-                        "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                        "protected_skill_ids": protected_skill_ids
-                    }]
-                });
-            }
+            let protect_choice =
+                blocked_core_protection_choice(finding, scan, &declared_core, &blocked_skills);
+            let protection_available = protect_choice["available"].as_bool() == Some(true);
             let source_choice = json!({
                 "choice": "preserve_or_retarget_dependent_sources",
                 "requires_confirmation": true,
@@ -3956,18 +3981,30 @@ fn finding_roster_planning(
                 .iter()
                 .any(|scope| scope != "untrusted_external");
         if requires_more_than_read_confirmation {
+            let protect_choice =
+                blocked_core_protection_choice(finding, scan, &declared_core, &blocked_skills);
             return Ok(Some(json!({
                 "supported": false,
                 "reason": "mutation_scope_blocks_roster_change",
                 "decision": "choose_mutable_placements_or_keep_unchanged",
+                "decision_code": "protect_read_only_skills_or_keep_unchanged",
                 "automatic_change_supported": false,
                 "snapshot_id": scan_id,
                 "request_field": "finding_roster_changes",
+                "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "absence_of_usage_evidence": "not_negative_evidence",
+                "explicit_only_or_archive_decision_implied": false,
+                "agent_count": agents.len(),
+                "agents": agents,
                 "mutation_scopes": mutation_scopes,
                 "blocked_change_count": blocked_change_count,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
-                "next": "Provider and durable read permissions authorize inspection only; keep these placements unchanged or choose current mutable placements. Rescan when scope facts are missing."
+                "blocked_skill_count": blocked_skills.count,
+                "blocked_skills": blocked_skills.items,
+                "blocked_skills_truncated": blocked_skills.truncated,
+                "resolution_choices": [protect_choice],
+                "next": "Provider and durable read permissions authorize inspection only; keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
             })));
         }
         let untrusted_external_skill_ids = supported

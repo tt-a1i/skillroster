@@ -66,6 +66,14 @@ points to a SkillRoster-owned JSON detail file; validate its schema before
 using the complete identities and argv. Do not inspect or trust targets
 independently, synthesize broader parents, or submit a partial Plan.
 
+If planning reports `mutation_scope_blocks_roster_change`, read its typed
+`resolution_choices`. A compact `protect_blocked_skills_as_core` choice with
+`protected_skill_ids_complete: false` is not executable; open the same Finding
+with `--full`. Only after the user confirms a full choice with
+`plan_request_template_available: true` may you replay its exact Plan request.
+That choice keeps the blocked Skills Core while mutable placements are
+right-sized; it never makes provider or durable-read-only placements mutable.
+
 For an escaping Skill link, show the observed target, obtain confirmation, and
 choose exactly one typed `permission_paths` continuation:
 
