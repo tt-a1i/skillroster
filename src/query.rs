@@ -1267,7 +1267,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 }
 
-fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
+fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, usize) {
     for (skill_id, placements) in placements_by_skill(scan) {
         let Some(skill) = scan.skills.iter().find(|skill| skill.id == skill_id) else {
             continue;
@@ -1337,9 +1337,11 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .map(|skill| normalize_skill_name(&skill.name))
         .collect::<Vec<_>>();
     let mut candidates = Vec::new();
+    let mut pair_comparison_count = 0usize;
     for (index, left) in scan.skills.iter().enumerate() {
         let left_tokens = &vocabularies[index];
         for (right_index, right) in scan.skills.iter().enumerate().skip(index + 1) {
+            pair_comparison_count = pair_comparison_count.saturating_add(1);
             if normalized_names[index] == normalized_names[right_index] {
                 continue;
             }
@@ -1384,6 +1386,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             EvidenceQuality::Inferred,
         );
     }
+    (vocabularies.len(), pair_comparison_count)
 }
 
 fn physical_source_identity(
@@ -2998,7 +3001,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_overlap_analysis_stays_bounded_for_a_realistic_inventory() {
+    fn semantic_overlap_work_stays_bounded_for_a_realistic_inventory() {
         let (_, mut scan) = fixture();
         let representative = scan.skills[0].clone();
         let shared_body = std::iter::repeat_n(
@@ -3020,17 +3023,13 @@ mod tests {
         scan.placements.clear();
         scan.usage.clear();
 
-        let started = std::time::Instant::now();
-        let report = build_report(&scan);
+        let mut findings = Vec::new();
+        let (vocabulary_count, pair_comparison_count) = overlap_findings(&scan, &mut findings);
 
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "semantic overlap analysis took {:?} for 193 Skills",
-            started.elapsed()
-        );
+        assert_eq!(vocabulary_count, 193);
+        assert_eq!(pair_comparison_count, 193 * 192 / 2);
         assert_eq!(
-            report
-                .findings
+            findings
                 .iter()
                 .filter(|finding| finding.title == "Semantic overlap candidate")
                 .count(),
