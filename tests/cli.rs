@@ -8690,6 +8690,288 @@ fn legacy_large_roster_snapshot_requests_a_typed_physical_identity_rescan() {
 }
 
 #[test]
+fn large_roster_same_name_library_target_exposes_a_validated_core_protection_plan() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    for (agent_root, prefix, shared_body) in [
+        (home.join(".codex/skills"), "codex", "codex variant"),
+        (home.join(".hermes/skills"), "hermes", "hermes variant"),
+        (home.join(".pi/agent/skills"), "pi", "pi variant"),
+    ] {
+        for index in 0..50 {
+            let name = format!("{prefix}-skill-{index:03}");
+            let skill = agent_root.join(&name);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\n---\nfixture\n"),
+            )
+            .unwrap();
+        }
+        let shared = agent_root.join("zz-shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(
+            shared.join("SKILL.md"),
+            format!("---\nname: zz-shared\n---\n{shared_body}\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "large_default_roster")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", &finding_id, "--full"]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], false);
+    assert_eq!(planning["reason"], "same_name_library_target_conflict");
+    assert_eq!(
+        planning["reason_code"],
+        "same_name_variants_require_explicit_preservation"
+    );
+    let claims = &planning["library_target_claims"];
+    assert_eq!(claims["claimant_count"], 3);
+    assert_eq!(claims["claimants_complete"], true);
+    assert_eq!(claims["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        claims["groups"][0]["claimants"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        claims["groups"][0]["same_name_finding"]["state"],
+        "available"
+    );
+    assert!(claims["groups"][0]["same_name_finding"]["finding_id"].is_string());
+    let choice = &planning["resolution_choices"][0];
+    assert_eq!(choice["choice"], "protect_library_target_claimants_as_core");
+    assert_eq!(choice["available"], true);
+    assert_eq!(choice["protected_skill_ids_complete"], true);
+    assert_eq!(choice["protected_skill_ids"].as_array().unwrap().len(), 3);
+
+    let unprotected = json!({
+        "schema_version": 1,
+        "finding_roster_changes": [{
+            "finding_id": finding_id,
+            "core_budget": 50,
+            "protected_skill_ids": []
+        }]
+    });
+    let blocked = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&unprotected.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["code"],
+        "roster_library_target_claim_conflict"
+    );
+    assert_eq!(
+        blocked["error"]["details"]["claimants"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(blocked["error"]["details"]["claimant_count"], 3);
+
+    let protected = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&choice["plan_request_template"].to_string()),
+    ));
+    assert_eq!(protected["result"]["state"], "ready", "{protected}");
+    let plan_id = protected["result"]["plan_id"].as_str().unwrap();
+    let protected_detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    let operations = protected_detail["result"]["operations"].as_array().unwrap();
+    let targets = operations
+        .iter()
+        .filter_map(|operation| operation["target"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(targets.len(), operations.len());
+}
+
+#[test]
+fn compact_large_roster_hides_a_template_when_later_claim_groups_exceed_its_bound() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for index in 0..50 {
+        let name = format!("core-skill-{index:03}");
+        let skill = root.join(&name);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    for (group, name) in [("alpha", "zz-alpha"), ("beta", "zz-beta")] {
+        for index in 0..6 {
+            let skill = root.join(format!("{group}-{index:02}"));
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n{group} variant {index}\n"),
+            )
+            .unwrap();
+        }
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "large_default_roster")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let compact = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+    let planning = &compact["result"]["planning"];
+    assert_eq!(planning["reason"], "library_target_claim_conflicts");
+    assert_eq!(planning["library_target_claims"]["group_count"], 2);
+    assert_eq!(planning["library_target_claims"]["claimant_count"], 12);
+    assert_eq!(
+        planning["library_target_claims"]["claimants_complete"],
+        false
+    );
+    let compact_choice = &planning["resolution_choices"][0];
+    assert_eq!(compact_choice["available"], false);
+    assert_eq!(compact_choice["protected_skill_ids_complete"], false);
+    assert!(compact_choice["protected_skill_ids"].is_null());
+    assert!(compact_choice["plan_request_template"].is_null());
+
+    let full = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    let full_planning = &full["result"]["planning"];
+    assert_eq!(
+        full_planning["library_target_claims"]["claimants_complete"],
+        true
+    );
+    assert_eq!(
+        full_planning["library_target_claims"]["groups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let full_choice = &full_planning["resolution_choices"][0];
+    assert_eq!(full_choice["available"], true);
+    assert_eq!(full_choice["protected_skill_ids_complete"], true);
+    assert_eq!(
+        full_choice["protected_skill_ids"].as_array().unwrap().len(),
+        12
+    );
+    assert!(full_choice["plan_request_template"].is_object());
+}
+
+#[test]
+fn repeated_claims_for_one_library_target_merge_before_finding_and_confirmation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    for index in 0..48 {
+        let name = format!("core-skill-{index:03}");
+        let skill = root.join(&name);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nfixture\n"),
+        )
+        .unwrap();
+    }
+    for index in 0..4 {
+        let skill = root.join(format!("shared-{index:02}"));
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: zz-shared\n---\nvariant {index}\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "large_default_roster")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+        None,
+    ));
+    let planning = &detail["result"]["planning"];
+    let claims = &planning["library_target_claims"];
+    assert_eq!(claims["group_count"], 1);
+    assert_eq!(claims["claimant_count"], 4);
+    assert_eq!(claims["groups"][0]["claimant_count"], 4);
+    assert_eq!(
+        claims["groups"][0]["claimants"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(
+        claims["groups"][0]["same_name_finding"]["state"],
+        "available"
+    );
+    let choice = &planning["resolution_choices"][0];
+    assert_eq!(choice["available"], true);
+    assert_eq!(choice["protected_skill_ids"].as_array().unwrap().len(), 4);
+
+    let protected = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&choice["plan_request_template"].to_string()),
+    ));
+    assert_eq!(protected["result"]["state"], "ready");
+}
+
+#[test]
 #[cfg(unix)]
 fn roster_plan_keeps_summary_detail_and_confirmation_scope_consistent() {
     let temp = TempDir::new().unwrap();

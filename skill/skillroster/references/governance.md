@@ -45,7 +45,16 @@ Make semantic choices in conversation, then submit them to
   Finding ID, per-Agent `core_budget` from 1 through 50, and optional protected
   Skill IDs. Protected, declared, and bootstrap Skills come first; target-Agent
   usage outranks exact-identity cross-Agent usage, then stable fallback. Missing
-  usage never implies Explicit-only or Archived.
+  usage never implies Explicit-only or Archived. If planning reports
+  `same_name_library_target_conflict`, inspect the linked divergent-content
+  Finding. Do not submit the default request or choose one variant by rank.
+  After confirmation, replay the exact validated
+  `protect_library_target_claimants_as_core` request when it is available. A
+  normalized-name collision is distinct from a same-name Finding; open full
+  detail and preserve every listed claimant unless the user resolves the names.
+  Multiple target groups can emerge during validation; a compact incomplete
+  closure has no executable template. Treat names differing only by case as
+  one portable Library target.
 - `finding_library_changes`: preferred for exact duplicates. Supply the Finding
   ID, a listed canonical placement, and `managed` or `hosted`.
 - Raw `roster_changes`, `library_changes`, and `source_updates` are advanced

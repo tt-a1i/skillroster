@@ -690,6 +690,36 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             })),
         };
     }
+    if let Some(conflict) =
+        error.downcast_ref::<crate::roster_plan::RosterLibraryTargetClaimConflict>()
+    {
+        let same_name = conflict.has_one_logical_name();
+        let claimant_count = conflict.claimants.len();
+        return ClassifiedError {
+            code: "roster_library_target_claim_conflict",
+            retryable: false,
+            details: Some(json!({
+                "reason": if same_name {
+                    "same_name_variants_require_explicit_preservation"
+                } else {
+                    "normalized_names_claim_one_library_target"
+                },
+                "claimant_count": claimant_count,
+                "claimants": conflict.claimants.iter().take(10).map(|claimant| json!({
+                    "skill_id": claimant.skill_id,
+                    "name": claimant.name
+                })).collect::<Vec<_>>(),
+                "claimants_truncated": claimant_count > 10,
+                "path": conflict.path,
+                "files_changed": false,
+                "next_action": if same_name {
+                    "open_same_name_finding_or_protect_all_claimants_as_core"
+                } else {
+                    "review_normalized_name_collision_or_protect_all_claimants_as_core"
+                }
+            })),
+        };
+    }
     if let Some(blocker) =
         error.downcast_ref::<crate::roster_plan::RosterPackageFingerprintVariants>()
     {

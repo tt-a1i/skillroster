@@ -127,6 +127,19 @@ choices; never bypass it with divergent direct Roster changes.
 `roster_physical_identity_rescan_required` means the latest legacy Snapshot
 does not contain the immutable physical identity needed for selection. Run its
 typed read-only Scan action; do not infer identity from current paths.
+If full large-Roster detail reports `same_name_library_target_conflict`, do not
+submit the default request: separate stable Skill identities would claim one
+name-derived Library path. Present the linked same-name Finding for content
+review and, when available, the validated
+`protect_library_target_claimants_as_core` choice. A
+`library_target_name_normalization_conflict` has distinct original names and
+no same-name Finding; present every claimant from full detail. Execute an exact
+protection request only after user confirmation. Never select a canonical
+variant from ranking, path order, or recency.
+One protection validation may discover multiple Library targets; present every
+group and original name from `library_target_claims`. A compact incomplete
+closure never authorizes a Plan template. Names differing only by case are
+treated as one portable target identity across supported filesystems.
 When `planning.reason` is `trusted_canonical_sources_required`, follow its
 same-Report/Snapshot `source_confirmation_finding` reference through the
 read-only `view_source_confirmation_finding` action when available. The

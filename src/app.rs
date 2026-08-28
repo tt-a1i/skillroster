@@ -2215,6 +2215,7 @@ fn report_command(
                 &report.scan_id,
                 &latest_scan_id,
                 &scan,
+                state_dir,
                 full,
             )? {
                 object.insert("planning".into(), planning);
@@ -3682,46 +3683,65 @@ fn blocked_skill_planning(
     }
 }
 
+struct CoreProtectionValidation {
+    protected_skill_ids: BTreeSet<String>,
+    library_target_conflicts: Vec<crate::roster_plan::RosterLibraryTargetClaimConflict>,
+}
+
 fn blocked_core_protection_choice(
+    store: &StateStore,
     finding: &FindingRecord,
     scan: &ScanResult,
     declared_core: &BTreeSet<(AgentKind, String)>,
     blocked_skills: &BlockedSkillPlanning,
-) -> Value {
-    let protected_skill_ids = blocked_skills
+    state_dir: &Path,
+    full: bool,
+) -> Result<Value> {
+    let initial_protected_skill_ids = blocked_skills
         .displayed_skill_ids
         .iter()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let mut available = false;
-    let mut unavailable_reason = blocked_skills
-        .truncated
-        .then_some("blocked_skill_set_incomplete");
-    let mut unavailable_detail = None;
-    if !blocked_skills.truncated {
-        match crate::roster_recommendation::recommend(
+    let validation = (!blocked_skills.truncated).then(|| {
+        validated_core_protection(
             finding,
             scan,
             declared_core,
-            &crate::roster_recommendation::RecommendationRequest {
-                core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
-                protected_skill_ids: protected_skill_ids.clone(),
-            },
+            state_dir,
+            initial_protected_skill_ids.clone(),
+            Vec::new(),
         )
-        .and_then(|recommendation| {
-            crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)
-        }) {
-            Ok(supported) if supported.exclusions.is_empty() => {
-                available = true;
-                unavailable_reason = None;
-            }
-            Ok(_) => unavailable_reason = Some("protected_core_validation_unavailable"),
-            Err(error) => {
-                unavailable_reason = Some("protected_core_selection_unavailable");
-                unavailable_detail = Some(error.to_string());
-            }
-        }
-    }
+    });
+    let validation_succeeded = validation.as_ref().is_some_and(|result| result.is_ok());
+    let validated = validation.as_ref().and_then(|result| result.as_ref().ok());
+    let disclosure = library_target_claim_disclosure(
+        store,
+        finding,
+        validated
+            .map(|validated| validated.library_target_conflicts.as_slice())
+            .unwrap_or_default(),
+        full,
+    )?;
+    let protected_skill_ids = validated
+        .map(|validated| validated.protected_skill_ids.clone())
+        .unwrap_or(initial_protected_skill_ids);
+    let protected_ids_complete = !blocked_skills.truncated
+        && (full || protected_skill_ids.len() <= 10)
+        && disclosure["claimants_complete"].as_bool() == Some(true);
+    let available = validation_succeeded && protected_ids_complete;
+    let unavailable_reason = if blocked_skills.truncated {
+        Some("blocked_skill_set_incomplete")
+    } else if !protected_ids_complete {
+        Some("protected_skill_set_incomplete")
+    } else if available {
+        None
+    } else {
+        Some("protected_core_selection_unavailable")
+    };
+    let unavailable_detail = validation
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
     let protected_skill_ids = protected_skill_ids.into_iter().collect::<Vec<_>>();
     let mut choice = json!({
         "choice": "protect_blocked_skills_as_core",
@@ -3729,10 +3749,11 @@ fn blocked_core_protection_choice(
         "available": available,
         "unavailable_reason": unavailable_reason,
         "unavailable_detail": unavailable_detail,
-        "protected_skill_ids": protected_skill_ids,
-        "protected_skill_ids_complete": !blocked_skills.truncated,
+        "protected_skill_ids": if protected_ids_complete { json!(protected_skill_ids) } else { Value::Null },
+        "protected_skill_ids_complete": protected_ids_complete,
+        "library_target_claims": disclosure,
         "plan_request_template_available": available,
-        "next": if blocked_skills.truncated {
+        "next": if blocked_skills.truncated || !protected_ids_complete {
             "open the full Finding before constructing a complete protected-Skill Plan request"
         } else if !available {
             "the production Recommendation or Plan preconditions reject this Core protection set"
@@ -3750,7 +3771,159 @@ fn blocked_core_protection_choice(
             }]
         });
     }
-    choice
+    Ok(choice)
+}
+
+fn validated_core_protection(
+    finding: &FindingRecord,
+    scan: &ScanResult,
+    declared_core: &BTreeSet<(AgentKind, String)>,
+    state_dir: &Path,
+    mut protected_skill_ids: BTreeSet<String>,
+    mut library_target_conflicts: Vec<crate::roster_plan::RosterLibraryTargetClaimConflict>,
+) -> Result<CoreProtectionValidation> {
+    let mut merged_conflicts = Vec::new();
+    for conflict in library_target_conflicts.drain(..) {
+        merge_library_target_conflict(&mut merged_conflicts, conflict);
+    }
+    library_target_conflicts = merged_conflicts;
+    loop {
+        let recommendation = crate::roster_recommendation::recommend(
+            finding,
+            scan,
+            declared_core,
+            &crate::roster_recommendation::RecommendationRequest {
+                core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
+                protected_skill_ids: protected_skill_ids.clone(),
+            },
+        )?;
+        let supported =
+            crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes)?;
+        if !supported.exclusions.is_empty() {
+            bail!("protected Skills remain blocked by mutation preconditions");
+        }
+        match crate::roster_plan::derive(scan, state_dir, &supported.changes) {
+            Ok(_) => {
+                return Ok(CoreProtectionValidation {
+                    protected_skill_ids,
+                    library_target_conflicts,
+                });
+            }
+            Err(error) => {
+                let Some(conflict) =
+                    error.downcast_ref::<crate::roster_plan::RosterLibraryTargetClaimConflict>()
+                else {
+                    return Err(error);
+                };
+                let before = protected_skill_ids.len();
+                protected_skill_ids.extend(
+                    conflict
+                        .claimants
+                        .iter()
+                        .map(|claimant| claimant.skill_id.clone()),
+                );
+                if protected_skill_ids.len() == before {
+                    return Err(error);
+                }
+                merge_library_target_conflict(&mut library_target_conflicts, conflict.clone());
+            }
+        }
+    }
+}
+
+fn merge_library_target_conflict(
+    conflicts: &mut Vec<crate::roster_plan::RosterLibraryTargetClaimConflict>,
+    conflict: crate::roster_plan::RosterLibraryTargetClaimConflict,
+) {
+    if let Some(existing) = conflicts
+        .iter_mut()
+        .find(|existing| existing.path == conflict.path)
+    {
+        existing.claimants.extend(conflict.claimants);
+        existing.claimants.sort_by(|left, right| {
+            (&left.skill_id, &left.name).cmp(&(&right.skill_id, &right.name))
+        });
+        existing.claimants.dedup();
+        return;
+    }
+    conflicts.push(conflict);
+    conflicts.sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn library_target_claim_disclosure(
+    store: &StateStore,
+    finding: &FindingRecord,
+    conflicts: &[crate::roster_plan::RosterLibraryTargetClaimConflict],
+    full: bool,
+) -> Result<Value> {
+    let claimant_count = conflicts
+        .iter()
+        .map(|conflict| conflict.claimants.len())
+        .sum::<usize>();
+    let limit = if full { usize::MAX } else { 10 };
+    let mut remaining = limit;
+    let report = if conflicts.is_empty() {
+        None
+    } else {
+        Some(
+            store
+                .get_report(&finding.report_id)?
+                .ok_or_else(|| anyhow!("Report {} does not exist", finding.report_id))?,
+        )
+    };
+    let mut groups = Vec::new();
+    for conflict in conflicts {
+        if remaining == 0 {
+            break;
+        }
+        let visible_count = conflict.claimants.len().min(remaining);
+        remaining = remaining.saturating_sub(visible_count);
+        let skill_ids = conflict
+            .claimants
+            .iter()
+            .map(|claimant| claimant.skill_id.clone())
+            .collect::<BTreeSet<_>>();
+        let same_name_finding_id = if conflict.has_one_logical_name() {
+            matching_variant_finding_id(
+                store,
+                report.as_ref().expect("report loaded for conflicts"),
+                &skill_ids,
+            )?
+        } else {
+            None
+        };
+        groups.push(json!({
+            "library_target": conflict.path,
+            "reason_code": if conflict.has_one_logical_name() {
+                "same_name_variants_require_explicit_preservation"
+            } else {
+                "normalized_names_claim_one_library_target"
+            },
+            "claimant_count": conflict.claimants.len(),
+            "claimants": conflict.claimants.iter().take(visible_count).map(|claimant| json!({
+                "skill_id": claimant.skill_id,
+                "name": claimant.name
+            })).collect::<Vec<_>>(),
+            "claimants_truncated": visible_count < conflict.claimants.len(),
+            "same_name_finding": {
+                "state": if !conflict.has_one_logical_name() {
+                    "not_applicable"
+                } else if same_name_finding_id.is_some() {
+                    "available"
+                } else {
+                    "finding_unavailable"
+                },
+                "finding_id": same_name_finding_id
+            }
+        }));
+    }
+    Ok(json!({
+        "group_count": conflicts.len(),
+        "claimant_count": claimant_count,
+        "groups": groups,
+        "claimants_complete": claimant_count <= limit,
+        "groups_truncated": groups.len() < conflicts.len()
+    }))
 }
 
 fn is_untrusted_external_blocker(exclusion: &crate::roster_plan::RosterChangeExclusion) -> bool {
@@ -3818,6 +3991,7 @@ fn finding_roster_planning(
     scan_id: &ScanId,
     latest_scan_id: &ScanId,
     scan: &ScanResult,
+    state_dir: &Path,
     full: bool,
 ) -> Result<Option<Value>> {
     if !crate::roster_recommendation::is_large_roster_finding(finding) {
@@ -3934,8 +4108,15 @@ fn finding_roster_planning(
             .map(|path| path.display().to_string())
             .collect::<BTreeSet<_>>();
         if source_dependency {
-            let protect_choice =
-                blocked_core_protection_choice(finding, scan, &declared_core, &blocked_skills);
+            let protect_choice = blocked_core_protection_choice(
+                store,
+                finding,
+                scan,
+                &declared_core,
+                &blocked_skills,
+                state_dir,
+                full,
+            )?;
             let protection_available = protect_choice["available"].as_bool() == Some(true);
             let source_choice = json!({
                 "choice": "preserve_or_retarget_dependent_sources",
@@ -3996,8 +4177,15 @@ fn finding_roster_planning(
                 .iter()
                 .any(|scope| scope != "untrusted_external");
         if requires_more_than_read_confirmation {
-            let protect_choice =
-                blocked_core_protection_choice(finding, scan, &declared_core, &blocked_skills);
+            let protect_choice = blocked_core_protection_choice(
+                store,
+                finding,
+                scan,
+                &declared_core,
+                &blocked_skills,
+                state_dir,
+                full,
+            )?;
             return Ok(Some(json!({
                 "supported": false,
                 "reason": "mutation_scope_blocks_roster_change",
@@ -4066,6 +4254,96 @@ fn finding_roster_planning(
                 "next": "rescan and reopen the new large-Roster Finding"
             }
         })));
+    }
+    if let Err(error) = crate::roster_plan::derive(scan, state_dir, &supported.changes) {
+        if let Some(conflict) =
+            error.downcast_ref::<crate::roster_plan::RosterLibraryTargetClaimConflict>()
+        {
+            let conflict_skill_ids = conflict
+                .claimants
+                .iter()
+                .map(|claimant| claimant.skill_id.clone())
+                .collect::<BTreeSet<_>>();
+            let protected_validation = validated_core_protection(
+                finding,
+                scan,
+                &declared_core,
+                state_dir,
+                conflict_skill_ids.clone(),
+                vec![conflict.clone()],
+            );
+            let validated = protected_validation.as_ref().ok();
+            let protected_skill_ids = validated
+                .map(|validated| validated.protected_skill_ids.clone())
+                .unwrap_or(conflict_skill_ids)
+                .into_iter()
+                .collect::<Vec<_>>();
+            let conflicts = validated
+                .map(|validated| validated.library_target_conflicts.as_slice())
+                .unwrap_or_else(|| std::slice::from_ref(conflict));
+            let disclosure = library_target_claim_disclosure(store, finding, conflicts, full)?;
+            let protected_ids_complete = (full || protected_skill_ids.len() <= 10)
+                && disclosure["claimants_complete"].as_bool() == Some(true);
+            let protection_available = protected_validation.is_ok() && protected_ids_complete;
+            let conflict_kind = if conflicts.len() == 1 {
+                if conflicts[0].has_one_logical_name() {
+                    "same_name_library_target_conflict"
+                } else {
+                    "library_target_name_normalization_conflict"
+                }
+            } else {
+                "library_target_claim_conflicts"
+            };
+            let conflict_reason_code = if conflicts.len() == 1 {
+                if conflicts[0].has_one_logical_name() {
+                    "same_name_variants_require_explicit_preservation"
+                } else {
+                    "normalized_names_claim_one_library_target"
+                }
+            } else {
+                "multiple_library_targets_require_explicit_preservation"
+            };
+            let unavailable_detail = protected_validation.as_ref().err().map(ToString::to_string);
+            let mut protection_choice = json!({
+                "choice": "protect_library_target_claimants_as_core",
+                "requires_confirmation": true,
+                "available": protection_available,
+                "protected_skill_ids": if protected_ids_complete { json!(protected_skill_ids) } else { Value::Null },
+                "protected_skill_ids_complete": protected_ids_complete,
+                "plan_request_template_available": protection_available,
+                "unavailable_detail": unavailable_detail,
+                "next": if protection_available {
+                    "after user confirmation, submit the exact Plan request to preserve every conflicting variant as Core"
+                } else if !protected_ids_complete {
+                    "open the full Finding before constructing a complete protected-Skill Plan request"
+                } else {
+                    "the production Recommendation or Plan preconditions reject this Core protection set"
+                }
+            });
+            if protection_available {
+                protection_choice["plan_request_template"] = json!({
+                    "schema_version": 1,
+                    "finding_roster_changes": [{
+                        "finding_id": finding.id,
+                        "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                        "protected_skill_ids": protected_skill_ids
+                    }]
+                });
+            }
+            return Ok(Some(json!({
+                "supported": false,
+                "reason": conflict_kind,
+                "reason_code": conflict_reason_code,
+                "automatic_change_supported": false,
+                "snapshot_id": scan_id,
+                "request_field": "finding_roster_changes",
+                "library_target_claims": disclosure,
+                "resolution_choices": [protection_choice],
+                "files_changed": false,
+                "state_files_changed": false
+            })));
+        }
+        return Err(error);
     }
     Ok(Some(json!({
         "supported": true,
@@ -12186,6 +12464,50 @@ mod recovery_tests {
         assert_eq!(output["error"]["details"]["identity_role"], "target");
         assert_eq!(output["error"]["details"]["path"], "/tmp/library/shared");
         assert_eq!(output["error"]["details"]["files_changed"], false);
+    }
+
+    #[test]
+    fn normalized_library_target_claim_conflict_is_typed_and_bounded() {
+        let error = crate::roster_plan::RosterLibraryTargetClaimConflict {
+            claimants: (0..11)
+                .map(|index| crate::roster_plan::LibraryTargetClaimant {
+                    skill_id: format!("skill_{index:032}"),
+                    name: if index % 2 == 0 {
+                        "foo bar".into()
+                    } else {
+                        "foo@bar".into()
+                    },
+                })
+                .collect(),
+            path: PathBuf::from("/tmp/library/foo-bar"),
+        };
+
+        let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+
+        assert_eq!(
+            output["error"]["code"],
+            "roster_library_target_claim_conflict"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "normalized_names_claim_one_library_target"
+        );
+        assert_eq!(output["error"]["details"]["claimant_count"], 11);
+        assert_eq!(
+            output["error"]["details"]["claimants"]
+                .as_array()
+                .unwrap()
+                .len(),
+            10
+        );
+        assert_eq!(output["error"]["details"]["claimants_truncated"], true);
+        assert_eq!(output["error"]["relevant_ids"], json!([]));
+        assert!(
+            !output["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("skill_")
+        );
     }
 
     #[test]
