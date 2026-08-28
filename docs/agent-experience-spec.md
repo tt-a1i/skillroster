@@ -112,6 +112,12 @@ semantic conclusion and may read a returned `SKILL.md` path when those facts
 are insufficient; candidate evidence never authorizes a Plan.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
+For `mutation_scope_blocks_roster_change`, open full detail before offering
+Core protection whenever the compact protected-Skill set is incomplete. Only
+present a `protect_blocked_skills_as_core` Plan template when
+`plan_request_template_available` is true, and require user confirmation
+before replaying it. This keeps read-only Skills unchanged; it does not make
+their placements mutable.
 When `planning.reason` is `trusted_canonical_sources_required`, follow its
 same-Report/Snapshot `source_confirmation_finding` reference through the
 read-only `view_source_confirmation_finding` action when available. The
