@@ -81,6 +81,42 @@ impl std::fmt::Display for RosterOperationConflict {
 
 impl std::error::Error for RosterOperationConflict {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryTargetClaimant {
+    pub skill_id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct RosterLibraryTargetClaimConflict {
+    pub claimants: Vec<LibraryTargetClaimant>,
+    pub path: PathBuf,
+}
+
+impl RosterLibraryTargetClaimConflict {
+    pub fn has_one_logical_name(&self) -> bool {
+        self.claimants
+            .iter()
+            .map(|claimant| claimant.name.trim().to_lowercase())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == 1
+    }
+}
+
+impl std::fmt::Display for RosterLibraryTargetClaimConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} Skill identities would claim one Library target {}; review every claimant name and content or preserve every claimant as Core before retrying",
+            self.claimants.len(),
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for RosterLibraryTargetClaimConflict {}
+
 #[derive(Debug)]
 pub struct RosterPackageFingerprintVariants {
     pub skill_id: String,
@@ -676,6 +712,7 @@ pub fn derive(
     let mut operation_groups = BTreeMap::<&str, usize>::new();
     let mut exclusions = Vec::new();
     let mut retargeted_placements = BTreeSet::new();
+    let mut library_target_claims = BTreeMap::<PathBuf, Vec<LibraryTargetClaimant>>::new();
 
     for (skill_id, requests) in by_skill {
         let skill = scan
@@ -822,10 +859,19 @@ pub fn derive(
                         "Skill {skill_id} has no owned exact-digest content to preserve before exposure removal"
                     )
                 })?;
-            let library_path = library_root.join(safe_name(&skill.name)?);
+            let safe_library_name = safe_name(&skill.name)?;
+            let library_path = library_root.join(&safe_library_name);
+            let library_target_identity = library_root.join(safe_library_name.to_ascii_lowercase());
             if library_path.exists() {
                 bail!("Library target {} already exists", library_path.display());
             }
+            library_target_claims
+                .entry(library_target_identity)
+                .or_default()
+                .push(LibraryTargetClaimant {
+                    skill_id: skill_id.to_owned(),
+                    name: skill.name.clone(),
+                });
             needs_library_root |= !library_root.exists();
             let canonical_source = physical_mutation_path(canonical);
             let canonical_fingerprint = change::fingerprint(&canonical_source)?;
@@ -1024,6 +1070,17 @@ pub fn derive(
             affected_agents.insert(request.agent.clone());
             affected_skills.insert(skill_id.to_string());
         }
+    }
+
+    if let Some((path, mut claimants)) = library_target_claims
+        .into_iter()
+        .find(|(_, claimants)| claimants.len() > 1)
+    {
+        claimants.sort_by(|left, right| {
+            (&left.skill_id, &left.name).cmp(&(&right.skill_id, &right.name))
+        });
+        claimants.dedup();
+        return Err(RosterLibraryTargetClaimConflict { claimants, path }.into());
     }
 
     if needs_backup_root {
@@ -1862,8 +1919,116 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.downcast_ref::<RosterOperationConflict>().is_some());
-        assert!(error.to_string().contains("same-name variant Finding"));
+        let conflict = error
+            .downcast_ref::<RosterLibraryTargetClaimConflict>()
+            .expect("Library target prerequisite");
+        assert!(conflict.has_one_logical_name());
+        assert_eq!(conflict.claimants.len(), 2);
+        assert!(
+            conflict
+                .claimants
+                .iter()
+                .all(|claimant| claimant.name == "shared")
+        );
+        assert_eq!(conflict.path, state.join("library/shared"));
+        assert!(
+            error
+                .to_string()
+                .contains("preserve every claimant as Core")
+        );
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn normalized_different_names_report_every_library_target_claimant() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        for (root, name) in [
+            (home.join(".codex/skills/first"), "foo bar"),
+            (home.join(".hermes/skills/second"), "foo@bar"),
+        ] {
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n{name}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir(&state).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let changes = snapshot
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                placement.agent.map(|agent| RosterChange {
+                    agent: agent.id().into(),
+                    skill_id: placement.skill_id.clone(),
+                    state: "on_demand".into(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+        let conflict = error
+            .downcast_ref::<RosterLibraryTargetClaimConflict>()
+            .expect("normalized Library target conflict");
+
+        assert!(!conflict.has_one_logical_name());
+        assert_eq!(
+            conflict
+                .claimants
+                .iter()
+                .map(|claimant| claimant.name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["foo bar", "foo@bar"])
+        );
+        assert_eq!(conflict.path, state.join("library/foo-bar"));
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn case_variant_names_share_one_portable_library_target_identity() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        for (root, name) in [
+            (home.join(".codex/skills/first"), "Foo"),
+            (home.join(".hermes/skills/second"), "foo"),
+        ] {
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n{name}\n"),
+            )
+            .unwrap();
+        }
+        fs::create_dir(&state).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let changes = snapshot
+            .placements
+            .iter()
+            .filter_map(|placement| {
+                placement.agent.map(|agent| RosterChange {
+                    agent: agent.id().into(),
+                    skill_id: placement.skill_id.clone(),
+                    state: "on_demand".into(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let error = derive(&snapshot, &state, &changes).unwrap_err();
+        let conflict = error
+            .downcast_ref::<RosterLibraryTargetClaimConflict>()
+            .expect("case-folded Library target conflict");
+
+        assert!(conflict.has_one_logical_name());
+        assert_eq!(conflict.claimants.len(), 2);
+        assert_eq!(conflict.path, state.join("library/foo"));
         assert!(fs::read_dir(&state).unwrap().next().is_none());
     }
 
