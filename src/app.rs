@@ -258,18 +258,7 @@ pub fn run(cli: Cli) -> Result<Output> {
                 parse_source_roots(&cli.source_roots)?,
                 args.summary,
             )?;
-            (
-                "scan",
-                result,
-                warnings,
-                vec![action(
-                    "report",
-                    &["report", "--json"],
-                    false,
-                    false,
-                    "scan_complete",
-                )],
-            )
+            ("scan", result, warnings, vec![report_action()])
         }
         Some(Command::Report(args)) => {
             let request = if let Some(id) = args.finding.as_deref() {
@@ -813,16 +802,7 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
         .transpose()?
         .unwrap_or(false)
     {
-        (
-            ReadinessState::ReportRequired,
-            Some(action(
-                "report",
-                &["report", "--json"],
-                false,
-                false,
-                "scan_complete",
-            )),
-        )
+        (ReadinessState::ReportRequired, Some(report_action()))
     } else {
         (ReadinessState::Ready, None)
     };
@@ -9477,6 +9457,16 @@ fn action(
         requires_confirmation: confirmation,
         reason_code: reason.into(),
     }
+}
+
+fn report_action() -> SuggestedAction {
+    action(
+        "report",
+        &["report", "--json"],
+        false,
+        false,
+        "scan_complete",
+    )
 }
 
 fn snapshot_rescan_action() -> SuggestedAction {

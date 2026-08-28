@@ -12,7 +12,7 @@ use crate::model::{
 use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermission};
 use crate::state_security;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 fn sqlite_nofollow_path(path: &Path) -> StorageResult<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
@@ -147,6 +147,7 @@ const MIGRATIONS: [(i64, Migration); SCHEMA_VERSION as usize] = [
     (9, migration_v9),
     (10, migration_v10),
     (11, migration_v11),
+    (12, migration_v12),
 ];
 
 fn validate_migrations(migrations: &[(i64, Migration)], schema_version: i64) -> StorageResult<()> {
@@ -546,7 +547,7 @@ impl StateStore {
             .query_row(
                 "SELECT r.id, r.scan_id, r.created_at, r.summary_json FROM reports r
                  JOIN scan_payloads p ON p.scan_id = r.scan_id
-                 WHERE r.created_at >= p.updated_at
+                 WHERE r.scan_payload_updated_at = p.updated_at
                  ORDER BY r.created_at DESC, r.rowid DESC LIMIT 1",
                 [],
                 |row| {
@@ -576,7 +577,7 @@ impl StateStore {
             "SELECT EXISTS(
                 SELECT 1 FROM reports r
                 JOIN scan_payloads p ON p.scan_id = r.scan_id
-                WHERE r.scan_id = ?1 AND r.created_at >= p.updated_at
+                WHERE r.scan_id = ?1 AND r.scan_payload_updated_at = p.updated_at
             )",
             [id.as_str()],
             |row| row.get(0),
@@ -1143,8 +1144,11 @@ impl StateStore {
         findings: &[FindingRecord],
     ) -> StorageResult<()> {
         let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "INSERT INTO reports (id, scan_id, created_at, summary_json) VALUES (?1, ?2, ?3, ?4)",
+        let inserted = transaction.execute(
+            "INSERT INTO reports
+                (id, scan_id, created_at, scan_payload_updated_at, summary_json)
+             SELECT ?1, ?2, ?3, p.updated_at, ?4
+             FROM scan_payloads p WHERE p.scan_id = ?2",
             params![
                 report.id.as_str(),
                 report.scan_id.as_str(),
@@ -1152,6 +1156,12 @@ impl StateStore {
                 json(&report.summary)?,
             ],
         )?;
+        if inserted != 1 {
+            return Err(StorageError::InvalidData(format!(
+                "Report {} has no persisted Snapshot payload",
+                report.id
+            )));
+        }
         for finding in findings {
             save_finding(&transaction, finding)?;
         }
@@ -2371,6 +2381,23 @@ fn migration_v11(transaction: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn migration_v12(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "ALTER TABLE reports ADD COLUMN scan_payload_updated_at INTEGER;
+         UPDATE reports
+         SET scan_payload_updated_at = (
+             SELECT p.updated_at FROM scan_payloads p WHERE p.scan_id = reports.scan_id
+         )
+         WHERE EXISTS (
+             SELECT 1 FROM scan_payloads p
+             WHERE p.scan_id = reports.scan_id AND reports.created_at >= p.updated_at
+         );
+         CREATE INDEX reports_scan_payload_version
+            ON reports(scan_id, scan_payload_updated_at);",
+    )?;
+    Ok(())
+}
+
 fn table_count(connection: &Connection, table: &str) -> StorageResult<u64> {
     let query = format!("SELECT COUNT(*) FROM {table}");
     Ok(connection.query_row(&query, [], |row| row.get(0))?)
@@ -2678,7 +2705,7 @@ mod tests {
 
     #[test]
     fn migration_upgrades_prior_states_sequentially() {
-        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
             let mut connection = Connection::open_in_memory().unwrap();
             let transaction = connection.transaction().unwrap();
             migration_v1(&transaction).unwrap();
@@ -2708,6 +2735,9 @@ mod tests {
             }
             if starting_version >= 10 {
                 migration_v10(&transaction).unwrap();
+            }
+            if starting_version >= 11 {
+                migration_v11(&transaction).unwrap();
             }
             transaction
                 .pragma_update(None, "user_version", starting_version)
@@ -2827,6 +2857,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reverse_invalidations, 1);
+    }
+
+    #[test]
+    fn report_payload_version_migration_backfills_only_previously_fresh_reports() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (_, migration) in &MIGRATIONS[..11] {
+            migration(&transaction).unwrap();
+        }
+        transaction
+            .execute_batch(
+                "INSERT INTO scans VALUES ('scan_a', 1, 2, 'completed', '[]');
+                 INSERT INTO scan_payloads VALUES ('scan_a', '{}', 100);
+                 INSERT INTO reports VALUES
+                    ('report_stale', 'scan_a', 99, '{}'),
+                    ('report_fresh', 'scan_a', 100, '{}');",
+            )
+            .unwrap();
+
+        migration_v12(&transaction).unwrap();
+
+        let bound = transaction
+            .prepare("SELECT id FROM reports WHERE scan_payload_updated_at IS NOT NULL ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(bound, vec!["report_fresh"]);
+        let indexed: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'reports_scan_payload_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
     }
 
     #[test]
@@ -3871,6 +3939,77 @@ mod tests {
         let latest = store.latest_report().unwrap().unwrap();
         assert_eq!(latest.id, second_report.id);
         assert_eq!(latest.summary["order"], 2);
+    }
+
+    #[test]
+    fn report_freshness_binds_the_exact_payload_version_without_timestamp_ordering() {
+        let store = StateStore::open_in_memory().unwrap();
+        let scan = scan();
+        store.save_scan(&scan).unwrap();
+        store
+            .save_scan_payload(&scan.id, &serde_json::json!({"version": 1}))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE scan_payloads SET updated_at = 200 WHERE scan_id = ?1",
+                [scan.id.as_str()],
+            )
+            .unwrap();
+        let first = ReportRecord {
+            id: ReportId::parse("report_00000000000000000000000000000001").unwrap(),
+            scan_id: scan.id.clone(),
+            created_at: 100,
+            summary: serde_json::json!({"version": 1}),
+        };
+        store.save_report(&first, &[]).unwrap();
+        assert!(store.report_exists_for_scan(&scan.id).unwrap());
+
+        store
+            .connection
+            .execute(
+                "UPDATE scan_payloads SET updated_at = 201 WHERE scan_id = ?1",
+                [scan.id.as_str()],
+            )
+            .unwrap();
+        assert!(!store.report_exists_for_scan(&scan.id).unwrap());
+        assert!(store.latest_report().unwrap().is_none());
+
+        let second = ReportRecord {
+            id: ReportId::parse("report_00000000000000000000000000000002").unwrap(),
+            created_at: 100,
+            summary: serde_json::json!({"version": 2}),
+            ..first
+        };
+        store.save_report(&second, &[]).unwrap();
+        assert!(store.report_exists_for_scan(&scan.id).unwrap());
+        assert_eq!(store.latest_report().unwrap().unwrap().id, second.id);
+    }
+
+    #[test]
+    fn report_freshness_query_uses_the_payload_version_index() {
+        let store = StateStore::open_in_memory().unwrap();
+        let details = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT EXISTS(
+                    SELECT 1 FROM reports r
+                    JOIN scan_payloads p ON p.scan_id = r.scan_id
+                    WHERE r.scan_id = ?1 AND r.scan_payload_updated_at = p.updated_at
+                 )",
+            )
+            .unwrap()
+            .query_map(["scan_any"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("reports_scan_payload_version")),
+            "query plan did not use the Report freshness index: {details:?}"
+        );
     }
 
     #[test]

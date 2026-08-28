@@ -987,6 +987,20 @@ fn home_and_status_resume_the_first_value_flow_until_the_current_report_exists()
     let complete = json_output(&run(&common, None));
     assert_eq!(complete["result"]["state"], "ready");
     assert_eq!(complete["suggested_actions"], json!([]));
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    database
+        .execute("UPDATE scan_payloads SET updated_at = updated_at + 1", [])
+        .unwrap();
+    drop(database);
+    let payload_changed = json_output(&run(&common, None));
+    assert_eq!(payload_changed["result"]["state"], "report_required");
+    json_output(&run_suggested_action(
+        &payload_changed["suggested_actions"][0],
+    ));
+    let rebuilt = json_output(&run(&common, None));
+    assert_eq!(rebuilt["result"]["state"], "ready");
+    assert_eq!(rebuilt["suggested_actions"], json!([]));
 }
 
 #[test]
