@@ -62,6 +62,12 @@ The Agent selects one primary action from current state:
 
 The Agent never manufactures a problem so that an Apply action exists.
 
+The default no-subcommand Home is the Agent's bounded readiness router. It and
+Status share one action-priority decision: recovery, missing-Snapshot Scan,
+invalidated-Snapshot Scan, Ready Plan inspection, then no required
+continuation. Home never calls a stale Snapshot ready, and its human surface
+prints the same exact argv returned in the JSON suggested action.
+
 ## 4. First-screen information
 
 The initial response should fit roughly one conversation viewport. It contains:
@@ -170,10 +176,10 @@ the original Snapshot becomes current again. If a newer Scan already observed
 the applied state, Undo returns another required Scan before current-inventory
 decisions resume.
 
-While facts are invalid, Status names `snapshot_state: rescan_required`, binds
-the invalidating Receipt ID, and returns the same read-only Scan continuation.
-The Agent follows recovery first when required, then stale-fact refresh, then
-ordinary pending-Plan inspection.
+While facts are invalid, Home and Status name `snapshot_state:
+rescan_required`, bind the invalidating Receipt ID, and return the same
+read-only Scan continuation. The Agent follows recovery first when required,
+then stale-fact refresh, then ordinary pending-Plan inspection.
 
 ## 7. Drill-down behavior
 

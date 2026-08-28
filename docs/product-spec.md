@@ -194,6 +194,7 @@ SkillRoster records source, revision, and content hash when available. A source-
 The first complete command surface is:
 
 ```bash
+skillroster [--json]
 skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--require-snapshot <scan-id>] [--json]
@@ -207,6 +208,14 @@ skillroster source-root inspect [--json]
 skillroster source-root revoke <permission-id> [--json]
 skillroster setup [--modified-choice retain-local|adopt-current] [--json]
 ```
+
+The no-subcommand Home is the bounded readiness projection for Agents. It does
+not maintain an independent readiness heuristic. Home and `status` use one
+continuation selector with this priority: recovery inspection, missing-Snapshot
+Scan, invalidated-Snapshot Scan, actionable Ready Plan inspection, then no
+required continuation. Home exposes `recovery_required`, `no_snapshot`,
+`rescan_required`, `plan_ready`, or `ready`; its JSON action and human argv are
+the same generated continuation with the original discovery context preserved.
 
 Finding lists and full Finding records default to 20 rows per page. Compact
 `report --finding <id>` detail defaults to five rows so an Agent receives the
@@ -475,6 +484,10 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
 - Plans and Receipts remain until explicitly purged.
 - Overflow source-confirmation details are versioned local artifacts retained until explicitly purged or local state is deleted.
 - `status` exposes storage location, retention state, and retained source-confirmation artifact counts and bytes.
+- Home is a bounded projection of the same current-state and continuation
+  decision used by `status`. It never reports `ready` merely because a completed
+  but invalidated Snapshot exists, and it never leaves a missing Snapshot or
+  recovery state without the exact read-only continuation.
 - `status` remains read-only and available when current inventory facts are
   invalid. It exposes typed `snapshot_state`, the invalidating Receipt ID, and
   the required Scan continuation. Recovery inspection remains higher priority;

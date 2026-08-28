@@ -169,7 +169,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         "lifecycle" => lifecycle(result, &mut lines),
         "source-root" => source_root(result, &mut lines),
         "setup" => setup(result, &mut lines, options.width),
-        _ => home(result, &mut lines),
+        _ => home(result, &mut lines, options.width),
     }
     if styled {
         for line in &mut lines {
@@ -329,7 +329,14 @@ fn fact_items(lines: &mut Vec<String>, label: &str, items: Vec<String>, width: u
 }
 
 fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
-    fact(lines, "Database", text(value, "database_path"));
+    fact(
+        lines,
+        "Database",
+        middle_truncate(
+            &text(value, "database_path"),
+            width.saturating_sub(25).max(1),
+        ),
+    );
     fact(lines, "Schema", text(value, "schema_version"));
     fact(lines, "Latest Snapshot", text(value, "latest_snapshot_id"));
     fact(
@@ -370,24 +377,9 @@ fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
         fact(lines, "Last Receipt", "none");
     }
     fact(lines, "Recovery", text(value, "recovery_state"));
-    let next = if value["recovery_state"] == "required" {
-        "Next: skillroster lifecycle recovery".to_owned()
-    } else if value.get("latest_snapshot_id").is_none_or(Value::is_null) {
-        "Next: skillroster scan".to_owned()
-    } else if value["snapshot_state"] == "rescan_required" {
-        "Next: skillroster scan --summary --json".to_owned()
-    } else if pending_plan.is_some() {
-        "Next: inspect the Review Plan above".to_owned()
-    } else {
-        "Next: scan only when fresher inventory is needed".to_owned()
-    };
     lines.push(String::new());
     lines.push("Read-only · no Agent files changed".into());
-    if display_width(&next) > width {
-        lines.push(middle_truncate(&next, width));
-    } else {
-        lines.push(next);
-    }
+    continuation(value, lines, width);
 }
 
 fn scan(value: &Value, lines: &mut Vec<String>) {
@@ -1773,11 +1765,66 @@ fn source_root(value: &Value, lines: &mut Vec<String>) {
     ));
 }
 
-fn home(value: &Value, lines: &mut Vec<String>) {
+fn home(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "State", text(value, "state"));
+    fact(lines, "Snapshot state", text(value, "snapshot_state"));
     fact(lines, "Recovery", text(value, "recovery_state"));
     lines.push(String::new());
-    lines.push("Next: skillroster scan | report | status".into());
+    continuation(value, lines, width);
+}
+
+fn continuation(value: &Value, lines: &mut Vec<String>, width: usize) {
+    if let Some(action) = value.get("next_action").filter(|action| !action.is_null()) {
+        lines.push("Continue argv:".into());
+        for (index, argument) in action["argv"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .enumerate()
+        {
+            let prefix = format!("  [{index}] ");
+            let indent = " ".repeat(display_width(&prefix));
+            let budget = width.saturating_sub(display_width(&prefix) + 2).max(8);
+            let chunks = exact_json_string_chunks(argument, budget);
+            let last = chunks.len().saturating_sub(1);
+            for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+                lines.push(format!(
+                    "{}{}{}",
+                    if chunk_index == 0 { &prefix } else { &indent },
+                    chunk,
+                    if chunk_index < last { " +" } else { "" }
+                ));
+            }
+        }
+    } else {
+        lines.push("No required continuation".into());
+    }
+}
+
+fn exact_json_string_chunks(value: &str, budget: usize) -> Vec<String> {
+    if value.is_empty() {
+        return vec!["\"\"".into()];
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        current.push(character);
+        let encoded = serde_json::to_string(&current).unwrap_or_else(|_| "\"\"".into());
+        if display_width(&encoded) <= budget {
+            continue;
+        }
+        current.pop();
+        if !current.is_empty() {
+            chunks.push(serde_json::to_string(&current).unwrap_or_else(|_| "\"\"".into()));
+        }
+        current.clear();
+        current.push(character);
+    }
+    if !current.is_empty() {
+        chunks.push(serde_json::to_string(&current).unwrap_or_else(|_| "\"\"".into()));
+    }
+    chunks
 }
 
 fn summary(safety: &str, next: &str) -> Vec<String> {
@@ -1929,7 +1976,7 @@ mod tests {
     }
 
     #[test]
-    fn status_routes_to_the_highest_priority_read_only_decision() {
+    fn status_renders_the_provided_continuation_without_reinterpreting_state() {
         let base = json!({
             "database_path": "/db",
             "schema_version": 9,
@@ -1944,7 +1991,11 @@ mod tests {
                 "created_at": 1
             }],
             "last_receipt": null,
-            "recovery_state": "clear"
+            "recovery_state": "clear",
+            "next_action": {
+                "action": "inspect_pending_plan",
+                "argv": ["skillroster", "plan", "--show", "plan_01M0QDAC102GEXKCMHVP97GF2V", "--json"]
+            }
         });
         let options = RenderOptions {
             width: 80,
@@ -1953,45 +2004,64 @@ mod tests {
 
         let pending = render("status", &base, options);
         assert!(pending.contains("Review Plan            plan_01M0QDAC102GEXKCMHVP97GF2V"));
-        assert!(pending.contains("Next: inspect the Review Plan above"));
-        assert!(!pending.contains("Next: skillroster scan"));
+        assert!(pending.contains("Continue argv:\n  [0] \"skillroster\"\n  [1] \"plan\""));
+        assert!(pending.contains("  [3] \"plan_01M0QDAC102GEXKCMHVP97GF2V\""));
+        assert!(pending.lines().all(|line| display_width(line) <= 80));
 
-        let narrow = render(
-            "status",
-            &base,
+        let mut recovery = base.clone();
+        recovery["recovery_state"] = json!("required");
+        let recovery = render("status", &recovery, options);
+        assert!(recovery.contains("  [3] \"plan_01M0QDAC102GEXKCMHVP97GF2V\""));
+
+        let mut healthy = base;
+        healthy["pending_plan_count"] = json!(0);
+        healthy["pending_plans"] = json!([]);
+        healthy["next_action"] = Value::Null;
+        let healthy = render("status", &healthy, options);
+        assert!(healthy.contains("No required continuation"));
+    }
+
+    #[test]
+    fn continuation_wraps_exact_json_chunks_to_the_requested_width() {
+        let value = json!({
+            "next_action": {
+                "argv": [
+                    "skillroster",
+                    "--state-dir",
+                    "/a state directory with spaces/and/a/very/long/path/that/must/not/be/truncated"
+                ]
+            }
+        });
+        let output = render(
+            "home",
+            &value,
             RenderOptions {
                 width: 40,
                 styled: false,
             },
         );
-        assert!(narrow.contains("Review Plan"));
-        assert!(narrow.contains("\n    plan_01M0QDAC102GEXKCMHVP97GF2V"));
-        assert!(!narrow.contains("Review Plan            plan_"));
-        assert!(narrow.contains("Next: inspect the Review Plan above"));
-        assert!(narrow.lines().all(|line| display_width(line) <= 40));
-
-        let mut recovery = base.clone();
-        recovery["recovery_state"] = json!("required");
-        let recovery = render("status", &recovery, options);
-        assert!(recovery.contains("Next: skillroster lifecycle recovery"));
-
-        let mut missing_snapshot = base.clone();
-        missing_snapshot["latest_snapshot_id"] = Value::Null;
-        missing_snapshot["snapshot_state"] = json!("missing");
-        let missing_snapshot = render("status", &missing_snapshot, options);
-        assert!(missing_snapshot.contains("Next: skillroster scan"));
-
-        let mut stale = base.clone();
-        stale["snapshot_state"] = json!("rescan_required");
-        let stale = render("status", &stale, options);
-        assert!(stale.contains("Snapshot state         rescan_required"));
-        assert!(stale.contains("Next: skillroster scan --summary --json"));
-
-        let mut healthy = base;
-        healthy["pending_plan_count"] = json!(0);
-        healthy["pending_plans"] = json!([]);
-        let healthy = render("status", &healthy, options);
-        assert!(healthy.contains("Next: scan only when fresher inventory is needed"));
+        assert!(output.lines().all(|line| display_width(line) <= 40));
+        assert!(output.contains(" +\n      \""));
+        let chunks = output
+            .lines()
+            .skip_while(|line| *line != "Continue argv:")
+            .skip(1)
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                let payload = trimmed
+                    .find(']')
+                    .map(|close| trimmed[close + 1..].trim_start())
+                    .unwrap_or(trimmed);
+                payload
+                    .starts_with('"')
+                    .then(|| payload.strip_suffix(" +").unwrap_or(payload))
+            })
+            .map(|chunk| serde_json::from_str::<String>(chunk).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks.concat(),
+            "skillroster--state-dir/a state directory with spaces/and/a/very/long/path/that/must/not/be/truncated"
+        );
     }
 
     #[test]

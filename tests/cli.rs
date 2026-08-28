@@ -36,6 +36,51 @@ fn run(args: &[&str], stdin: Option<&str>) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_with_columns(args: &[&str], columns: usize) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_skillroster"))
+        .args(args)
+        .env("COLUMNS", columns.to_string())
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap()
+}
+
+fn continuation_argv(output: &str) -> Vec<String> {
+    let mut argv = Vec::new();
+    let mut current = None::<String>;
+    let mut in_continuation = false;
+    for line in output.lines() {
+        if line == "Continue argv:" {
+            in_continuation = true;
+            continue;
+        }
+        if !in_continuation || line.trim().is_empty() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let payload = if let Some(close) = trimmed
+            .strip_prefix('[')
+            .and_then(|line| line.find(']').map(|close| (line, close)))
+        {
+            if let Some(argument) = current.take() {
+                argv.push(argument);
+            }
+            close.0[close.1 + 1..].trim_start()
+        } else if trimmed.starts_with('"') {
+            trimmed
+        } else {
+            break;
+        };
+        let chunk = payload.strip_suffix(" +").unwrap_or(payload);
+        let decoded: String = serde_json::from_str(chunk).unwrap();
+        current.get_or_insert_with(String::new).push_str(&decoded);
+    }
+    if let Some(argument) = current {
+        argv.push(argument);
+    }
+    argv
+}
+
 #[cfg(unix)]
 fn run_with_umask(args: &[&str], umask: libc::mode_t) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_skillroster"));
@@ -816,6 +861,179 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
     assert!(healthy["result"]["latest_snapshot_id"].is_string());
     assert_eq!(healthy["result"]["recovery_state"], "clear");
     assert_eq!(healthy["suggested_actions"], json!([]));
+}
+
+#[test]
+fn home_and_status_share_the_missing_snapshot_scan_continuation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home with spaces");
+    let state = temp.path().join("state with spaces");
+    fs::create_dir_all(&home).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let home_result = json_output(&run(&common, None));
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let expected = context_action_argv(&home, &state, &["scan", "--summary", "--json"]);
+
+    assert_eq!(home_result["result"]["state"], "no_snapshot");
+    assert_eq!(home_result["result"]["snapshot_state"], "missing");
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
+    assert_eq!(home_result["suggested_actions"][0]["argv"], expected);
+    assert_eq!(home_result["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        home_result["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
+    let human = run_with_columns(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ],
+        60,
+    );
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    let expected_argv = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|argument| argument.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(continuation_argv(&human), expected_argv);
+    assert!(human.lines().all(|line| line.chars().count() <= 60));
+    let human_status = run_with_columns(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "status",
+        ],
+        60,
+    );
+    assert!(human_status.status.success());
+    let human_status = String::from_utf8(human_status.stdout).unwrap();
+    assert_eq!(continuation_argv(&human_status), expected_argv);
+    assert!(
+        human_status.lines().all(|line| line.chars().count() <= 60),
+        "line exceeded 60 columns:\n{human_status}"
+    );
+}
+
+#[test]
+fn home_routes_a_current_snapshot_only_when_a_ready_plan_exists() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let healthy = json_output(&run(&common, None));
+    assert_eq!(healthy["result"]["state"], "ready");
+    assert_eq!(healthy["result"]["snapshot_state"], "current");
+    assert_eq!(healthy["suggested_actions"], json!([]));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let plan_ready = json_output(&run(&common, None));
+    assert_eq!(plan_ready["result"]["state"], "plan_ready");
+    assert_eq!(plan_ready["result"]["snapshot_state"], "current");
+    assert_eq!(plan_ready["result"]["pending_plan_count"], 1);
+    assert_eq!(plan_ready["suggested_actions"], status["suggested_actions"]);
+    assert_eq!(
+        plan_ready["suggested_actions"][0]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "plan",
+                "--show",
+                setup["result"]["plan_id"].as_str().unwrap(),
+                "--json"
+            ]
+        )
+    );
+}
+
+#[test]
+fn home_and_status_prioritize_recovery_over_an_invalidated_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let applied_receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let applied_journal = state
+        .join("receipts")
+        .join(format!("{applied_receipt_id}.json"));
+    let mut orphan: Value = serde_json::from_slice(&fs::read(applied_journal).unwrap()).unwrap();
+    let orphan_id = "receipt_00000000000000000000000000";
+    orphan["id"] = json!(orphan_id);
+    orphan["status"] = json!("recovery_required");
+    fs::write(
+        state.join("receipts").join(format!("{orphan_id}.json")),
+        serde_json::to_vec_pretty(&orphan).unwrap(),
+    )
+    .unwrap();
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let home_result = json_output(&run(&common, None));
+    assert_eq!(home_result["result"]["state"], "recovery_required");
+    assert_eq!(home_result["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_receipt_id"],
+        applied_receipt_id
+    );
+    assert_eq!(home_result["result"]["recovery_state"], "required");
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
+    assert_eq!(
+        home_result["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["lifecycle", "recovery", "--json"])
+    );
+    assert_eq!(
+        home_result["suggested_actions"][0]["reason_code"],
+        "recovery_required"
+    );
 }
 
 #[test]
@@ -4292,6 +4510,17 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
     assert_eq!(status["result"]["pending_plans"], json!([]));
     assert_eq!(status["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(status["suggested_actions"][0]["action"], "scan");
+    let home_result = json_output(&run(&common, None));
+    assert_eq!(home_result["result"]["state"], "rescan_required");
+    assert_eq!(home_result["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        home_result["result"]["snapshot_invalidated_by_receipt_id"],
+        applied["result"]["receipt_id"]
+    );
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
