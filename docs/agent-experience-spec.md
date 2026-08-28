@@ -179,7 +179,10 @@ decisions resume.
 
 While facts are invalid, Home and Status name `snapshot_state:
 rescan_required`, bind the invalidating Receipt ID, and return the same
-read-only Scan continuation. The Agent follows recovery first when required,
+read-only Scan continuation as the primary action. When a verified Applied
+Receipt caused the invalidation, they also return that exact confirmed Undo as
+a secondary action; an Undo-created invalidation remains Scan-only. The Agent
+follows recovery first when required,
 then stale-fact refresh, then ordinary pending-Plan inspection.
 
 ## 7. Drill-down behavior

@@ -1096,6 +1096,14 @@ fn home_and_status_prioritize_recovery_over_an_invalidated_snapshot() {
         status["suggested_actions"]
     );
     assert_eq!(
+        home_result["suggested_actions"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        home_result["result"]["next_action"],
+        home_result["suggested_actions"][0]
+    );
+    assert_eq!(
         home_result["suggested_actions"][0]["argv"],
         context_action_argv(&home, &state, &["lifecycle", "recovery", "--json"])
     );
@@ -4513,8 +4521,10 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
     let ready_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(ready_status["result"]["pending_plan_count"], 2);
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    let bootstrap = home.join(".codex/skills/skillroster");
 
     assert_eq!(applied["result"]["verification"], "passed");
+    assert!(bootstrap.is_dir());
     assert_eq!(applied["result"]["rescan_required"], true);
     assert_eq!(applied["suggested_actions"].as_array().unwrap().len(), 2);
     assert_eq!(applied["suggested_actions"][0]["action"], "scan");
@@ -4577,8 +4587,34 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
     );
     assert_eq!(status["result"]["pending_plan_count"], 0);
     assert_eq!(status["result"]["pending_plans"], json!([]));
-    assert_eq!(status["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(status["suggested_actions"].as_array().unwrap().len(), 2);
     assert_eq!(status["suggested_actions"][0]["action"], "scan");
+    assert_eq!(
+        status["result"]["next_action"],
+        status["suggested_actions"][0]
+    );
+    assert_eq!(status["suggested_actions"][1]["action"], "undo");
+    assert_eq!(
+        status["suggested_actions"][1]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "undo",
+                applied["result"]["receipt_id"].as_str().unwrap(),
+                "--json",
+            ],
+        )
+    );
+    assert_eq!(status["suggested_actions"][1]["mutates"], true);
+    assert_eq!(
+        status["suggested_actions"][1]["reason_code"],
+        "receipt_undoable"
+    );
+    assert_eq!(
+        status["suggested_actions"][1]["requires_confirmation"],
+        true
+    );
     let home_result = json_output(&run(&common, None));
     assert_eq!(home_result["result"]["state"], "rescan_required");
     assert_eq!(home_result["result"]["snapshot_state"], "rescan_required");
@@ -4590,9 +4626,13 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
         home_result["suggested_actions"],
         status["suggested_actions"]
     );
-    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
-    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    let undone = json_output(&run_suggested_action(&home_result["suggested_actions"][1]));
     assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(
+        undone["result"]["reverses_receipt_id"],
+        applied["result"]["receipt_id"]
+    );
+    assert!(!bootstrap.exists());
     let restored = json_output(&run(
         &[&common[..], &["report", "--summary"]].concat(),
         None,
@@ -4696,6 +4736,17 @@ fn exact_undo_invalidates_a_newer_post_apply_snapshot() {
         blocked["error"]["details"]["snapshot_id"],
         post_apply_scan["result"]["snapshot_id"]
     );
+    let resumed_home = json_output(&run(&common, None));
+    let resumed_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(
+        resumed_home["suggested_actions"],
+        resumed_status["suggested_actions"]
+    );
+    assert_eq!(
+        resumed_home["suggested_actions"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(resumed_home["suggested_actions"][0]["action"], "scan");
 
     let refreshed = json_output(&run_suggested_action(&undone["suggested_actions"][0]));
     assert_eq!(refreshed["result"]["placement_count"], 0);

@@ -28,7 +28,7 @@ use crate::model::{
     ScanStatus, Severity, SkillId, SkillRecord, SuggestedAction, UsageEvent, UsageStage,
 };
 use crate::scan::{self, ExplicitSkillRoot, RootKind, ScanOptions, ScanResult};
-use crate::sqlite::StateStore;
+use crate::sqlite::{SnapshotInvalidationKind, StateStore};
 use crate::state_security;
 
 pub use crate::action_context::ActionContext;
@@ -117,13 +117,13 @@ pub fn run(cli: Cli) -> Result<Output> {
     let (command, mut result, warnings, mut actions) = match cli.command {
         None => {
             let readiness = readiness_decision(&store, &state_dir)?;
-            let actions = readiness.continuation.clone().into_iter().collect();
+            let actions = readiness.actions.clone();
             let result = home_result(&readiness);
             ("home", result, vec![], actions)
         }
         Some(Command::Status) => {
             let readiness = readiness_decision(&store, &state_dir)?;
-            let actions = readiness.continuation.clone().into_iter().collect();
+            let actions = readiness.actions.clone();
             let result = status_result(&store, &database_path, &state_dir, &readiness)?;
             ("status", result, vec![], actions)
         }
@@ -342,13 +342,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             if rescan_required {
                 actions.push(snapshot_rescan_action());
             }
-            actions.push(action(
-                "undo",
-                &["undo", &id, "--json"],
-                true,
-                true,
-                "receipt_undoable",
-            ));
+            actions.push(receipt_undo_action(&id));
             ("apply", result, vec![], actions)
         }
         Some(Command::Undo(args)) => {
@@ -735,16 +729,19 @@ struct ReadinessDecision {
     pending_plans: Vec<PlanRecord>,
     recovery_required: bool,
     journal_issues: Vec<Value>,
-    continuation: Option<SuggestedAction>,
+    actions: Vec<SuggestedAction>,
 }
 
 fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessDecision> {
     let latest_snapshot = store.latest_completed_scan()?;
     let latest_scan_id = latest_snapshot.as_ref().map(|scan| &scan.id);
-    let invalidating_receipt_id = latest_scan_id
+    let invalidation = latest_scan_id
         .map(|scan_id| store.snapshot_invalidating_receipt(scan_id))
         .transpose()?
         .flatten();
+    let invalidating_receipt_id = invalidation
+        .as_ref()
+        .map(|invalidation| invalidation.receipt_id.clone());
     let snapshot_state = if latest_scan_id.is_none() {
         SnapshotState::Missing
     } else if invalidating_receipt_id.is_some() {
@@ -759,52 +756,53 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
         store.pending_plans(actionable_scan_id, STATUS_PENDING_PLAN_LIMIT)?;
     let journal_issues = journal_issues(store, state_dir)?;
     let recovery_required = store.recovery_required()? || !journal_issues.is_empty();
-    let (state, continuation) = if recovery_required {
+    let (state, actions) = if recovery_required {
         (
             ReadinessState::RecoveryRequired,
-            Some(action(
+            vec![action(
                 "inspect_recovery",
                 &["lifecycle", "recovery", "--json"],
                 false,
                 false,
                 "recovery_required",
-            )),
+            )],
         )
     } else if snapshot_state == SnapshotState::Missing {
         (
             ReadinessState::NoSnapshot,
-            Some(action(
+            vec![action(
                 "scan",
                 &["scan", "--summary", "--json"],
                 false,
                 false,
                 "snapshot_required",
-            )),
+            )],
         )
-    } else if snapshot_state == SnapshotState::RescanRequired {
-        (
-            ReadinessState::RescanRequired,
-            Some(snapshot_rescan_action()),
-        )
+    } else if let Some(invalidation) = invalidation {
+        let mut actions = vec![snapshot_rescan_action()];
+        if invalidation.kind == SnapshotInvalidationKind::AppliedReceipt {
+            actions.push(receipt_undo_action(invalidation.receipt_id.as_str()));
+        }
+        (ReadinessState::RescanRequired, actions)
     } else if let Some(plan) = pending_plans.first() {
         (
             ReadinessState::PlanReady,
-            Some(action(
+            vec![action(
                 "inspect_pending_plan",
                 &["plan", "--show", plan.id.as_str(), "--json"],
                 false,
                 false,
                 "pending_plan_requires_review",
-            )),
+            )],
         )
     } else if !latest_scan_id
         .map(|scan_id| store.report_exists_for_scan(scan_id))
         .transpose()?
         .unwrap_or(false)
     {
-        (ReadinessState::ReportRequired, Some(report_action()))
+        (ReadinessState::ReportRequired, vec![report_action()])
     } else {
-        (ReadinessState::Ready, None)
+        (ReadinessState::Ready, Vec::new())
     };
     Ok(ReadinessDecision {
         state,
@@ -815,7 +813,7 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
         pending_plans,
         recovery_required,
         journal_issues,
-        continuation,
+        actions,
     })
 }
 
@@ -9102,10 +9100,10 @@ fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
 }
 
 fn require_snapshot_current(store: &StateStore, scan_id: &ScanId) -> Result<()> {
-    if let Some(receipt_id) = store.snapshot_invalidating_receipt(scan_id)? {
+    if let Some(invalidation) = store.snapshot_invalidating_receipt(scan_id)? {
         return Err(SnapshotRescanRequired {
             snapshot_id: scan_id.clone(),
-            receipt_id,
+            receipt_id: invalidation.receipt_id,
         }
         .into());
     }
@@ -9476,6 +9474,16 @@ fn snapshot_rescan_action() -> SuggestedAction {
         false,
         false,
         "verified_mutation_requires_rescan",
+    )
+}
+
+fn receipt_undo_action(receipt_id: &str) -> SuggestedAction {
+    action(
+        "undo",
+        &["undo", receipt_id, "--json"],
+        true,
+        true,
+        "receipt_undoable",
     )
 }
 
