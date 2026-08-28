@@ -2316,6 +2316,8 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         )
         .unwrap();
     }
+    let first_source = fs::canonicalize(first_source).unwrap();
+    let second_source = fs::canonicalize(second_source).unwrap();
     let codex_root = home.join(".codex/skills");
     let claude_root = home.join(".claude/skills");
     fs::create_dir_all(&codex_root).unwrap();
@@ -6875,6 +6877,7 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
         "---\nname: external\n---\nfixture\n",
     )
     .unwrap();
+    let outside = fs::canonicalize(outside).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("zzz-external")).unwrap();
     for index in 0..51 {
         let directory = root.join(format!("skill-{index:03}"));
@@ -7054,6 +7057,7 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
     let reviewed = temp.path().join("reviewed");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&reviewed).unwrap();
+    let reviewed = fs::canonicalize(reviewed).unwrap();
     for index in 0..10 {
         let directory = root.join(format!("aaa-{index:03}"));
         fs::create_dir(&directory).unwrap();
@@ -7357,6 +7361,7 @@ fn full_roster_finding_can_protect_read_only_skills_and_prepare_a_plan() {
                 format!("---\nname: {name}\n---\nfixture\n"),
             )
             .unwrap();
+            let source = fs::canonicalize(source).unwrap();
             symlink(&source, root.join(&name)).unwrap();
             source
         })
@@ -10741,6 +10746,85 @@ fn escaping_link_resolution_separates_durable_and_temporary_read_paths() {
 
 #[cfg(unix)]
 #[test]
+fn escaping_link_finding_deduplicates_canonical_source_targets() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source = temp.path().join("trusted-source");
+    let alias = temp.path().join("source-alias");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: external\ndescription: fixture\n---\n",
+    )
+    .unwrap();
+    let source = fs::canonicalize(source).unwrap();
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    std::os::unix::fs::symlink(&source, root.join("direct")).unwrap();
+    std::os::unix::fs::symlink(&alias, root.join("through-alias")).unwrap();
+    let entrypoint_link = root.join("entrypoint-link");
+    fs::create_dir(&entrypoint_link).unwrap();
+    std::os::unix::fs::symlink(source.join("SKILL.md"), entrypoint_link.join("SKILL.md")).unwrap();
+    let malformed_target = temp.path().join("not-a-skill-directory");
+    fs::write(&malformed_target, "not a Skill directory\n").unwrap();
+    std::os::unix::fs::symlink(&malformed_target, root.join("malformed-directory-link")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    let detail = json_output(&run(
+        &[&common[..], &["report", "--finding", finding_id]].concat(),
+        None,
+    ));
+
+    assert_eq!(
+        detail["result"]["resolution"]["observed_link_targets"],
+        json!([source])
+    );
+    assert_eq!(
+        detail["result"]["resolution"]["observed_link_target_count"],
+        1
+    );
+    assert_eq!(detail["result"]["impact"]["affected_placement_count"], 3);
+    assert!(
+        detail["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["facts"]["link_target"] == json!(source))
+    );
+    assert_eq!(
+        detail["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "confirm_source_root_read_permission")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn escaping_link_finding_requests_exact_read_permission_instead_of_a_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -10754,6 +10838,7 @@ fn escaping_link_finding_requests_exact_read_permission_instead_of_a_plan() {
         "---\nname: external\ndescription: fixture\n---\n",
     )
     .unwrap();
+    let source = fs::canonicalize(source).unwrap();
     std::os::unix::fs::symlink(&source, root.join("external")).unwrap();
     let common = [
         "--home",
@@ -11160,6 +11245,7 @@ fn unreadable_link_scan_preserves_a_retained_skill_identity() {
         "---\nname: retained-external\ndescription: fixture\n---\n",
     )
     .unwrap();
+    let source = fs::canonicalize(source).unwrap();
     let linked = root.join("retained-external");
     std::os::unix::fs::symlink(&source, &linked).unwrap();
     let entrypoint = linked.join("SKILL.md");
