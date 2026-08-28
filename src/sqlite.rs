@@ -13,6 +13,11 @@ use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermissio
 use crate::state_security;
 
 const SCHEMA_VERSION: i64 = 12;
+const REPORT_EXISTS_FOR_SCAN_SQL: &str = "SELECT EXISTS(
+        SELECT 1 FROM reports r
+        JOIN scan_payloads p ON p.scan_id = r.scan_id
+        WHERE r.scan_id = ?1 AND r.scan_payload_updated_at = p.updated_at
+    )";
 
 fn sqlite_nofollow_path(path: &Path) -> StorageResult<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
@@ -485,7 +490,7 @@ impl StateStore {
             "INSERT INTO scan_payloads (scan_id, payload_json, updated_at)
              VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))
              ON CONFLICT(scan_id) DO UPDATE SET payload_json = excluded.payload_json,
-                 updated_at = excluded.updated_at",
+                 updated_at = MAX(scan_payloads.updated_at + 1, excluded.updated_at)",
             params![id.as_str(), json(payload)?],
         )?;
         Ok(())
@@ -573,15 +578,9 @@ impl StateStore {
     }
 
     pub fn report_exists_for_scan(&self, id: &ScanId) -> StorageResult<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM reports r
-                JOIN scan_payloads p ON p.scan_id = r.scan_id
-                WHERE r.scan_id = ?1 AND r.scan_payload_updated_at = p.updated_at
-            )",
-            [id.as_str()],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .connection
+            .query_row(REPORT_EXISTS_FOR_SCAN_SQL, [id.as_str()], |row| row.get(0))?)
     }
 
     pub fn save_agent(&self, agent: &AgentRecord) -> StorageResult<AgentId> {
@@ -1970,7 +1969,10 @@ impl StateStore {
                             scan_payloads.updated_at) >= ?1
                     ), json('[]'))
                  ),
-                 updated_at = CAST(strftime('%s', 'now') AS INTEGER) + 1
+                 updated_at = MAX(
+                    scan_payloads.updated_at + 1,
+                    CAST(strftime('%s', 'now') AS INTEGER)
+                 )
              WHERE EXISTS (
                 SELECT 1 FROM json_each(scan_payloads.payload_json, '$.usage') AS usage
                 WHERE COALESCE(
@@ -3952,9 +3954,12 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE scan_payloads SET updated_at = 200 WHERE scan_id = ?1",
+                "UPDATE scan_payloads SET updated_at = 10000000000 WHERE scan_id = ?1",
                 [scan.id.as_str()],
             )
+            .unwrap();
+        store
+            .save_scan_payload(&scan.id, &serde_json::json!({"version": 1}))
             .unwrap();
         let first = ReportRecord {
             id: ReportId::parse("report_00000000000000000000000000000001").unwrap(),
@@ -3965,13 +3970,26 @@ mod tests {
         store.save_report(&first, &[]).unwrap();
         assert!(store.report_exists_for_scan(&scan.id).unwrap());
 
-        store
+        let first_version: i64 = store
             .connection
-            .execute(
-                "UPDATE scan_payloads SET updated_at = 201 WHERE scan_id = ?1",
+            .query_row(
+                "SELECT updated_at FROM scan_payloads WHERE scan_id = ?1",
                 [scan.id.as_str()],
+                |row| row.get(0),
             )
             .unwrap();
+        store
+            .save_scan_payload(&scan.id, &serde_json::json!({"version": 2}))
+            .unwrap();
+        let second_version: i64 = store
+            .connection
+            .query_row(
+                "SELECT updated_at FROM scan_payloads WHERE scan_id = ?1",
+                [scan.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_version, first_version + 1);
         assert!(!store.report_exists_for_scan(&scan.id).unwrap());
         assert!(store.latest_report().unwrap().is_none());
 
@@ -3991,14 +4009,7 @@ mod tests {
         let store = StateStore::open_in_memory().unwrap();
         let details = store
             .connection
-            .prepare(
-                "EXPLAIN QUERY PLAN
-                 SELECT EXISTS(
-                    SELECT 1 FROM reports r
-                    JOIN scan_payloads p ON p.scan_id = r.scan_id
-                    WHERE r.scan_id = ?1 AND r.scan_payload_updated_at = p.updated_at
-                 )",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {REPORT_EXISTS_FOR_SCAN_SQL}"))
             .unwrap()
             .query_map(["scan_any"], |row| row.get::<_, String>(3))
             .unwrap()
@@ -4033,6 +4044,13 @@ mod tests {
                     }],
                     "coverage": [{"agent": "codex", "denominator_reliable": false}]
                 }),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE scan_payloads SET updated_at = 10000000000 WHERE scan_id = ?1",
+                [scan.id.as_str()],
             )
             .unwrap();
         let agent = AgentRecord {
@@ -4086,6 +4104,15 @@ mod tests {
         assert_eq!(result.deleted_raw_usage_rows, 1);
         assert_eq!(result.deleted_evidence_rows, 1);
         assert_eq!(result.deleted_payload_usage_summaries, 1);
+        let payload_version: i64 = store
+            .connection
+            .query_row(
+                "SELECT updated_at FROM scan_payloads WHERE scan_id = ?1",
+                [scan.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(payload_version, 10000000001);
         let counts = store.lifecycle_counts().unwrap();
         assert_eq!(counts.raw_usage_rows, 0);
         assert_eq!(counts.monthly_usage_rows, 1);
