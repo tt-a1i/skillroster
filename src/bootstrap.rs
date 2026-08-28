@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn content_version_comes_from_the_bundled_skill_frontmatter() {
-        assert_eq!(content_version(), Some("1.8.28"));
+        assert_eq!(content_version(), Some("1.8.29"));
     }
 
     #[test]

@@ -63,8 +63,8 @@ fn json_output(output: &std::process::Output) -> Value {
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.28");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.28");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.29");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.29");
 }
 
 #[cfg(unix)]
@@ -3268,7 +3268,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.28"
+        "1.8.29"
     );
 
     let undone = json_output(&run(
@@ -3366,7 +3366,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
         (
             "SKILL.md",
             include_str!("../skill/skillroster/SKILL.md").replace(
-                "bootstrap-version: \"1.8.28\"",
+                "bootstrap-version: \"1.8.29\"",
                 "bootstrap-version: \"1.8.23\"",
             ),
         ),
@@ -3442,7 +3442,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
     assert_eq!(current["result"]["state"], "up_to_date");
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.28"
+        "1.8.29"
     );
 
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
