@@ -3303,6 +3303,25 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_atomic_rename_is_rejected_before_mutation_or_receipt() {
+        let (_temp, root, state) = fixture();
+        let target = root.join("not-created.md");
+        let plan = prepared_write(&root, &state, &target);
+        crate::anchored_fs::force_atomic_noreplace_unsupported_once();
+
+        let error = apply(&plan).unwrap_err();
+
+        assert_eq!(error.code, "filesystem_error");
+        assert!(
+            error
+                .message
+                .contains("atomic no-replace rename is unavailable")
+        );
+        assert!(!target.exists());
+        assert!(!state.join("receipts").exists());
+    }
+
+    #[test]
     fn journal_reuses_an_owned_temp_left_by_an_interrupted_write() {
         let (_temp, root, state) = fixture();
         let receipt = ChangeReceipt {

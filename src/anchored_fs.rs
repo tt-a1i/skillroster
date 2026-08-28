@@ -31,6 +31,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     static BEFORE_RENAME_NOREPLACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static FORCE_ATOMIC_NOREPLACE_UNSUPPORTED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -81,6 +83,11 @@ pub(crate) fn set_after_renamed_entry_first_check_hook(hook: impl FnOnce() + 'st
 #[cfg(all(test, any(unix, windows)))]
 pub(crate) fn set_before_rename_noreplace_hook(hook: impl FnOnce() + 'static) {
     BEFORE_RENAME_NOREPLACE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
+pub(crate) fn force_atomic_noreplace_unsupported_once() {
+    FORCE_ATOMIC_NOREPLACE_UNSUPPORTED.with(|forced| forced.set(true));
 }
 
 #[cfg(test)]
@@ -203,6 +210,16 @@ fn run_before_rename_noreplace_hook() {
 #[cfg(not(test))]
 fn run_before_rename_noreplace_hook() {}
 
+#[cfg(test)]
+fn take_forced_atomic_noreplace_unsupported() -> bool {
+    FORCE_ATOMIC_NOREPLACE_UNSUPPORTED.with(|forced| forced.replace(false))
+}
+
+#[cfg(not(test))]
+fn take_forced_atomic_noreplace_unsupported() -> bool {
+    false
+}
+
 struct Anchor {
     path: PathBuf,
     dir: Dir,
@@ -263,14 +280,20 @@ fn parent_dir_and_name(anchor: &Anchor, relative: &Path) -> io::Result<(Dir, OsS
     Ok((anchor.dir.open_dir(parent)?, name.to_os_string()))
 }
 
+fn unsupported_atomic_noreplace_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable; mutation requires Linux or WSL2 with RENAME_NOREPLACE support",
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn classify_atomic_noreplace_probe(error: io::Error) -> io::Result<()> {
     match error.raw_os_error() {
         Some(libc::ENOENT) => Ok(()),
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "atomic no-replace rename is unavailable; mutation requires Linux or WSL2 with RENAME_NOREPLACE support",
-        )),
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => {
+            Err(unsupported_atomic_noreplace_error())
+        }
         _ => Err(error),
     }
 }
@@ -537,6 +560,10 @@ impl<'a> AnchoredFs<'a> {
     pub(crate) fn require_atomic_noreplace_rename(&self) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
 
+        if take_forced_atomic_noreplace_unsupported() {
+            return Err(unsupported_atomic_noreplace_error());
+        }
+
         let state = self
             .anchors
             .iter()
@@ -562,7 +589,11 @@ impl<'a> AnchoredFs<'a> {
 
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn require_atomic_noreplace_rename(&self) -> io::Result<()> {
-        Ok(())
+        if take_forced_atomic_noreplace_unsupported() {
+            Err(unsupported_atomic_noreplace_error())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn open(
