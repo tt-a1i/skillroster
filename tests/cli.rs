@@ -3668,10 +3668,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
     let legacy_files = [
         (
             "SKILL.md",
-            include_str!("../skill/skillroster/SKILL.md").replace(
-                "bootstrap-version: \"1.8.29\"",
-                "bootstrap-version: \"1.8.23\"",
-            ),
+            include_str!("fixtures/bootstrap-v1.8.23.md").to_owned(),
         ),
         (
             "references/routing.md",
@@ -9540,14 +9537,15 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
                 "--home",
                 home,
                 "find",
-                "active search marker",
                 "--hint",
                 "inspect active identity",
                 "--limit",
                 "1",
                 "--require-snapshot",
                 snapshot,
-                "--json"
+                "--json",
+                "--",
+                "active search marker"
             ],
             "mutates": false,
             "requires_confirmation": false,
@@ -10184,6 +10182,135 @@ fn non_unicode_identity_coverage_blocks_exact_snapshot_consumers() {
             "non_unicode_identity_coverage_incomplete"
         );
     }
+}
+
+#[test]
+fn find_preserves_leading_hyphen_tasks_and_replayable_variant_actions() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex = home.join(".codex/skills/hyphen-route");
+    let claude = home.join(".claude/skills/hyphen-route");
+    fs::create_dir_all(&codex).unwrap();
+    fs::create_dir_all(&claude).unwrap();
+    fs::write(
+        codex.join("SKILL.md"),
+        "---\nname: hyphen-route\ndescription: Review a leading hyphen route\n---\ncodex variant\n",
+    )
+    .unwrap();
+    fs::write(
+        claude.join("SKILL.md"),
+        "---\nname: hyphen-route\ndescription: Review a leading hyphen route\n---\nclaude variant\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let task = "--review leading hyphen route";
+    let hint = "review route";
+
+    for tail in [&["find"][..], &["find", "--", ""][..]] {
+        let rejected = run(&[&common[..], tail].concat(), None);
+        assert!(!rejected.status.success());
+        let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
+        assert_eq!(rejected["error"]["code"], "invalid_cli_arguments");
+    }
+
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let found = json_output(&run(
+        &[&common[..], &["find", task, "--hint", hint, "--limit", "1"]].concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["task"], task);
+    assert_eq!(found["result"]["retrieval_hints"], json!([hint]));
+    assert_eq!(found["result"]["matches"][0]["name"], "hyphen-route");
+    assert_eq!(found["result"]["matches"][0]["variant_count"], 2);
+    let load_action = found["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "load_exact_variant_for_comparison")
+        .unwrap();
+    assert!(
+        load_action["argv"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(task))
+    );
+    assert_eq!(
+        &load_action["argv"].as_array().unwrap()
+            [load_action["argv"].as_array().unwrap().len() - 2..],
+        &[json!("--"), json!(task)]
+    );
+    assert!(
+        load_action["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == [json!("--require-snapshot"), json!(snapshot)])
+    );
+
+    let loaded = json_output(&run_suggested_action(load_action));
+    assert_eq!(loaded["result"]["task"], task);
+    assert_eq!(loaded["result"]["retrieval_hints"], json!([hint]));
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["selection"]["name"],
+        "hyphen-route"
+    );
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["verification"]["identity_matches_snapshot"],
+        true
+    );
+
+    let refreshed = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_ne!(refreshed["result"]["snapshot_id"], snapshot);
+    let stale = run_suggested_action(load_action);
+    assert!(!stale.status.success());
+    let stale: Value = serde_json::from_slice(&stale.stdout).unwrap();
+    assert_eq!(stale["error"]["code"], "find_snapshot_changed");
+    assert_eq!(stale["error"]["details"]["expected_snapshot_id"], snapshot);
+    assert_eq!(
+        stale["error"]["details"]["actual_snapshot_id"],
+        refreshed["result"]["snapshot_id"]
+    );
+
+    let option_shaped_task = "--json";
+    let reserved = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "--hint",
+                hint,
+                "--limit",
+                "1",
+                "--",
+                option_shaped_task,
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(reserved["result"]["task"], option_shaped_task);
+    assert_eq!(reserved["result"]["matches"][0]["name"], "hyphen-route");
+    assert!(
+        reserved["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .all(|action| {
+                let argv = action["argv"].as_array().unwrap();
+                argv[argv.len() - 2..] == [json!("--"), json!(option_shaped_task)]
+            })
+    );
 }
 
 #[test]

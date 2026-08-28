@@ -118,9 +118,17 @@ test("only the exact injected Bootstrap path is eligible for route-order classif
 });
 
 test("find parser accepts quoted tasks and rejects aliases and shell syntax", () => {
-  assert.deepEqual(parseFindCommand('skillroster find "中文 task" --hint "English hint" --json'), {
+  assert.deepEqual(parseFindCommand('skillroster find --hint "English hint" --json -- "中文 task"'), {
     task: "中文 task",
     hints: ["English hint"],
+  });
+  assert.deepEqual(parseFindCommand('skillroster find --hint "option shaped" --json -- "--json"'), {
+    task: "--json",
+    hints: ["option shaped"],
+  });
+  assert.deepEqual(parseFindCommand('skillroster find "legacy task" --hint "legacy hint" --json'), {
+    task: "legacy task",
+    hints: ["legacy hint"],
   });
   assert.throws(() => parseFindCommand('/tmp/skillroster find "task" --json'), /literal/);
   assert.throws(() => parseFindCommand('skillroster find "task" --json; touch /tmp/pwned'), /shell syntax/);
@@ -130,7 +138,7 @@ test("find parser accepts quoted tasks and rejects aliases and shell syntax", ()
 });
 
 test("quoted natural punctuation is literal while unquoted operators remain unsafe", () => {
-  const natural = 'skillroster find "为什么失败?! $() [草稿]*" --hint "中文?!" --json';
+  const natural = 'skillroster find --hint "中文?!" --json -- "为什么失败?! $() [草稿]*"';
   assert.equal(containsUnquotedShellSyntax(natural), false);
   assert.deepEqual(parseFindCommand(natural), { task: "为什么失败?! $() [草稿]*", hints: ["中文?!"] });
   assert.equal(containsUnquotedShellSyntax('skillroster find "safe" --json && whoami'), true);

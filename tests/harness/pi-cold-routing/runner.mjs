@@ -752,7 +752,7 @@ function runArm(options, manifest, task, arm, snapshot) {
     assertPiIdentity(options.piIdentity);
     const common = ["--home", home, "--state-dir", state, "--json"];
     const scan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan.json"), artifactBudget);
-    const initialFind = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-before.json"), artifactBudget);
+    const initialFind = runJson(snapshot.paths.cli, common, ["find", "--hint", task.family, "--", task.prompt], undefined, join(artifacts, "find-before.json"), artifactBudget);
     const target = initialFind.result.matches.find((match) => match.name === task.expected_skill); if (!target) fail(`preflight find did not return ${task.expected_skill}`);
     const report = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-full.json"), artifactBudget);
     const finding = report.result.findings.find((item) => item.affected_skill_ids?.includes(target.skill_id)); const evidenceId = finding?.evidence_ids?.[0]; if (!evidenceId) fail(`no Evidence supports ${task.expected_skill}`);
@@ -761,7 +761,7 @@ function runArm(options, manifest, task, arm, snapshot) {
     const plan = runJson(snapshot.paths.cli, common, ["plan", "--stdin"], JSON.stringify(request), join(artifacts, "plan.json"), artifactBudget);
     const apply = runJson(snapshot.paths.cli, common, ["apply", plan.result.plan_id], undefined, join(artifacts, "apply.json"), artifactBudget); if (apply.result.verification !== "passed") fail("Apply did not verify");
     const governedScan = runJson(snapshot.paths.cli, common, ["scan"], undefined, join(artifacts, "scan-governed.json"), artifactBudget);
-    const governed = runJson(snapshot.paths.cli, common, ["find", task.prompt, "--hint", task.family], undefined, join(artifacts, "find-governed.json"), artifactBudget);
+    const governed = runJson(snapshot.paths.cli, common, ["find", "--hint", task.family, "--", task.prompt], undefined, join(artifacts, "find-governed.json"), artifactBudget);
     const governedTarget = governed.result.matches.find((match) => match.name === task.expected_skill); if (!governedTarget || governedTarget.roster_state !== arm) fail(`governed find did not prove ${arm}`);
     const governedReport = runJson(snapshot.paths.cli, common, ["report", "--full"], undefined, join(artifacts, "report-governed.json"), artifactBudget);
     const actualExposure = governedReport.result.default_exposure; const expectedExposure = arm === "on_demand" ? 0 : 1; if (actualExposure !== expectedExposure) fail(`default exposure ${actualExposure}, expected ${expectedExposure}`);

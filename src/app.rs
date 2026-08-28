@@ -5152,7 +5152,7 @@ fn find_command(
                 task,
                 &retrieval_hints,
                 found,
-                required_snapshot_id.map(|_| &scan_id),
+                Some(&scan_id),
             ));
         }
     }
@@ -5245,7 +5245,7 @@ fn find_action_argv(
     kind: FindActionKind<'_>,
     required_snapshot_id: Option<&ScanId>,
 ) -> Vec<String> {
-    let mut argv = vec!["find".to_owned(), task.to_owned()];
+    let mut argv = vec!["find".to_owned()];
     for hint in hints {
         argv.extend(["--hint".to_owned(), hint.clone()]);
     }
@@ -5265,6 +5265,7 @@ fn find_action_argv(
         argv.extend(["--require-snapshot".to_owned(), snapshot_id.to_string()]);
     }
     argv.push("--json".to_owned());
+    argv.extend(["--".to_owned(), task.to_owned()]);
     argv
 }
 

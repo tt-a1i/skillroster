@@ -5,7 +5,7 @@ description: >
   local Skill roster. Before reading or changing the workspace for a task that
   may need instructions not already visible, preserve the complete user message
   verbatim as TASK. For non-English or mixed input, run
-  `skillroster find --hint "ONE FAITHFUL ENGLISH CAPABILITY PARAPHRASE" --load --limit 1 --json -- "TASK"`;
+  `skillroster find "TASK" --hint "ONE FAITHFUL ENGLISH CAPABILITY PARAPHRASE" --load --limit 1 --json`;
   for English input omit `--hint`. Follow the complete verified SKILL.md in
   `result.loaded_skill.content.text`. Also use
   for inventory, usage evidence, duplicates, broken links, Core/On-demand
@@ -13,7 +13,7 @@ description: >
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.29"
+  bootstrap-version: "1.8.23"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -43,10 +43,8 @@ change the workspace and do not execute a non-routing command:
    capability paraphrase as `HINT`. It supplements `TASK`; it never replaces it.
 3. Invoke the fixed SkillRoster executable with `TASK` and `HINT` as separate,
    literal argv values; never interpolate either into shell syntax. Use:
-   - English: `skillroster find --load --limit 1 --json -- "TASK"`
-   - Otherwise: `skillroster find --hint "HINT" --load --limit 1 --json -- "TASK"`
-   The `--` boundary is required even when `TASK` does not begin with `-`; it
-   keeps opaque user text from being parsed as a SkillRoster option.
+   - English: `skillroster find "TASK" --load --limit 1 --json`
+   - Otherwise: `skillroster find "TASK" --hint "HINT" --load --limit 1 --json`
 4. When `HINT` was used, first require
    `ranking_strategy: task_hint_reciprocal_rank_fusion`.
 5. Require `loaded_skill.selection.rank: 1`, `content.complete: true`, and all
