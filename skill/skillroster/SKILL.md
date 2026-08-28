@@ -13,7 +13,7 @@ description: >
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.28"
+  bootstrap-version: "1.8.29"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 

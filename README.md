@@ -52,6 +52,24 @@ Copilot 用久了，Skill 会散落在不同目录：同一个能力到处复制
 SkillRoster 不提供 Marketplace，也不调用模型或运行 MCP Server。AI Agent 负责理解
 你的意图；SkillRoster 负责返回有边界的事实，并执行已经批准的变更。
 
+### 一眼看懂治理结果
+
+在同一份确定性的 120-Skill 清单上，公开 CLI 验收会实际执行 Scan、Report、Plan、
+Apply 和 Undo，而不是加载预先写好的结果：
+
+| 受控场景 | 默认暴露 | 重复 Placement | 可验证恢复 |
+| --- | ---: | ---: | --- |
+| 未治理 | 200 | 80 | 无 |
+| 谨慎人工治理 | 64 | 10 | 无 Receipt |
+| SkillRoster Apply 后 | **36** | **0** | Receipt 验证；Undo 按字节恢复 Agent tree（200 / 80） |
+
+这说明 SkillRoster 能在保留 On-demand 检索的同时减少默认暴露、消除这份清单中的重复
+Placement，并把变更限制在可验证、可撤销的 Receipt 内。完整的三臂过程（包含谨慎人工
+治理对照）见[可重复验收记录](docs/acceptance.md#executed-three-arm-value-comparison)。
+
+这是受控清单上的产品行为证据，不是对 token、人工成本、生产性能、模型质量，或
+Core / On-demand 划分普遍优越性的证明。
+
 ## 30 秒开始
 
 使用 Homebrew 安装当前版本：
@@ -183,12 +201,14 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
-SkillRoster v1.8.28 已实现完整的本地治理闭环：发现、标准化 Inventory、保守的使用证据、
-有边界的报告、本地检索、不可变 Plan、Apply/Undo、恢复、生命周期控制，以及 8 个直接
-Agent Adapter。
+公开版本 v1.8.28 已实现完整的本地治理闭环；当前 `main` 正在准备 v1.8.29 候选版，
+把后续合并的安全与可靠性加固交付给安装用户。能力包括发现、标准化 Inventory、保守的
+使用证据、有边界的报告、本地检索、不可变 Plan、Apply/Undo、恢复、生命周期控制，
+以及 8 个直接 Agent Adapter。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)
 - [发布与平台证据](docs/acceptance/release-v1.8.28-candidate.md)
+- [v1.8.29 候选版说明](docs/acceptance/release-v1.8.29-candidate.md)
 - [验收记录](docs/acceptance.md)
 - [产品简介](docs/product-brief.md)
 - [统一术语](CONTEXT.md)

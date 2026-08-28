@@ -1010,10 +1010,50 @@ fn three_arm_value_comparison_runs_real_filesystem_governance_and_restore() {
     assert_eq!(applied["result"]["verification"], "passed");
     let roster = measure(&roster_home, &roster_state);
 
+    assert_eq!(unmanaged.exposure, 200);
+    assert_eq!(unmanaged.duplicates, 80);
+    assert_eq!(manual.exposure, 64);
+    assert_eq!(manual.duplicates, 10);
+    assert_eq!(roster.exposure, 36);
+    assert_eq!(roster.duplicates, 0);
     assert!(manual.exposure < unmanaged.exposure);
     assert!(roster.exposure * 2 <= unmanaged.exposure);
     assert!(manual.duplicates < unmanaged.duplicates);
     assert!(roster.duplicates < manual.duplicates);
+
+    let acceptance = include_str!("../docs/acceptance.md");
+    for expected_row in [
+        format!(
+            "| Unmanaged | {} | {} |",
+            unmanaged.exposure, unmanaged.duplicates
+        ),
+        format!(
+            "| Careful manual | {} | {} |",
+            manual.exposure, manual.duplicates
+        ),
+        format!(
+            "| SkillRoster Apply | {} | {} |",
+            roster.exposure, roster.duplicates
+        ),
+    ] {
+        assert!(
+            acceptance.contains(&expected_row),
+            "acceptance ledger is missing measured row: {expected_row}"
+        );
+    }
+
+    let loaded = cli_json(
+        &roster_home,
+        &roster_state,
+        &["find", "value-skill-119", "--load", "--limit", "1"],
+        None,
+    );
+    assert_eq!(loaded["result"]["matches"][0]["name"], "value-skill-119");
+    assert_eq!(loaded["result"]["loaded_skill"]["selection"]["rank"], 1);
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["content"]["complete"],
+        true
+    );
 
     let undone = cli_json(
         &roster_home,

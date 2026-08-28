@@ -55,6 +55,27 @@ Plan and your confirmation.
 It is **not** another marketplace, model, or MCP server. The AI agent interprets
 your intent; SkillRoster supplies bounded facts and executes approved changes.
 
+### The governance result at a glance
+
+On the same deterministic 120-Skill inventory, the public CLI acceptance path
+actually runs Scan, Report, Plan, Apply, and Undo instead of loading prepared
+results:
+
+| Controlled arm | Default exposure | Duplicate placements | Verifiable recovery |
+| --- | ---: | ---: | --- |
+| Unmanaged | 200 | 80 | None |
+| Careful manual governance | 64 | 10 | No Receipt |
+| After SkillRoster Apply | **36** | **0** | Receipt verified; Undo restored the Agent tree byte-for-byte (200 / 80) |
+
+This shows that SkillRoster can reduce default exposure, remove duplicate
+placements in this inventory, keep On-demand retrieval, and bind the change to
+a verified, reversible Receipt. The complete three-arm procedure, including the
+careful-manual control, is in the [repeatable acceptance record](docs/acceptance.md#executed-three-arm-value-comparison).
+
+This is controlled-inventory product evidence. It does not prove token or labor
+savings, production performance, model quality, or universally superior Core
+and On-demand choices.
+
 ## Start in 30 seconds
 
 Install the current release with Homebrew:
@@ -193,13 +214,16 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-SkillRoster v1.8.28 implements the local governance loop: discovery, normalized
-inventory, conservative usage evidence, bounded reporting, local retrieval,
-immutable planning, Apply/Undo, recovery, lifecycle controls, and eight direct
-agent adapters.
+Public release v1.8.28 implements the complete local governance loop. `main` is
+preparing the v1.8.29 candidate so the security and reliability hardening merged
+since that release reaches installed users. The loop includes discovery,
+normalized inventory, conservative usage evidence, bounded reporting, local
+retrieval, immutable planning, Apply/Undo, recovery, lifecycle controls, and
+eight direct agent adapters.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
 - [Release and platform evidence](docs/acceptance/release-v1.8.28-candidate.md)
+- [v1.8.29 candidate notes](docs/acceptance/release-v1.8.29-candidate.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)
 - [Canonical vocabulary](CONTEXT.md)
