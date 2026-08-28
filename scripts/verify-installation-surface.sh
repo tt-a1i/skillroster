@@ -3,11 +3,13 @@ set -euo pipefail
 
 formula="Formula/skillroster.rb"
 manifest="Cargo.toml"
+bootstrap="skill/skillroster/SKILL.md"
 installation="docs/installation.md"
 website="website/index.html"
 
 published_version="$(awk -F '"' '/^[[:space:]]*version "/ { print $2; exit }' "$formula")"
 candidate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' "$manifest")"
+bootstrap_version="$(awk -F '"' '/^[[:space:]]*bootstrap-version:/ { print $2; exit }' "$bootstrap")"
 
 [[ "$published_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "could not derive the published version from $formula" >&2
@@ -15,6 +17,10 @@ candidate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' "$manifest")
 }
 [[ "$candidate_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "could not derive the source candidate version from $manifest" >&2
+  exit 1
+}
+[[ "$bootstrap_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "could not derive the bundled Bootstrap version from $bootstrap" >&2
   exit 1
 }
 
@@ -41,6 +47,7 @@ require_literal "$installation" "SKILLROSTER_VERSION=${published_version}"
 require_literal "$installation" "--tag v${published_version} skillroster"
 require_literal "$installation" "Published CLI v${published_version} bundles Bootstrap content version ${published_version}."
 require_literal "$installation" "source-tree candidate is **v${candidate_version}**"
+require_literal "$installation" "Its bundled Bootstrap content version is ${bootstrap_version}."
 
 require_literal "$website" "CURRENT RELEASE v${published_version}"
 require_literal "$website" "IMMUTABLE CURRENT RELEASE · v${published_version}"
