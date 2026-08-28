@@ -12,6 +12,25 @@ use crate::scan;
 pub(super) const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug)]
+pub(super) struct FindSnapshotChanged {
+    pub(super) expected_snapshot_id: ScanId,
+    pub(super) actual_snapshot_id: ScanId,
+    pub(super) retry_argv: Vec<String>,
+}
+
+impl std::fmt::Display for FindSnapshotChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Find recovery expected Snapshot {} but latest is {}",
+            self.expected_snapshot_id, self.actual_snapshot_id
+        )
+    }
+}
+
+impl std::error::Error for FindSnapshotChanged {}
+
+#[derive(Debug)]
 pub(super) struct SkillLoadBlocked {
     pub(super) reason: &'static str,
     pub(super) skill_id: String,
@@ -21,6 +40,7 @@ pub(super) struct SkillLoadBlocked {
     pub(super) mutation_scopes: Vec<String>,
     pub(super) expected_digest: Option<String>,
     pub(super) actual_digest: Option<String>,
+    pub(super) retry_argv: Option<Vec<String>>,
 }
 
 impl std::fmt::Display for SkillLoadBlocked {
@@ -66,6 +86,43 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(changed) = error.downcast_ref::<FindSnapshotChanged>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "find_snapshot_changed".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids: vec![
+                    changed.expected_snapshot_id.to_string(),
+                    changed.actual_snapshot_id.to_string(),
+                ],
+                paths: Vec::new(),
+                details: Some(json!({
+                    "expected_snapshot_id": changed.expected_snapshot_id,
+                    "actual_snapshot_id": changed.actual_snapshot_id,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "rerun_find_on_latest_snapshot",
+                })),
+            },
+        );
+        let argv = changed
+            .retry_argv
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        envelope.suggested_actions = vec![action(
+            "rerun_find_on_latest_snapshot",
+            &argv,
+            false,
+            false,
+            "find_snapshot_changed",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(rescan) = error.downcast_ref::<ContentIdentityRescanRequired>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -140,28 +197,33 @@ pub fn error_json_with_context(
             },
         );
         let safe_retry = match blocked.reason {
-            "same_name_variants_ambiguous" | "no_routable_match" => Some((
+            "same_name_variants_ambiguous" => blocked.retry_argv.clone().map(|argv| {
+                (
+                    "inspect_same_name_variants",
+                    argv,
+                    "same_name_variants_ambiguous",
+                )
+            }),
+            "no_routable_match" => Some((
                 "inspect_current_report",
-                vec!["report", "--summary", "--json"],
+                vec!["report".into(), "--summary".into(), "--json".into()],
+                "verified_skill_load_blocked",
             )),
             "placement_missing_from_snapshot"
             | "package_fingerprint_incomplete"
             | "legacy_snapshot_requires_rescan"
             | "eligible_placement_missing"
             | "entrypoint_content_drift"
-            | "package_identity_drift" => {
-                Some(("refresh_snapshot", vec!["scan", "--summary", "--json"]))
-            }
+            | "package_identity_drift" => Some((
+                "refresh_snapshot",
+                vec!["scan".into(), "--summary".into(), "--json".into()],
+                "verified_skill_load_blocked",
+            )),
             _ => None,
         };
-        if let Some((name, argv)) = safe_retry {
-            envelope.suggested_actions = vec![action(
-                name,
-                &argv,
-                false,
-                false,
-                "verified_skill_load_blocked",
-            )];
+        if let Some((name, argv, reason_code)) = safe_retry {
+            let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            envelope.suggested_actions = vec![action(name, &argv, false, false, reason_code)];
             action_context.apply(&mut envelope.suggested_actions);
         }
         return serde_json::to_string(&envelope)
@@ -319,7 +381,7 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
     if let Some(blocker) = error.downcast_ref::<SkillLoadBlocked>() {
         let (next_action, retry_mode) = match blocker.reason {
             "same_name_variants_ambiguous" => {
-                ("inspect_variant_finding", "read_only_command_available")
+                ("inspect_same_name_variants", "read_only_command_available")
             }
             "variant_selector_requires_load" => (
                 "add_load_or_remove_variant_selector",

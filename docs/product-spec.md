@@ -182,7 +182,7 @@ The first complete command surface is:
 ```bash
 skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
-skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--json]
+skillroster find <task> [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--require-snapshot <scan-id>] [--json]
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
@@ -200,6 +200,14 @@ decision and action chain without spending context on a large first page.
 Explicit `--limit` values always win on paged Finding lists and detail;
 `page` totals and continuation actions remain the authoritative path to
 omitted rows. Top-level `report --full` remains an unpaged exhaustive export.
+
+`find --require-snapshot <scan-id>` is an optimistic read boundary used by
+typed continuation actions. Find fails closed with `find_snapshot_changed`
+when another Scan has become latest; it never silently resolves an ambiguity
+or loads exact variant content against a different Snapshot. The returned
+read-only retry replaces the stale requirement with the latest observed
+Snapshot requirement and preserves the task, hints, limit, and discovery
+context so the Agent can restart from those facts without reopening the race.
 
 `source-root confirm` persists one exact local read permission bound to a
 current completed escaping-link Finding, its observed canonical directory, and

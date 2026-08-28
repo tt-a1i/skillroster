@@ -3262,6 +3262,12 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
                 .is_file()
         );
     }
+    let routing =
+        fs::read_to_string(bootstrap.parent().unwrap().join("references/routing.md")).unwrap();
+    assert!(routing.contains("inspect_same_name_variants"));
+    assert!(routing.contains("find_snapshot_changed"));
+    assert!(routing.contains("rerun_find_on_latest_snapshot"));
+    assert!(routing.contains("Do not reconstruct or rerun Find"));
     let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(current["result"]["state"], "up_to_date");
     assert!(current["result"]["plan_id"].is_null());
@@ -3372,7 +3378,7 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
         ),
         (
             "references/routing.md",
-            include_str!("../skill/skillroster/references/routing.md").to_owned(),
+            include_str!("fixtures/bootstrap-routing-v1.8.23.md").to_owned(),
         ),
         (
             "references/governance.md",
@@ -3409,13 +3415,13 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
         preview["result"]["targets"][0]["installed_version"],
         "1.8.23"
     );
-    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 2);
+    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 3);
     assert_eq!(preview["result"]["files_changed"], false);
 
     let plan_id = preview["result"]["plan_id"].as_str().unwrap();
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(applied["result"]["verification"], "passed");
-    assert_eq!(applied["result"]["changed_path_count"], 2);
+    assert_eq!(applied["result"]["changed_path_count"], 3);
     for (relative_path, expected) in [
         ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
         (
@@ -7996,6 +8002,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     ];
     let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
     let before = json_output(&run(
         &[&common[..], &["find", "active search marker"]].concat(),
         None,
@@ -8004,7 +8011,15 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     let ambiguous_load = run(
         &[
             &common[..],
-            &["find", "active search marker", "--load", "--limit", "1"],
+            &[
+                "find",
+                "active search marker",
+                "--hint",
+                "inspect active identity",
+                "--load",
+                "--limit",
+                "1",
+            ],
         ]
         .concat(),
         None,
@@ -8015,16 +8030,75 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         ambiguous_load["error"]["details"]["reason"],
         "same_name_variants_ambiguous"
     );
-    let retry_argv = ambiguous_load["suggested_actions"][0]["argv"]
-        .as_array()
-        .unwrap();
     assert_eq!(
-        &retry_argv[retry_argv.len() - 3..],
-        &[json!("report"), json!("--summary"), json!("--json")]
+        ambiguous_load["error"]["details"]["next_action"],
+        "inspect_same_name_variants"
     );
     assert_eq!(
-        ambiguous_load["suggested_actions"][0]["requires_confirmation"],
-        false
+        ambiguous_load["suggested_actions"][0],
+        json!({
+            "action": "inspect_same_name_variants",
+            "description": "inspect_same_name_variants",
+            "argv": [
+                "skillroster",
+                "--state-dir",
+                state,
+                "--home",
+                home,
+                "find",
+                "active search marker",
+                "--hint",
+                "inspect active identity",
+                "--limit",
+                "1",
+                "--require-snapshot",
+                snapshot,
+                "--json"
+            ],
+            "mutates": false,
+            "requires_confirmation": false,
+            "reason_code": "same_name_variants_ambiguous"
+        })
+    );
+    let variants = json_output(&run_suggested_action(
+        &ambiguous_load["suggested_actions"][0],
+    ));
+    assert_eq!(variants["result"]["matches"][0]["variant_count"], 2);
+    assert_eq!(
+        variants["result"]["matches"][0]["variant_finding"]["state"],
+        "available"
+    );
+    assert_eq!(
+        variants["result"]["matches"][0]["variant_finding"]["snapshot_id"],
+        snapshot
+    );
+    assert!(
+        variants["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "inspect_variant_finding")
+    );
+    assert_eq!(
+        variants["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .count(),
+        2
+    );
+    assert!(
+        variants["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .all(|action| action["argv"]
+                .as_array()
+                .unwrap()
+                .windows(2)
+                .any(|pair| { pair == [json!("--require-snapshot"), json!(snapshot)] }))
     );
 
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
@@ -8118,6 +8192,52 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         .concat(),
         None,
     ));
+
+    let newer_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let stale_retry = run_suggested_action(&ambiguous_load["suggested_actions"][0]);
+    assert!(!stale_retry.status.success());
+    let stale_retry: Value = serde_json::from_slice(&stale_retry.stdout).unwrap();
+    assert_eq!(stale_retry["error"]["code"], "find_snapshot_changed");
+    assert_eq!(
+        stale_retry["error"]["details"]["expected_snapshot_id"],
+        snapshot
+    );
+    assert_eq!(
+        stale_retry["error"]["details"]["actual_snapshot_id"],
+        newer_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(stale_retry["error"]["details"]["files_changed"], false);
+    assert!(stale_retry["result"].is_null());
+    let fresh_snapshot = newer_scan["result"]["snapshot_id"].as_str().unwrap();
+    let fresh_retry = &stale_retry["suggested_actions"][0];
+    assert_eq!(fresh_retry["action"], "rerun_find_on_latest_snapshot");
+    assert!(
+        fresh_retry["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == [json!("--require-snapshot"), json!(fresh_snapshot)])
+    );
+
+    let fresh_variants = json_output(&run_suggested_action(fresh_retry));
+    assert_eq!(
+        fresh_variants["result"]["matches"][0]["variant_finding"]["snapshot_id"],
+        fresh_snapshot
+    );
+    let fresh_load_actions = fresh_variants["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+        .collect::<Vec<_>>();
+    assert_eq!(fresh_load_actions.len(), 2);
+    assert!(fresh_load_actions.iter().all(|action| {
+        action["argv"]
+            .as_array()
+            .unwrap()
+            .windows(2)
+            .any(|pair| pair == [json!("--require-snapshot"), json!(fresh_snapshot)])
+    }));
 }
 
 #[test]

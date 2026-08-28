@@ -217,6 +217,10 @@ pub struct FindArgs {
     /// Load one exact identity from an ambiguous Top-1 same-name group.
     #[arg(long, value_name = "SKILL_ID")]
     pub variant_skill_id: Option<String>,
+
+    /// Fail closed unless the latest Snapshot still matches this opaque ID.
+    #[arg(long, value_name = "SCAN_ID")]
+    pub require_snapshot: Option<String>,
 }
 
 pub const MAX_FIND_RESULTS: u16 = 100;

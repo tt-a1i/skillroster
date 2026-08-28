@@ -36,9 +36,9 @@ pub use crate::action_context::ActionContext;
 mod error;
 
 use error::{
-    ContentIdentityRescanRequired, LibraryRootConflict, MAX_AGENT_LOADED_SKILL_BYTES,
-    PlanSnapshotDrift, SkillLoadBlocked, StoredFindingCoverageInvalid,
-    incomplete_fingerprint_blocker,
+    ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
+    MAX_AGENT_LOADED_SKILL_BYTES, PlanSnapshotDrift, SkillLoadBlocked,
+    StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
@@ -323,15 +323,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             ("report", result, vec![], actions)
         }
         Some(Command::Find(args)) => {
-            let (result, actions) = find_command(
-                &store,
-                &state_dir,
-                &args.task,
-                &args.hints,
-                usize::from(args.limit),
-                args.load,
-                args.variant_skill_id.as_deref(),
-            )?;
+            let (result, actions) = find_command(&store, &state_dir, &args)?;
             ("find", result, vec![], actions)
         }
         Some(Command::Plan(args)) => {
@@ -4446,12 +4438,14 @@ fn session_finding_coverage(
 fn find_command(
     store: &StateStore,
     state_dir: &Path,
-    task: &str,
-    hints: &[String],
-    limit: usize,
-    load: bool,
-    variant_skill_id: Option<&str>,
+    args: &crate::cli::FindArgs,
 ) -> Result<(Value, Vec<SuggestedAction>)> {
+    let task = args.task.as_str();
+    let hints = args.hints.as_slice();
+    let limit = usize::from(args.limit);
+    let load = args.load;
+    let variant_skill_id = args.variant_skill_id.as_deref();
+    let required_snapshot_id = args.require_snapshot.as_deref();
     if variant_skill_id.is_some() && !load {
         return Err(SkillLoadBlocked {
             reason: "variant_selector_requires_load",
@@ -4462,12 +4456,29 @@ fn find_command(
             mutation_scopes: Vec::new(),
             expected_digest: None,
             actual_digest: None,
+            retry_argv: None,
         }
         .into());
     }
-    let (scan_id, scan) = latest_scan(store)?;
-    require_content_identity(&scan)?;
     let retrieval_hints = normalize_retrieval_hints(hints);
+    let (scan_id, scan) = latest_scan(store)?;
+    if let Some(expected) = required_snapshot_id {
+        let expected = ScanId::parse(expected.to_owned())?;
+        if expected != scan_id {
+            return Err(FindSnapshotChanged {
+                expected_snapshot_id: expected,
+                actual_snapshot_id: scan_id.clone(),
+                retry_argv: find_action_argv(
+                    task,
+                    &retrieval_hints,
+                    FindActionKind::InspectVariants { limit },
+                    Some(&scan_id),
+                ),
+            }
+            .into());
+        }
+    }
+    require_content_identity(&scan)?;
     let retrieval_query = crate::query::RetrievalQuery::from_parts(
         std::iter::once(task).chain(retrieval_hints.iter().map(String::as_str)),
     );
@@ -4609,13 +4620,24 @@ fn find_command(
             mutation_scopes: Vec::new(),
             expected_digest: None,
             actual_digest: None,
+            retry_argv: None,
         }
         .into());
     }
     let loaded_skill = if load && !matches.is_empty() {
         let ranked = &matches[0];
+        let ambiguity_retry_argv =
+            (ranked.variant_count != 1 && variant_skill_id.is_none()).then(|| {
+                find_action_argv(
+                    task,
+                    &retrieval_hints,
+                    FindActionKind::InspectVariants { limit },
+                    Some(&scan_id),
+                )
+            });
         let selected = select_explicit_variant(ranked, variant_skill_id)?;
-        let mut loaded = verified_top_skill_load(&scan_id, &scan, state_dir, &selected)?;
+        let mut loaded =
+            verified_top_skill_load(&scan_id, &scan, state_dir, &selected, ambiguity_retry_argv)?;
         if let Some(skill_id) = variant_skill_id {
             loaded["selection"]["ranking_evidence_scope"] = json!("ranked_capability_group");
             loaded["selection"]["variant_selection"] = json!({
@@ -4680,7 +4702,12 @@ fn find_command(
                         | Some(crate::query::VariantFindingState::SourceConfirmationRequired)
                 )
         }) {
-            actions.extend(explicit_variant_load_actions(task, &retrieval_hints, found));
+            actions.extend(explicit_variant_load_actions(
+                task,
+                &retrieval_hints,
+                found,
+                required_snapshot_id.map(|_| &scan_id),
+            ));
         }
     }
     let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
@@ -4730,6 +4757,7 @@ fn select_explicit_variant(
         mutation_scopes: Vec::new(),
         expected_digest: None,
         actual_digest: None,
+        retry_argv: None,
     };
     if ranked.variant_count <= 1 {
         return Err(blocked("variant_selector_requires_ambiguous_top_match").into());
@@ -4759,28 +4787,61 @@ fn select_explicit_variant(
     Ok(selected)
 }
 
+#[derive(Clone, Copy)]
+enum FindActionKind<'a> {
+    InspectVariants { limit: usize },
+    LoadVariant { skill_id: &'a str },
+}
+
+fn find_action_argv(
+    task: &str,
+    hints: &[String],
+    kind: FindActionKind<'_>,
+    required_snapshot_id: Option<&ScanId>,
+) -> Vec<String> {
+    let mut argv = vec!["find".to_owned(), task.to_owned()];
+    for hint in hints {
+        argv.extend(["--hint".to_owned(), hint.clone()]);
+    }
+    match kind {
+        FindActionKind::InspectVariants { limit } => {
+            argv.extend(["--limit".to_owned(), limit.to_string()]);
+        }
+        FindActionKind::LoadVariant { skill_id } => argv.extend([
+            "--load".to_owned(),
+            "--limit".to_owned(),
+            "1".to_owned(),
+            "--variant-skill-id".to_owned(),
+            skill_id.to_owned(),
+        ]),
+    }
+    if let Some(snapshot_id) = required_snapshot_id {
+        argv.extend(["--require-snapshot".to_owned(), snapshot_id.to_string()]);
+    }
+    argv.push("--json".to_owned());
+    argv
+}
+
 fn explicit_variant_load_actions(
     task: &str,
     hints: &[String],
     ranked: &crate::query::FindMatch,
+    required_snapshot_id: Option<&ScanId>,
 ) -> Vec<SuggestedAction> {
     ranked
         .variants
         .iter()
         .filter(|variant| !variant.paths.is_empty())
         .map(|variant| {
-            let mut argv = vec!["skillroster".to_owned(), "find".to_owned(), task.to_owned()];
-            for hint in hints {
-                argv.extend(["--hint".to_owned(), hint.clone()]);
-            }
-            argv.extend([
-                "--load".to_owned(),
-                "--limit".to_owned(),
-                "1".to_owned(),
-                "--variant-skill-id".to_owned(),
-                variant.skill_id.clone(),
-                "--json".to_owned(),
-            ]);
+            let mut argv = vec!["skillroster".to_owned()];
+            argv.extend(find_action_argv(
+                task,
+                hints,
+                FindActionKind::LoadVariant {
+                    skill_id: &variant.skill_id,
+                },
+                required_snapshot_id,
+            ));
             SuggestedAction {
                 action: "load_exact_variant_for_comparison".into(),
                 description: "load_exact_variant_for_comparison".into(),
@@ -5234,6 +5295,7 @@ fn verified_top_skill_load(
     scan: &ScanResult,
     state_dir: &Path,
     matched: &crate::query::FindMatch,
+    ambiguity_retry_argv: Option<Vec<String>>,
 ) -> Result<Value> {
     let blocked = |reason, path, expected_digest, actual_digest| SkillLoadBlocked {
         reason,
@@ -5248,6 +5310,7 @@ fn verified_top_skill_load(
             .collect(),
         expected_digest,
         actual_digest,
+        retry_argv: ambiguity_retry_argv.clone(),
     };
 
     if matched.variant_count != 1 {
