@@ -1537,6 +1537,18 @@ fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Detected Agents",
         array_len(value, "detected_agents"),
     );
+    let first_skill_roots = value
+        .get("detected_agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|agent| {
+            agent.get("detection_basis").and_then(Value::as_str) == Some("included_session_root")
+        })
+        .count();
+    if first_skill_roots > 0 {
+        fact(lines, "First Skill roots", first_skill_roots.to_string());
+    }
     fact(
         lines,
         "Physical targets",
@@ -2047,6 +2059,36 @@ mod tests {
         );
         assert!(unsupported.contains("unsupported bootstrap targets were preserved"));
         assert!(unsupported.contains("Unsupported            1"));
+    }
+
+    #[test]
+    fn setup_output_names_a_first_skill_root_plan() {
+        let output = render(
+            "setup",
+            &json!({
+                "state": "preview_ready",
+                "cli_version": "1.8.29",
+                "bootstrap_content_version": "1.8.29",
+                "detected_agents": [{
+                    "agent": "codex",
+                    "detection_basis": "included_session_root"
+                }],
+                "physical_target_count": 1,
+                "current_count": 0,
+                "missing_count": 1,
+                "outdated_count": 0,
+                "modified_count": 0,
+                "unsupported_count": 0,
+                "plan_id": "plan_1",
+                "targets": []
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(output.contains("First Skill roots      1"));
+        assert!(output.contains("Preview only · no files changed"));
     }
 
     #[test]

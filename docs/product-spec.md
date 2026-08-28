@@ -254,6 +254,16 @@ bounded decision fields is not equivalent: it remains immutable and auditable,
 while Setup creates one decision-complete replacement. Both can temporarily
 appear as pending; the Agent presents only the newly returned Plan ID.
 
+Detection is Snapshot-bound and explicit. `existing_skill_root` means the
+Agent's fixed Skill root already exists. `included_session_root` means the
+current completed Snapshot included that Agent's fixed session root while its
+Skill root was genuinely missing. In the latter case Setup may plan only the
+fixed missing parent chain, Bootstrap package directories, and four managed
+files for that same adapter. A completely empty Home does not establish Agent
+presence and remains `no_supported_agent`. Planning is read-only; Apply still
+requires confirmation and produces a Receipt whose Undo restores both files
+and newly created directories.
+
 `find` preserves the user's original task and accepts repeatable Agent-authored
 retrieval hints. Hints let the semantic caller supply a cross-language or
 capability paraphrase while the CLI remains a deterministic local lexical
