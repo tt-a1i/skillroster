@@ -201,14 +201,13 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
-公开版本 v1.8.28 已实现完整的本地治理闭环；当前 `main` 正在准备 v1.8.29 候选版，
-把后续合并的安全与可靠性加固交付给安装用户。能力包括发现、标准化 Inventory、保守的
+公开版本 v1.8.29 已实现完整的本地治理闭环，并交付了文件系统、安全与恢复边界加固。
+能力包括发现、标准化 Inventory、保守的
 使用证据、有边界的报告、本地检索、不可变 Plan、Apply/Undo、恢复、生命周期控制，
 以及 8 个直接 Agent Adapter。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)
-- [发布与平台证据](docs/acceptance/release-v1.8.28-candidate.md)
-- [v1.8.29 候选版说明](docs/acceptance/release-v1.8.29-candidate.md)
+- [v1.8.29 发布与平台证据](docs/acceptance/release-v1.8.29-candidate.md)
 - [验收记录](docs/acceptance.md)
 - [产品简介](docs/product-brief.md)
 - [统一术语](CONTEXT.md)

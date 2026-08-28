@@ -1,6 +1,6 @@
-# SkillRoster v1.8.29 candidate
+# SkillRoster v1.8.29 release receipt
 
-## Release notes draft
+## Release notes
 
 SkillRoster 1.8.29 brings the fail-closed and reversible boundaries promised by
 the product model to the public package built from current `main`.
@@ -37,22 +37,20 @@ Snapshots created before the Unicode identity contract require a new complete
 Scan before exact identity decisions. Existing user-owned Skill contents are
 not migrated or deleted by upgrading the binary.
 
-## Preparation evidence
+## Release evidence
 
-The public baseline is v1.8.28. Candidate preparation starts from exact
-`origin/main` revision `b7f6d47d9746dc3d6735b9e328748a467d603085` in a clean
-worktree. Cargo, installation examples, presentation fixtures, the website
-source, and bundled Bootstrap content are versioned as 1.8.29. The checked-in
-Homebrew Formula remains at the last published release until v1.8.29 artifacts
-exist and their independently verified checksum is available.
+The annotated `v1.8.29` tag resolves exactly to
+`b996c7e52bd849243ce7772cff30602a00c4270b`. The official tag workflow
+[run 33197816927](https://github.com/tt-a1i/skillroster/actions/runs/33197816927)
+passed the strict repository gate, Linux, Windows, macOS arm64 and x86_64
+build/governance jobs, and the WSL2 Linux governance smoke.
 
-The implementation already merged after v1.8.28 is represented by pull requests
-#233, #235, #237, #239, #241, #243, #245, #247, #249, #251, and #253. The
-outcome-first README clarification in #254 is also part of this candidate.
+The release delta is recorded in first-parent history from #233 through #297.
+That includes the security fixes, typed-module simplification, first-value
+acceptance work, routing and recovery corrections found during review, and the
+final WSL capability boundary.
 
-## Candidate gates
-
-The candidate is not accepted until one exact final source revision passes:
+The exact tagged revision passed:
 
 - `cargo fmt --all --check`;
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`;
@@ -60,12 +58,20 @@ The candidate is not accepted until one exact final source revision passes:
 - the public CLI acceptance suite and both Node routing harnesses;
 - `git diff --check` and the CI change-scope self-test.
 
-Candidate preparation does not create or push a tag, publish a GitHub Release,
-change the Homebrew tap, or mutate any public release asset. Those remain a
-separate explicitly authorized publication gate. Final candidate SHA, CI run,
-four-platform archives, adjacent checksums, WSL evidence, anonymous download
-readback, governance smoke, and Homebrew installation evidence will be recorded
-only after they exist.
+The [public GitHub Release](https://github.com/tt-a1i/skillroster/releases/tag/v1.8.29)
+contains four platform archives and four adjacent checksum files. All eight
+assets were downloaded through their unauthenticated public URLs; every
+checksum passed. The public macOS arm64 archive reported `skillroster 1.8.29`,
+rendered help, and passed the complete synthetic Scan, Setup, Apply, Receipt,
+Undo, recovery-clear, and retained-ID governance smoke.
+
+The [Homebrew tap](https://github.com/tt-a1i/homebrew-skillroster) publishes
+v1.8.29 arm64 macOS and x86_64 Linux bottles. Both Homebrew test-bot jobs passed
+in [run 33198038445](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33198038445),
+and `brew pr-pull` published the bottles in
+[run 33199481374](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33199481374).
+The public macOS arm64 bottle was independently downloaded, matched the Formula
+checksum, reported `skillroster 1.8.29`, and passed the same governance smoke.
 
 The release WSL boundary is WSL2. WSL1 rejects Apply and Undo when its kernel
 cannot provide atomic no-replace rename; SkillRoster does not substitute a
