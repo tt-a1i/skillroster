@@ -165,7 +165,7 @@ release binaries, always against synthetic temporary homes:
   governance smoke checks.
 
 WSL is tested as Linux in the release workflow by importing a checksum-pinned
-Canonical Ubuntu 24.04 image into WSL1 on the Windows runner, then executing the
+Canonical Ubuntu 24.04 image into WSL2 on the Windows runner, then executing the
 packaged Linux binary through the same governance loop. The final successful
 candidate and official tag run are the release record; a failed or skipped WSL
 job does not count as support.

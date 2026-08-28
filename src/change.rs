@@ -636,6 +636,9 @@ fn apply_locked_with_anchored(
     run_before_sequence_validation_hook();
     validate_operation_sequence_anchored(&plan.operations, &anchored)?;
     reject_unresolved_recovery_except(&anchored, &plan.state_dir, "")?;
+    anchored
+        .require_atomic_noreplace_rename()
+        .map_err(|error| ChangeError::io("validate mutation filesystem", &plan.state_dir, error))?;
 
     let receipt_id = format!("receipt_{}", ulid::Ulid::new());
     let mut receipt = ChangeReceipt {
@@ -826,6 +829,11 @@ fn undo_locked_with_anchored(
         ));
     }
     reject_unresolved_recovery_except(&anchored, &receipt.state_dir, &receipt.id)?;
+    anchored
+        .require_atomic_noreplace_rename()
+        .map_err(|error| {
+            ChangeError::io("validate mutation filesystem", &receipt.state_dir, error)
+        })?;
     if reverse_receipt_exists(&anchored, &receipt.state_dir, &receipt.id)? {
         return Err(ChangeError::new(
             "receipt_already_undone",

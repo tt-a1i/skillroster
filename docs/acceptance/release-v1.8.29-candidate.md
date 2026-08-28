@@ -66,3 +66,7 @@ separate explicitly authorized publication gate. Final candidate SHA, CI run,
 four-platform archives, adjacent checksums, WSL evidence, anonymous download
 readback, governance smoke, and Homebrew installation evidence will be recorded
 only after they exist.
+
+The release WSL boundary is WSL2. WSL1 rejects Apply and Undo when its kernel
+cannot provide atomic no-replace rename; SkillRoster does not substitute a
+race-prone check-then-rename fallback.

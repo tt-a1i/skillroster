@@ -264,6 +264,18 @@ fn parent_dir_and_name(anchor: &Anchor, relative: &Path) -> io::Result<(Dir, OsS
 }
 
 #[cfg(target_os = "linux")]
+fn classify_atomic_noreplace_probe(error: io::Error) -> io::Result<()> {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => Ok(()),
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unavailable; mutation requires Linux or WSL2 with RENAME_NOREPLACE support",
+        )),
+        _ => Err(error),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn rename_noreplace(
     from_anchor: &Anchor,
     from: &Path,
@@ -515,6 +527,42 @@ impl<'a> AnchoredFs<'a> {
         let retained = retained.dir.try_clone()?.into_std_file();
         let candidate = candidate.dir.into_std_file();
         same_file_identity(&retained, &candidate)
+    }
+
+    /// Refuse mutation before the first write when the filesystem cannot
+    /// provide an atomic descriptor-relative no-replace rename. An empty
+    /// source name makes this probe mutation-free: supported kernels return
+    /// ENOENT, while WSL1 and unsupported filesystems reject the flag.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn require_atomic_noreplace_rename(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+
+        let state = self
+            .anchors
+            .iter()
+            .find(|anchor| anchor.path == self.state_path)
+            .ok_or_else(|| io::Error::other("state capability is missing"))?;
+        let empty = c"";
+        let result = unsafe {
+            libc::renameat2(
+                state.dir.as_raw_fd(),
+                empty.as_ptr(),
+                state.dir.as_raw_fd(),
+                empty.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Err(io::Error::other(
+                "atomic no-replace rename probe unexpectedly mutated an empty path",
+            ));
+        }
+        classify_atomic_noreplace_probe(io::Error::last_os_error())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn require_atomic_noreplace_rename(&self) -> io::Result<()> {
+        Ok(())
     }
 
     pub(crate) fn open(
@@ -1601,4 +1649,43 @@ fn same_file_identity(left: &fs::File, right: &fs::File) -> io::Result<bool> {
     }
 
     Ok(identity(left.as_raw_handle())? == identity(right.as_raw_handle())?)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_probe_tests {
+    use super::classify_atomic_noreplace_probe;
+    use std::io;
+
+    #[test]
+    fn atomic_noreplace_probe_accepts_missing_source() {
+        assert!(
+            classify_atomic_noreplace_probe(io::Error::from_raw_os_error(libc::ENOENT)).is_ok()
+        );
+    }
+
+    #[test]
+    fn running_kernel_accepts_the_mutation_free_probe() {
+        let empty = c"";
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                empty.as_ptr(),
+                libc::AT_FDCWD,
+                empty.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        assert_eq!(result, -1);
+        classify_atomic_noreplace_probe(io::Error::last_os_error())
+            .expect("the test kernel must support atomic no-replace rename");
+    }
+
+    #[test]
+    fn atomic_noreplace_probe_rejects_unsupported_kernel_or_filesystem() {
+        for code in [libc::EINVAL, libc::ENOSYS, libc::EOPNOTSUPP] {
+            let error = classify_atomic_noreplace_probe(io::Error::from_raw_os_error(code))
+                .expect_err("unsupported no-replace rename must fail closed");
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        }
+    }
 }
