@@ -4113,7 +4113,7 @@ fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
         json!([{
             "agent": "codex",
             "detection_basis": "included_session_root",
-            "target": skill_root.join("skillroster/SKILL.md")
+            "target": skill_root.join("skillroster").join("SKILL.md")
         }])
     );
     assert_eq!(setup["result"]["missing_count"], 1);
@@ -4196,7 +4196,7 @@ fn setup_builds_only_the_fixed_missing_skill_root_chain_for_a_detected_agent() {
         json!([{
             "agent": "opencode",
             "detection_basis": "included_session_root",
-            "target": skill_root.join("skillroster/SKILL.md")
+            "target": skill_root.join("skillroster").join("SKILL.md")
         }])
     );
     assert_eq!(setup["result"]["operation_count"], 9);
