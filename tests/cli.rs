@@ -5152,6 +5152,84 @@ fn scan_keeps_repository_metadata_out_of_root_discovery_coverage() {
     assert!(observed["detail"].is_null());
 }
 
+#[cfg(unix)]
+#[test]
+fn scan_excludes_linked_repository_metadata_from_entrypoint_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("empty-home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let skill = root.join("example");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&skill).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(skill.join("SKILL.md"), "---\nname: example\n---\n").unwrap();
+    fs::write(outside.join("SKILL.md"), "---\nname: hidden\n---\n").unwrap();
+    symlink(&outside, root.join(".git")).unwrap();
+
+    let explicit_root = format!("codex={}", root.display());
+    let scan = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--root",
+            &explicit_root,
+            "--json",
+            "scan",
+        ],
+        None,
+    ));
+
+    assert_eq!(scan["result"]["skill_count"], 1);
+    assert_eq!(scan["result"]["placement_count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn scan_ignores_linked_support_without_a_nested_skill_entrypoint() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("empty-home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let parent = root.join("parent");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&parent).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(parent.join("SKILL.md"), "---\nname: parent\n---\n").unwrap();
+    symlink(&outside, parent.join("references")).unwrap();
+
+    let explicit_root = format!("codex={}", root.display());
+    let scan = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--root",
+            &explicit_root,
+            "--json",
+            "scan",
+        ],
+        None,
+    ));
+
+    assert_eq!(scan["result"]["skill_count"], 1);
+    assert_eq!(scan["result"]["placement_count"], 1);
+    let observed = scan["result"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observed| observed["path"] == root.display().to_string())
+        .unwrap();
+    assert_eq!(observed["discovery_complete"], true);
+}
+
 #[test]
 fn source_confirmation_crash_temp_does_not_block_lifecycle_cleanup() {
     let temp = TempDir::new().unwrap();

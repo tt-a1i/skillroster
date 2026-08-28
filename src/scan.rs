@@ -1340,6 +1340,12 @@ fn discover_entrypoints(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         let file_name = entry.file_name();
+        if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
+            .iter()
+            .any(|excluded| file_name == *excluded)
+        {
+            continue;
+        }
         if file_name == "SKILL.md" {
             let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
             let expected_physical_entrypoint = fs::canonicalize(&path)
@@ -1359,12 +1365,6 @@ fn discover_entrypoints(
                 default_exposed,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
-                .iter()
-                .any(|excluded| file_name == *excluded)
-            {
-                continue;
-            }
             if directory_has_skill && !directory_declares_skill(&path)? {
                 continue;
             }
@@ -1387,11 +1387,15 @@ fn discover_entrypoints(
             // traversed recursively before the boundary has been evaluated.
             let linked_entrypoint = path.join("SKILL.md");
             let (target, status) = inspect_link(approved_roots, &path, &metadata);
+            let declares_skill = directory_declares_skill(&path)?;
+            if directory_has_skill && !declares_skill {
+                continue;
+            }
             let Some(child_name) = file_name.to_str() else {
                 outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
                 continue;
             };
-            if linked_entrypoint.exists() || status != LinkStatus::Valid {
+            if declares_skill || status != LinkStatus::Valid {
                 let expected_physical_entrypoint = fs::canonicalize(&linked_entrypoint)
                     .ok()
                     .filter(|path| path.to_str().is_some());
@@ -1423,7 +1427,14 @@ fn discover_entrypoints(
 fn directory_declares_skill(directory: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(directory.join("SKILL.md")) {
         Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(error),
     }
 }
