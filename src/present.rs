@@ -370,24 +370,9 @@ fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
         fact(lines, "Last Receipt", "none");
     }
     fact(lines, "Recovery", text(value, "recovery_state"));
-    let next = if value["recovery_state"] == "required" {
-        "Next: skillroster lifecycle recovery".to_owned()
-    } else if value.get("latest_snapshot_id").is_none_or(Value::is_null) {
-        "Next: skillroster scan".to_owned()
-    } else if value["snapshot_state"] == "rescan_required" {
-        "Next: skillroster scan --summary --json".to_owned()
-    } else if pending_plan.is_some() {
-        "Next: inspect the Review Plan above".to_owned()
-    } else {
-        "Next: scan only when fresher inventory is needed".to_owned()
-    };
     lines.push(String::new());
     lines.push("Read-only · no Agent files changed".into());
-    if display_width(&next) > width {
-        lines.push(middle_truncate(&next, width));
-    } else {
-        lines.push(next);
-    }
+    continuation(value, lines);
 }
 
 fn scan(value: &Value, lines: &mut Vec<String>) {
@@ -1775,9 +1760,19 @@ fn source_root(value: &Value, lines: &mut Vec<String>) {
 
 fn home(value: &Value, lines: &mut Vec<String>) {
     fact(lines, "State", text(value, "state"));
+    fact(lines, "Snapshot state", text(value, "snapshot_state"));
     fact(lines, "Recovery", text(value, "recovery_state"));
     lines.push(String::new());
-    lines.push("Next: skillroster scan | report | status".into());
+    continuation(value, lines);
+}
+
+fn continuation(value: &Value, lines: &mut Vec<String>) {
+    if let Some(action) = value.get("next_action").filter(|action| !action.is_null()) {
+        let argv = serde_json::to_string(&action["argv"]).unwrap_or_else(|_| "[]".to_owned());
+        lines.push(format!("Continue argv: {argv}"));
+    } else {
+        lines.push("No required continuation".into());
+    }
 }
 
 fn summary(safety: &str, next: &str) -> Vec<String> {
@@ -1929,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn status_routes_to_the_highest_priority_read_only_decision() {
+    fn status_renders_the_provided_continuation_without_reinterpreting_state() {
         let base = json!({
             "database_path": "/db",
             "schema_version": 9,
@@ -1944,7 +1939,11 @@ mod tests {
                 "created_at": 1
             }],
             "last_receipt": null,
-            "recovery_state": "clear"
+            "recovery_state": "clear",
+            "next_action": {
+                "action": "inspect_pending_plan",
+                "argv": ["skillroster", "plan", "--show", "plan_01M0QDAC102GEXKCMHVP97GF2V", "--json"]
+            }
         });
         let options = RenderOptions {
             width: 80,
@@ -1953,45 +1952,20 @@ mod tests {
 
         let pending = render("status", &base, options);
         assert!(pending.contains("Review Plan            plan_01M0QDAC102GEXKCMHVP97GF2V"));
-        assert!(pending.contains("Next: inspect the Review Plan above"));
-        assert!(!pending.contains("Next: skillroster scan"));
-
-        let narrow = render(
-            "status",
-            &base,
-            RenderOptions {
-                width: 40,
-                styled: false,
-            },
-        );
-        assert!(narrow.contains("Review Plan"));
-        assert!(narrow.contains("\n    plan_01M0QDAC102GEXKCMHVP97GF2V"));
-        assert!(!narrow.contains("Review Plan            plan_"));
-        assert!(narrow.contains("Next: inspect the Review Plan above"));
-        assert!(narrow.lines().all(|line| display_width(line) <= 40));
+        let exact = "Continue argv: [\"skillroster\",\"plan\",\"--show\",\"plan_01M0QDAC102GEXKCMHVP97GF2V\",\"--json\"]";
+        assert!(pending.contains(exact));
 
         let mut recovery = base.clone();
         recovery["recovery_state"] = json!("required");
         let recovery = render("status", &recovery, options);
-        assert!(recovery.contains("Next: skillroster lifecycle recovery"));
-
-        let mut missing_snapshot = base.clone();
-        missing_snapshot["latest_snapshot_id"] = Value::Null;
-        missing_snapshot["snapshot_state"] = json!("missing");
-        let missing_snapshot = render("status", &missing_snapshot, options);
-        assert!(missing_snapshot.contains("Next: skillroster scan"));
-
-        let mut stale = base.clone();
-        stale["snapshot_state"] = json!("rescan_required");
-        let stale = render("status", &stale, options);
-        assert!(stale.contains("Snapshot state         rescan_required"));
-        assert!(stale.contains("Next: skillroster scan --summary --json"));
+        assert!(recovery.contains(exact));
 
         let mut healthy = base;
         healthy["pending_plan_count"] = json!(0);
         healthy["pending_plans"] = json!([]);
+        healthy["next_action"] = Value::Null;
         let healthy = render("status", &healthy, options);
-        assert!(healthy.contains("Next: scan only when fresher inventory is needed"));
+        assert!(healthy.contains("No required continuation"));
     }
 
     #[test]

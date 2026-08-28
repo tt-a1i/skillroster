@@ -819,6 +819,157 @@ fn healthy_status_does_not_suggest_an_unconditional_rescan() {
 }
 
 #[test]
+fn home_and_status_share_the_missing_snapshot_scan_continuation() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home with spaces");
+    let state = temp.path().join("state with spaces");
+    fs::create_dir_all(&home).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let home_result = json_output(&run(&common, None));
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let expected = context_action_argv(&home, &state, &["scan", "--summary", "--json"]);
+
+    assert_eq!(home_result["result"]["state"], "no_snapshot");
+    assert_eq!(home_result["result"]["snapshot_state"], "missing");
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
+    assert_eq!(home_result["suggested_actions"][0]["argv"], expected);
+    assert_eq!(home_result["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        home_result["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+
+    let human = run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains(&serde_json::to_string(&expected).unwrap()));
+    let human_status = run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "status",
+        ],
+        None,
+    );
+    assert!(human_status.status.success());
+    let human_status = String::from_utf8(human_status.stdout).unwrap();
+    assert!(human_status.contains(&serde_json::to_string(&expected).unwrap()));
+}
+
+#[test]
+fn home_routes_a_current_snapshot_only_when_a_ready_plan_exists() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let healthy = json_output(&run(&common, None));
+    assert_eq!(healthy["result"]["state"], "ready");
+    assert_eq!(healthy["result"]["snapshot_state"], "current");
+    assert_eq!(healthy["suggested_actions"], json!([]));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let plan_ready = json_output(&run(&common, None));
+    assert_eq!(plan_ready["result"]["state"], "plan_ready");
+    assert_eq!(plan_ready["result"]["snapshot_state"], "current");
+    assert_eq!(plan_ready["result"]["pending_plan_count"], 1);
+    assert_eq!(plan_ready["suggested_actions"], status["suggested_actions"]);
+    assert_eq!(
+        plan_ready["suggested_actions"][0]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &[
+                "plan",
+                "--show",
+                setup["result"]["plan_id"].as_str().unwrap(),
+                "--json"
+            ]
+        )
+    );
+}
+
+#[test]
+fn home_and_status_prioritize_recovery_over_an_invalidated_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    database
+        .execute(
+            "UPDATE receipts SET status = 'recovery_required' WHERE id = ?1",
+            [applied["result"]["receipt_id"].as_str().unwrap()],
+        )
+        .unwrap();
+    drop(database);
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    let home_result = json_output(&run(&common, None));
+    assert_eq!(home_result["result"]["state"], "recovery_required");
+    assert_eq!(home_result["result"]["recovery_state"], "required");
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
+    assert_eq!(
+        home_result["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["lifecycle", "recovery", "--json"])
+    );
+    assert_eq!(
+        home_result["suggested_actions"][0]["reason_code"],
+        "recovery_required"
+    );
+}
+
+#[test]
 fn public_cli_exits_quietly_when_the_output_consumer_closes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -4292,6 +4443,17 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
     assert_eq!(status["result"]["pending_plans"], json!([]));
     assert_eq!(status["suggested_actions"].as_array().unwrap().len(), 1);
     assert_eq!(status["suggested_actions"][0]["action"], "scan");
+    let home_result = json_output(&run(&common, None));
+    assert_eq!(home_result["result"]["state"], "rescan_required");
+    assert_eq!(home_result["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        home_result["result"]["snapshot_invalidated_by_receipt_id"],
+        applied["result"]["receipt_id"]
+    );
+    assert_eq!(
+        home_result["suggested_actions"],
+        status["suggested_actions"]
+    );
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");

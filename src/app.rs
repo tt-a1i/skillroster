@@ -114,44 +114,16 @@ pub fn run(cli: Cli) -> Result<Output> {
     state_security::secure_state_layout(&state_dir)
         .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
 
-    let (command, mut result, warnings, actions) = match cli.command {
-        None => ("home", home_result(&store, &state_dir)?, vec![], vec![]),
+    let (command, mut result, warnings, mut actions) = match cli.command {
+        None => {
+            let status = status_result(&store, &database_path, &state_dir)?;
+            let actions = status_actions(&status);
+            let result = home_result(&status, actions.first());
+            ("home", result, vec![], actions)
+        }
         Some(Command::Status) => {
             let result = status_result(&store, &database_path, &state_dir)?;
-            let recovery_required = result["recovery_state"] == "required";
-            let actions = if recovery_required {
-                vec![action(
-                    "inspect_recovery",
-                    &["lifecycle", "recovery", "--json"],
-                    false,
-                    false,
-                    "recovery_required",
-                )]
-            } else if result["latest_snapshot_id"].is_null() {
-                vec![action(
-                    "scan",
-                    &["scan", "--summary", "--json"],
-                    false,
-                    false,
-                    "snapshot_required",
-                )]
-            } else if result["snapshot_state"] == "rescan_required" {
-                vec![snapshot_rescan_action()]
-            } else if let Some(plan_id) = result["pending_plans"]
-                .as_array()
-                .and_then(|plans| plans.first())
-                .and_then(|plan| plan["plan_id"].as_str())
-            {
-                vec![action(
-                    "inspect_pending_plan",
-                    &["plan", "--show", plan_id, "--json"],
-                    false,
-                    false,
-                    "pending_plan_requires_review",
-                )]
-            } else {
-                Vec::new()
-            };
+            let actions = status_actions(&result);
             ("status", result, vec![], actions)
         }
         Some(Command::SourceRoot(args)) => match args.command {
@@ -516,10 +488,13 @@ pub fn run(cli: Cli) -> Result<Output> {
     action_context.apply_result(command, &mut result);
     state_security::secure_state_layout(&state_dir)
         .with_context(|| format!("cannot secure state layout {}", state_dir.display()))?;
+    action_context.apply(&mut actions);
+    if matches!(command, "home" | "status") {
+        result["next_action"] = json!(actions.first());
+    }
     let mut envelope = JsonEnvelope::success(command, result.clone());
     envelope.warnings = warnings;
     envelope.suggested_actions = actions;
-    action_context.apply(&mut envelope.suggested_actions);
     Ok(Output {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
@@ -721,12 +696,59 @@ fn parse_agent_kind(value: &str) -> Result<AgentKind> {
         .ok_or_else(|| anyhow!("unsupported Agent: {value}"))
 }
 
-fn home_result(store: &StateStore, state_dir: &Path) -> Result<Value> {
-    Ok(json!({
-        "state": if store.latest_completed_scan()?.is_some() { "ready" } else { "no_snapshot" },
-        "recovery_state": recovery_text(store, state_dir)?,
+fn home_result(status: &Value, next_action: Option<&SuggestedAction>) -> Value {
+    let state = match next_action.map(|action| action.reason_code.as_str()) {
+        Some("recovery_required") => "recovery_required",
+        Some("snapshot_required") => "no_snapshot",
+        Some("verified_mutation_requires_rescan") => "rescan_required",
+        Some("pending_plan_requires_review") => "plan_ready",
+        Some(_) | None => "ready",
+    };
+    json!({
+        "state": state,
+        "snapshot_state": status["snapshot_state"],
+        "latest_snapshot_id": status["latest_snapshot_id"],
+        "snapshot_invalidated_by_receipt_id": status["snapshot_invalidated_by_receipt_id"],
+        "pending_plan_count": status["pending_plan_count"],
+        "recovery_state": status["recovery_state"],
         "files_changed": false
-    }))
+    })
+}
+
+fn status_actions(result: &Value) -> Vec<SuggestedAction> {
+    if result["recovery_state"] == "required" {
+        vec![action(
+            "inspect_recovery",
+            &["lifecycle", "recovery", "--json"],
+            false,
+            false,
+            "recovery_required",
+        )]
+    } else if result["latest_snapshot_id"].is_null() {
+        vec![action(
+            "scan",
+            &["scan", "--summary", "--json"],
+            false,
+            false,
+            "snapshot_required",
+        )]
+    } else if result["snapshot_state"] == "rescan_required" {
+        vec![snapshot_rescan_action()]
+    } else if let Some(plan_id) = result["pending_plans"]
+        .as_array()
+        .and_then(|plans| plans.first())
+        .and_then(|plan| plan["plan_id"].as_str())
+    {
+        vec![action(
+            "inspect_pending_plan",
+            &["plan", "--show", plan_id, "--json"],
+            false,
+            false,
+            "pending_plan_requires_review",
+        )]
+    } else {
+        Vec::new()
+    }
 }
 
 fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> Result<Value> {
