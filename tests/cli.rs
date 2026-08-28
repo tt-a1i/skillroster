@@ -5063,6 +5063,96 @@ fn explicit_roots_preserve_all_eight_agent_identities() {
 }
 
 #[test]
+fn scan_keeps_deep_package_support_out_of_root_discovery_coverage() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("empty-home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let parent = root.join("parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(
+        parent.join("SKILL.md"),
+        "---\nname: parent\ndescription: Parent skill\n---\n",
+    )
+    .unwrap();
+    fs::write(
+        child.join("SKILL.md"),
+        "---\nname: child\ndescription: Nested child skill\n---\n",
+    )
+    .unwrap();
+    fs::create_dir_all(parent.join("references/one/two/three/four/five")).unwrap();
+
+    let explicit_root = format!("codex={}", root.display());
+    let scan = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--root",
+            &explicit_root,
+            "--json",
+            "scan",
+        ],
+        None,
+    ));
+
+    assert_eq!(scan["result"]["skill_count"], 2);
+    assert_eq!(scan["result"]["placement_count"], 2);
+    let observed = scan["result"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observed| observed["path"] == root.display().to_string())
+        .unwrap();
+    assert_eq!(observed["status"], "included");
+    assert_eq!(observed["discovery_complete"], true);
+    assert!(observed["detail"].is_null());
+}
+
+#[test]
+fn scan_keeps_repository_metadata_out_of_root_discovery_coverage() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("empty-home");
+    let state = temp.path().join("state");
+    let root = temp.path().join("skills");
+    let skill = root.join("example");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: example\ndescription: Example skill\n---\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".git/logs/refs/remotes/origin/archive")).unwrap();
+
+    let explicit_root = format!("codex={}", root.display());
+    let scan = json_output(&run(
+        &[
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--root",
+            &explicit_root,
+            "--json",
+            "scan",
+        ],
+        None,
+    ));
+
+    assert_eq!(scan["result"]["skill_count"], 1);
+    let observed = scan["result"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|observed| observed["path"] == root.display().to_string())
+        .unwrap();
+    assert_eq!(observed["discovery_complete"], true);
+    assert!(observed["detail"].is_null());
+}
+
+#[test]
 fn source_confirmation_crash_temp_does_not_block_lifecycle_cleanup() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

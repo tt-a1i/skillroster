@@ -1335,7 +1335,7 @@ fn discover_entrypoints(
     let mut outcome = SkillDiscoveryOutcome::default();
     let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
-    let directory_has_skill = directory.join("SKILL.md").is_file();
+    let directory_has_skill = directory_declares_skill(directory)?;
     for entry in entries {
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
@@ -1359,6 +1359,15 @@ fn discover_entrypoints(
                 default_exposed,
             });
         } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+            if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
+                .iter()
+                .any(|excluded| file_name == *excluded)
+            {
+                continue;
+            }
+            if directory_has_skill && !directory_declares_skill(&path)? {
+                continue;
+            }
             let Some(child_name) = file_name.to_str() else {
                 outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
                 continue;
@@ -1411,14 +1420,22 @@ fn discover_entrypoints(
     Ok(outcome)
 }
 
+fn directory_declares_skill(directory: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(directory.join("SKILL.md")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+const ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
 const HERMES_EXCLUDED_SKILL_DIRS: &[&str] = &[
-    ".git",
     ".github",
     ".hub",
     ".archive",
     ".venv",
     "venv",
-    "node_modules",
     "site-packages",
     "__pycache__",
     ".tox",
@@ -3839,6 +3856,36 @@ enabled = true
                 && placement.governable
         }));
         assert!(result.roots.iter().any(|seen| seen.explicit));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_broken_skill_entrypoint_remains_visible_as_unsafe() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_directory("nested-broken-entrypoint");
+        let parent = root.join("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(parent.join("SKILL.md"), "---\nname: parent\n---\n").unwrap();
+        symlink(parent.join("missing.md"), child.join("SKILL.md")).unwrap();
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.placements.len(), 2);
+        let nested = result
+            .placements
+            .iter()
+            .find(|placement| placement.directory == child)
+            .unwrap();
+        assert_eq!(nested.link_status, LinkStatus::Broken);
         fs::remove_dir_all(root).unwrap();
     }
 
