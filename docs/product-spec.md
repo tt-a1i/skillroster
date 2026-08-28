@@ -54,7 +54,7 @@ Use this placement test for every capability: local truth, stable identity, repr
 
 ### 4.1 Inventory and identity
 
-A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently.
+A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently. Entrypoint discovery traverses root and category directories within its depth bound. Once a directory declares `SKILL.md`, arbitrary descendants are package support content rather than more entrypoint search space; only direct child directories that also declare `SKILL.md` continue the nested-Skill chain. Repository and build trees `.git`, `target`, and `node_modules` are excluded from entrypoint discovery. These exclusions do not weaken package fingerprints: support files remain identity- and drift-bearing under the independent fingerprint bounds.
 
 The immutable Scan payload is the historical Snapshot record. SQLite's
 normalized placement table is the current projection: when a stable placement
