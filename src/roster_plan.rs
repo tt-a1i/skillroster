@@ -1134,10 +1134,7 @@ fn ensure_physical_exposure_compatible(
 }
 
 fn physical_mutation_path(placement: &SkillPlacement) -> PathBuf {
-    if is_symlink(&placement.directory) {
-        return physical_entry_path(&placement.directory);
-    }
-    placement.physical_directory_or_logical().to_path_buf()
+    placement.current_physical_mutation_path()
 }
 
 fn depends_on_physical_removal(placement: &SkillPlacement, removal: &[&SkillPlacement]) -> bool {
@@ -1203,28 +1200,16 @@ fn ensure_unique_operation_paths(operations: &[OperationInput]) -> Result<()> {
 
 fn physical_operation_path(path: &Path) -> PathBuf {
     if is_symlink(path) {
-        return physical_entry_path(path);
+        return crate::scan::physical_entry_path(path);
     }
     if let Ok(resolved) = std::fs::canonicalize(path) {
         return resolved;
     }
-    physical_entry_path(path)
+    crate::scan::physical_entry_path(path)
 }
 
 fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-}
-
-fn physical_entry_path(path: &Path) -> PathBuf {
-    let Some(parent) = path.parent() else {
-        return path.to_path_buf();
-    };
-    let Some(name) = path.file_name() else {
-        return path.to_path_buf();
-    };
-    std::fs::canonicalize(parent)
-        .unwrap_or_else(|_| parent.to_path_buf())
-        .join(name)
 }
 
 fn verified_real_source(
