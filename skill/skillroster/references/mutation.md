@@ -23,6 +23,15 @@ and obtain one explicit confirmation. Do not replace the Plan with filesystem
 commands or bypass drift checks. Report verification, changed-path count,
 Receipt ID, and canonical deletion count.
 
+A verified Apply returns `rescan_required: true`. Follow its read-only Scan
+action before Report, Find, Plan, Setup, source confirmation, or another Apply;
+the Plan's Snapshot predates the verified mutation and is no longer current.
+Keep the exact Receipt Undo action available. Status, recovery inspection, and
+Undo remain valid before that Scan. If exact Undo verifies first, the original
+Snapshot is current again and no redundant Scan is required. If a newer Scan
+already observed the applied state, verified Undo returns its own required Scan
+action; follow it before using current inventory facts.
+
 “Complete” means every affected Agent, Skill, placement, operation group,
 exclusion, risk, and before/after delta is accounted for by count. It does not
 mean dumping every internal operation. Load stored Plan detail only for exact

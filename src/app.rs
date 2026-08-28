@@ -37,7 +37,7 @@ mod error;
 
 use error::{
     ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
-    MAX_AGENT_LOADED_SKILL_BYTES, PlanSnapshotDrift, SkillLoadBlocked,
+    MAX_AGENT_LOADED_SKILL_BYTES, PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired,
     StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
@@ -135,6 +135,8 @@ pub fn run(cli: Cli) -> Result<Output> {
                     false,
                     "snapshot_required",
                 )]
+            } else if result["snapshot_state"] == "rescan_required" {
+                vec![snapshot_rescan_action()]
             } else if let Some(plan_id) = result["pending_plans"]
                 .as_array()
                 .and_then(|plans| plans.first())
@@ -365,24 +367,27 @@ pub fn run(cli: Cli) -> Result<Output> {
                 }
             }
             let progress = crate::present::ProgressGuard::start("apply", cli.json);
-            let result = apply_command(&store, &args.id, &state_lock)?;
+            let mut result = apply_command(&store, &args.id, &state_lock)?;
             progress.finish();
             let id = result["receipt_id"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            (
-                "apply",
-                result,
-                vec![],
-                vec![action(
-                    "undo",
-                    &["undo", &id, "--json"],
-                    true,
-                    true,
-                    "receipt_undoable",
-                )],
-            )
+            let rescan_required = result["verification"].as_str() == Some("passed")
+                && result["status"].as_str() == Some("applied");
+            result["rescan_required"] = json!(rescan_required);
+            let mut actions = Vec::new();
+            if rescan_required {
+                actions.push(snapshot_rescan_action());
+            }
+            actions.push(action(
+                "undo",
+                &["undo", &id, "--json"],
+                true,
+                true,
+                "receipt_undoable",
+            ));
+            ("apply", result, vec![], actions)
         }
         Some(Command::Undo(args)) => {
             if !cli.json {
@@ -397,7 +402,12 @@ pub fn run(cli: Cli) -> Result<Output> {
             let progress = crate::present::ProgressGuard::start("undo", cli.json);
             let result = undo_command(&store, &args.id, &state_lock)?;
             progress.finish();
-            ("undo", result, vec![], vec![])
+            let actions = if result["rescan_required"].as_bool() == Some(true) {
+                vec![snapshot_rescan_action()]
+            } else {
+                Vec::new()
+            };
+            ("undo", result, vec![], actions)
         }
         Some(Command::Lifecycle(args)) => match args.command {
             LifecycleCommand::Inspect => (
@@ -722,8 +732,22 @@ fn home_result(store: &StateStore, state_dir: &Path) -> Result<Value> {
 fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> Result<Value> {
     let latest = store.latest_completed_scan()?;
     let latest_scan_id = latest.as_ref().map(|scan| &scan.id);
+    let invalidating_receipt_id = latest_scan_id
+        .map(|scan_id| store.snapshot_invalidating_receipt(scan_id))
+        .transpose()?
+        .flatten();
+    let snapshot_state = if latest_scan_id.is_none() {
+        "missing"
+    } else if invalidating_receipt_id.is_some() {
+        "rescan_required"
+    } else {
+        "current"
+    };
+    let actionable_scan_id = (snapshot_state == "current")
+        .then_some(latest_scan_id)
+        .flatten();
     let (pending_plan_count, pending_plans) =
-        store.pending_plans(latest_scan_id, STATUS_PENDING_PLAN_LIMIT)?;
+        store.pending_plans(actionable_scan_id, STATUS_PENDING_PLAN_LIMIT)?;
     let pending_plans = pending_plans
         .into_iter()
         .map(|plan| {
@@ -748,7 +772,9 @@ fn status_result(store: &StateStore, database_path: &Path, state_dir: &Path) -> 
         "database_path": database_path,
         "schema_version": store.schema_version()?,
         "latest_snapshot_id": latest.as_ref().map(|scan| scan.id.to_string()),
-        "latest_snapshot_at": latest.and_then(|scan| scan.completed_at),
+        "latest_snapshot_at": latest.as_ref().and_then(|scan| scan.completed_at),
+        "snapshot_state": snapshot_state,
+        "snapshot_invalidated_by_receipt_id": invalidating_receipt_id,
         "pending_plan_count": pending_plan_count,
         "pending_plans_returned": pending_plans.len(),
         "pending_plans_truncated": pending_plan_count > pending_plans.len(),
@@ -2054,6 +2080,11 @@ fn report_command(
         offset,
     } = request
     {
+        let latest_scan_id = store
+            .latest_completed_scan()?
+            .ok_or_else(|| anyhow!("no completed Snapshot exists"))?
+            .id;
+        require_snapshot_current(store, &latest_scan_id)?;
         let limit = finding_page_limit(full, limit);
         let id = FindingId::parse(id.to_string())?;
         let stored = store
@@ -2085,10 +2116,6 @@ fn report_command(
                 "coverage".into(),
                 finding_coverage_facts(coverage_basis, evidence_quality, &scan),
             );
-            let latest_scan_id = store
-                .latest_completed_scan()?
-                .ok_or_else(|| anyhow!("no completed Snapshot exists"))?
-                .id;
             if let Some(planning) =
                 finding_library_planning(&stored, &report.scan_id, &latest_scan_id, &scan)
             {
@@ -7524,6 +7551,12 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     if let Some(reverse) = store.reverse_receipt_for(&id)? {
         bail!("Receipt {id} was already undone by {reverse}");
     }
+    let plan = store
+        .get_plan(&record.plan_id)?
+        .ok_or_else(|| anyhow!("Plan {} does not exist", record.plan_id))?;
+    let latest_snapshot_id = store
+        .latest_scan_payload::<Value>()?
+        .map(|(scan_id, _)| scan_id);
     let original: ChangeReceipt =
         serde_json::from_value(record.verification["change_receipt"].clone())?;
     require_clear_journals(store, &original.state_dir)?;
@@ -7560,9 +7593,10 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
             "after": record.verification["library_state"]["before"]
         }),
     )?;
+    let invalidates_snapshot_id = latest_snapshot_id.filter(|scan_id| scan_id != &plan.scan_id);
     if outcome.verification_passed {
         store
-            .save_undo_receipt(&id, &receipt)
+            .save_undo_receipt(&id, &receipt, invalidates_snapshot_id.as_ref())
             .with_context(|| {
                 format!(
                     "Undo journal {} is durable but SQLite finalization failed; run lifecycle recovery --json",
@@ -7572,7 +7606,10 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     } else {
         store.save_receipt(&receipt)?;
     }
-    Ok(mutation_result(&outcome, &receipt, Some(id)))
+    let mut result = mutation_result(&outcome, &receipt, Some(id));
+    result["rescan_required"] =
+        json!(outcome.verification_passed && invalidates_snapshot_id.is_some());
+    Ok(result)
 }
 
 const LEGACY_SINGLE_FILE_BOOTSTRAPS: &[(&str, &str)] = &[
@@ -7930,6 +7967,7 @@ fn setup_command_with_manifests<'a>(
             "next": "skillroster scan --summary --json"
         }));
     };
+    require_snapshot_current(store, &snapshot_id)?;
     let current_package = current_bootstrap_package();
     let mut detected = Vec::new();
     let mut targets = Vec::new();
@@ -8965,9 +9003,22 @@ fn restore_library_state(store: &StateStore, before: &Value) -> Result<()> {
 }
 
 fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
-    store
+    let scan = store
         .latest_scan_payload()?
-        .ok_or_else(|| anyhow!("no completed Snapshot; run skillroster scan first"))
+        .ok_or_else(|| anyhow!("no completed Snapshot; run skillroster scan first"))?;
+    require_snapshot_current(store, &scan.0)?;
+    Ok(scan)
+}
+
+fn require_snapshot_current(store: &StateStore, scan_id: &ScanId) -> Result<()> {
+    if let Some(receipt_id) = store.snapshot_invalidating_receipt(scan_id)? {
+        return Err(SnapshotRescanRequired {
+            snapshot_id: scan_id.clone(),
+            receipt_id,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn require_content_identity(scan: &ScanResult) -> Result<()> {
@@ -9315,6 +9366,16 @@ fn action(
         requires_confirmation: confirmation,
         reason_code: reason.into(),
     }
+}
+
+fn snapshot_rescan_action() -> SuggestedAction {
+    action(
+        "scan",
+        &["scan", "--summary", "--json"],
+        false,
+        false,
+        "verified_mutation_requires_rescan",
+    )
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use crate::model::{
 use crate::source_policy::{RootIdentity, SourcePermissionId, SourceRootPermission};
 use crate::state_security;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 fn sqlite_nofollow_path(path: &Path) -> StorageResult<PathBuf> {
     let parent = path.parent().ok_or_else(|| {
@@ -146,6 +146,7 @@ const MIGRATIONS: [(i64, Migration); SCHEMA_VERSION as usize] = [
     (8, migration_v8),
     (9, migration_v9),
     (10, migration_v10),
+    (11, migration_v11),
 ];
 
 fn validate_migrations(migrations: &[(i64, Migration)], schema_version: i64) -> StorageResult<()> {
@@ -503,6 +504,27 @@ impl StateStore {
             .optional()?;
         stored
             .map(|(id, payload)| Ok((ScanId::parse(id).map_err(invalid_id)?, from_json(&payload)?)))
+            .transpose()
+    }
+
+    pub fn snapshot_invalidating_receipt(
+        &self,
+        scan_id: &ScanId,
+    ) -> StorageResult<Option<ReceiptId>> {
+        self.connection
+            .query_row(
+                "SELECT r.id FROM snapshot_invalidations i
+                 JOIN receipts r ON r.id = i.receipt_id
+                 WHERE i.snapshot_id = ?1
+                   AND ((r.reverses_receipt_id IS NULL AND r.status = 'applied')
+                     OR (r.reverses_receipt_id IS NOT NULL AND r.status = 'undone'))
+                 ORDER BY i.created_at DESC, i.rowid DESC
+                 LIMIT 1",
+                [scan_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|id| ReceiptId::parse(id).map_err(invalid_id))
             .transpose()
     }
 
@@ -1382,6 +1404,18 @@ impl StateStore {
         }
         let transaction = self.connection.unchecked_transaction()?;
         save_receipt_transaction(&transaction, receipt)?;
+        if next == PlanStatus::Applied && receipt.status == ReceiptStatus::Applied {
+            let changed = transaction.execute(
+                "INSERT INTO snapshot_invalidations (snapshot_id, receipt_id, created_at)
+                 SELECT scan_id, ?1, ?2 FROM plans WHERE id = ?3",
+                params![receipt.id.as_str(), receipt.created_at, plan.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::InvalidData(format!(
+                    "plan {plan} has no Snapshot to invalidate"
+                )));
+            }
+        }
         for source in trusted_sources {
             let changed = transaction.execute(
                 "INSERT INTO source_baselines
@@ -1429,6 +1463,7 @@ impl StateStore {
         &self,
         original: &ReceiptId,
         receipt: &ReceiptRecord,
+        invalidates_snapshot_id: Option<&ScanId>,
     ) -> StorageResult<()> {
         if receipt.reverses_receipt_id.as_ref() != Some(original)
             || receipt.status != ReceiptStatus::Undone
@@ -1439,6 +1474,17 @@ impl StateStore {
         }
         let transaction = self.connection.unchecked_transaction()?;
         save_receipt_transaction(&transaction, receipt)?;
+        if let Some(snapshot_id) = invalidates_snapshot_id {
+            transaction.execute(
+                "INSERT INTO snapshot_invalidations (snapshot_id, receipt_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    snapshot_id.as_str(),
+                    receipt.id.as_str(),
+                    receipt.created_at
+                ],
+            )?;
+        }
         let changed = transaction.execute(
             "UPDATE receipts SET status = 'undone', completed_at = ?1
              WHERE id = ?2 AND status = 'applied'",
@@ -1935,6 +1981,7 @@ impl StateStore {
              WHERE trusted_by_receipt_id IS NOT NULL",
             [],
         )?;
+        transaction.execute("DELETE FROM snapshot_invalidations", [])?;
         transaction.execute("DELETE FROM receipt_operations", [])?;
         transaction.execute("DELETE FROM receipts", [])?;
         transaction.execute("DELETE FROM plan_operations", [])?;
@@ -2282,6 +2329,36 @@ fn migration_v10(transaction: &Transaction<'_>) -> StorageResult<()> {
     Ok(())
 }
 
+fn migration_v11(transaction: &Transaction<'_>) -> StorageResult<()> {
+    transaction.execute_batch(
+        "CREATE TABLE snapshot_invalidations (
+            snapshot_id TEXT NOT NULL REFERENCES scans(id),
+            receipt_id TEXT NOT NULL REFERENCES receipts(id),
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(snapshot_id, receipt_id)
+         );
+         INSERT INTO snapshot_invalidations (snapshot_id, receipt_id, created_at)
+         SELECT p.scan_id, r.id, r.created_at
+         FROM receipts r JOIN plans p ON p.id = r.plan_id
+         WHERE r.status = 'applied' AND r.reverses_receipt_id IS NULL;
+         INSERT OR IGNORE INTO snapshot_invalidations (snapshot_id, receipt_id, created_at)
+         SELECT latest.id, reverse.id, reverse.created_at
+         FROM receipts reverse
+         JOIN plans p ON p.id = reverse.plan_id
+         JOIN scans latest ON latest.id = (
+             SELECT s.id FROM scans s
+             WHERE s.status = 'completed'
+             ORDER BY s.completed_at DESC, s.started_at DESC, s.rowid DESC
+             LIMIT 1
+         )
+         WHERE reverse.status = 'undone'
+           AND reverse.reverses_receipt_id IS NOT NULL
+           AND latest.id != p.scan_id
+           AND reverse.completed_at >= latest.completed_at;",
+    )?;
+    Ok(())
+}
+
 fn table_count(connection: &Connection, table: &str) -> StorageResult<u64> {
     let query = format!("SELECT COUNT(*) FROM {table}");
     Ok(connection.query_row(&query, [], |row| row.get(0))?)
@@ -2589,7 +2666,7 @@ mod tests {
 
     #[test]
     fn migration_upgrades_prior_states_sequentially() {
-        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9] {
+        for starting_version in [1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
             let mut connection = Connection::open_in_memory().unwrap();
             let transaction = connection.transaction().unwrap();
             migration_v1(&transaction).unwrap();
@@ -2617,6 +2694,9 @@ mod tests {
             if starting_version >= 9 {
                 migration_v9(&transaction).unwrap();
             }
+            if starting_version >= 10 {
+                migration_v10(&transaction).unwrap();
+            }
             transaction
                 .pragma_update(None, "user_version", starting_version)
                 .unwrap();
@@ -2634,13 +2714,107 @@ mod tests {
         let path = temp.path().join("skillroster.db");
         assert!(StateStore::requires_migration(&path).unwrap());
 
-        let connection = Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 9).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for migration in [
+            migration_v1 as Migration,
+            migration_v2,
+            migration_v3,
+            migration_v4,
+            migration_v5,
+            migration_v6,
+            migration_v7,
+            migration_v8,
+            migration_v9,
+            migration_v10,
+        ] {
+            migration(&transaction).unwrap();
+        }
+        transaction.pragma_update(None, "user_version", 10).unwrap();
+        transaction.commit().unwrap();
         drop(connection);
         assert!(StateStore::requires_migration(&path).unwrap());
 
         drop(StateStore::open(&path).unwrap());
         assert!(!StateStore::requires_migration(&path).unwrap());
+    }
+
+    #[test]
+    fn snapshot_invalidation_migration_backfills_applied_and_later_undo_receipts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (_, migration) in &MIGRATIONS[..10] {
+            migration(&transaction).unwrap();
+        }
+        transaction
+            .execute_batch(
+                "INSERT INTO scans VALUES
+                    ('scan_a', 1, 10, 'completed', '[]'),
+                    ('scan_b', 11, 20, 'completed', '[]');
+                 INSERT INTO plans VALUES
+                    ('plan_a', 'scan_a', NULL, 2, 'applied', '{}', 'a', '{}'),
+                    ('plan_b', 'scan_b', NULL, 12, 'applied', '{}', 'b', '{}');
+                 INSERT INTO receipts VALUES
+                    ('receipt_original', 'plan_a', NULL, 3, 4, 'undone', '{}'),
+                    ('receipt_reverse', 'plan_a', 'receipt_original', 21, 22, 'undone', '{}'),
+                    ('receipt_applied', 'plan_b', NULL, 13, 14, 'applied', '{}');",
+            )
+            .unwrap();
+
+        migration_v11(&transaction).unwrap();
+
+        let rows = transaction
+            .prepare(
+                "SELECT snapshot_id, receipt_id FROM snapshot_invalidations
+                 ORDER BY receipt_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("scan_b".to_owned(), "receipt_applied".to_owned()),
+                ("scan_b".to_owned(), "receipt_reverse".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_invalidation_migration_fails_closed_for_ambiguous_same_second_order() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for (_, migration) in &MIGRATIONS[..10] {
+            migration(&transaction).unwrap();
+        }
+        transaction
+            .execute_batch(
+                "INSERT INTO scans VALUES
+                    ('scan_before', 1, 10, 'completed', '[]'),
+                    ('scan_after', 20, 20, 'completed', '[]');
+                 INSERT INTO plans VALUES
+                    ('plan_a', 'scan_before', NULL, 2, 'applied', '{}', 'a', '{}');
+                 INSERT INTO receipts VALUES
+                    ('receipt_original', 'plan_a', NULL, 3, 4, 'undone', '{}'),
+                    ('receipt_reverse', 'plan_a', 'receipt_original', 19, 20, 'undone', '{}');",
+            )
+            .unwrap();
+
+        migration_v11(&transaction).unwrap();
+
+        let reverse_invalidations: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_invalidations
+                 WHERE receipt_id = 'receipt_reverse'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reverse_invalidations, 1);
     }
 
     #[test]
@@ -2931,7 +3105,12 @@ mod tests {
             verification: serde_json::json!({}),
             operation_results: vec![],
         };
-        store.save_receipt(&original).unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
+            .unwrap();
         let reverse = ReceiptRecord {
             id: ReceiptId::new(),
             plan_id: plan.id,
@@ -2942,7 +3121,9 @@ mod tests {
             verification: serde_json::json!({}),
             operation_results: vec![],
         };
-        store.save_undo_receipt(&original.id, &reverse).unwrap();
+        store
+            .save_undo_receipt(&original.id, &reverse, None)
+            .unwrap();
         assert_eq!(
             store.get_receipt(&original.id).unwrap().unwrap().status,
             ReceiptStatus::Undone
@@ -2956,8 +3137,99 @@ mod tests {
             id: ReceiptId::new(),
             ..reverse
         };
-        assert!(store.save_undo_receipt(&original.id, &duplicate).is_err());
+        assert!(
+            store
+                .save_undo_receipt(&original.id, &duplicate, None)
+                .is_err()
+        );
         assert!(!store.receipt_exists(&duplicate.id).unwrap());
+    }
+
+    #[test]
+    fn applied_and_undo_receipts_invalidate_only_the_snapshot_they_changed() {
+        let store = StateStore::open_in_memory().unwrap();
+        let original_scan = scan();
+        store.save_scan(&original_scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: original_scan.id.clone(),
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        let original = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+
+        assert!(
+            store
+                .snapshot_invalidating_receipt(&original_scan.id)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &original)
+            .unwrap();
+        assert_eq!(
+            store
+                .snapshot_invalidating_receipt(&original_scan.id)
+                .unwrap(),
+            Some(original.id.clone())
+        );
+        let newer_scan = scan();
+        store.save_scan(&newer_scan).unwrap();
+        assert!(
+            store
+                .snapshot_invalidating_receipt(&newer_scan.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let reverse = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id,
+            reverses_receipt_id: Some(original.id.clone()),
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::Undone,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store
+            .save_undo_receipt(&original.id, &reverse, Some(&newer_scan.id))
+            .unwrap();
+        assert!(
+            store
+                .snapshot_invalidating_receipt(&original_scan.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.snapshot_invalidating_receipt(&newer_scan.id).unwrap(),
+            Some(reverse.id)
+        );
+        let post_undo_scan = scan();
+        store.save_scan(&post_undo_scan).unwrap();
+        assert!(
+            store
+                .snapshot_invalidating_receipt(&post_undo_scan.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

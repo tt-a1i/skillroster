@@ -337,6 +337,7 @@ fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Snapshot age",
         age(value.get("latest_snapshot_at").and_then(Value::as_i64)),
     );
+    fact(lines, "Snapshot state", text(value, "snapshot_state"));
     fact(lines, "Pending Plans", text(value, "pending_plan_count"));
     let pending_plan = value
         .get("pending_plans")
@@ -373,6 +374,8 @@ fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
         "Next: skillroster lifecycle recovery".to_owned()
     } else if value.get("latest_snapshot_id").is_none_or(Value::is_null) {
         "Next: skillroster scan".to_owned()
+    } else if value["snapshot_state"] == "rescan_required" {
+        "Next: skillroster scan --summary --json".to_owned()
     } else if pending_plan.is_some() {
         "Next: inspect the Review Plan above".to_owned()
     } else {
@@ -1507,6 +1510,10 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
     fact(lines, "Changed paths", text(value, "changed_path_count"));
     fact(lines, "Verification", text(value, "verification"));
     fact(lines, "Undo available", text(value, "undo_available"));
+    if value.get("rescan_required").and_then(Value::as_bool) == Some(true) {
+        fact(lines, "Current facts", "Scan required");
+        fact(lines, "Continue", "skillroster scan --summary --json");
+    }
     if value
         .get("files_changed")
         .and_then(Value::as_bool)
@@ -1514,7 +1521,11 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
     {
         lines.extend(summary(
             "Changed · bounded by the Receipt",
-            "Use the Receipt ID to inspect or undo",
+            if value.get("rescan_required").and_then(Value::as_bool) == Some(true) {
+                "Run the Scan continuation before Report or Find; Undo remains available"
+            } else {
+                "Use the Receipt ID to inspect or undo"
+            },
         ));
     } else {
         lines.extend(summary(
@@ -1924,6 +1935,7 @@ mod tests {
             "schema_version": 9,
             "latest_snapshot_id": "scan_current",
             "latest_snapshot_at": 1,
+            "snapshot_state": "current",
             "pending_plan_count": 1,
             "pending_plans": [{
                 "plan_id": "plan_01M0QDAC102GEXKCMHVP97GF2V",
@@ -1965,8 +1977,15 @@ mod tests {
 
         let mut missing_snapshot = base.clone();
         missing_snapshot["latest_snapshot_id"] = Value::Null;
+        missing_snapshot["snapshot_state"] = json!("missing");
         let missing_snapshot = render("status", &missing_snapshot, options);
         assert!(missing_snapshot.contains("Next: skillroster scan"));
+
+        let mut stale = base.clone();
+        stale["snapshot_state"] = json!("rescan_required");
+        let stale = render("status", &stale, options);
+        assert!(stale.contains("Snapshot state         rescan_required"));
+        assert!(stale.contains("Next: skillroster scan --summary --json"));
 
         let mut healthy = base;
         healthy["pending_plan_count"] = json!(0);
@@ -2009,6 +2028,33 @@ mod tests {
         );
         assert!(output.contains("Verified · no files changed"));
         assert!(!output.contains("Changed · bounded"));
+    }
+
+    #[test]
+    fn verified_apply_tells_humans_to_refresh_current_facts() {
+        let output = render(
+            "apply",
+            &json!({
+                "plan_id": "plan_1",
+                "receipt_id": "receipt_1",
+                "changed_path_count": 4,
+                "verification": "passed",
+                "undo_available": true,
+                "rescan_required": true,
+                "files_changed": true
+            }),
+            RenderOptions {
+                width: 80,
+                styled: false,
+            },
+        );
+        assert!(output.contains("Current facts          Scan required"));
+        assert!(output.contains("Continue               skillroster scan --summary --json"));
+        assert!(
+            output.contains(
+                "Run the Scan continuation before Report or Find; Undo remains available"
+            )
+        );
     }
 
     #[test]
