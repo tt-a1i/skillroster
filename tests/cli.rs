@@ -45,6 +45,38 @@ fn run_with_columns(args: &[&str], columns: usize) -> std::process::Output {
         .unwrap()
 }
 
+fn executable_copy_is_busy(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const ETXTBSY: i32 = 26;
+        error.raw_os_error() == Some(ETXTBSY)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn output_after_executable_copy(command: &mut Command) -> std::process::Output {
+    const MAX_ATTEMPTS: usize = 5;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match command.output() {
+            Ok(output) => return output,
+            // Linux CI can briefly retain a write lease after publishing a
+            // copied executable. Retry only ETXTBSY; every other spawn error
+            // and a persistent lease still fail the test immediately.
+            Err(error) if executable_copy_is_busy(&error) && attempt < MAX_ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("cannot run copied test executable: {error}"),
+        }
+    }
+
+    unreachable!("the bounded executable-copy retry loop always returns or panics")
+}
+
 fn continuation_argv(output: &str) -> Vec<String> {
     let mut argv = Vec::new();
     let mut current = None::<String>;
@@ -344,19 +376,17 @@ fn suggested_action_argv_stays_bound_to_the_running_executable() {
     fs::copy(env!("CARGO_BIN_EXE_skillroster"), &staged_executable).unwrap();
     fs::rename(staged_executable, &executable).unwrap();
     let executable = executable.to_str().unwrap();
-    let initial = json_output(
-        &Command::new(executable)
-            .args([
-                "--state-dir",
-                state.to_str().unwrap(),
-                "--home",
-                home.to_str().unwrap(),
-                "--json",
-            ])
-            .env("PATH", &shadow_bin)
-            .output()
-            .unwrap(),
-    );
+    let mut initial_command = Command::new(executable);
+    initial_command
+        .args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .env("PATH", &shadow_bin);
+    let initial = json_output(&output_after_executable_copy(&mut initial_command));
     let argv = initial["suggested_actions"][0]["argv"]
         .as_array()
         .unwrap()
