@@ -340,7 +340,9 @@ fn suggested_action_argv_stays_bound_to_the_running_executable() {
     let archive = temp.path().join("skillroster-1.8.31-test-target");
     fs::create_dir(&archive).unwrap();
     let executable = archive.join(shadow_name);
-    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &executable).unwrap();
+    let staged_executable = archive.join(format!("staged-{shadow_name}"));
+    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &staged_executable).unwrap();
+    fs::rename(staged_executable, &executable).unwrap();
     let executable = executable.to_str().unwrap();
     let initial = json_output(
         &Command::new(executable)
@@ -417,7 +419,9 @@ fn non_unicode_running_executable_fails_closed_without_a_path_fallback() {
     let executable = temp
         .path()
         .join(OsString::from_vec(b"skillroster-\xff".to_vec()));
-    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &executable).unwrap();
+    let staged_executable = temp.path().join("staged-skillroster");
+    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &staged_executable).unwrap();
+    fs::rename(staged_executable, &executable).unwrap();
 
     let output = Command::new(&executable)
         .args([
