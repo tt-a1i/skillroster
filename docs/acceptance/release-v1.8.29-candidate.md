@@ -30,12 +30,14 @@ the product model to the public package built from current `main`.
   and exact Undo. These are controlled-fixture outcomes, not token, labor,
   performance, model-quality, or universal-superiority claims.
 
-The release keeps SQLite schema 10, JSON envelope schema 1, local-only
-operation, explicit confirmation, and Receipt-bounded Apply/Undo. Strict JSON
-consumers must continue to tolerate additive typed error and coverage fields.
-Snapshots created before the Unicode identity contract require a new complete
-Scan before exact identity decisions. Existing user-owned Skill contents are
-not migrated or deleted by upgrading the binary.
+The release upgrades the local state database from SQLite schema 10 to schema
+12 through the sequential v11 and v12 migrations. JSON envelope schema 1,
+local-only operation, explicit confirmation, and Receipt-bounded Apply/Undo
+remain unchanged. Strict JSON consumers must continue to tolerate additive
+typed error and coverage fields. Snapshots created before the Unicode identity
+contract require a new complete Scan before exact identity decisions. The
+database migration does not migrate or delete existing user-owned Skill
+contents.
 
 ## Release evidence
 
