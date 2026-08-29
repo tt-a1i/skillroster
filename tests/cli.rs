@@ -299,7 +299,7 @@ fn startup_leaves_unrecognized_control_files_untouched() {
 
 fn context_action_argv(home: &Path, state: &Path, tail: &[&str]) -> Value {
     let mut argv = vec![
-        "skillroster".to_owned(),
+        env!("CARGO_BIN_EXE_skillroster").to_owned(),
         "--state-dir".to_owned(),
         state.to_string_lossy().into_owned(),
         "--home".to_owned(),
@@ -316,9 +316,135 @@ fn run_suggested_action(action: &Value) -> std::process::Output {
         .iter()
         .map(|value| value.as_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    assert_eq!(argv.first().map(String::as_str), Some("skillroster"));
-    let args = argv[1..].iter().map(String::as_str).collect::<Vec<_>>();
-    run(&args, None)
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some(env!("CARGO_BIN_EXE_skillroster"))
+    );
+    Command::new(&argv[0]).args(&argv[1..]).output().unwrap()
+}
+
+#[test]
+fn suggested_action_argv_stays_bound_to_the_running_executable() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let shadow_bin = temp.path().join("shadow-bin");
+    fs::create_dir_all(&shadow_bin).unwrap();
+    let shadow_name = if cfg!(windows) {
+        "skillroster.exe"
+    } else {
+        "skillroster"
+    };
+    fs::write(shadow_bin.join(shadow_name), b"not the running executable").unwrap();
+
+    let archive = temp.path().join("skillroster-1.8.31-test-target");
+    fs::create_dir(&archive).unwrap();
+    let executable = archive.join(shadow_name);
+    let staged_executable = archive.join(format!("staged-{shadow_name}"));
+    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &staged_executable).unwrap();
+    fs::rename(staged_executable, &executable).unwrap();
+    let executable = executable.to_str().unwrap();
+    let initial = json_output(
+        &Command::new(executable)
+            .args([
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+                "--json",
+            ])
+            .env("PATH", &shadow_bin)
+            .output()
+            .unwrap(),
+    );
+    let argv = initial["suggested_actions"][0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(argv.first().copied(), Some(executable));
+    let continued = json_output(
+        &Command::new(argv[0])
+            .args(&argv[1..])
+            .env("PATH", &shadow_bin)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(continued["command"], "scan");
+    assert_eq!(continued["ok"], true);
+
+    let human = Command::new(executable)
+        .args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+        ])
+        .env("PATH", &shadow_bin)
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human_argv = continuation_argv(&String::from_utf8(human.stdout).unwrap());
+    assert_eq!(human_argv.first().map(String::as_str), Some(executable));
+
+    let report_argv = continued["suggested_actions"][0]["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(report_argv.first().copied(), Some(executable));
+    let report = json_output(
+        &Command::new(report_argv[0])
+            .args(&report_argv[1..])
+            .env("PATH", &shadow_bin)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(report["command"], "report");
+    assert_eq!(report["ok"], true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_unicode_running_executable_fails_closed_without_a_path_fallback() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let executable = temp
+        .path()
+        .join(OsString::from_vec(b"skillroster-\xff".to_vec()));
+    let staged_executable = temp.path().join("staged-skillroster");
+    fs::copy(env!("CARGO_BIN_EXE_skillroster"), &staged_executable).unwrap();
+    fs::rename(staged_executable, &executable).unwrap();
+
+    let output = Command::new(&executable)
+        .args([
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let failure: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(failure["ok"], false);
+    assert!(
+        failure["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("current executable path must be valid Unicode")
+    );
+    assert_eq!(failure["suggested_actions"], json!([]));
+    assert!(!state.exists());
 }
 
 #[test]
@@ -360,7 +486,7 @@ fn suggested_action_argv_replays_the_same_discovery_context() {
     assert_eq!(
         scan["suggested_actions"][0]["argv"],
         json!([
-            "skillroster",
+            env!("CARGO_BIN_EXE_skillroster"),
             "--state-dir",
             state,
             "--home",
@@ -7104,7 +7230,7 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
         .find(|action| action["action"] == "view_source_confirmation_finding")
         .expect("blocked Roster exposes its source Finding continuation");
     let source_argv = source_action["argv"].as_array().unwrap();
-    assert_eq!(source_argv[0], "skillroster");
+    assert_eq!(source_argv[0], env!("CARGO_BIN_EXE_skillroster"));
     assert_eq!(source_argv[1], "--state-dir");
     assert_eq!(source_argv[2], state.to_str().unwrap());
     assert_eq!(source_argv[3], "--home");
@@ -7371,9 +7497,15 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
     let suggested_argv = blocked["suggested_actions"][0]["argv"].as_array().unwrap();
     assert_eq!(
         &suggested_argv[..5],
-        &json!(["skillroster", "--state-dir", state, "--home", home])
-            .as_array()
-            .unwrap()[..]
+        &json!([
+            env!("CARGO_BIN_EXE_skillroster"),
+            "--state-dir",
+            state,
+            "--home",
+            home
+        ])
+        .as_array()
+        .unwrap()[..]
     );
     assert_eq!(
         &blocked["error"]["details"]["after_confirmation"]["argv_template"]
@@ -8804,7 +8936,7 @@ fn legacy_large_roster_snapshot_requests_a_typed_physical_identity_rescan() {
     assert_eq!(
         planning["action"]["argv"],
         json!([
-            "skillroster",
+            env!("CARGO_BIN_EXE_skillroster"),
             "--state-dir",
             state.to_str().unwrap(),
             "--home",
@@ -9681,7 +9813,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
             "action": "inspect_same_name_variants",
             "description": "inspect_same_name_variants",
             "argv": [
-                "skillroster",
+                env!("CARGO_BIN_EXE_skillroster"),
                 "--state-dir",
                 state,
                 "--home",

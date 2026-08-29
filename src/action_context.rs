@@ -8,14 +8,34 @@ use crate::model::SuggestedAction;
 
 /// Discovery and state options that suggested actions retain so they operate
 /// on the same local analysis context as the command that produced them.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ActionContext {
+    pub(crate) executable: String,
     pub(crate) argv: Vec<String>,
     pub(crate) argv_without_source_roots: Vec<String>,
 }
 
+impl Default for ActionContext {
+    fn default() -> Self {
+        Self {
+            executable: "skillroster".into(),
+            argv: Vec::new(),
+            argv_without_source_roots: Vec::new(),
+        }
+    }
+}
+
 impl ActionContext {
     pub fn from_cli(cli: &Cli) -> Result<Self> {
+        Self::from_cli_with_executable(cli, Path::new("skillroster"))
+    }
+
+    pub(crate) fn from_process(cli: &Cli) -> Result<Self> {
+        let executable = std::env::current_exe().context("cannot resolve current executable")?;
+        Self::from_cli_with_executable(cli, &executable)
+    }
+
+    fn from_cli_with_executable(cli: &Cli, executable: &Path) -> Result<Self> {
         let mut argv = Vec::new();
         if let Some(state_dir) = &cli.state_dir {
             let state_dir = if state_dir.is_absolute() {
@@ -44,15 +64,13 @@ impl ActionContext {
             ]);
         }
         Ok(Self {
+            executable: action_path(executable, "current executable")?,
             argv,
             argv_without_source_roots,
         })
     }
 
     pub(crate) fn apply(&self, actions: &mut [SuggestedAction]) {
-        if self.argv.is_empty() {
-            return;
-        }
         for action in actions {
             let context = if action.action == "scan"
                 && action.reason_code == "source_root_permission_recorded"
@@ -70,15 +88,29 @@ impl ActionContext {
             let insertion =
                 usize::from(action.argv.first().is_some_and(|arg| arg == "skillroster"));
             action.argv.splice(insertion..insertion, context.clone());
+            if insertion == 1 {
+                action.argv[0].clone_from(&self.executable);
+            }
         }
     }
 
-    pub(crate) fn argv(&self) -> &[String] {
-        &self.argv
+    pub(crate) fn command_argv_prefix(&self) -> Vec<String> {
+        std::iter::once(self.executable.clone())
+            .chain(self.argv.iter().cloned())
+            .collect()
     }
 
     pub(crate) fn apply_json_argv(&self, argv: &mut Value) {
-        apply_json_argv_context(argv, &self.argv);
+        apply_json_argv_context(argv, &self.argv, &self.executable);
+    }
+
+    pub(crate) fn bind_json_executable(&self, argv: &mut Value) {
+        let Some(first) = argv.as_array_mut().and_then(|values| values.first_mut()) else {
+            return;
+        };
+        if first.as_str() == Some("skillroster") {
+            *first = Value::String(self.executable.clone());
+        }
     }
 
     pub(crate) fn apply_result(&self, command: &str, result: &mut Value) {
@@ -107,7 +139,11 @@ impl ActionContext {
                 if let Some(argv) = result.pointer_mut(
                     "/resolution/permission_paths/durable_permission/next/argv_template",
                 ) {
-                    apply_json_argv_context(argv, &self.argv_without_source_roots);
+                    apply_json_argv_context(
+                        argv,
+                        &self.argv_without_source_roots,
+                        &self.executable,
+                    );
                 }
             }
             _ => {}
@@ -129,18 +165,18 @@ impl ActionContext {
     }
 }
 
-fn apply_json_argv_context(argv: &mut Value, context: &[String]) {
+fn apply_json_argv_context(argv: &mut Value, context: &[String], executable: &str) {
     let Some(values) = argv.as_array_mut() else {
         return;
     };
-    if context.is_empty() {
-        return;
-    }
     let insertion = usize::from(values.first().and_then(Value::as_str) == Some("skillroster"));
     values.splice(
         insertion..insertion,
         context.iter().cloned().map(Value::String),
     );
+    if insertion == 1 {
+        values[0] = Value::String(executable.to_owned());
+    }
 }
 
 fn action_path(path: &Path, option: &str) -> Result<String> {
@@ -151,6 +187,7 @@ fn action_path(path: &Path, option: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use serde_json::json;
 
     use super::*;
@@ -167,8 +204,40 @@ mod tests {
     }
 
     #[test]
+    fn executable_binding_does_not_require_discovery_options() {
+        let context = ActionContext {
+            executable: "/verified/skillroster".into(),
+            argv: Vec::new(),
+            argv_without_source_roots: Vec::new(),
+        };
+        let mut actions = [action("scan", "retry_scan", &["skillroster", "scan"])];
+
+        context.apply(&mut actions);
+
+        assert_eq!(actions[0].argv, ["/verified/skillroster", "scan"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_current_executable_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let cli = Cli::try_parse_from(["skillroster", "--json"]).unwrap();
+        let executable = std::path::PathBuf::from(OsString::from_vec(vec![b'/', 0xff]));
+
+        let error = ActionContext::from_cli_with_executable(&cli, &executable).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "current executable path must be valid Unicode for suggested action argv"
+        );
+    }
+
+    #[test]
     fn temporary_source_roots_preserve_order_and_require_confirmation() {
         let context = ActionContext {
+            executable: "skillroster".into(),
             argv: vec![
                 "--home".into(),
                 "/home".into(),
@@ -198,6 +267,7 @@ mod tests {
     #[test]
     fn only_recorded_permission_followup_drops_temporary_source_roots() {
         let context = ActionContext {
+            executable: "skillroster".into(),
             argv: vec![
                 "--home".into(),
                 "/home".into(),
@@ -245,6 +315,7 @@ mod tests {
     #[test]
     fn durable_permission_followup_drops_temporary_source_roots() {
         let context = ActionContext {
+            executable: "skillroster".into(),
             argv: vec![
                 "--home".into(),
                 "/home".into(),
@@ -276,6 +347,7 @@ mod tests {
     #[test]
     fn report_planning_scan_keeps_context_and_marks_temporary_roots() {
         let context = ActionContext {
+            executable: "skillroster".into(),
             argv: vec![
                 "--state-dir".into(),
                 "/state".into(),

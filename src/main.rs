@@ -35,9 +35,15 @@ fn main() {
     };
     let json = cli.json;
     let command = cli.command_name();
-    let action_context = match app::ActionContext::from_cli(&cli) {
-        Ok(context) => context,
+    // Apply and Undo start progress inside `app::run`, after human confirmation.
+    let progress = (!matches!(command, "apply" | "undo"))
+        .then(|| skillroster::present::ProgressGuard::start(command, json));
+    let (action_context, output) = match app::run_process(cli) {
+        Ok(process) => process,
         Err(error) => {
+            if let Some(progress) = progress {
+                progress.finish();
+            }
             if json {
                 write_stdout_or_exit(&app::error_json(command, error.as_ref()));
             } else {
@@ -46,11 +52,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // Apply and Undo start progress inside `app::run`, after human confirmation.
-    let progress = (!matches!(command, "apply" | "undo"))
-        .then(|| skillroster::present::ProgressGuard::start(command, json));
 
-    match app::run(cli) {
+    match output {
         Ok(output) => {
             if let Some(progress) = progress {
                 progress.finish();
