@@ -16,6 +16,9 @@ classify_paths() {
       skill/skillroster/*|tests/fixtures/*)
         full=true
         ;;
+      docs/release-archive/README.md)
+        full=true
+        ;;
       LICENSE|*.md)
         ;;
       *)
@@ -38,6 +41,7 @@ self_test() {
     'skill/skillroster/SKILL.md' \
     'skill/skillroster/references/routing.md' \
     'skill/skillroster/manifest.json' \
+    'docs/release-archive/README.md' \
     'tests/fixtures/bootstrap-v1.8.23.md' \
     'src/bootstrap.rs'; do
     actual="$(printf '%s\n' "$runtime_path" | classify_paths)"

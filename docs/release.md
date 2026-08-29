@@ -5,6 +5,13 @@ from the public source tree. Workflows must never upload local Skill libraries,
 agent sessions, inventories, plans, receipts, configuration, credentials, or
 other user data.
 
+Every archive packages `docs/release-archive/README.md` as its root
+`README.md`. That guide is intentionally version-neutral because an immutable
+candidate tag cannot truthfully claim which release is currently public. The
+packaging jobs on all four platforms verify that the archived README matches
+the checked-in source exactly; the normal full CI gate rejects a hard-coded
+release version in that source.
+
 ## Candidate build
 
 1. Update `Cargo.toml` and `Cargo.lock` to the intended version.

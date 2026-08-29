@@ -3,6 +3,7 @@ set -euo pipefail
 
 target="${1:?target is required}"
 version="${2:?version is required}"
+archive_readme="docs/release-archive/README.md"
 
 case "$target" in
   x86_64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin) ;;
@@ -33,13 +34,15 @@ if [[ -e "$stage" || -L "$stage" || -e "$archive" || -L "$archive" || -e "$check
   exit 1
 fi
 
+bash scripts/verify-release-archive-readme.sh
+
 cleanup_stage() {
   if [[ -e "$stage" || -L "$stage" ]]; then rm -rf -- "$stage"; fi
 }
 trap cleanup_stage EXIT
 mkdir -p "$stage"
 install -m 0755 "target/${target}/release/skillroster" "$stage/skillroster"
-cp README.md "$stage/README.md"
+cp "$archive_readme" "$stage/README.md"
 cp LICENSE "$stage/LICENSE"
 scripts/release/smoke.sh "$stage/skillroster"
 tar -C "$dist_root" -czf "$archive" "$name"
@@ -48,6 +51,10 @@ trap - EXIT
 
 if ! tar -xOf "$archive" "$name/LICENSE" | cmp - LICENSE; then
   echo "release archive does not contain the repository LICENSE" >&2
+  exit 1
+fi
+if ! tar -xOf "$archive" "$name/README.md" | cmp - "$archive_readme"; then
+  echo "release archive README differs from the version-neutral source" >&2
   exit 1
 fi
 
