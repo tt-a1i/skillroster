@@ -490,6 +490,18 @@ ran all eight Core and On-demand arms. Cold retrieval and target loading passed
 4/4, while the overall task-success gate failed because two Core controls also
 failed. The result is preserved as a failed holdout rather than tuned or rerun.
 
+## Roster recommendation pilot protocol
+
+The [frozen privacy-safe protocol](research/roster-recommendation-pilot-v1.md)
+defines the separate authority, stage, recommendation, safety, and stop-rule
+boundaries for a future independent qualitative pilot. Its
+[synthetic dry run](acceptance/roster-recommendation-pilot-v1-dry-run.md)
+exercises three invented participants and five recommendation records,
+including an invocation failure, retrieval failure, rejection, and typed
+blocker. The strict ledger rejects extra or identifying fields, and its summary
+authorizes no ranking, embedding, model, or policy change. No real participant
+was recruited or observed.
+
 ## Evidence boundary
 
 These checks establish deterministic routing and safe local governance; they do

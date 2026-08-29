@@ -1,0 +1,140 @@
+{
+  "format": "skillroster-roster-recommendation-pilot",
+  "participants": [
+    {
+      "aggregate_inventory": {
+        "default_exposure": 36,
+        "placement_count": 120,
+        "session_coverage": "sampled_limited",
+        "skill_count": 64
+      },
+      "pseudonym": "synthetic-a",
+      "recommendations": [
+        {
+          "outcome": "accepted",
+          "reason_category": "accepted_as_proposed",
+          "recommendation_category": "core_general",
+          "stage_results": {
+            "diagnosis": "passed",
+            "deterministic_retrieval": "passed",
+            "final_task": "passed",
+            "invocation": "passed",
+            "plan": "passed",
+            "recommendation_decision": "accepted",
+            "setup": "passed"
+          }
+        }
+      ],
+      "run_status": "observed",
+      "safety_outcome": {
+        "authority_verified": true,
+        "identifying_path_persisted": false,
+        "raw_conversation_persisted": false,
+        "secret_persisted": false,
+        "skill_content_persisted": false,
+        "unapproved_write_count": 0
+      },
+      "supported_agents": ["codex"]
+    },
+    {
+      "aggregate_inventory": {
+        "default_exposure": 24,
+        "placement_count": 84,
+        "session_coverage": "complete",
+        "skill_count": 51
+      },
+      "pseudonym": "synthetic-b",
+      "recommendations": [
+        {
+          "outcome": "rejected",
+          "reason_category": "personal_preference",
+          "recommendation_category": "on_demand_agent_specific",
+          "stage_results": {
+            "diagnosis": "passed",
+            "deterministic_retrieval": "passed",
+            "final_task": "passed",
+            "invocation": "passed",
+            "plan": "passed",
+            "recommendation_decision": "rejected",
+            "setup": "passed"
+          }
+        }
+      ],
+      "run_status": "observed",
+      "safety_outcome": {
+        "authority_verified": true,
+        "identifying_path_persisted": false,
+        "raw_conversation_persisted": false,
+        "secret_persisted": false,
+        "skill_content_persisted": false,
+        "unapproved_write_count": 0
+      },
+      "supported_agents": ["claude-code", "codex"]
+    },
+    {
+      "aggregate_inventory": {
+        "default_exposure": 71,
+        "placement_count": 143,
+        "session_coverage": "sampled_limited",
+        "skill_count": 92
+      },
+      "pseudonym": "synthetic-c",
+      "recommendations": [
+        {
+          "outcome": "not_evaluated",
+          "reason_category": "not_evaluated",
+          "recommendation_category": "core_agent_specific",
+          "stage_results": {
+            "diagnosis": "not_evaluated",
+            "deterministic_retrieval": "not_evaluated",
+            "final_task": "not_evaluated",
+            "invocation": "failed",
+            "plan": "not_evaluated",
+            "recommendation_decision": "not_evaluated",
+            "setup": "passed"
+          }
+        },
+        {
+          "outcome": "not_evaluated",
+          "reason_category": "not_evaluated",
+          "recommendation_category": "on_demand_general",
+          "stage_results": {
+            "diagnosis": "passed",
+            "deterministic_retrieval": "failed",
+            "final_task": "not_evaluated",
+            "invocation": "passed",
+            "plan": "passed",
+            "recommendation_decision": "not_evaluated",
+            "setup": "passed"
+          }
+        },
+        {
+          "outcome": "blocked",
+          "reason_category": "insufficient_evidence",
+          "recommendation_category": "source_blocked",
+          "stage_results": {
+            "diagnosis": "passed",
+            "deterministic_retrieval": "passed",
+            "final_task": "not_evaluated",
+            "invocation": "passed",
+            "plan": "blocked",
+            "recommendation_decision": "blocked",
+            "setup": "passed"
+          }
+        }
+      ],
+      "run_status": "observed",
+      "safety_outcome": {
+        "authority_verified": true,
+        "identifying_path_persisted": false,
+        "raw_conversation_persisted": false,
+        "secret_persisted": false,
+        "skill_content_persisted": false,
+        "unapproved_write_count": 0
+      },
+      "supported_agents": ["hermes", "pi"]
+    }
+  ],
+  "schema_version": 1,
+  "synthetic": true
+}
