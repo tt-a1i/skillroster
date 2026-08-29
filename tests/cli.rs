@@ -3719,6 +3719,11 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
     assert_eq!(applied["result"]["verification"], "passed");
     assert_eq!(applied["result"]["changed_path_count"], 4);
+    assert_eq!(
+        applied["result"]["changed_paths"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(applied["result"]["changed_paths_truncated"], false);
     for (relative_path, expected) in [
         ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
         (
@@ -3752,6 +3757,12 @@ fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(undone["result"]["changed_path_count"], 4);
+    assert_eq!(
+        undone["result"]["changed_paths"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(undone["result"]["changed_paths_truncated"], false);
     for (relative_path, expected) in legacy_files {
         assert_eq!(
             fs::read_to_string(package.join(relative_path)).unwrap(),
@@ -4123,6 +4134,18 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     assert_eq!(status["result"]["recovery_state"], "clear");
 
     let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["changed_path_count"], 36);
+    assert_eq!(
+        applied["result"]["changed_paths"].as_array().unwrap().len(),
+        10
+    );
+    assert_eq!(applied["result"]["changed_paths_truncated"], true);
+    let applied_paths = applied["result"]["changed_paths"].as_array().unwrap();
+    assert!(
+        applied_paths
+            .windows(2)
+            .all(|pair| { pair[0].as_str().unwrap() <= pair[1].as_str().unwrap() })
+    );
     for root in physical_roots {
         assert!(root.join("skillroster/SKILL.md").is_file());
         assert!(root.join("skillroster/references/routing.md").is_file());
@@ -4130,8 +4153,22 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
         assert!(root.join("skillroster/references/mutation.md").is_file());
     }
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    let persisted_receipt: Value = serde_json::from_slice(
+        &fs::read(state.join("receipts").join(format!("{receipt_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        persisted_receipt["changed_paths"].as_array().unwrap().len(),
+        36
+    );
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
+    assert_eq!(undone["result"]["changed_path_count"], 36);
+    assert_eq!(
+        undone["result"]["changed_paths"].as_array().unwrap().len(),
+        10
+    );
+    assert_eq!(undone["result"]["changed_paths_truncated"], true);
     for root in physical_roots {
         assert!(!root.join("skillroster").exists());
     }

@@ -43,6 +43,7 @@ use error::{
 pub use error::{error_json, error_json_with_context};
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
+const MUTATION_CHANGED_PATH_PREVIEW_LIMIT: usize = 10;
 const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
     "snapshot_id",
     "digest",
@@ -9668,13 +9669,19 @@ fn mutation_result(
     receipt: &ReceiptRecord,
     reverses: Option<ReceiptId>,
 ) -> Value {
+    let changed_path_count = outcome.receipt.changed_paths.len();
+    let mut changed_paths = outcome.receipt.changed_paths.clone();
+    changed_paths.sort();
+    changed_paths.truncate(MUTATION_CHANGED_PATH_PREVIEW_LIMIT);
+
     json!({
         "plan_id": receipt.plan_id,
         "receipt_id": receipt.id,
         "reverses_receipt_id": reverses,
         "status": receipt.status,
-        "changed_path_count": outcome.receipt.changed_paths.len(),
-        "changed_paths": outcome.receipt.changed_paths,
+        "changed_path_count": changed_path_count,
+        "changed_paths": changed_paths,
+        "changed_paths_truncated": changed_path_count > MUTATION_CHANGED_PATH_PREVIEW_LIMIT,
         "verification": if outcome.verification_passed { "passed" } else { "failed" },
         "canonical_deletion_count": 0,
         "undo_available": outcome.receipt.status == change::ReceiptStatus::Applied,
