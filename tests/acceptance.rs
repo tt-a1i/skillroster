@@ -85,20 +85,60 @@ fn cli_json(home: &Path, state: &Path, args: &[&str], stdin: Option<&str>) -> Va
     envelope
 }
 
-fn plan_evidence_id(home: &Path, state: &Path) -> String {
-    let report = cli_json(home, state, &["report"], None);
-    let finding = report["result"]["findings"]
+fn plan_evidence_ids(
+    home: &Path,
+    state: &Path,
+    skill_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let required = skill_ids.into_iter().collect::<BTreeSet<_>>();
+    let report = cli_json(home, state, &["report", "--full"], None);
+    let finding_id = report["result"]["findings"]
         .as_array()
-        .and_then(|findings| findings.first())
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["kind"] == "unknown_provenance")
+        })
         .and_then(|finding| finding["id"].as_str())
-        .expect("fixture report must expose a traceable Finding");
-    let detail = cli_json(home, state, &["report", "--finding", finding], None);
-    detail["result"]["items"]
-        .as_array()
-        .and_then(|items| items.first())
-        .and_then(|item| item["evidence_id"].as_str())
-        .expect("Finding must expose Evidence through the public CLI")
-        .to_string()
+        .expect("fixture report must expose the provenance Finding")
+        .to_owned();
+    let mut offset = 0_u64;
+    let mut covered = BTreeSet::new();
+    let mut evidence_ids = Vec::new();
+    loop {
+        let offset_arg = offset.to_string();
+        let detail = cli_json(
+            home,
+            state,
+            &[
+                "report",
+                "--finding",
+                &finding_id,
+                "--limit",
+                "20",
+                "--offset",
+                &offset_arg,
+            ],
+            None,
+        );
+        for item in detail["result"]["items"].as_array().unwrap() {
+            let Some(skill_id) = item["facts"]["skill_id"].as_str() else {
+                continue;
+            };
+            if required.contains(skill_id) && covered.insert(skill_id.to_owned()) {
+                evidence_ids.push(item["evidence_id"].as_str().unwrap().to_owned());
+            }
+        }
+        let Some(next_offset) = detail["result"]["page"]["next_offset"].as_u64() else {
+            break;
+        };
+        offset = next_offset;
+    }
+    assert_eq!(
+        covered, required,
+        "the public Finding pages must expose relevant Evidence for every raw Roster change"
+    );
+    evidence_ids
 }
 
 fn public_skill_ids(home: &Path, state: &Path, names: &[String]) -> BTreeMap<String, String> {
@@ -781,7 +821,7 @@ fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_succes
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
         .collect::<Vec<_>>();
     let ids = public_skill_ids(&home, &state, &names);
-    let evidence_id = plan_evidence_id(&home, &state);
+    let evidence_ids = plan_evidence_ids(&home, &state, ids.values().cloned());
     let core = BTreeSet::from(["research", "diagnose", "code-review"]);
     let roster_changes = names
         .iter()
@@ -796,7 +836,7 @@ fn maintained_routing_set_meets_top_three_and_governance_does_not_regress_succes
     let request = serde_json::json!({
         "schema_version": 1,
         "scan_id": scan_id,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": evidence_ids,
         "roster_changes": roster_changes
     });
     let plan = cli_json(
@@ -975,7 +1015,7 @@ fn three_arm_value_comparison_runs_real_filesystem_governance_and_restore() {
     let scan_result = cli_json(&roster_home, &roster_state, &["scan"], None);
     let scan_id = scan_result["result"]["snapshot_id"].as_str().unwrap();
     let ids = public_skill_ids(&roster_home, &roster_state, &names);
-    let evidence_id = plan_evidence_id(&roster_home, &roster_state);
+    let evidence_ids = plan_evidence_ids(&roster_home, &roster_state, ids.values().cloned());
     let mut roster_changes = Vec::new();
     for (index, name) in names.iter().enumerate() {
         roster_changes.push(serde_json::json!({
@@ -994,7 +1034,7 @@ fn three_arm_value_comparison_runs_real_filesystem_governance_and_restore() {
     let request = serde_json::json!({
         "schema_version": 1,
         "scan_id": scan_id,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": evidence_ids,
         "roster_changes": roster_changes
     });
     let plan = cli_json(

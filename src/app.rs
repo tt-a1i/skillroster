@@ -37,8 +37,8 @@ mod error;
 
 use error::{
     ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
-    MAX_AGENT_LOADED_SKILL_BYTES, PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired,
-    StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
+    MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked,
+    SnapshotRescanRequired, StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
@@ -7683,6 +7683,9 @@ fn prepare_plan(
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
     validate_plan_evidence(store, &prepared, &scan_id)?;
+    if finding_provenance.is_none() && !prepared.roster_changes.is_empty() {
+        validate_raw_roster_evidence_scope(store, &prepared, &scan)?;
+    }
     if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
         let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
         if let Some(existing) = store.ready_plan_with_reuse_identity(
@@ -9313,6 +9316,46 @@ fn validate_plan_evidence(store: &StateStore, plan: &PreparedPlan, scan_id: &Sca
         }
     }
     Ok(())
+}
+
+fn validate_raw_roster_evidence_scope(
+    store: &StateStore,
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+) -> Result<()> {
+    let evidence = plan
+        .evidence_ids
+        .iter()
+        .map(|raw_id| {
+            let evidence_id = EvidenceId::parse(raw_id.clone())?;
+            store
+                .get_evidence(&evidence_id)?
+                .ok_or_else(|| anyhow!("Evidence {evidence_id} does not exist"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let unsupported_changes = plan
+        .roster_changes
+        .iter()
+        .filter(|change| {
+            !evidence
+                .iter()
+                .any(|record| match record.subject_type.as_str() {
+                    "skill" => record.subject_id == change.skill_id,
+                    "placement" => scan.placements.iter().any(|placement| {
+                        placement.id == record.subject_id && placement.skill_id == change.skill_id
+                    }),
+                    _ => false,
+                })
+        })
+        .map(|change| (change.agent.clone(), change.skill_id.clone()))
+        .collect::<Vec<_>>();
+    if unsupported_changes.is_empty() {
+        return Ok(());
+    }
+    Err(PlanEvidenceScopeMismatch {
+        unsupported_changes,
+    }
+    .into())
 }
 
 fn capture_roster_state(store: &StateStore, plan: &PreparedPlan) -> Result<Vec<Value>> {

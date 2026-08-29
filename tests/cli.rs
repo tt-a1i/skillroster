@@ -106,6 +106,18 @@ fn json_output(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_id: &str) -> String {
+    database
+        .query_row(
+            "SELECT id FROM evidence
+             WHERE scan_id = ?1 AND subject_type = 'skill' AND subject_id = ?2
+             ORDER BY id LIMIT 1",
+            rusqlite::params![snapshot_id, skill_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("missing Evidence for Skill {skill_id}: {error}"))
+}
+
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(output["result"]["bootstrap_content_version"], "1.8.29");
@@ -2828,6 +2840,145 @@ fn variant_finding_rechecks_drift_beyond_the_displayed_variant_limit() {
 }
 
 #[test]
+fn raw_roster_plan_requires_evidence_for_the_changed_skill() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let target = home.join(".codex/skills/target-skill");
+    let unrelated_codex = home.join(".codex/skills/unrelated-skill");
+    let unrelated_claude = home.join(".claude/skills/unrelated-skill");
+    for directory in [&target, &unrelated_codex, &unrelated_claude] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    fs::write(
+        target.join("SKILL.md"),
+        "---\nname: target-skill\ndescription: Target capability\n---\n",
+    )
+    .unwrap();
+    let unrelated_content = "---\nname: unrelated-skill\ndescription: Unrelated capability\n---\n";
+    fs::write(unrelated_codex.join("SKILL.md"), unrelated_content).unwrap();
+    fs::write(unrelated_claude.join("SKILL.md"), unrelated_content).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot_id = scan["result"]["snapshot_id"].as_str().unwrap();
+    let findings = json_output(&run(
+        &[&common[..], &["report", "--findings", "--limit", "20"]].concat(),
+        None,
+    ));
+    let unrelated_evidence_id = findings["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "exact_duplicate_placements")
+        .unwrap()["primary_evidence_id"]
+        .as_str()
+        .unwrap();
+    let find = json_output(&run(
+        &[&common[..], &["find", "target capability", "--limit", "1"]].concat(),
+        None,
+    ));
+    let target_skill_id = find["result"]["matches"][0]["skill_id"].as_str().unwrap();
+    let request = json!({
+        "schema_version": 1,
+        "scan_id": snapshot_id,
+        "evidence_ids": [unrelated_evidence_id],
+        "roster_changes": [{
+            "agent": "codex",
+            "skill_id": target_skill_id,
+            "state": "on_demand"
+        }]
+    });
+
+    let output = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+
+    assert!(!output.status.success());
+    let rejected: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rejected["error"]["code"], "plan_evidence_scope_mismatch");
+    assert_eq!(
+        rejected["error"]["details"]["reason"],
+        "no_cited_evidence_covers_roster_change"
+    );
+    assert_eq!(rejected["error"]["details"]["files_changed"], false);
+    assert_eq!(
+        rejected["error"]["details"]["unsupported_changes"],
+        json!([{"agent": "codex", "skill_id": target_skill_id}])
+    );
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 0);
+    assert!(target.join("SKILL.md").is_file());
+
+    let target_claude = home.join(".claude/skills/target-skill");
+    fs::create_dir_all(&target_claude).unwrap();
+    fs::copy(target.join("SKILL.md"), target_claude.join("SKILL.md")).unwrap();
+    let rescan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let current_snapshot_id = rescan["result"]["snapshot_id"].as_str().unwrap();
+    let current_findings = json_output(&run(
+        &[&common[..], &["report", "--findings", "--limit", "20"]].concat(),
+        None,
+    ));
+    let mut target_placement_evidence_id = None;
+    for finding in current_findings["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["kind"] == "exact_duplicate_placements")
+    {
+        let finding_id = finding["id"].as_str().unwrap();
+        let detail = json_output(&run(
+            &[&common[..], &["report", "--finding", finding_id, "--full"]].concat(),
+            None,
+        ));
+        if !detail["result"]["affected_skill_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|skill_id| skill_id.as_str() == Some(target_skill_id))
+        {
+            continue;
+        }
+        target_placement_evidence_id = detail["result"]["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|evidence| evidence["subject_type"] == "placement")
+            .and_then(|evidence| evidence["id"].as_str())
+            .map(str::to_owned);
+        break;
+    }
+    let target_placement_evidence_id = target_placement_evidence_id
+        .expect("the target duplicate Finding must expose Placement Evidence");
+    let relevant_request = json!({
+        "schema_version": 1,
+        "scan_id": current_snapshot_id,
+        "evidence_ids": [target_placement_evidence_id],
+        "roster_changes": [{
+            "agent": "codex",
+            "skill_id": target_skill_id,
+            "state": "on_demand"
+        }]
+    });
+    let accepted = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&relevant_request.to_string()),
+    ));
+    assert_eq!(accepted["ok"], true);
+    assert_eq!(
+        accepted["result"]["evidence"]["ids"],
+        json!([target_placement_evidence_id])
+    );
+}
+
+#[test]
 fn public_cli_scans_reports_plans_applies_and_undoes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -3013,13 +3164,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     ));
     assert_eq!(find["result"]["matches"][0]["name"], "example");
     let skill_id = find["result"]["matches"][0]["skill_id"].as_str().unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
 
     let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     let setup_plan = setup["result"]["plan_id"].as_str().unwrap();
@@ -5618,13 +5763,7 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     let skill_id = payload["skills"][0]["id"].as_str().unwrap();
     let placement_id = payload["placements"][0]["id"].as_str().unwrap();
     let current_fingerprint = payload["placements"][0]["content_digest"].as_str().unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
     let upstream =
         "---\nname: source-skill\nsource: github:example/source-skill\nversion: v2\n---\nnew\n";
     let digest = |content: &str| format!("{:x}", Sha256::digest(content.as_bytes()));
@@ -5937,13 +6076,7 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         .iter()
         .map(|placement| placement["id"].clone())
         .collect::<Vec<_>>();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
     let request = |state_name: &str| {
         json!({
             "schema_version": 1,
@@ -6340,6 +6473,12 @@ fn multi_skill_library_plan_preserves_totals_beyond_the_item_preview() {
             .values()
             .all(|placements| placements.len() == 2)
     );
+    let evidence_ids = payload["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|skill| skill_evidence_id(&database, snapshot, skill["id"].as_str().unwrap()))
+        .collect::<Vec<_>>();
     let library_changes = placements_by_skill
         .into_iter()
         .map(|(skill_id, placements)| {
@@ -6358,17 +6497,10 @@ fn multi_skill_library_plan_preserves_totals_beyond_the_item_preview() {
             })
         })
         .collect::<Vec<_>>();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
     let request = json!({
         "schema_version": 1,
         "scan_id": snapshot,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": evidence_ids,
         "library_changes": library_changes
     });
 
@@ -8374,13 +8506,7 @@ fn shared_physical_roster_plan_moves_once_and_blocks_conflicting_states() {
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
     let skill_id = payload["skills"][0]["id"].as_str().unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
 
     let conflict = json!({
         "schema_version": 1,
@@ -9155,13 +9281,12 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
         )
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_ids = payload["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|skill| skill_evidence_id(&database, snapshot, skill["id"].as_str().unwrap()))
+        .collect::<Vec<_>>();
     let roster_changes = payload["skills"]
         .as_array()
         .unwrap()
@@ -9177,7 +9302,7 @@ fn large_roster_apply_reduces_exposure_and_undo_restores_every_skill() {
     let proposal = json!({
         "schema_version": 1,
         "scan_id": snapshot,
-        "evidence_ids": [evidence_id],
+        "evidence_ids": evidence_ids,
         "roster_changes": roster_changes
     });
     let plan_output = run(
@@ -9287,13 +9412,7 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
     let skill_id = payload["skills"][0]["id"].as_str().unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
     let request = json!({
         "schema_version": 1,
         "scan_id": snapshot,
@@ -9365,13 +9484,7 @@ fn core_roster_adds_verified_link_and_undo_restores_absence() {
     );
 
     let restored_snapshot = restored_scan["result"]["snapshot_id"].as_str().unwrap();
-    let restored_evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [restored_snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let restored_evidence_id = skill_evidence_id(&database, restored_snapshot, skill_id);
     let mut drift_request = request.clone();
     drift_request["scan_id"] = json!(restored_snapshot);
     drift_request["evidence_ids"] = json!([restored_evidence_id]);
@@ -9436,13 +9549,7 @@ fn public_find_uses_full_fts_body_and_archive_undo_restores_routing() {
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
     let skill_id = payload["skills"][0]["id"].as_str().unwrap();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
     let request = json!({
         "schema_version": 1,
         "scan_id": snapshot,
@@ -9653,13 +9760,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         .and_then(|placement| placement["skill_id"].as_str())
         .unwrap();
     let codex_skill_id = codex_skill_id.to_owned();
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, &codex_skill_id);
     let request = json!({
         "schema_version": 1,
         "scan_id": snapshot,
@@ -11076,13 +11177,7 @@ fn escaping_link_finding_requests_exact_read_permission_instead_of_a_plan() {
             .iter()
             .all(|placement| { placement["fingerprint_completeness"] == "complete" })
     );
-    let evidence_id: String = database
-        .query_row(
-            "SELECT id FROM evidence WHERE scan_id = ?1 ORDER BY id LIMIT 1",
-            [snapshot],
-            |row| row.get(0),
-        )
-        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
     let placement_ids = placements
         .iter()
         .map(|placement| placement["id"].as_str().unwrap())
