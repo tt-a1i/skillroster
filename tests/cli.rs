@@ -4259,6 +4259,8 @@ fn setup_treats_a_package_with_no_managed_files_as_missing_and_preserves_extra_f
     assert_eq!(setup["result"]["modified_count"], 0);
     assert_eq!(setup["result"]["targets"][0]["status"], "missing");
     assert_eq!(setup["result"]["operation_count"], 5);
+    assert_eq!(setup["result"]["affected"]["agent_count"], 1);
+    assert_eq!(setup["result"]["affected"]["agents"], json!(["codex"]));
     let applied = json_output(&run(
         &[
             &common[..],
@@ -4382,6 +4384,20 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
     assert_eq!(setup["result"]["missing_count"], 8);
     assert_eq!(setup["result"]["physical_target_count"], 6);
     assert_eq!(setup["result"]["operation_count"], 36);
+    assert_eq!(setup["result"]["affected"]["agent_count"], 8);
+    assert_eq!(
+        setup["result"]["affected"]["agents"],
+        json!([
+            "claude-code",
+            "codex",
+            "cursor",
+            "gemini-cli",
+            "github-copilot",
+            "hermes",
+            "opencode",
+            "pi"
+        ])
+    );
 
     let plan_id = setup["result"]["plan_id"].as_str().unwrap();
     let detail = json_output(&run(
@@ -4689,6 +4705,55 @@ fn setup_does_not_reuse_an_incomplete_legacy_plan_summary() {
     let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
     assert_eq!(status["result"]["pending_plan_count"], 2);
     assert!(status["result"]["last_receipt"].is_null());
+}
+
+#[test]
+fn setup_does_not_reuse_a_legacy_zero_affected_agent_summary() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    fs::create_dir_all(&root).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let first = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let first_plan_id = first["result"]["plan_id"].as_str().unwrap();
+
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let immutable: String = database
+        .query_row(
+            "SELECT immutable_json FROM plans WHERE id = ?1",
+            [first_plan_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&immutable).unwrap();
+    legacy["input"]["summary"]["affected"]["agent_count"] = json!(0);
+    legacy["input"]["summary"]["affected"]["agents"] = json!([]);
+    legacy["input"]["reuse_identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("affected_agents");
+    database
+        .execute(
+            "UPDATE plans SET immutable_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy.to_string(), first_plan_id],
+        )
+        .unwrap();
+    drop(database);
+
+    let retry = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(retry["result"]["state"], "preview_ready");
+    assert_ne!(retry["result"]["plan_id"], first["result"]["plan_id"]);
+    assert_eq!(retry["result"]["affected"]["agent_count"], 1);
+    assert_eq!(retry["result"]["affected"]["agents"], json!(["codex"]));
+    assert!(!root.join("skillroster").exists());
 }
 
 #[test]
