@@ -356,7 +356,7 @@ pub fn error_json_with_context(
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
     }
     let classified = classify_error(error);
-    serde_json::to_string(&JsonEnvelope::<Value>::failure(
+    let mut envelope = JsonEnvelope::<Value>::failure(
         command,
         ApiError {
             code: classified.code.into(),
@@ -366,8 +366,18 @@ pub fn error_json_with_context(
             relevant_ids: extract_relevant_ids(&error.to_string()),
             paths: extract_paths(&error.to_string()),
         },
-    ))
-    .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
+    );
+    if classified.code == "snapshot_required" {
+        envelope.suggested_actions = vec![action(
+            "scan",
+            &["scan", "--summary", "--json"],
+            false,
+            false,
+            "snapshot_required",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+    }
+    serde_json::to_string(&envelope).unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into())
 }
 
 struct ClassifiedError {
@@ -937,7 +947,7 @@ fn classify_generic_error(error: &(dyn std::error::Error + 'static)) -> (&'stati
         };
     }
     if message.contains("no completed snapshot") {
-        ("snapshot_required", false)
+        ("snapshot_required", true)
     } else if message.contains("recovery is required") {
         ("recovery_required", false)
     } else if message.contains("does not exist") {
