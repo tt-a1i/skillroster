@@ -5369,12 +5369,14 @@ fn agent_plan_refuses_arbitrary_skill_root_write_file() {
 #[test]
 fn json_failure_is_one_parseable_document() {
     let temp = TempDir::new().unwrap();
+    let home = temp.path();
+    let state = temp.path().join("state");
     let output = run(
         &[
             "--home",
-            temp.path().to_str().unwrap(),
+            home.to_str().unwrap(),
             "--state-dir",
-            temp.path().join("state").to_str().unwrap(),
+            state.to_str().unwrap(),
             "--json",
             "report",
         ],
@@ -5385,7 +5387,15 @@ fn json_failure_is_one_parseable_document() {
     assert_eq!(value["ok"], false);
     assert_eq!(value["command"], "report");
     assert_eq!(value["error"]["code"], "snapshot_required");
-    assert_eq!(value["error"]["retryable"], false);
+    assert_eq!(value["error"]["retryable"], true);
+    assert_eq!(
+        value["suggested_actions"][0]["argv"],
+        context_action_argv(home, &state, &["scan", "--summary", "--json"])
+    );
+    assert_eq!(
+        value["suggested_actions"][0]["reason_code"],
+        "snapshot_required"
+    );
     assert!(output.stderr.is_empty());
 
     let invalid = run(&["--json", "not-a-command"], None);
