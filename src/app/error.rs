@@ -275,6 +275,10 @@ pub fn error_json_with_context(
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
     }
     if let Some(blocked) = error.downcast_ref::<crate::roster_plan::RosterPlanBlocked>() {
+        let mut details = blocked.details.clone();
+        if let Some(argv) = details.pointer_mut("/after_confirmation/argv_template") {
+            action_context.bind_json_executable(argv);
+        }
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
             ApiError {
@@ -283,7 +287,7 @@ pub fn error_json_with_context(
                 retryable: false,
                 relevant_ids: blocked.relevant_ids.clone(),
                 paths: blocked.paths.clone(),
-                details: Some(blocked.details.clone()),
+                details: Some(details),
             },
         );
         if !blocked.paths.is_empty() {

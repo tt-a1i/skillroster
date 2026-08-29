@@ -66,6 +66,16 @@ pub struct Output {
 
 pub fn run(cli: Cli) -> Result<Output> {
     let action_context = ActionContext::from_cli(&cli)?;
+    run_with_context(cli, &action_context)
+}
+
+pub fn run_process(cli: Cli) -> Result<(ActionContext, Result<Output>)> {
+    let action_context = ActionContext::from_process(&cli)?;
+    let output = run_with_context(cli, &action_context);
+    Ok((action_context, output))
+}
+
+fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> {
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
@@ -295,7 +305,7 @@ pub fn run(cli: Cli) -> Result<Output> {
             let showing_detail = args.show.is_some();
             let result = match args.show.as_deref() {
                 Some(id) => plan_detail_command(&store, id)?,
-                None => plan_command(&store, &state_dir, action_context.argv())?,
+                None => plan_command(&store, &state_dir, &action_context.command_argv_prefix())?,
             };
             let id = result["plan_id"].as_str().unwrap_or_default().to_string();
             let mut actions = Vec::new();
@@ -1249,24 +1259,38 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
         .into_iter()
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>();
-        let action_context_argv = match schema_version {
-            1 => Vec::new(),
-            2 | 3 => detail["action_context_argv"]
-                .as_array()?
-                .iter()
-                .map(Value::as_str)
-                .collect::<Option<Vec<_>>>()?,
+        let mut expected_argv = match schema_version {
+            1 => vec!["skillroster"],
+            2 | 3 => {
+                let action_context_argv = detail["action_context_argv"]
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?;
+                recognized_action_context_argv(&action_context_argv).then_some(())?;
+                let mut argv = vec!["skillroster"];
+                argv.extend(action_context_argv);
+                argv
+            }
+            4 => {
+                let action_argv_prefix = detail["action_argv_prefix"]
+                    .as_array()?
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?;
+                let (executable, action_context_argv) = action_argv_prefix.split_first()?;
+                Path::new(executable).is_absolute().then_some(())?;
+                recognized_action_context_argv(action_context_argv).then_some(())?;
+                action_argv_prefix
+            }
             _ => return None,
         };
-        recognized_action_context_argv(&action_context_argv).then_some(())?;
-        let mut expected_argv = vec!["skillroster"];
-        expected_argv.extend(action_context_argv);
         for root in &source_roots {
             expected_argv.extend(["--source-root", *root]);
         }
         match schema_version {
             1 | 2 => expected_argv.extend(["scan", "--json"]),
-            3 => expected_argv.extend(["scan", "--summary", "--json"]),
+            3 | 4 => expected_argv.extend(["scan", "--summary", "--json"]),
             _ => return None,
         }
         let argv = detail["after_confirmation"]["argv"]
@@ -1275,7 +1299,7 @@ fn recognized_source_confirmation_detail(detail: &Value) -> bool {
             .map(Value::as_str)
             .collect::<Option<Vec<_>>>()?;
         Some(
-            matches!(schema_version, 1..=3)
+            matches!(schema_version, 1..=4)
                 && detail["reason"] == "trusted_canonical_sources_required"
                 && detail["decision"] == "confirm_trusted_source_roots"
                 && (1..=crate::roster_recommendation::MAX_CORE_BUDGET as u64)
@@ -12343,7 +12367,10 @@ mod recovery_tests {
     #[test]
     fn source_block_json_keeps_complete_roots_in_the_detail_file() {
         let state = TempDir::new().unwrap();
-        let action_argv_prefix = vec![
+        let executable = crate::roster_plan::test_absolute_path("bin/skillroster")
+            .display()
+            .to_string();
+        let action_context_argv = vec![
             "--state-dir".to_owned(),
             state.path().display().to_string(),
             "--home".to_owned(),
@@ -12351,6 +12378,9 @@ mod recovery_tests {
                 .display()
                 .to_string(),
         ];
+        let action_argv_prefix = std::iter::once(executable.clone())
+            .chain(action_context_argv.iter().cloned())
+            .collect::<Vec<_>>();
         let exclusions = (0..11)
             .map(|index| {
                 let skill_id = format!("skill_{index:032}");
@@ -12386,8 +12416,9 @@ mod recovery_tests {
             "plan",
             &blocked,
             &ActionContext {
-                argv: action_argv_prefix.clone(),
-                argv_without_source_roots: action_argv_prefix.clone(),
+                executable,
+                argv: action_context_argv.clone(),
+                argv_without_source_roots: action_context_argv,
             },
         ))
         .unwrap();
@@ -12417,7 +12448,7 @@ mod recovery_tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
-        assert_eq!(argv[1..=action_argv_prefix.len()], action_argv_prefix);
+        assert_eq!(argv[..action_argv_prefix.len()], action_argv_prefix);
         let bounded_template = envelope["error"]["details"]["after_confirmation"]["argv_template"]
             .as_array()
             .unwrap()
@@ -12425,7 +12456,7 @@ mod recovery_tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         assert_eq!(
-            bounded_template[1..=action_argv_prefix.len()],
+            bounded_template[..action_argv_prefix.len()],
             action_argv_prefix
         );
         let expected_roots = (0..11)
@@ -12447,8 +12478,8 @@ mod recovery_tests {
             .as_str()
             .unwrap();
         let complete: Value = serde_json::from_slice(&std::fs::read(detail_path).unwrap()).unwrap();
-        assert_eq!(complete["schema_version"], 3);
-        assert_eq!(complete["action_context_argv"], json!(action_argv_prefix));
+        assert_eq!(complete["schema_version"], 4);
+        assert_eq!(complete["action_argv_prefix"], json!(action_argv_prefix));
         assert_eq!(complete["source_roots"], json!(expected_roots));
         let complete_argv = complete["after_confirmation"]["argv"]
             .as_array()
@@ -12457,7 +12488,7 @@ mod recovery_tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         assert_eq!(
-            complete_argv[1..=action_argv_prefix.len()],
+            complete_argv[..action_argv_prefix.len()],
             action_argv_prefix
         );
         assert_eq!(
@@ -12473,6 +12504,22 @@ mod recovery_tests {
             );
         }
         validate_source_confirmation_detail(Path::new(detail_path)).unwrap();
+        let mut legacy = complete.clone();
+        legacy["schema_version"] = json!(3);
+        legacy.as_object_mut().unwrap().remove("action_argv_prefix");
+        legacy["action_context_argv"] = json!(&action_argv_prefix[1..]);
+        let mut legacy_argv = vec!["skillroster".to_owned()];
+        legacy_argv.extend(action_argv_prefix[1..].iter().cloned());
+        for root in &expected_roots {
+            legacy_argv.extend(["--source-root".to_owned(), root.clone()]);
+        }
+        legacy_argv.extend([
+            "scan".to_owned(),
+            "--summary".to_owned(),
+            "--json".to_owned(),
+        ]);
+        legacy["after_confirmation"]["argv"] = json!(legacy_argv);
+        assert!(recognized_source_confirmation_detail(&legacy));
         assert_eq!(
             source_confirmation_detail_summary(state.path()).unwrap()["count"],
             1
@@ -12484,7 +12531,7 @@ mod recovery_tests {
             1
         );
         let mut unrecognized = complete.clone();
-        unrecognized["action_context_argv"] = json!(["--yes", "true"]);
+        unrecognized["action_argv_prefix"] = json!(["skillroster", "--yes", "true"]);
         assert!(!recognized_source_confirmation_detail(&unrecognized));
         assert_eq!(remove_source_confirmation_details(state.path()).unwrap(), 1);
         assert!(!Path::new(detail_path).exists());

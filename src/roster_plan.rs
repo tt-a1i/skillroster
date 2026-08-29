@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 const SOURCE_CONFIRMATION_JSON_LIMIT: usize = 10;
-const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 3;
+const SOURCE_CONFIRMATION_SCHEMA_VERSION: u32 = 4;
 
 use crate::change::{self, LibraryChangeAction, OperationInput, RosterChange};
 use crate::harness::AgentKind;
@@ -285,6 +285,12 @@ pub fn source_confirmation_block(
     state_dir: &Path,
     action_argv_prefix: &[String],
 ) -> Result<RosterPlanBlocked> {
+    let executable = action_argv_prefix
+        .first()
+        .ok_or_else(|| anyhow!("source-confirmation action argv requires an executable"))?;
+    if !Path::new(executable).is_absolute() {
+        bail!("source-confirmation action executable must be an absolute path");
+    }
     let mut exclusions = exclusions.to_vec();
     exclusions.sort_by(|left, right| {
         (&left.agent, &left.name, &left.skill_id).cmp(&(&right.agent, &right.name, &right.skill_id))
@@ -368,7 +374,7 @@ pub fn source_confirmation_block(
                     "skill_ids": skill_ids,
                     "source_root_count": source_root_count,
                     "source_roots": source_root_paths,
-                    "action_context_argv": action_argv_prefix,
+                    "action_argv_prefix": action_argv_prefix,
                     "after_confirmation": {
                         "repeatable_option": "--source-root",
                         "source_roots": source_root_paths,
@@ -427,8 +433,7 @@ fn scan_with_source_roots_argv(
     action_argv_prefix: &[String],
     source_roots: &[String],
 ) -> Vec<String> {
-    let mut argv = vec!["skillroster".into()];
-    argv.extend_from_slice(action_argv_prefix);
+    let mut argv = action_argv_prefix.to_vec();
     for root in source_roots {
         argv.push("--source-root".into());
         argv.push(root.clone());
@@ -1371,6 +1376,10 @@ mod tests {
 
     use super::*;
     use crate::scan::{ScanOptions, scan};
+
+    fn test_action_argv_prefix() -> Vec<String> {
+        vec![test_absolute_path("bin/skillroster").display().to_string()]
+    }
 
     #[test]
     fn typed_operation_serializes_to_the_public_plan_shape() {
@@ -2468,9 +2477,14 @@ mod tests {
                 safety_blocker: None,
             },
         ];
-        let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
-                .unwrap();
+        let blocked = source_confirmation_block(
+            "finding_fixture",
+            10,
+            &exclusions,
+            state.path(),
+            &test_action_argv_prefix(),
+        )
+        .unwrap();
         let reviewed = [
             test_absolute_path("opt/reviewed/alpha"),
             test_absolute_path("opt/reviewed/beta"),
@@ -2502,6 +2516,8 @@ mod tests {
     #[test]
     fn source_confirmation_block_writes_omitted_identities_to_a_detail_file() {
         let state = TempDir::new().unwrap();
+        let executable = test_absolute_path("bin/skillroster").display().to_string();
+        let action_argv_prefix = vec![executable.clone()];
         let exclusions = (0..11)
             .map(|index| RosterChangeExclusion {
                 agent: "codex".into(),
@@ -2514,9 +2530,14 @@ mod tests {
                 safety_blocker: None,
             })
             .collect::<Vec<_>>();
-        let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
-                .unwrap();
+        let blocked = source_confirmation_block(
+            "finding_fixture",
+            10,
+            &exclusions,
+            state.path(),
+            &action_argv_prefix,
+        )
+        .unwrap();
         let changes = blocked.details["blocked_changes"].as_array().unwrap();
         assert_eq!(changes.len(), 10);
         assert_eq!(blocked.details["blocked_change_count"], 11);
@@ -2572,8 +2593,8 @@ mod tests {
             "atomic publication must not leave a temporary artifact"
         );
         let complete: Value = serde_json::from_slice(&fs::read(detail_path).unwrap()).unwrap();
-        assert_eq!(complete["schema_version"], 3);
-        assert_eq!(complete["action_context_argv"], json!([]));
+        assert_eq!(complete["schema_version"], 4);
+        assert_eq!(complete["action_argv_prefix"], json!(action_argv_prefix));
         assert_eq!(complete["blocked_changes"].as_array().unwrap().len(), 11);
         assert_eq!(complete["source_roots"], json!(expected_roots));
         assert_eq!(
@@ -2586,6 +2607,7 @@ mod tests {
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
+        assert_eq!(argv[0], executable);
         assert_eq!(&argv[argv.len() - 3..], ["scan", "--summary", "--json"]);
         for root in &expected_roots {
             let root = root.display().to_string();
@@ -2632,8 +2654,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
-                .is_err()
+            source_confirmation_block(
+                "finding_fixture",
+                10,
+                &exclusions,
+                state.path(),
+                &test_action_argv_prefix(),
+            )
+            .is_err()
         );
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
@@ -2673,9 +2701,14 @@ mod tests {
             safety_blocker: None,
         }];
         let state = TempDir::new().unwrap();
-        let blocked =
-            source_confirmation_block("finding_fixture", 10, &exclusions, state.path(), &[])
-                .unwrap();
+        let blocked = source_confirmation_block(
+            "finding_fixture",
+            10,
+            &exclusions,
+            state.path(),
+            &test_action_argv_prefix(),
+        )
+        .unwrap();
         assert!(blocked.paths.is_empty());
         assert_eq!(blocked.details["source_roots"], json!([]));
         assert_eq!(blocked.details["blocked_changes"][0]["name"], "rootish");
