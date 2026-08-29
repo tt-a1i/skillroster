@@ -214,15 +214,15 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-Public release v1.8.31 implements the complete local governance loop. A raw
-Roster Plan now fails closed unless its Evidence covers every target Skill or
-Placement. The loop
+Public release v1.8.32 implements the complete local governance loop. Every
+Agent continuation stays bound to the SkillRoster executable that emitted it
+instead of silently handing control to an older version on `PATH`. The loop
 includes discovery, normalized inventory, conservative usage evidence, bounded
 reporting, local retrieval, immutable planning, Apply/Undo, recovery, lifecycle
 controls, and eight direct agent adapters.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
-- [v1.8.31 release and platform evidence](docs/acceptance/release-v1.8.31-candidate.md)
+- [v1.8.32 release and platform evidence](docs/acceptance/release-v1.8.32-candidate.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)
 - [Canonical vocabulary](CONTEXT.md)
