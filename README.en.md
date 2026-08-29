@@ -214,14 +214,15 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-Public release v1.8.29 implements the complete local governance loop and ships
-the filesystem, security, and recovery hardening merged since v1.8.28. The loop
+Public release v1.8.30 implements the complete local governance loop and keeps
+large Apply/Undo Agent JSON bounded without weakening complete Receipts or exact
+recovery. The loop
 includes discovery, normalized inventory, conservative usage evidence, bounded
 reporting, local retrieval, immutable planning, Apply/Undo, recovery, lifecycle
 controls, and eight direct agent adapters.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
-- [v1.8.29 release and platform evidence](docs/acceptance/release-v1.8.29-candidate.md)
+- [v1.8.30 release and platform evidence](docs/acceptance/release-v1.8.30-candidate.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)
 - [Canonical vocabulary](CONTEXT.md)
