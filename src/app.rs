@@ -6103,7 +6103,12 @@ fn operation_groups(operations: &[Operation]) -> Value {
     json!(groups)
 }
 
-fn affected_summary(prepared: &PreparedPlan, scan: &ScanResult, impact: &Value) -> Value {
+fn affected_summary(
+    prepared: &PreparedPlan,
+    scan: &ScanResult,
+    impact: &Value,
+    bootstrap_scope: Option<&BootstrapPlanScope>,
+) -> Value {
     let mut agents = prepared
         .roster_changes
         .iter()
@@ -6168,6 +6173,11 @@ fn affected_summary(prepared: &PreparedPlan, scan: &ScanResult, impact: &Value) 
             .flatten()
             .filter_map(Value::as_str)
             .map(str::to_owned),
+    );
+    agents.extend(
+        bootstrap_scope
+            .into_iter()
+            .flat_map(|scope| scope.affected_agents.iter().cloned()),
     );
     let skill_count = skills.len();
     let skill_ids = skills.iter().take(10).cloned().collect::<Vec<_>>();
@@ -6422,6 +6432,7 @@ enum PlanOrigin {
 struct BootstrapPlanScope {
     anchor_roots: Vec<PathBuf>,
     missing_skill_roots: Vec<PathBuf>,
+    affected_agents: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -7797,7 +7808,7 @@ fn prepare_plan(
     let risk = plan_risk(&prepared);
     let operations_by_kind = operation_groups(&prepared.operations);
     let impact = bounded_plan_impact(impact);
-    let affected = affected_summary(&prepared, &scan, &impact);
+    let affected = affected_summary(&prepared, &scan, &impact, bootstrap_scope);
     let diff_summary = plan_diff_summary(
         effective_origin,
         &source_update_diffs,
@@ -8429,6 +8440,7 @@ fn setup_command_with_manifests<'a>(
     let mut physical_targets = BTreeSet::new();
     let mut planned_directories = BTreeSet::new();
     let mut planned_files = BTreeSet::new();
+    let mut planned_agents = BTreeSet::new();
     let mut bootstrap_anchor_roots = BTreeSet::new();
     let mut bootstrap_missing_skill_roots = BTreeSet::new();
     let physical_home = std::fs::canonicalize(home)
@@ -8552,6 +8564,7 @@ fn setup_command_with_manifests<'a>(
                 || (package_status == "modified"
                     && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
             if should_install {
+                planned_agents.insert(agent.id().to_owned());
                 if root_missing {
                     let mut missing_directories = Vec::new();
                     let mut cursor = Some(root.as_path());
@@ -8692,6 +8705,7 @@ fn setup_command_with_manifests<'a>(
     let bootstrap_scope = BootstrapPlanScope {
         anchor_roots: bootstrap_anchor_roots.into_iter().collect(),
         missing_skill_roots: bootstrap_missing_skill_roots.into_iter().collect(),
+        affected_agents: planned_agents.into_iter().collect(),
     };
     let plan = prepare_plan(
         store,
@@ -8703,7 +8717,8 @@ fn setup_command_with_manifests<'a>(
                 None => Value::Null,
                 Some(ModifiedBootstrapChoice::RetainLocal) => json!("retain-local"),
                 Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
-            }
+            },
+            "affected_agents": bootstrap_scope.affected_agents.clone()
         })),
         &[],
         Some(&bootstrap_scope),
