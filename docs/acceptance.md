@@ -191,6 +191,18 @@ authorization for the synthetic scope, then verified Apply, Receipt, Undo, and
 recovery-clear Status. The bootstrap Skill separately requires an explicit user
 confirmation before any real Apply or Undo and never asks per-file questions.
 
+## Packaged fresh-user governance journey
+
+The [v1.8.29 packaged fresh-user journey](acceptance/packaged-fresh-user-governance-v1.8.29.md)
+starts from an anonymously downloaded, checksum-verified public macOS arm64
+archive rather than a source-tree binary. Two fresh isolated runs separately
+recorded installation, Bootstrap preview and Apply, diagnosis, one exact Roster Plan
+authorization, verified Apply and Receipt, recovery-clear Status, rank-one
+On-demand exact load, and verified Undo. In both runs the governed Codex and
+Claude Code fixture returned to the same 76-record byte ledger with zero added,
+removed, or changed records. The redacted machine ledger contains no real-home
+paths, raw conversations, Skill bodies, credentials, or opaque local IDs.
+
 ## Agent-led Finding drilldown evidence
 
 Before the 1.3 release, the Agent reused one immutable read-only Snapshot from

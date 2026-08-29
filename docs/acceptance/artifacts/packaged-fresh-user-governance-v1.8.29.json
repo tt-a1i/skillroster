@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "suite_id": "packaged-fresh-user-governance-v1.8.29",
+  "issue": 259,
+  "status": "passed_twice_on_reference_platform",
+  "source": {
+    "release_tag": "v1.8.29",
+    "release_commit": "b996c7e52bd849243ce7772cff30602a00c4270b",
+    "artifact": "skillroster-1.8.29-aarch64-apple-darwin.tar.gz",
+    "artifact_sha256": "e79376eafc6541d80b27ccb861f041fca38e1ccf51b42cd130af191df872de09",
+    "binary_sha256": "1d03390f5f5fb06e0cb0687c0604c2b2c8ff80339c78b8b254b593e98b5b42f5",
+    "binary_version": "skillroster 1.8.29",
+    "anonymous_download": true,
+    "adjacent_checksum_verified": true,
+    "source_tree_binary_used": false,
+    "bootstrap_content_version": "1.8.29",
+    "bootstrap_skill_sha256": "c62bc41e54000a6191c781b45d082440cb5930bc26a1511dafc000cb1c1af5e3"
+  },
+  "request": {
+    "kind": "natural_language_agent_governance_request",
+    "projection": "inspect and improve SkillRoster by governing only an isolated synthetic fixture",
+    "raw_text_persisted": false,
+    "entrypoint": "installed_bootstrap_then_public_cli"
+  },
+  "isolation": {
+    "reference_platform": "macos_arm64",
+    "fresh_run_count": 2,
+    "preliminary_run_count": 2,
+    "fresh_home_per_run": true,
+    "fresh_state_per_run": true,
+    "isolated_agent_roots_per_run": true,
+    "synthetic_skills": 19,
+    "synthetic_cross_agent_copies": 12,
+    "real_user_directories_read": false,
+    "real_user_directories_written": false,
+    "repository_files_mutated_by_product": false
+  },
+  "runs": [
+    {
+      "run": 1,
+      "stages": {
+        "installation": {"status": "passed", "published_artifact_only": true},
+        "bootstrap": {"status": "passed", "preview_ready": true, "agents": ["claude-code", "codex"], "authorization_status": "authorized_under_approved_synthetic_ticket_scope", "apply_verification": "passed", "changed_path_count": 12, "canonical_deletion_count": 0, "receipt_present": true, "bootstrap_read_complete": true, "governance_reference_read_complete": true, "mutation_reference_read_complete": true},
+        "diagnosis": {"status": "passed", "independent_skills": 20, "placements": 33, "default_exposure": 33, "exact_duplicate_skills": 13, "exact_duplicate_placements": 26, "usage_coverage": "missing_for_all_8_supported_agents", "unused_claim_made": false, "files_changed": false},
+        "plan": {"status": "ready", "target": "agent-session-miner", "target_agent": "codex", "target_state": "on_demand", "before_default_exposure": 33, "after_default_exposure": 32, "operation_count": 2, "canonical_deletion_count": 0, "files_changed": false, "full_detail_reviewed": true},
+        "confirmation": {"status": "authorized_once_for_ticket_scoped_synthetic_plan", "per_operation_prompts": 0, "raw_text_persisted": false},
+        "apply": {"status": "passed", "authorization_status": "covered_by_roster_plan_confirmation", "verification": "passed", "changed_path_count": 2, "canonical_deletion_count": 0},
+        "receipt": {"status": "present", "opaque_id_persisted": false, "undo_available": true},
+        "recovery": {"status": "clear", "journal_issue_count": 0},
+        "on_demand_retrieval": {"status": "passed", "rank": 1, "loaded_name": "agent-session-miner", "roster_state": "on_demand", "identity_matches_snapshot": true, "package_fingerprint_matches_snapshot": true},
+        "undo": {"status": "passed", "authorization_status": "authorized_under_approved_synthetic_ticket_scope", "verification": "passed", "changed_path_count": 2},
+        "byte_ledger": {"status": "equal", "record_count": 76, "regular_file_count": 39, "directory_count": 37, "regular_file_bytes": 43889, "digest_before": "4c1674f8dbfa10c35641b8beb238b9c8d923ebfb0167d672000b6d464486f282", "digest_after": "4c1674f8dbfa10c35641b8beb238b9c8d923ebfb0167d672000b6d464486f282", "added_records": 0, "removed_records": 0, "changed_records": 0}
+      }
+    },
+    {
+      "run": 2,
+      "stages": {
+        "installation": {"status": "passed", "published_artifact_only": true},
+        "bootstrap": {"status": "passed", "preview_ready": true, "agents": ["claude-code", "codex"], "authorization_status": "authorized_under_approved_synthetic_ticket_scope", "apply_verification": "passed", "changed_path_count": 12, "canonical_deletion_count": 0, "receipt_present": true, "bootstrap_read_complete": true, "governance_reference_read_complete": true, "mutation_reference_read_complete": true},
+        "diagnosis": {"status": "passed", "independent_skills": 20, "placements": 33, "default_exposure": 33, "exact_duplicate_skills": 13, "exact_duplicate_placements": 26, "usage_coverage": "missing_for_all_8_supported_agents", "unused_claim_made": false, "files_changed": false},
+        "plan": {"status": "ready", "target": "agent-session-miner", "target_agent": "codex", "target_state": "on_demand", "before_default_exposure": 33, "after_default_exposure": 32, "operation_count": 2, "canonical_deletion_count": 0, "files_changed": false, "full_detail_reviewed": true},
+        "confirmation": {"status": "authorized_once_for_ticket_scoped_synthetic_plan", "per_operation_prompts": 0, "raw_text_persisted": false},
+        "apply": {"status": "passed", "authorization_status": "covered_by_roster_plan_confirmation", "verification": "passed", "changed_path_count": 2, "canonical_deletion_count": 0},
+        "receipt": {"status": "present", "opaque_id_persisted": false, "undo_available": true},
+        "recovery": {"status": "clear", "journal_issue_count": 0},
+        "on_demand_retrieval": {"status": "passed", "rank": 1, "loaded_name": "agent-session-miner", "roster_state": "on_demand", "identity_matches_snapshot": true, "package_fingerprint_matches_snapshot": true},
+        "undo": {"status": "passed", "authorization_status": "authorized_under_approved_synthetic_ticket_scope", "verification": "passed", "changed_path_count": 2},
+        "byte_ledger": {"status": "equal", "record_count": 76, "regular_file_count": 39, "directory_count": 37, "regular_file_bytes": 43889, "digest_before": "4c1674f8dbfa10c35641b8beb238b9c8d923ebfb0167d672000b6d464486f282", "digest_after": "4c1674f8dbfa10c35641b8beb238b9c8d923ebfb0167d672000b6d464486f282", "added_records": 0, "removed_records": 0, "changed_records": 0}
+      }
+    }
+  ],
+  "repeatability": {
+    "same_stage_outcomes": true,
+    "same_bootstrap_bytes": true,
+    "same_plan_impact": true,
+    "same_ledger_digest": true,
+    "accepted_sequence_frozen_before_run": true,
+    "accepted_runs_started_from_complete_bootstrap_read": true,
+    "preliminary_parser_corrections": 3,
+    "preliminary_parser_corrections_caused_governance_mutation": false,
+    "preliminary_runs_used_for_acceptance_claim": false
+  },
+  "privacy": {
+    "absolute_paths": false,
+    "opaque_local_ids": false,
+    "skill_bodies": false,
+    "raw_conversation": false,
+    "credentials": false,
+    "raw_command_output": false,
+    "raw_evidence_location": "external_temporary_directory_not_committed"
+  },
+  "limitations": {
+    "independent_new_user_tested": false,
+    "platforms_in_this_journey": ["macos_arm64"],
+    "relevant_evidence_used_for_raw_roster_plan": true,
+    "unrelated_raw_evidence_rejection_proven_by_this_artifact": false,
+    "later_unrelated_evidence_fix": "issue_303_merged_to_main_after_v1.8.30",
+    "recommendation_quality_claim": false,
+    "token_savings_claim": false,
+    "labor_savings_claim": false,
+    "model_quality_claim": false,
+    "universal_core_on_demand_superiority_claim": false
+  }
+}
