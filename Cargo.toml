@@ -1,6 +1,6 @@
 [package]
 name = "skillroster"
-version = "1.8.34"
+version = "1.8.35"
 edition = "2024"
 rust-version = "1.85"
 description = "Local skill governance for AI agents"
