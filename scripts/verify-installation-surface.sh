@@ -10,6 +10,7 @@ website="website/index.html"
 published_version="$(awk -F '"' '/^[[:space:]]*version "/ { print $2; exit }' "$formula")"
 candidate_version="$(awk -F '"' '/^version = "/ { print $2; exit }' "$manifest")"
 bootstrap_version="$(awk -F '"' '/^[[:space:]]*bootstrap-version:/ { print $2; exit }' "$bootstrap")"
+published_revision="$(awk -F '"' '/^[[:space:]]*revision:/ { print $2; exit }' "$formula")"
 
 [[ "$published_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "could not derive the published version from $formula" >&2
@@ -21,6 +22,22 @@ bootstrap_version="$(awk -F '"' '/^[[:space:]]*bootstrap-version:/ { print $2; e
 }
 [[ "$bootstrap_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "could not derive the bundled Bootstrap version from $bootstrap" >&2
+  exit 1
+}
+[[ "$published_revision" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "could not derive the published revision from $formula" >&2
+  exit 1
+}
+git cat-file -e "$published_revision^{commit}" 2>/dev/null || {
+  echo "$formula revision $published_revision is unavailable; fetch repository history" >&2
+  exit 1
+}
+published_bootstrap_version="$(
+  git show "$published_revision:$bootstrap" |
+    awk -F '"' '/^[[:space:]]*bootstrap-version:/ { print $2; exit }'
+)"
+[[ "$published_bootstrap_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "could not derive the published Bootstrap version at $published_revision" >&2
   exit 1
 }
 
@@ -45,7 +62,7 @@ reject_literal() {
 require_literal "$installation" "The current public release is **v${published_version}**."
 require_literal "$installation" "SKILLROSTER_VERSION=${published_version}"
 require_literal "$installation" "--tag v${published_version} skillroster"
-require_literal "$installation" "Published CLI v${published_version} bundles Bootstrap content version ${published_version}."
+require_literal "$installation" "Published CLI v${published_version} bundles Bootstrap content version ${published_bootstrap_version}."
 require_literal "$installation" "The source tree is **v${candidate_version}**."
 require_literal "$installation" "Its bundled Bootstrap content version is ${bootstrap_version}."
 
