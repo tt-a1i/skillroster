@@ -56,6 +56,10 @@ if ! validate_regular_file_at_parent "$archive_readme" "$expected_archive_parent
   echo "release archive README must be a regular in-repository file without linked ancestors: $archive_readme" >&2
   exit 1
 fi
+if [[ "$(git check-attr eol -- "$archive_readme")" != "$archive_readme: eol: lf" ]]; then
+  echo "release archive README must be checked out with LF on every platform" >&2
+  exit 1
+fi
 
 if contains_release_version < "$archive_readme"; then
   echo "release archive README must not hard-code a release version" >&2
