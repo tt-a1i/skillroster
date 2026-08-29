@@ -2,3 +2,4 @@
 LICENSE text eol=lf
 skill/**/SKILL.md text eol=lf
 tests/fixtures/bootstrap-*.md text eol=lf
+docs/release-archive/README.md text eol=lf

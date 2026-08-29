@@ -37,6 +37,7 @@ jobs:
         run: |
           bash scripts/verify-readme-value.sh
           bash scripts/verify-installation-surface.sh
+          bash scripts/verify-release-archive-readme.sh
           bash scripts/ci-change-scope.sh --self-test
           full=true
           if [[ "$EVENT_NAME" != "workflow_dispatch" && -n "$BASE_SHA" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}"; then
@@ -124,6 +125,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: bash scripts/ci-node-harness.sh
+
+      - name: Parse Windows release packager
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/release/package-windows.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
 
   gate:
     name: CI gate
