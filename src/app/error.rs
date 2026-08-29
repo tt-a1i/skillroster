@@ -95,6 +95,23 @@ impl std::fmt::Display for SnapshotRescanRequired {
 
 impl std::error::Error for SnapshotRescanRequired {}
 
+#[derive(Debug)]
+pub(super) struct PlanEvidenceScopeMismatch {
+    pub(super) unsupported_changes: Vec<(String, String)>,
+}
+
+impl std::fmt::Display for PlanEvidenceScopeMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cited Evidence does not cover {} raw Roster change(s)",
+            self.unsupported_changes.len()
+        )
+    }
+}
+
+impl std::error::Error for PlanEvidenceScopeMismatch {}
+
 pub fn error_json(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
     error_json_with_context(command, error, &ActionContext::default())
 }
@@ -104,6 +121,41 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(mismatch) = error.downcast_ref::<PlanEvidenceScopeMismatch>() {
+        const PREVIEW_LIMIT: usize = 10;
+        let unsupported_changes = mismatch
+            .unsupported_changes
+            .iter()
+            .take(PREVIEW_LIMIT)
+            .map(|(agent, skill_id)| json!({"agent": agent, "skill_id": skill_id}))
+            .collect::<Vec<_>>();
+        let relevant_ids = mismatch
+            .unsupported_changes
+            .iter()
+            .take(PREVIEW_LIMIT)
+            .map(|(_, skill_id)| skill_id.clone())
+            .collect();
+        return serde_json::to_string(&JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "plan_evidence_scope_mismatch".into(),
+                message: error.to_string(),
+                retryable: false,
+                relevant_ids,
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "no_cited_evidence_covers_roster_change",
+                    "unsupported_change_count": mismatch.unsupported_changes.len(),
+                    "unsupported_changes": unsupported_changes,
+                    "unsupported_changes_truncated": mismatch.unsupported_changes.len() > PREVIEW_LIMIT,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "cite_relevant_finding_evidence_or_use_finding_request"
+                })),
+            },
+        ))
+        .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(required) =
         error.downcast_ref::<crate::roster_recommendation::PhysicalMutationIdentityRescanRequired>()
     {
