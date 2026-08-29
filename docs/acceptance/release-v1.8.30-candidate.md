@@ -12,7 +12,7 @@ callers without weakening recovery.
 - The persisted Receipt journal still contains the complete changed-path set,
   and Undo continues to use that complete recovery record.
 
-This patch release keeps SQLite schema 10 and JSON envelope schema 1. Strict
+This patch release keeps SQLite schema 12 and JSON envelope schema 1. Strict
 JSON consumers must tolerate the new additive field. There is no migration and
 no change to the local-only, explicit-confirmation, fail-closed mutation model.
 The bundled Bootstrap instructions are unchanged at content version 1.8.29, so

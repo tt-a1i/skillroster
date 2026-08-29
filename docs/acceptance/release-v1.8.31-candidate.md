@@ -11,7 +11,7 @@ SkillRoster 1.8.31 closes an Evidence-scope hole in raw Roster planning.
 - Relevant Skill Evidence and Placement Evidence remain accepted, and
   Finding-derived Roster planning keeps its existing behavior.
 
-This patch release keeps SQLite schema 10 and JSON envelope schema 1. There is
+This patch release keeps SQLite schema 12 and JSON envelope schema 1. There is
 no migration and no change to the local-only, explicit-confirmation,
 Receipt-backed mutation model. The bundled Bootstrap instructions remain at
 content version 1.8.29, so upgrading the CLI does not cause an unnecessary
