@@ -1,0 +1,88 @@
+{
+  "format": "skillroster-roster-recommendation-pilot-summary",
+  "participants": {
+    "abandoned_before_observation": 0,
+    "observed": 3,
+    "reported": 3,
+    "required": 3
+  },
+  "participant_readiness": {
+    "decision_ready": 3,
+    "diagnosed": 3,
+    "required_decision_ready": 2
+  },
+  "product_change_authority": {
+    "embedding": false,
+    "model": false,
+    "policy": false,
+    "ranking": false,
+    "reason": "synthetic_evidence_cannot_authorize_product_change"
+  },
+  "reason_categories": {
+    "accepted_as_proposed": 1,
+    "insufficient_evidence": 1,
+    "not_evaluated": 2,
+    "personal_preference": 1
+  },
+  "recommendation_outcomes": {
+    "accepted": 1,
+    "blocked": 1,
+    "not_evaluated": 2,
+    "rejected": 1
+  },
+  "safety": {
+    "authority_unverified_observed_count": 0,
+    "identifying_path_persisted_count": 0,
+    "raw_conversation_persisted_count": 0,
+    "secret_persisted_count": 0,
+    "skill_content_persisted_count": 0,
+    "unapproved_write_count": 0,
+    "passed": true
+  },
+  "schema_version": 1,
+  "stage_results": {
+    "setup": {
+      "blocked": 0,
+      "failed": 0,
+      "not_evaluated": 0,
+      "passed": 5
+    },
+    "invocation": {
+      "blocked": 0,
+      "failed": 1,
+      "not_evaluated": 0,
+      "passed": 4
+    },
+    "diagnosis": {
+      "blocked": 0,
+      "failed": 0,
+      "not_evaluated": 1,
+      "passed": 4
+    },
+    "plan": {
+      "blocked": 1,
+      "failed": 0,
+      "not_evaluated": 1,
+      "passed": 3
+    },
+    "deterministic_retrieval": {
+      "blocked": 0,
+      "failed": 1,
+      "not_evaluated": 1,
+      "passed": 3
+    },
+    "recommendation_decision": {
+      "accepted": 1,
+      "blocked": 1,
+      "not_evaluated": 2,
+      "rejected": 1
+    },
+    "final_task": {
+      "blocked": 0,
+      "failed": 0,
+      "not_evaluated": 3,
+      "passed": 2
+    }
+  },
+  "synthetic": true
+}
