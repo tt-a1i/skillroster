@@ -4,7 +4,7 @@ SkillRoster stores inventory, evidence, plans, receipts, and configuration on
 the local machine. Installation does not connect it to a hosted service or
 upload Skill contents or agent session history.
 
-The current public release is **v1.8.32**. Its Formula, annotated tag, four
+The current public release is **v1.8.33**. Its Formula, annotated tag, four
 platform archives, and adjacent checksums are public.
 
 WSL users need WSL2 and should use the Linux archive. WSL1 lacks the atomic
@@ -34,7 +34,7 @@ On macOS or Linux, the archive contains a versioned directory. Extract it and
 install the binary from that directory (not from the current directory):
 
 ```sh
-SKILLROSTER_VERSION=1.8.32
+SKILLROSTER_VERSION=1.8.33
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -50,7 +50,8 @@ Agent, then restart that Agent so future sessions can resolve `skillroster`.
 On Windows, compare `Get-FileHash .\skillroster-*.zip -Algorithm SHA256` with
 the checksum file. Extract the archive, open its versioned directory, then
 place `skillroster.exe` in a directory on `PATH`. Every release archive also
-contains the complete Apache-2.0 `LICENSE` distributed with the binary.
+contains `README.md` and the complete Apache-2.0 `LICENSE` distributed with the
+binary.
 
 ## Build or install from source
 
@@ -58,7 +59,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v1.8.32 skillroster
+  --tag v1.8.33 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the
@@ -92,7 +93,7 @@ skillroster scan --summary --json
 skillroster setup --json
 ```
 
-Published CLI v1.8.32 bundles Bootstrap content version 1.8.29.
+Published CLI v1.8.33 bundles Bootstrap content version 1.8.29.
 The source tree is **v1.8.33**.
 Its bundled Bootstrap content version is 1.8.29. CLI and Bootstrap versions can
 differ intentionally when CLI behavior changes without changing the Bootstrap
