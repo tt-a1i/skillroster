@@ -5145,13 +5145,21 @@ fn find_command(
         }
         .into());
     }
-    if load && cjk_hint_required {
-        if let Some(ranked) = matches
+    if load {
+        let weak_top_match = matches
             .first()
-            .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked))
-        {
+            .filter(|ranked| ranked.variant_count == 1 || variant_skill_id.is_some())
+            .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
+        let weak_match_reason = if cjk_hint_required {
+            Some("cjk_hint_required_for_weak_match")
+        } else if !retrieval_hints.is_empty() {
+            Some("hint_direct_selection_evidence_required")
+        } else {
+            None
+        };
+        if let (Some(ranked), Some(reason)) = (weak_top_match, weak_match_reason) {
             return Err(SkillLoadBlocked {
-                reason: "cjk_hint_required_for_weak_match",
+                reason,
                 skill_id: ranked.skill_id.clone(),
                 skill_name: ranked.name.clone(),
                 path: None,

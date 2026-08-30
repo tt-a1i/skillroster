@@ -1480,6 +1480,13 @@ fn find_load_abstains_from_a_weak_unhinted_cross_language_match() {
         None,
     ));
     assert_eq!(hinted["result"]["matches"][0]["name"], "github-code-review");
+    assert!(
+        hinted["result"]["matches"][0]["match_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "description_token_phrase")
+    );
     assert_eq!(
         hinted["result"]["loaded_skill"]["selection"]["name"],
         "github-code-review"
@@ -1868,6 +1875,96 @@ fn public_find_prefers_a_complete_multi_token_name_hint_over_broad_native_overla
     assert_eq!(
         hinted["result"]["loaded_skill"]["selection"]["name"],
         "simplify-codebase"
+    );
+}
+
+#[test]
+fn public_find_load_rejects_a_weak_hinted_top_match_before_returning_instructions() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "product-business-analysis",
+            "---\nname: product-business-analysis\ndescription: Analyze product or business data to support a decision or recommendation.\n---\n",
+        ),
+        (
+            "to-spec",
+            "---\nname: to-spec\ndescription: Turn the current conversation into a spec and publish it to the project issue tracker.\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "把这组产品决定整理成可执行规格";
+    let weak_hint = "convert product decisions into an executable specification";
+    let ordinary = json_output(&run(
+        &[
+            &common[..],
+            &["find", task, "--hint", weak_hint, "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        ordinary["result"]["matches"][0]["name"],
+        "product-business-analysis"
+    );
+
+    let blocked = run(
+        &[
+            &common[..],
+            &["find", task, "--hint", weak_hint, "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "verified_skill_load_blocked");
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "hint_direct_selection_evidence_required"
+    );
+    assert_eq!(
+        blocked["error"]["details"]["next_action"],
+        "refine_agent_authored_hint_with_direct_capability_evidence"
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert!(blocked["result"].is_null());
+    assert!(blocked["suggested_actions"].as_array().unwrap().is_empty());
+
+    let refined = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                task,
+                "--hint",
+                "turn the current conversation into a spec and publish it to the project issue tracker",
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(refined["result"]["matches"][0]["name"], "to-spec");
+    assert_eq!(
+        refined["result"]["loaded_skill"]["selection"]["name"],
+        "to-spec"
     );
 }
 
