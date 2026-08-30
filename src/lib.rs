@@ -7,6 +7,7 @@ pub mod cli;
 mod durable_fs;
 pub mod harness;
 pub mod model;
+mod package_fingerprint;
 pub mod present;
 pub mod query;
 pub mod roster_plan;

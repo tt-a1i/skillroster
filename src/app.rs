@@ -6140,6 +6140,7 @@ fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
     );
     object.insert("source_updates".into(), json!(prepared.source_updates));
     object.insert("library_changes".into(), json!(prepared.library_changes));
+    object.insert("path_projections".into(), json!(prepared.path_projections));
     object.insert(
         "roster_before".into(),
         record.input["roster_before"].clone(),
@@ -6205,7 +6206,7 @@ fn affected_summary(
         .iter()
         .map(|change| change.agent.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let skills = prepared
+    let mut skills = prepared
         .roster_changes
         .iter()
         .map(|change| change.skill_id.clone())
@@ -6222,6 +6223,11 @@ fn affected_summary(
                 .map(|change| change.skill_id.clone()),
         )
         .collect::<std::collections::BTreeSet<_>>();
+    skills.extend(
+        bootstrap_scope
+            .into_iter()
+            .flat_map(|scope| scope.affected_skill_ids.iter().cloned()),
+    );
     let roster_pairs = prepared
         .roster_changes
         .iter()
@@ -6272,13 +6278,16 @@ fn affected_summary(
     );
     let skill_count = skills.len();
     let skill_ids = skills.iter().take(10).cloned().collect::<Vec<_>>();
+    let bootstrap_placement_count = bootstrap_scope
+        .map(|scope| scope.affected_placement_count)
+        .unwrap_or_default();
     json!({
         "agent_count": agents.len(),
         "agents": agents,
         "skill_count": skill_count,
         "skill_ids": skill_ids,
         "skill_ids_truncated": skill_count > 10,
-        "placement_count": placements.len()
+        "placement_count": placements.len().saturating_add(bootstrap_placement_count)
     })
 }
 
@@ -6524,6 +6533,8 @@ struct BootstrapPlanScope {
     anchor_roots: Vec<PathBuf>,
     missing_skill_roots: Vec<PathBuf>,
     affected_agents: Vec<String>,
+    affected_skill_ids: Vec<String>,
+    affected_placement_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -7914,6 +7925,9 @@ fn prepare_plan(
         "library_changes",
         "before_state",
     ];
+    if !prepared.path_projections.is_empty() {
+        detail_contains.push("path_projections");
+    }
     if selection_evidence_full.is_some() {
         detail_contains.push("complete_core_selections");
     }
@@ -8531,6 +8545,7 @@ fn setup_command_with_manifests<'a>(
     let mut physical_targets = BTreeSet::new();
     let mut planned_directories = BTreeSet::new();
     let mut planned_files = BTreeSet::new();
+    let mut planned_package_overrides = BTreeMap::<PathBuf, BTreeMap<PathBuf, String>>::new();
     let mut planned_agents = BTreeSet::new();
     let mut bootstrap_anchor_roots = BTreeSet::new();
     let mut bootstrap_missing_skill_roots = BTreeSet::new();
@@ -8710,6 +8725,10 @@ fn setup_command_with_manifests<'a>(
                     if !planned_files.insert(physical_target) {
                         continue;
                     }
+                    planned_package_overrides
+                        .entry(physical_directory.clone())
+                        .or_default()
+                        .insert(PathBuf::from(relative_path), content.clone());
                     let kind = match status {
                         BootstrapFileStatus::Missing => "write_file",
                         BootstrapFileStatus::Modified
@@ -8793,15 +8812,50 @@ fn setup_command_with_manifests<'a>(
         });
         return Ok(result);
     }
+    let mut affected_skill_ids = BTreeSet::new();
+    let mut path_projections = Vec::with_capacity(planned_package_overrides.len());
+    for (directory, overrides) in &planned_package_overrides {
+        let expected_before_fingerprint = change::package_fingerprint(directory)?;
+        affected_skill_ids.insert(scan::projected_skill_id(directory, overrides).with_context(
+            || {
+                format!(
+                    "cannot determine projected Bootstrap Skill identity for {}",
+                    directory.display()
+                )
+            },
+        )?);
+        let expected_after_fingerprint =
+            change::projected_package_fingerprint(directory, overrides)?;
+        if change::package_fingerprint(directory)? != expected_before_fingerprint {
+            bail!(
+                "Bootstrap Skill package {} changed while Setup was projecting it; rerun Scan and Setup",
+                directory.display()
+            );
+        }
+        path_projections.push(json!({
+            "path": directory,
+            "expected_before_fingerprint": expected_before_fingerprint,
+            "expected_after_fingerprint": expected_after_fingerprint
+        }));
+    }
+    let affected_skill_ids = affected_skill_ids.into_iter().collect();
+    let affected_agents = planned_agents.into_iter().collect::<Vec<_>>();
     let bootstrap_scope = BootstrapPlanScope {
         anchor_roots: bootstrap_anchor_roots.into_iter().collect(),
         missing_skill_roots: bootstrap_missing_skill_roots.into_iter().collect(),
-        affected_agents: planned_agents.into_iter().collect(),
+        affected_placement_count: affected_agents.len(),
+        affected_agents,
+        affected_skill_ids,
     };
     let plan = prepare_plan(
         store,
         state_dir,
-        json!({"schema_version": 1, "scan_id": snapshot_id, "operations": operations}),
+        json!({
+            "schema_version": 1,
+            "scan_id": snapshot_id,
+            "operations": operations,
+            "path_projections": path_projections
+        }),
         PlanOrigin::BootstrapSetup,
         Some(json!({
             "modified_choice": match modified_choice {
@@ -8809,7 +8863,9 @@ fn setup_command_with_manifests<'a>(
                 Some(ModifiedBootstrapChoice::RetainLocal) => json!("retain-local"),
                 Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
             },
-            "affected_agents": bootstrap_scope.affected_agents.clone()
+            "affected_agents": bootstrap_scope.affected_agents.clone(),
+            "affected_skill_ids": bootstrap_scope.affected_skill_ids.clone(),
+            "affected_placement_count": bootstrap_scope.affected_placement_count
         })),
         &[],
         Some(&bootstrap_scope),
@@ -11482,6 +11538,7 @@ mod recovery_tests {
             }],
             source_updates: vec![],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![PathBuf::from("/fixture")],
             state_dir: PathBuf::from("/fixture/state"),
         };
@@ -11544,6 +11601,7 @@ mod recovery_tests {
             }],
             source_updates: vec![],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![PathBuf::from("/fixture")],
             state_dir: PathBuf::from("/fixture/state"),
         };
@@ -11610,6 +11668,7 @@ mod recovery_tests {
                 canonical_path: placement_path.clone(),
                 library_path: None,
             }],
+            path_projections: vec![],
             approved_roots: vec![PathBuf::from("/fixture")],
             state_dir: PathBuf::from("/fixture/state"),
         };
@@ -11671,6 +11730,7 @@ mod recovery_tests {
                 target: entrypoint,
             }],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![PathBuf::from("/fixture")],
             state_dir: PathBuf::from("/fixture/state"),
         };
@@ -11724,6 +11784,7 @@ mod recovery_tests {
                 canonical_path: PathBuf::from("/fixture/root/shared/a2"),
                 library_path: None,
             }],
+            path_projections: vec![],
             approved_roots: vec![PathBuf::from("/fixture")],
             state_dir: PathBuf::from("/fixture/state"),
         };
@@ -12192,6 +12253,7 @@ mod recovery_tests {
             roster_changes: vec![],
             source_updates: vec![],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![temp.path().to_path_buf()],
             state_dir: state_dir.clone(),
         };
@@ -12275,6 +12337,7 @@ mod recovery_tests {
             roster_changes: vec![],
             source_updates: vec![],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![temp.path().to_path_buf()],
             state_dir: state_dir.clone(),
         };
@@ -12364,6 +12427,7 @@ mod recovery_tests {
             roster_changes: vec![],
             source_updates: vec![],
             library_changes: vec![],
+            path_projections: vec![],
             approved_roots: vec![],
             state_dir: PathBuf::new(),
         };
