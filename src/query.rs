@@ -2711,7 +2711,23 @@ fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
 }
 
 pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
-    has_protectable_task_evidence(matched) || has_direct_hint_evidence(matched)
+    // Rank fusion may preserve broad lexical evidence. Returning complete Skill
+    // instructions requires direct selection evidence instead.
+    let has_exact_metadata_phrase = matched
+        .match_reasons
+        .iter()
+        .any(|reason| matches!(reason.as_str(), "exact_name" | "declared_trigger"));
+    let has_complete_name_tokens = {
+        let name_token_count = tokens(&matched.name).len();
+        name_token_count > 0
+            && match_reason_count(matched, "name_tokens:") == Some(name_token_count)
+    };
+    let has_specific_description_phrase = matched
+        .match_reasons
+        .iter()
+        .any(|reason| reason == "description_phrase")
+        && match_reason_count(matched, "description_tokens:").is_some_and(|count| count >= 2);
+    has_exact_metadata_phrase || has_complete_name_tokens || has_specific_description_phrase
 }
 
 fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
@@ -3675,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_load_strength_distinguishes_weak_overlap_from_direct_or_cjk_evidence() {
+    fn verified_load_strength_requires_direct_selection_evidence() {
         assert!(!has_strong_verified_load_evidence(&matched(
             "request-refactor-plan",
             1,
@@ -3691,10 +3707,24 @@ mod tests {
             1,
             &["name_tokens:2", "all_text_tokens:2"],
         )));
-        assert!(has_strong_verified_load_evidence(&matched(
+        assert!(!has_strong_verified_load_evidence(&matched(
             "humanizer-zh",
             1,
             &["cjk_description_bigrams:1", "cjk_all_text_bigrams:3"],
+        )));
+        assert!(!has_strong_verified_load_evidence(&matched(
+            "request-refactor-plan",
+            1,
+            &["name_phrase", "name_tokens:1"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "native-review",
+            1,
+            &[
+                "description_phrase",
+                "description_tokens:4",
+                "cjk_description_bigrams:4",
+            ],
         )));
     }
 
