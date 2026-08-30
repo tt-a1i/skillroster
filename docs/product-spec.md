@@ -325,6 +325,8 @@ omit the field. Rank position remains discriminating within these
 small candidate pools: a high-ranked Agent hint match outranks weak lexical
 overlap that merely appears in both channels, while the strongest original-task
 match remains within the default top three when it has protectable evidence.
+A complete Skill-name token match is direct hint evidence for both single- and
+multi-token names; a partial multi-token name match is not.
 Smaller limits intentionally return only the corresponding stable prefix.
 Hinted retrieval uses a fixed internal pool of up to 100 capabilities, matching
 the public maximum limit. For the same Snapshot, task, and hints, changing
