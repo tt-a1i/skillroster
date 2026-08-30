@@ -1469,6 +1469,202 @@ fn public_find_hints_do_not_erase_a_native_task_match() {
 }
 
 #[test]
+fn public_find_prefers_a_direct_single_token_name_hint_over_broad_native_overlap() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "pdf",
+            "---\nname: pdf\ndescription: Read PDF files and inspect rendered layout on every page.\n---\n",
+        ),
+        (
+            "yunxiao-smartcr",
+            "---\nname: yunxiao-smartcr\ndescription: >\n  本地代码审查师（Code Reviewer），通过 AST 静态检查和 LLM 审查产出报告。\n  触发场景：审查代码变更、检查一下、看有没有问题、PR 检查。\n  不应触发：排障、性能优化建议、纯代码解释、单测生成。\n---\n读取变更并检查每一页报告的排版。\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "读取这个 PDF 并检查每一页的排版有没有问题",
+                "--hint",
+                "read PDF inspect rendered layout on every page",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "pdf");
+    assert_eq!(found["result"]["matches"][0]["augmented_channel_rank"], 1);
+}
+
+#[test]
+fn public_find_does_not_treat_part_of_a_multi_token_name_as_direct_hint_evidence() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "native-task",
+            "---\nname: native-task\ndescription: 原始任务专用能力\n---\n",
+        ),
+        (
+            "github-code-review",
+            "---\nname: github-code-review\ndescription: Review documents, contracts, reports, plans, policies, requirements, evidence, and risks.\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "原始任务专用能力",
+                "--hint",
+                "review documents contracts reports plans policies requirements evidence risks",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "native-task");
+    assert_eq!(
+        found["result"]["matches"][0]["ranking_adjustments"],
+        json!(["protected_original_task_match"])
+    );
+}
+
+#[test]
+fn public_find_respects_a_chinese_do_not_use_clause() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "diagnose",
+            "---\nname: diagnose\ndescription: Diagnose intermittent failures, reproduce them, and identify root causes.\n---\n",
+        ),
+        (
+            "yunxiao-smartcr",
+            "---\nname: yunxiao-smartcr\ndescription: >\n  本地代码审查师。触发场景：审查代码变更、检查一下、看有没有问题。\n  不应触发：偶现失败、复现并定位、排障、为什么会崩、报错是什么意思。\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "这个偶现失败到底是什么原因，帮我复现并定位",
+                "--hint",
+                "diagnose intermittent failure reproduce and identify root cause",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    let names = found["result"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|matched| matched["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names[0], "diagnose");
+    assert!(!names.contains(&"yunxiao-smartcr"));
+}
+
+#[test]
+fn public_find_keeps_a_positive_cjk_clause_after_an_exclusion() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/mixed-routing");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: mixed-routing\ndescription: 适用于代码审查。不应触发：排障。也适用于事故复盘。\n---\n",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "事故复盘",
+                "--hint",
+                "incident retrospective",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "mixed-routing");
+}
+
+#[test]
 fn public_find_hinted_ranking_is_prefix_stable_across_limits() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
