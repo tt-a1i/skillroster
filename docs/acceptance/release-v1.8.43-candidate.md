@@ -1,6 +1,6 @@
-# SkillRoster v1.8.43 candidate
+# SkillRoster v1.8.43 release receipt
 
-## Release notes draft
+## Outcome
 
 SkillRoster 1.8.43 makes Agent-authored retrieval hints both more reliable and
 safer at the complete-instruction boundary.
@@ -44,9 +44,9 @@ verified-load authorization. SQLite remains at schema 12, the JSON envelope
 remains at schema 1, and bundled Bootstrap content remains at version 1.8.29.
 It does not mutate Agent or Skill files.
 
-## Preparation evidence
+## Source and review chain
 
-Candidate preparation starts from exact `origin/main` revision
+Release preparation started from exact `origin/main` revision
 `5996148473a09d39b9956e7832f091894fdff55d`.
 
 [#359](https://github.com/tt-a1i/skillroster/pull/359) aligned complete
@@ -84,25 +84,83 @@ fix head, the full local gate passed 327 Rust unit tests, 8 acceptance tests,
 installation-surface validation, archive README validation, the change-scope
 self-test, and `git diff --check`.
 
-The source candidate and Cargo package are versioned as 1.8.43. Public install
-examples, the website current-release labels, README release evidence, and the
-Homebrew Formula deliberately remain at v1.8.42 until the v1.8.43 tag,
-artifacts, checksums, and Homebrew package actually exist.
+[#362](https://github.com/tt-a1i/skillroster/pull/362) prepared version 1.8.43
+at exact head `59be020d07dfc0ec8c730864783154887746ddcc` and merged as exact
+release source revision `76a6885669f96ba37c919641f4b207e99b2b27fe`.
+The PR
+[CI run 33321599897](https://github.com/tt-a1i/skillroster/actions/runs/33321599897)
+and exact-main
+[CI run 33321885194](https://github.com/tt-a1i/skillroster/actions/runs/33321885194)
+passed change scope, Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64,
+and the aggregate CI gate at their exact revisions. Two independent exact-head
+reviews passed with no blocking findings. The complete local gate passed twice
+on the candidate bytes: 327 Rust unit tests, 8 acceptance tests, 119 CLI tests,
+and 152 Node harness tests, plus strict Clippy, formatting, installation-surface
+validation, archive README validation, the change-scope self-test, and
+`git diff --check`.
 
-## Candidate gates
+## Published release
 
-The candidate is not accepted until one exact final source revision passes:
+Annotated tag `v1.8.43` has tag object
+`7eb064beaba68061ad8cf3258ecbc5f737df54fe` and resolves to exact source
+revision `76a6885669f96ba37c919641f4b207e99b2b27fe`. The tag
+[release workflow](https://github.com/tt-a1i/skillroster/actions/runs/33322098095)
+passed the strict repository gate, all four supported-platform jobs, each
+governance smoke, and WSL2 at that exact revision.
 
-- `cargo fmt --all --check`;
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`;
-- `cargo test --locked --all-targets --all-features`;
-- the public CLI acceptance suite and Node harnesses;
-- `git diff --check`, installation-surface validation, archive README
-  validation, and the CI change-scope self-test;
-- four platform build and governance jobs plus the WSL2 governance smoke;
-- downloaded checksum verification and an external four-archive comparison
-  against the checked-in README Git blob.
+The public [GitHub Release](https://github.com/tt-a1i/skillroster/releases/tag/v1.8.43)
+contains four archives and four adjacent checksum files:
 
-Candidate preparation does not create or push a tag, publish a GitHub Release,
-update Homebrew, or mutate an existing public release asset. Those operations
-remain separately evidenced after candidate acceptance.
+| Target | SHA-256 |
+| --- | --- |
+| `aarch64-apple-darwin` | `0def10401e283cce13332eec4af16d135b5963c8352da54d07f44768358edbca` |
+| `x86_64-apple-darwin` | `ffc54fecb49a9e540879f7a2fb9ca278d7d5bb387c60b6f6bfe741873664b5df` |
+| `x86_64-pc-windows-msvc` | `941f0b9f697fa4bbc135b8b536528844fd566c74ccbfa66078a976ebff96bb04` |
+| `x86_64-unknown-linux-gnu` | `a661bc5952305f884f1f22a0cd78daa9c20b2b9e53bcd36252e0b2f8e9171cae` |
+
+All adjacent checksums passed. Every archive contained only its versioned
+directory, binary, README, and LICENSE; each README and LICENSE matched the
+checked-in Git blob byte-for-byte. The public asset inventory contained exactly
+those eight files. An anonymous macOS arm64 download matched its adjacent
+checksum and the tag-workflow artifact byte-for-byte, reported
+`skillroster 1.8.43`, and passed the release governance smoke in isolated
+temporary directories.
+
+## Homebrew
+
+The public [Homebrew tap](https://github.com/tt-a1i/homebrew-skillroster)
+updated through [PR #17](https://github.com/tt-a1i/homebrew-skillroster/pull/17)
+at exact head `335cd7956b7575bbf377f7f0c3d6ddeda4a74fbc`. The
+[brew test-bot run](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33323499540)
+built, installed, and tested macOS arm64 and Linux x86_64 bottles at that PR
+head. The
+[brew pr-pull run](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33323773777)
+was dispatched from tap `main` at
+`6019feffa842324cdf0687b95b7ed9b16c5977ed` after test-bot passed. It closed
+the PR without a regular merge commit, created equivalent Formula commit
+`c4f679d1a9bd950d12b341c02d64950a60527605`, published both bottles, and
+advanced tap `main` through bottle commit
+`f141e46f3f492fae25fdc1d69f2b5d6527448df5`.
+
+| Bottle | SHA-256 |
+| --- | --- |
+| `arm64_tahoe` | `40527cc32a3604f4795ff3a9241cf0ff0e1d44187b4ea5ce879127e8f5686dad` |
+| `x86_64_linux` | `bb4576bf7ead8842750994ed9d8d8107ea3ddebb8da63604eb2db70f294f2eca` |
+
+The public Formula checksums match the release-asset digests. An anonymous
+arm64 bottle download matched its Formula checksum, reported version 1.8.43,
+and completed an isolated `scan --summary --json` smoke with `ok=true` and
+`files_changed=false`. Verification extracted the bottle in a temporary
+directory and did not mutate the user's installed Homebrew package.
+
+## Boundaries
+
+- Direct-selection evidence is a lexical authorization boundary, not a general
+  semantic translation or intent-resolution engine.
+- Same-name Skill variants remain ambiguous until the Agent supplies an exact
+  verified variant; the ranking fix does not silently choose between them.
+- WSL2 is verified with the Linux archive. WSL1 remains fail-closed for Apply
+  and Undo because it lacks the required atomic no-replace rename primitive.
+- The release does not claim native Linux arm64 or Windows arm64 artifacts.
+- Publishing this release did not migrate state, modify Agent or Skill files,
+  or change the Bootstrap content version.
