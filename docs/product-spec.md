@@ -333,7 +333,27 @@ a larger result. A hint can therefore surface English
 metadata without letting its raw token count set one global cutoff that
 discards a strong native-task result. Each task or hint also remains a separate phrase for
 exact name, description, and declared-trigger evidence. The scanner reads
-ordinary and folded YAML description scalars. Ranking uses
+ordinary and folded YAML description scalars.
+
+An independent punctuation-delimited task clause that begins with `不要`, the
+parallel continuation `也不要`, or the complete ASCII marker `do not` remains
+verbatim in `task` but does not contribute positive candidate or ranking
+evidence. Prefixes such as `do nothing` are not markers. `task_exclusions`
+returns the recognized clauses so the Agent can audit that deterministic split.
+Terms already present in the positive task remain shared object evidence; only
+the constraint-specific remainder may exclude a Skill whose positive name,
+trigger, or description declares the prohibited capability. Agent-authored
+hints remain separate positive evidence and cannot cancel a task exclusion.
+`task_exclusion_effects` reports the exact affected candidate count plus a
+deterministic preview of at most 10 affected Skill identities, ordered by name
+and opaque Skill ID. Each preview item contains only the name, opaque ID, and
+the positive name, trigger, and description token counts that caused exclusion;
+`items_truncated` states whether more affected candidates were omitted. It does
+not expose Skill paths or content. An embedded negative state such as `diagnose
+why tests do not pass` is not an independent constraint clause and remains
+intact.
+
+Ranking uses
 top-level `triggers` and the semicolon-separated string
 `metadata.skillroster-routing-triggers` as the same declared retrieval
 evidence. The latter must be explicitly quoted and remains valid under the

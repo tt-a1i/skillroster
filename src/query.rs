@@ -17,6 +17,8 @@ pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
+const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "不要", "也不要"];
+const TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT: usize = 10;
 
 fn normalize_skill_name(name: &str) -> String {
     name.trim().to_lowercase()
@@ -361,6 +363,27 @@ pub struct FindMatch {
     pub variant_finding: Option<VariantFindingReference>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct TaskExclusionEffects {
+    pub affected_candidate_count: usize,
+    pub items: Vec<TaskExclusionEffect>,
+    pub items_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct TaskExclusionEffect {
+    pub skill_id: String,
+    pub name: String,
+    pub name_token_count: usize,
+    pub trigger_token_count: usize,
+    pub description_token_count: usize,
+}
+
+pub(crate) struct FindMatchingResult {
+    pub matches: Vec<FindMatch>,
+    pub task_exclusion_effects: TaskExclusionEffects,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VariantFindingReference {
     pub state: VariantFindingState,
@@ -436,10 +459,13 @@ fn placement_authority_facts(
 #[derive(Clone, Debug)]
 pub(crate) struct RetrievalQuery {
     text: String,
+    positive_task_text: String,
     phrases: Vec<String>,
+    excluded_task_phrases: Vec<String>,
 }
 
 impl RetrievalQuery {
+    #[cfg(test)]
     pub(crate) fn from_parts<'a>(parts: impl IntoIterator<Item = &'a str>) -> Self {
         let phrases = parts
             .into_iter()
@@ -447,14 +473,39 @@ impl RetrievalQuery {
             .filter(|part| !part.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        let text = phrases.join(" ");
+        Self {
+            positive_task_text: text.clone(),
+            text,
+            phrases,
+            excluded_task_phrases: Vec::new(),
+        }
+    }
+
+    pub(crate) fn from_task_and_hints<'a>(
+        task: &str,
+        hints: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let (positive_task, excluded_task_phrases) = task_routing_sections(task);
+        let positive_task_text = positive_task.clone();
+        let phrases = std::iter::once(positive_task)
+            .chain(hints.into_iter().map(str::trim).map(str::to_owned))
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
         Self {
             text: phrases.join(" "),
+            positive_task_text,
             phrases,
+            excluded_task_phrases,
         }
     }
 
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn excluded_task_phrases(&self) -> &[String] {
+        &self.excluded_task_phrases
     }
 }
 
@@ -1847,7 +1898,7 @@ fn category_name(category: FindingCategory) -> &'static str {
 }
 
 pub fn find(scan: &ScanResult, task: &str, limit: usize) -> Vec<FindMatch> {
-    let query = RetrievalQuery::from_parts([task]);
+    let query = RetrievalQuery::from_task_and_hints(task, std::iter::empty::<&str>());
     find_matching(scan, &query, limit, None, None)
 }
 
@@ -1858,11 +1909,37 @@ pub(crate) fn find_matching(
     candidate_ids: Option<&BTreeSet<String>>,
     variant_eligible_ids: Option<&BTreeSet<String>>,
 ) -> Vec<FindMatch> {
+    find_matching_with_evidence(scan, query, limit, candidate_ids, variant_eligible_ids).matches
+}
+
+pub(crate) fn find_matching_with_evidence(
+    scan: &ScanResult,
+    query: &RetrievalQuery,
+    limit: usize,
+    candidate_ids: Option<&BTreeSet<String>>,
+    variant_eligible_ids: Option<&BTreeSet<String>>,
+) -> FindMatchingResult {
     let query_text = query.text().trim().to_lowercase();
     if query_text.is_empty() || limit == 0 {
-        return Vec::new();
+        return FindMatchingResult {
+            matches: Vec::new(),
+            task_exclusion_effects: TaskExclusionEffects::default(),
+        };
     }
     let query_tokens = tokens(&query_text);
+    let positive_task_tokens = tokens(&query.positive_task_text);
+    let excluded_task_tokens = tokens(
+        &query
+            .excluded_task_phrases
+            .iter()
+            .map(|phrase| task_exclusion_body(phrase))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    let excluded_only_task_tokens = excluded_task_tokens
+        .difference(&positive_task_tokens)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let query_phrases = query
         .phrases
         .iter()
@@ -1885,6 +1962,7 @@ pub(crate) fn find_matching(
         variants.sort();
         variants.dedup();
     }
+    let mut task_exclusion_effects = Vec::new();
     let mut matches = scan
         .skills
         .iter()
@@ -1909,6 +1987,27 @@ pub(crate) fn find_matching(
             let name_overlap = query_tokens.intersection(&name_tokens).count();
             let trigger_overlap = query_tokens.intersection(&trigger_tokens).count();
             let description_overlap = query_tokens.intersection(&description_tokens).count();
+            let task_excluded_name_overlap =
+                excluded_only_task_tokens.intersection(&name_tokens).count();
+            let task_excluded_trigger_overlap = excluded_only_task_tokens
+                .intersection(&trigger_tokens)
+                .count();
+            let task_excluded_description_overlap = excluded_only_task_tokens
+                .intersection(&description_tokens)
+                .count();
+            if task_excluded_name_overlap > 0
+                || task_excluded_trigger_overlap > 0
+                || task_excluded_description_overlap > 0
+            {
+                task_exclusion_effects.push(TaskExclusionEffect {
+                    skill_id: skill.id.clone(),
+                    name: skill.name.clone(),
+                    name_token_count: task_excluded_name_overlap,
+                    trigger_token_count: task_excluded_trigger_overlap,
+                    description_token_count: task_excluded_description_overlap,
+                });
+                return None;
+            }
             let excluded_description_overlap = query_tokens
                 .intersection(&excluded_description_tokens)
                 .count();
@@ -2138,7 +2237,22 @@ pub(crate) fn find_matching(
     for (index, matched) in capabilities.iter_mut().enumerate() {
         matched.rank = index + 1;
     }
-    capabilities
+    task_exclusion_effects.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.skill_id.cmp(&right.skill_id))
+    });
+    let affected_candidate_count = task_exclusion_effects.len();
+    let items_truncated = affected_candidate_count > TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT;
+    task_exclusion_effects.truncate(TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT);
+    FindMatchingResult {
+        matches: capabilities,
+        task_exclusion_effects: TaskExclusionEffects {
+            affected_candidate_count,
+            items: task_exclusion_effects,
+            items_truncated,
+        },
+    }
 }
 
 pub(crate) fn fuse_retrieval_channels(
@@ -2455,6 +2569,47 @@ fn description_routing_sections(description: &str) -> (String, String) {
         }
     }
     (positive.join(" "), excluded.join(" "))
+}
+
+fn task_routing_sections(task: &str) -> (String, Vec<String>) {
+    let mut positive = Vec::new();
+    let mut excluded = Vec::new();
+    for section in task.split(['.', '!', '?', ';', ',', '\n', '。', '！', '？', '；', '，']) {
+        let section = section.trim();
+        if section.is_empty() {
+            continue;
+        }
+        if task_exclusion_marker(section).is_some() {
+            excluded.push(section.to_owned());
+        } else {
+            positive.push(section);
+        }
+    }
+    if excluded.is_empty() {
+        (task.trim().to_owned(), excluded)
+    } else {
+        (positive.join(" "), excluded)
+    }
+}
+
+fn task_exclusion_body(section: &str) -> &str {
+    task_exclusion_marker(section).map_or(section, |marker| section[marker.len()..].trim())
+}
+
+fn task_exclusion_marker(section: &str) -> Option<&'static str> {
+    TASK_EXCLUSION_MARKERS.iter().copied().find(|marker| {
+        if marker.is_ascii() {
+            section
+                .get(..marker.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
+                && section[marker.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_alphanumeric())
+        } else {
+            section.starts_with(marker)
+        }
+    })
 }
 
 fn trim_low_confidence_tail(matches: &mut Vec<FindMatch>, query_token_count: usize) {
@@ -3535,6 +3690,155 @@ mod tests {
 
         assert_eq!(desired, "use for standalone spreadsheet files");
         assert_eq!(excluded, "not for a live excel session");
+    }
+
+    #[test]
+    fn task_routing_sections_separate_independent_cjk_and_english_constraints() {
+        let (positive, excluded) = task_routing_sections(
+            "检查工作树问题，不要修改代码; do not run tests，也不要创建 issue",
+        );
+
+        assert_eq!(positive, "检查工作树问题");
+        assert_eq!(
+            excluded,
+            vec!["不要修改代码", "do not run tests", "也不要创建 issue"]
+        );
+    }
+
+    #[test]
+    fn task_routing_sections_require_a_complete_do_not_marker() {
+        for task in [
+            "do nothing unusual; inspect worktree problems",
+            "diagnose why tests do not pass",
+        ] {
+            let (positive, excluded) = task_routing_sections(task);
+
+            assert_eq!(positive, task);
+            assert!(excluded.is_empty());
+        }
+    }
+
+    #[test]
+    fn task_exclusions_filter_conflicting_hints_and_bound_effect_evidence() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-task-exclusions-{nonce}"));
+        let inspect = root.join("inspect-worktree");
+        fs::create_dir_all(&inspect).unwrap();
+        fs::write(
+            inspect.join("SKILL.md"),
+            "---\nname: inspect-worktree\ndescription: Inspect worktree problems.\n---\n",
+        )
+        .unwrap();
+        for index in 0..12 {
+            let editor = root.join(format!("editor-{index:02}"));
+            fs::create_dir_all(&editor).unwrap();
+            fs::write(
+                editor.join("SKILL.md"),
+                format!("---\nname: editor-{index:02}\ndescription: Modify.\n---\n"),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+        let query = RetrievalQuery::from_task_and_hints(
+            "Inspect worktree problems; do not modify",
+            ["editor-00"],
+        );
+
+        let result = find_matching_with_evidence(&scan, &query, 3, None, None);
+
+        assert_eq!(result.matches[0].name, "inspect-worktree");
+        assert_eq!(result.task_exclusion_effects.affected_candidate_count, 12);
+        assert_eq!(result.task_exclusion_effects.items.len(), 10);
+        assert!(result.task_exclusion_effects.items_truncated);
+        assert_eq!(result.task_exclusion_effects.items[0].name, "editor-00");
+        assert_eq!(result.task_exclusion_effects.items[9].name, "editor-09");
+        assert!(
+            result
+                .task_exclusion_effects
+                .items
+                .iter()
+                .all(|effect| effect.description_token_count == 1)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_exclusion_controls_preserve_exact_cjk_and_english_scores() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-task-controls-{nonce}"));
+        for (directory, contents) in [
+            (
+                "inspect-worktree",
+                "---\nname: inspect-worktree\ndescription: 检查工作树问题。\n---\n",
+            ),
+            (
+                "modify-code",
+                "---\nname: modify-code\ndescription: 修改当前工作树中的代码并运行测试。\n---\n",
+            ),
+            (
+                "inspect-en",
+                "---\nname: inspect-en\ndescription: Inspect worktree problems.\n---\n",
+            ),
+            (
+                "modify-en",
+                "---\nname: modify-en\ndescription: Modify current worktree code and run tests.\n---\n",
+            ),
+        ] {
+            let skill = root.join(directory);
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(skill.join("SKILL.md"), contents).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+
+        for (baseline_task, constrained_task, expected_name, expected_score) in [
+            (
+                "检查工作树问题",
+                "检查工作树问题，不要修改当前工作树中的代码并运行测试",
+                "inspect-worktree",
+                115.0,
+            ),
+            (
+                "Inspect worktree problems",
+                "Inspect worktree problems; do not modify current worktree code or run tests",
+                "inspect-en",
+                94.0,
+            ),
+        ] {
+            let baseline_query =
+                RetrievalQuery::from_task_and_hints(baseline_task, std::iter::empty::<&str>());
+            let constrained_query =
+                RetrievalQuery::from_task_and_hints(constrained_task, std::iter::empty::<&str>());
+            let baseline = find_matching(&scan, &baseline_query, 2, None, None);
+            let constrained = find_matching(&scan, &constrained_query, 2, None, None);
+
+            assert_eq!(baseline[0].name, expected_name);
+            assert_eq!(baseline[0].score, expected_score);
+            assert_eq!(constrained[0].name, baseline[0].name);
+            assert_eq!(constrained[0].score, baseline[0].score);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

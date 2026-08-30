@@ -4995,8 +4995,9 @@ fn find_command(
         }
     }
     require_content_identity(&scan)?;
-    let retrieval_query = crate::query::RetrievalQuery::from_parts(
-        std::iter::once(task).chain(retrieval_hints.iter().map(String::as_str)),
+    let retrieval_query = crate::query::RetrievalQuery::from_task_and_hints(
+        task,
+        retrieval_hints.iter().map(String::as_str),
     );
     let candidate_search_text = crate::query::candidate_search_text(retrieval_query.text());
     let mut candidate_ids = store
@@ -5027,13 +5028,15 @@ fn find_command(
     } else {
         usize::from(crate::cli::MAX_FIND_RESULTS)
     };
-    let augmented_matches = crate::query::find_matching(
+    let augmented_result = crate::query::find_matching_with_evidence(
         &scan,
         &retrieval_query,
         pool_limit,
         Some(&candidate_ids),
         Some(&routable_ids),
     );
+    let task_exclusion_effects = augmented_result.task_exclusion_effects;
+    let augmented_matches = augmented_result.matches;
     let ranking_strategy = if retrieval_hints.is_empty() {
         "single_lexical_channel"
     } else {
@@ -5042,7 +5045,8 @@ fn find_command(
     let mut matches = if retrieval_hints.is_empty() {
         augmented_matches
     } else {
-        let task_query = crate::query::RetrievalQuery::from_parts([task]);
+        let task_query =
+            crate::query::RetrievalQuery::from_task_and_hints(task, std::iter::empty::<&str>());
         let task_matches = crate::query::find_matching(
             &scan,
             &task_query,
@@ -5244,6 +5248,8 @@ fn find_command(
     let mut result = json!({
         "snapshot_id": scan_id,
         "task": task,
+        "task_exclusions": retrieval_query.excluded_task_phrases(),
+        "task_exclusion_effects": task_exclusion_effects,
         "retrieval_hints": retrieval_hints,
         "ranking_strategy": ranking_strategy,
         "matches": matches,
