@@ -345,8 +345,9 @@ only to the already-scanned, locally routable Skill set so natural CJK
 paraphrases can reach CJK metadata even when SQLite FTS has no whole-token
 candidate; Archived Skills remain excluded. Match reasons expose CJK
 description and full-text bigram counts. Ranking also treats explicit use and
-do-not-use description clauses as positive and exclusion evidence, and removes
-the low-confidence tail relative to the strongest result. Same-name Skill
+English/CJK do-not-use description clauses, including `not for` and `不应触发`,
+as positive and exclusion evidence, and removes the low-confidence tail
+relative to the strongest result. Same-name Skill
 identities occupy one ranked capability result and are
 reported as explicit variants rather than silently treated as equivalent.
 For an ambiguous result, `variant_finding` binds the complete routable identity

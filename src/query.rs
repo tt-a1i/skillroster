@@ -2430,11 +2430,12 @@ fn description_routing_sections(description: &str) -> (String, String) {
         "must not use",
         "should not use",
         "not for",
+        "不应触发",
     ];
     let description = description.to_lowercase();
     let mut positive = Vec::new();
     let mut excluded = Vec::new();
-    for section in description.split(['.', '!', '?', ';', '\n']) {
+    for section in description.split(['.', '!', '?', ';', '\n', '。', '！', '？', '；']) {
         let section = section.trim();
         if section.is_empty() {
             continue;
@@ -2494,10 +2495,11 @@ fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
 }
 
 fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
+    let has_complete_single_token_name = tokens(&matched.name).len() == 1
+        && match_reason_count(matched, "name_tokens:").is_some_and(|count| count == 1);
     has_direct_metadata_reason(matched)
-        || ["name_tokens:", "trigger_tokens:"]
-            .iter()
-            .any(|prefix| match_reason_count(matched, prefix).is_some_and(|count| count >= 2))
+        || has_complete_single_token_name
+        || match_reason_count(matched, "trigger_tokens:").is_some_and(|count| count >= 2)
 }
 
 fn has_direct_metadata_reason(matched: &FindMatch) -> bool {
