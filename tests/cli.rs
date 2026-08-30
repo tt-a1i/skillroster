@@ -1400,6 +1400,149 @@ fn public_find_keeps_the_user_task_and_uses_agent_retrieval_hints() {
 }
 
 #[test]
+fn find_load_abstains_from_a_weak_unhinted_cross_language_match() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "request-refactor-plan",
+            "---\nname: request-refactor-plan\ndescription: Request a structured refactor plan before changing code.\n---\nInspect the request and prepare a plan.\n",
+        ),
+        (
+            "github-code-review",
+            "---\nname: github-code-review\ndescription: Review pull requests on GitHub for correctness and security.\n---\nInspect the pull request diff and report findings.\n",
+        ),
+    ] {
+        let skill = skill_root.join(directory);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "审查这个 Pull Request";
+    let unhinted = json_output(&run(
+        &[&common[..], &["find", task, "--limit", "1"]].concat(),
+        None,
+    ));
+    assert_eq!(
+        unhinted["result"]["matches"][0]["name"],
+        "request-refactor-plan"
+    );
+    assert!(
+        unhinted["result"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("--hint"))
+    );
+
+    let blocked = run(
+        &[&common[..], &["find", task, "--load", "--limit", "1"]].concat(),
+        None,
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "verified_skill_load_blocked");
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "cjk_hint_required_for_weak_match"
+    );
+    assert_eq!(
+        blocked["error"]["details"]["next_action"],
+        "retry_with_agent_authored_english_hint"
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert!(blocked["result"].is_null());
+
+    let hinted = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                task,
+                "--hint",
+                "review a Pull Request on GitHub",
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(hinted["result"]["matches"][0]["name"], "github-code-review");
+    assert_eq!(
+        hinted["result"]["loaded_skill"]["selection"]["name"],
+        "github-code-review"
+    );
+}
+
+#[test]
+fn find_load_keeps_strong_native_cjk_and_explicit_name_routes() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "native-review",
+            "---\nname: native-review\ndescription: 审查代码的正确性和安全性。\n---\n检查代码并报告问题。\n",
+        ),
+        (
+            "archify",
+            "---\nname: archify\ndescription: Create interactive architecture diagrams.\n---\nRender the requested diagram.\n",
+        ),
+    ] {
+        let skill = skill_root.join(directory);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let native = json_output(&run(
+        &[
+            &common[..],
+            &["find", "审查代码的正确性和安全性", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        native["result"]["loaded_skill"]["selection"]["name"],
+        "native-review"
+    );
+
+    let explicit = json_output(&run(
+        &[
+            &common[..],
+            &["find", "使用 archify", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        explicit["result"]["loaded_skill"]["selection"]["name"],
+        "archify"
+    );
+}
+
+#[test]
 fn public_find_hints_do_not_erase_a_native_task_match() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

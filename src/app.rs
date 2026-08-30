@@ -5109,6 +5109,7 @@ fn find_command(
         &mut matches,
     )?;
     rescan_required |= variant_rescan_required;
+    let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
     if load && matches.is_empty() {
         let archived_match = crate::query::find_matching(
             &scan,
@@ -5143,6 +5144,29 @@ fn find_command(
             retry_argv: None,
         }
         .into());
+    }
+    if load && cjk_hint_required {
+        if let Some(ranked) = matches
+            .first()
+            .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked))
+        {
+            return Err(SkillLoadBlocked {
+                reason: "cjk_hint_required_for_weak_match",
+                skill_id: ranked.skill_id.clone(),
+                skill_name: ranked.name.clone(),
+                path: None,
+                roster_state: ranked.roster_state.clone(),
+                mutation_scopes: ranked
+                    .mutation_scopes
+                    .iter()
+                    .map(|scope| scope.id().to_owned())
+                    .collect(),
+                expected_digest: None,
+                actual_digest: None,
+                retry_argv: None,
+            }
+            .into());
+        }
     }
     let loaded_skill = if load && !matches.is_empty() {
         let ranked = &matches[0];
@@ -5230,7 +5254,6 @@ fn find_command(
             ));
         }
     }
-    let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
     if cjk_hint_required {
         warnings.push(
             "Find is lexical and the task contains CJK text; retry with one concise English capability paraphrase via --hint if relevant Skills use English metadata"

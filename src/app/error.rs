@@ -590,6 +590,10 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "inspect_current_report_or_refine_task",
                 "read_only_command_available",
             ),
+            "cjk_hint_required_for_weak_match" => (
+                "retry_with_agent_authored_english_hint",
+                "agent_correction_required",
+            ),
             "untrusted_external_source" => (
                 "confirm_exact_source_root_then_scan",
                 "user_decision_required",
