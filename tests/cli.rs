@@ -1887,6 +1887,36 @@ fn public_find_keeps_shared_task_objects_out_of_capability_exclusions() {
         .concat(),
         None,
     ));
+    let constrained_with_coordinator = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Review this Rust release PR for correctness, but do not simplify or refactor the code",
+                "--hint",
+                "code review",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let constrained_cjk_with_coordinator = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "审查这个 Rust 发布 PR 的正确性，但是不要简化或重构代码",
+                "--hint",
+                "code review",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
 
     assert_eq!(baseline["result"]["matches"][0]["name"], "code-review");
     assert_eq!(constrained["result"]["matches"][0]["name"], "code-review");
@@ -1929,6 +1959,26 @@ fn public_find_keeps_shared_task_objects_out_of_capability_exclusions() {
         .collect::<Vec<_>>();
     assert!(affected_cjk_names.contains(&"simplify-codebase"));
     assert!(!affected_cjk_names.contains(&"code-review"));
+    for (result, expected_exclusion) in [
+        (
+            constrained_with_coordinator,
+            "but do not simplify or refactor the code",
+        ),
+        (constrained_cjk_with_coordinator, "但是不要简化或重构代码"),
+    ] {
+        assert_eq!(result["result"]["matches"][0]["name"], "code-review");
+        assert_eq!(
+            result["result"]["task_exclusions"],
+            json!([expected_exclusion])
+        );
+        assert!(
+            result["result"]["matches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|matched| matched["name"] != "simplify-codebase")
+        );
+    }
 }
 
 #[test]
