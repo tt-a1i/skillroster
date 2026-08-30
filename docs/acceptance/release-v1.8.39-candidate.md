@@ -5,7 +5,7 @@
 SkillRoster 1.8.39 keeps explicit task exclusions from accidentally removing
 the capability the user actually requested.
 
-- A task such as “review this code, but do not simplify or refactor it” keeps
+- A task such as “review this code; do not simplify or refactor it” keeps
   `code-review` at Top-1 while excluding modification-oriented Skills such as
   `simplify-codebase`.
 - English `code` and Chinese `代码` are treated as shared task-object context
@@ -26,6 +26,12 @@ the English and Chinese replays reported `files_changed=false`.
 This patch changes lexical Find exclusion handling only. SQLite remains at
 schema 12, the JSON envelope remains at schema 1, and bundled Bootstrap content
 remains at version 1.8.29. It does not mutate Agent or Skill files.
+
+The published v1.8.39 parser required the negative clause itself to begin with
+an exclusion marker. Natural coordinator prefixes such as English `but` and
+Chinese `但是` were not recognized; [issue #344](https://github.com/tt-a1i/skillroster/issues/344)
+records the post-release dogfood reproducer and bounded source fix. The release
+artifacts remain immutable.
 
 ## Source and review chain
 

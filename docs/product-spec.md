@@ -338,8 +338,12 @@ ordinary and folded YAML description scalars.
 An independent punctuation-delimited task clause that begins with `不要`, the
 parallel continuation `也不要`, or the complete ASCII marker `do not` remains
 verbatim in `task` but does not contribute positive candidate or ranking
-evidence. Prefixes such as `do nothing` are not markers. `task_exclusions`
-returns the recognized clauses so the Agent can audit that deterministic split.
+evidence. The bounded coordinators `but`, `and`, `yet`, `但是`, `不过`, and `但`
+may immediately precede one of those markers; the original coordinated clause
+remains verbatim in `task_exclusions`. Prefixes such as `do nothing` are not
+markers, and a coordinator without an immediate marker remains positive task
+text. `task_exclusions` returns the recognized clauses so the Agent can audit
+that deterministic split.
 Terms already present in the positive task remain shared object evidence; only
 the constraint-specific remainder may exclude a Skill whose positive name,
 trigger, or description declares the prohibited capability. Agent-authored

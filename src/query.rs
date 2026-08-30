@@ -18,6 +18,7 @@ pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
 const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "不要", "也不要"];
+const TASK_EXCLUSION_COORDINATORS: &[&str] = &["but", "and", "yet", "但是", "不过", "但"];
 const TASK_EXCLUSION_CONTEXT_TOKENS: &[&str] = &["code", "代码"];
 const TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT: usize = 10;
 
@@ -2584,7 +2585,8 @@ fn task_routing_sections(task: &str) -> (String, Vec<String>) {
 }
 
 fn task_exclusion_body(section: &str) -> &str {
-    task_exclusion_marker(section).map_or(section, |marker| section[marker.len()..].trim())
+    let clause = task_exclusion_clause(section);
+    task_exclusion_marker_at_start(clause).map_or(clause, |marker| clause[marker.len()..].trim())
 }
 
 fn task_exclusion_capability_tokens(
@@ -2624,6 +2626,38 @@ fn task_exclusion_context_token_is_object(body: &str, context_token: &str) -> bo
 }
 
 fn task_exclusion_marker(section: &str) -> Option<&'static str> {
+    task_exclusion_marker_at_start(task_exclusion_clause(section))
+}
+
+fn task_exclusion_clause(section: &str) -> &str {
+    let section = section.trim();
+    TASK_EXCLUSION_COORDINATORS
+        .iter()
+        .find_map(|coordinator| {
+            let remainder = strip_task_exclusion_coordinator(section, coordinator)?;
+            task_exclusion_marker_at_start(remainder).map(|_| remainder)
+        })
+        .unwrap_or(section)
+}
+
+fn strip_task_exclusion_coordinator<'a>(section: &'a str, coordinator: &str) -> Option<&'a str> {
+    if coordinator.is_ascii() {
+        let prefix = section.get(..coordinator.len())?;
+        if !prefix.eq_ignore_ascii_case(coordinator) {
+            return None;
+        }
+        let remainder = &section[coordinator.len()..];
+        remainder
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_alphanumeric())
+            .then(|| remainder.trim_start())
+    } else {
+        section.strip_prefix(coordinator).map(str::trim_start)
+    }
+}
+
+fn task_exclusion_marker_at_start(section: &str) -> Option<&'static str> {
     TASK_EXCLUSION_MARKERS.iter().copied().find(|marker| {
         if marker.is_ascii() {
             section
@@ -3730,6 +3764,42 @@ mod tests {
             excluded,
             vec!["不要修改代码", "do not run tests", "也不要创建 issue"]
         );
+    }
+
+    #[test]
+    fn task_routing_sections_recognize_bounded_coordinators() {
+        for (task, expected_positive, expected_exclusion, expected_body) in [
+            (
+                "Review this PR, but do not simplify it",
+                "Review this PR",
+                "but do not simplify it",
+                "simplify it",
+            ),
+            (
+                "Review this PR, and do not refactor it",
+                "Review this PR",
+                "and do not refactor it",
+                "refactor it",
+            ),
+            (
+                "审查这个 PR，但是不要简化代码",
+                "审查这个 PR",
+                "但是不要简化代码",
+                "简化代码",
+            ),
+            (
+                "审查这个 PR，但不要重构代码",
+                "审查这个 PR",
+                "但不要重构代码",
+                "重构代码",
+            ),
+        ] {
+            let (positive, excluded) = task_routing_sections(task);
+
+            assert_eq!(positive, expected_positive);
+            assert_eq!(excluded, vec![expected_exclusion]);
+            assert_eq!(task_exclusion_body(expected_exclusion), expected_body);
+        }
     }
 
     #[test]
