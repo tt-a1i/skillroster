@@ -1625,6 +1625,305 @@ fn public_find_respects_a_chinese_do_not_use_clause() {
 }
 
 #[test]
+fn public_find_does_not_route_to_an_explicitly_excluded_task_capability() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "inspect-worktree",
+            "---\nname: inspect-worktree\ndescription: 检查工作树问题。\n---\nInspect worktree problems without changing files.\n",
+        ),
+        (
+            "modify-code",
+            "---\nname: modify-code\ndescription: 修改当前工作树中的代码并运行测试。\n---\nModify code and run tests.\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let baseline = json_output(&run(
+        &[&common[..], &["find", "检查工作树问题", "--limit", "2"]].concat(),
+        None,
+    ));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "检查工作树问题，不要修改当前工作树中的代码并运行测试",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(baseline["result"]["matches"][0]["name"], "inspect-worktree");
+    assert_eq!(baseline["result"]["matches"][0]["score"], 115.0);
+    assert_eq!(found["result"]["matches"][0]["name"], "inspect-worktree");
+    assert_eq!(
+        found["result"]["matches"][0]["score"],
+        baseline["result"]["matches"][0]["score"]
+    );
+    assert_eq!(
+        found["result"]["task_exclusions"],
+        json!(["不要修改当前工作树中的代码并运行测试"])
+    );
+    assert_eq!(found["result"]["files_changed"], false);
+}
+
+#[test]
+fn public_find_recognizes_parallel_cjk_task_exclusions() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "inspect-worktree",
+            "---\nname: inspect-worktree\ndescription: 检查工作树问题。\n---\nInspect worktree problems without changing files.\n",
+        ),
+        (
+            "modify-code",
+            "---\nname: modify-code\ndescription: 修改当前工作树中的代码并运行测试。\n---\nModify code and run tests.\n",
+        ),
+        (
+            "github-issues",
+            "---\nname: github-issues\ndescription: 创建和管理 GitHub issue。\n---\nCreate and manage GitHub issues.\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "检查工作树问题，不要修改当前工作树中的代码并运行测试，也不要创建 issue",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "inspect-worktree");
+    assert_eq!(
+        found["result"]["task_exclusions"],
+        json!(["不要修改当前工作树中的代码并运行测试", "也不要创建 issue"])
+    );
+    assert_eq!(
+        found["result"]["task_exclusion_effects"]["affected_candidate_count"],
+        2
+    );
+}
+
+#[test]
+fn public_find_does_not_route_to_an_english_do_not_constraint() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "inspect-en",
+            "---\nname: inspect-en\ndescription: Inspect worktree problems.\n---\nInspect the worktree without changing files.\n",
+        ),
+        (
+            "modify-en",
+            "---\nname: modify-en\ndescription: Modify current worktree code and run tests.\n---\nChange the worktree and run tests.\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let baseline = json_output(&run(
+        &[
+            &common[..],
+            &["find", "Inspect worktree problems", "--limit", "2"],
+        ]
+        .concat(),
+        None,
+    ));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Inspect worktree problems; do not modify current worktree code or run tests",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(baseline["result"]["matches"][0]["name"], "inspect-en");
+    assert_eq!(baseline["result"]["matches"][0]["score"], 94.0);
+    assert_eq!(found["result"]["matches"][0]["name"], "inspect-en");
+    assert_eq!(
+        found["result"]["matches"][0]["score"],
+        baseline["result"]["matches"][0]["score"]
+    );
+    assert_eq!(
+        found["result"]["task_exclusions"],
+        json!(["do not modify current worktree code or run tests"])
+    );
+}
+
+#[test]
+fn public_find_task_exclusion_constrains_a_conflicting_agent_hint() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "inspect-en",
+            "---\nname: inspect-en\ndescription: Inspect worktree problems.\n---\nInspect the worktree without changing files.\n",
+        ),
+        (
+            "editor",
+            "---\nname: editor\ndescription: Modify.\n---\nEdit files.\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Inspect worktree problems; do not modify",
+                "--hint",
+                "editor",
+                "--limit",
+                "2",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "inspect-en");
+    assert_eq!(
+        found["result"]["task"],
+        "Inspect worktree problems; do not modify"
+    );
+    assert_eq!(found["result"]["retrieval_hints"], json!(["editor"]));
+    let effects = &found["result"]["task_exclusion_effects"];
+    assert_eq!(effects["affected_candidate_count"], 1);
+    assert_eq!(effects["items_truncated"], false);
+    assert_eq!(effects["items"].as_array().unwrap().len(), 1);
+    assert_eq!(effects["items"][0]["name"], "editor");
+    assert_eq!(effects["items"][0]["name_token_count"], 0);
+    assert_eq!(effects["items"][0]["trigger_token_count"], 0);
+    assert_eq!(effects["items"][0]["description_token_count"], 1);
+    assert!(
+        effects["items"][0]["skill_id"]
+            .as_str()
+            .is_some_and(|skill_id| !skill_id.is_empty())
+    );
+}
+
+#[test]
+fn public_find_keeps_a_negative_state_inside_the_positive_task() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "diagnose",
+            "---\nname: diagnose\ndescription: Diagnose why tests fail and identify the root cause.\n---\n",
+        ),
+        (
+            "pass-tests",
+            "---\nname: pass-tests\ndescription: Run tests and make tests pass.\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &["find", "diagnose why tests do not pass", "--limit", "2"],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["task_exclusions"], json!([]));
+    assert!(
+        found["result"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|matched| matched["name"] == "diagnose")
+    );
+}
+
+#[test]
 fn public_find_keeps_a_positive_cjk_clause_after_an_exclusion() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
