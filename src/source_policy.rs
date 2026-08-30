@@ -673,28 +673,39 @@ pub fn policy_value(
     limit: usize,
     offset: usize,
 ) -> StorageResult<Value> {
-    policy_value_with_page(store, with_current_state, Some((limit, offset)))
-}
-
-/// Complete local export view. This is written to the user-selected lifecycle
-/// export file rather than returned inline in the Agent JSON envelope.
-pub fn policy_export_value(store: &StateStore) -> StorageResult<Value> {
-    policy_value_with_page(store, false, None)
-}
-
-fn policy_value_with_page(
-    store: &StateStore,
-    with_current_state: bool,
-    page: Option<(usize, usize)>,
-) -> StorageResult<Value> {
-    let permissions = inspect_permissions(store)?;
     let frozen = if with_current_state {
         Some(freeze_active_roots(store)?)
     } else {
         None
     };
+    policy_value_with_page(store, frozen.as_deref(), Some((limit, offset)))
+}
+
+/// Build the same bounded policy view from roots already frozen by readiness
+/// validation. Status uses this to avoid a second filesystem walk while it
+/// holds the shared state lock.
+pub fn policy_value_from_frozen(
+    store: &StateStore,
+    frozen: &[FrozenSourceRoot],
+    limit: usize,
+    offset: usize,
+) -> StorageResult<Value> {
+    policy_value_with_page(store, Some(frozen), Some((limit, offset)))
+}
+
+/// Complete local export view. This is written to the user-selected lifecycle
+/// export file rather than returned inline in the Agent JSON envelope.
+pub fn policy_export_value(store: &StateStore) -> StorageResult<Value> {
+    policy_value_with_page(store, None, None)
+}
+
+fn policy_value_with_page(
+    store: &StateStore,
+    frozen: Option<&[FrozenSourceRoot]>,
+    page: Option<(usize, usize)>,
+) -> StorageResult<Value> {
+    let permissions = inspect_permissions(store)?;
     let frozen_by_id = frozen
-        .as_ref()
         .map(|frozen| {
             frozen
                 .iter()

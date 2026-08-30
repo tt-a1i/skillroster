@@ -38,11 +38,13 @@ mod error;
 use error::{
     ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
     MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked,
-    SnapshotRescanRequired, StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
+    SnapshotRescanRequired, SourceRootSnapshotRescanRequired, StoredFindingCoverageInvalid,
+    incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
 const STATUS_PENDING_PLAN_LIMIT: usize = 20;
+const SOURCE_ROOT_INVALIDATION_PREVIEW_LIMIT: usize = 10;
 const MUTATION_CHANGED_PATH_PREVIEW_LIMIT: usize = 10;
 const SETUP_PLAN_SUMMARY_FIELDS: &[&str] = &[
     "snapshot_id",
@@ -736,6 +738,8 @@ struct ReadinessDecision {
     snapshot_state: SnapshotState,
     latest_snapshot: Option<ScanRun>,
     invalidating_receipt_id: Option<ReceiptId>,
+    invalidating_source_root_permission_ids: Vec<String>,
+    frozen_source_roots: Option<Vec<crate::source_policy::FrozenSourceRoot>>,
     pending_plan_count: usize,
     pending_plans: Vec<PlanRecord>,
     recovery_required: bool,
@@ -753,9 +757,22 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
     let invalidating_receipt_id = invalidation
         .as_ref()
         .map(|invalidation| invalidation.receipt_id.clone());
+    let (invalidating_source_root_permission_ids, frozen_source_roots) =
+        if let Some(scan_id) = latest_scan_id {
+            let scan = store.scan_payload::<ScanResult>(scan_id)?;
+            if let Some(scan) = scan.as_ref() {
+                snapshot_source_root_invalidations(store, scan)?
+            } else {
+                (Vec::new(), None)
+            }
+        } else {
+            (Vec::new(), None)
+        };
     let snapshot_state = if latest_scan_id.is_none() {
         SnapshotState::Missing
-    } else if invalidating_receipt_id.is_some() {
+    } else if invalidating_receipt_id.is_some()
+        || !invalidating_source_root_permission_ids.is_empty()
+    {
         SnapshotState::RescanRequired
     } else {
         SnapshotState::Current
@@ -795,6 +812,11 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
             actions.push(receipt_undo_action(invalidation.receipt_id.as_str()));
         }
         (ReadinessState::RescanRequired, actions)
+    } else if !invalidating_source_root_permission_ids.is_empty() {
+        (
+            ReadinessState::RescanRequired,
+            vec![source_root_snapshot_rescan_action()],
+        )
     } else if let Some(plan) = pending_plans.first() {
         (
             ReadinessState::PlanReady,
@@ -820,6 +842,8 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
         snapshot_state,
         latest_snapshot,
         invalidating_receipt_id,
+        invalidating_source_root_permission_ids,
+        frozen_source_roots,
         pending_plan_count,
         pending_plans,
         recovery_required,
@@ -829,11 +853,19 @@ fn readiness_decision(store: &StateStore, state_dir: &Path) -> Result<ReadinessD
 }
 
 fn home_result(readiness: &ReadinessDecision) -> Value {
+    let source_root_permission_ids = readiness
+        .invalidating_source_root_permission_ids
+        .iter()
+        .take(SOURCE_ROOT_INVALIDATION_PREVIEW_LIMIT)
+        .collect::<Vec<_>>();
     json!({
         "state": readiness.state.as_str(),
         "snapshot_state": readiness.snapshot_state.as_str(),
         "latest_snapshot_id": readiness.latest_snapshot.as_ref().map(|scan| scan.id.to_string()),
         "snapshot_invalidated_by_receipt_id": &readiness.invalidating_receipt_id,
+        "snapshot_invalidated_by_source_root_permission_ids": source_root_permission_ids,
+        "snapshot_invalidated_by_source_root_permission_count": readiness.invalidating_source_root_permission_ids.len(),
+        "snapshot_invalidated_by_source_root_permission_ids_truncated": readiness.invalidating_source_root_permission_ids.len() > SOURCE_ROOT_INVALIDATION_PREVIEW_LIMIT,
         "pending_plan_count": readiness.pending_plan_count,
         "recovery_state": if readiness.recovery_required { "required" } else { "clear" },
         "files_changed": false
@@ -846,6 +878,11 @@ fn status_result(
     state_dir: &Path,
     readiness: &ReadinessDecision,
 ) -> Result<Value> {
+    let source_root_permission_ids = readiness
+        .invalidating_source_root_permission_ids
+        .iter()
+        .take(SOURCE_ROOT_INVALIDATION_PREVIEW_LIMIT)
+        .collect::<Vec<_>>();
     let pending_plans = readiness
         .pending_plans
         .iter()
@@ -867,6 +904,11 @@ fn status_result(
         })
     });
     let lifecycle = store.lifecycle_counts()?;
+    let source_root_permissions = if let Some(frozen) = readiness.frozen_source_roots.as_deref() {
+        crate::source_policy::policy_value_from_frozen(store, frozen, 100, 0)?
+    } else {
+        crate::source_policy::policy_value(store, true, 100, 0)?
+    };
     Ok(json!({
         "state": readiness.state.as_str(),
         "database_path": database_path,
@@ -875,6 +917,9 @@ fn status_result(
         "latest_snapshot_at": readiness.latest_snapshot.as_ref().and_then(|scan| scan.completed_at),
         "snapshot_state": readiness.snapshot_state.as_str(),
         "snapshot_invalidated_by_receipt_id": &readiness.invalidating_receipt_id,
+        "snapshot_invalidated_by_source_root_permission_ids": source_root_permission_ids,
+        "snapshot_invalidated_by_source_root_permission_count": readiness.invalidating_source_root_permission_ids.len(),
+        "snapshot_invalidated_by_source_root_permission_ids_truncated": readiness.invalidating_source_root_permission_ids.len() > SOURCE_ROOT_INVALIDATION_PREVIEW_LIMIT,
         "pending_plan_count": readiness.pending_plan_count,
         "pending_plans_returned": pending_plans.len(),
         "pending_plans_truncated": readiness.pending_plan_count > pending_plans.len(),
@@ -889,7 +934,7 @@ fn status_result(
             "source_confirmation_details": source_confirmation_detail_summary(state_dir)?,
             "current": lifecycle,
         },
-        "source_root_permissions": crate::source_policy::policy_value(store, true, 100, 0)?,
+        "source_root_permissions": source_root_permissions,
         "files_changed": false
     }))
 }
@@ -5209,6 +5254,11 @@ fn find_command(
     if let Some(loaded_skill) = loaded_skill {
         result["loaded_skill"] = loaded_skill;
     }
+    // Find derives current paths and may load content after its initial
+    // Snapshot check. Re-freeze durable permissions before returning so a
+    // persistent revoke or filesystem-identity drift observed during the read
+    // discards those derived facts instead of returning them as authorized.
+    require_loaded_snapshot_current(store, &scan_id, &scan)?;
     Ok((result, actions))
 }
 
@@ -8426,7 +8476,7 @@ fn setup_command_with_manifests<'a>(
             "next": "skillroster scan --summary --json"
         }));
     };
-    require_snapshot_current(store, &snapshot_id)?;
+    require_loaded_snapshot_current(store, &snapshot_id, &snapshot)?;
     let current_package = current_bootstrap_package();
     let mut detected = Vec::new();
     let mut targets = Vec::new();
@@ -9509,12 +9559,15 @@ fn latest_scan(store: &StateStore) -> Result<(ScanId, ScanResult)> {
     let scan = store
         .latest_scan_payload()?
         .ok_or_else(|| anyhow!("no completed Snapshot; run skillroster scan first"))?;
-    require_snapshot_current(store, &scan.0)?;
+    require_loaded_snapshot_current(store, &scan.0, &scan.1)?;
     Ok(scan)
 }
 
 fn require_snapshot_current(store: &StateStore, scan_id: &ScanId) -> Result<()> {
-    if let Some(invalidation) = store.snapshot_invalidating_receipt(scan_id)? {
+    let scan = store.scan_payload::<ScanResult>(scan_id)?;
+    if let Some(scan) = scan.as_ref() {
+        require_loaded_snapshot_current(store, scan_id, scan)?;
+    } else if let Some(invalidation) = store.snapshot_invalidating_receipt(scan_id)? {
         return Err(SnapshotRescanRequired {
             snapshot_id: scan_id.clone(),
             receipt_id: invalidation.receipt_id,
@@ -9522,6 +9575,91 @@ fn require_snapshot_current(store: &StateStore, scan_id: &ScanId) -> Result<()> 
         .into());
     }
     Ok(())
+}
+
+fn require_loaded_snapshot_current(
+    store: &StateStore,
+    scan_id: &ScanId,
+    scan: &ScanResult,
+) -> Result<()> {
+    if let Some(invalidation) = store.snapshot_invalidating_receipt(scan_id)? {
+        return Err(SnapshotRescanRequired {
+            snapshot_id: scan_id.clone(),
+            receipt_id: invalidation.receipt_id,
+        }
+        .into());
+    }
+    let (permission_ids, _) = snapshot_source_root_invalidations(store, scan)?;
+    if !permission_ids.is_empty() {
+        return Err(SourceRootSnapshotRescanRequired {
+            snapshot_id: scan_id.clone(),
+            permission_ids,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn snapshot_source_root_invalidations(
+    store: &StateStore,
+    scan: &ScanResult,
+) -> Result<(
+    Vec<String>,
+    Option<Vec<crate::source_policy::FrozenSourceRoot>>,
+)> {
+    let inferred_permission_ids;
+    let used_permission_ids =
+        if let Some(permission_ids) = scan.durable_read_used_permission_ids.as_ref() {
+            permission_ids
+        } else {
+            inferred_permission_ids = legacy_used_source_root_permission_ids(scan);
+            &inferred_permission_ids
+        };
+    let snapshot_permissions = scan
+        .source_root_policy
+        .iter()
+        .filter(|fact| fact.state == crate::source_policy::SourceRootState::Active)
+        .filter(|fact| used_permission_ids.contains(&fact.permission_id))
+        .collect::<Vec<_>>();
+    if snapshot_permissions.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let current = crate::source_policy::freeze_active_roots(store)?;
+    let mut invalidated = snapshot_permissions
+        .into_iter()
+        .filter(|fact| {
+            !current.iter().any(|root| {
+                root.permission.id.as_str() == fact.permission_id
+                    && root.permission.path == fact.granted_path
+                    && root.permission.granted_at == fact.granted_at
+                    && root.state == crate::source_policy::SourceRootState::Active
+                    && root.resolved_path == fact.resolved_path
+            })
+        })
+        .map(|fact| fact.permission_id.clone())
+        .collect::<Vec<_>>();
+    invalidated.sort();
+    invalidated.dedup();
+    Ok((invalidated, Some(current)))
+}
+
+fn legacy_used_source_root_permission_ids(scan: &ScanResult) -> BTreeSet<String> {
+    scan.source_root_policy
+        .iter()
+        .filter(|fact| fact.state == crate::source_policy::SourceRootState::Active)
+        .filter(|fact| {
+            let root = fact.resolved_path.as_deref().unwrap_or(&fact.granted_path);
+            scan.placements.iter().any(|placement| {
+                placement.mutation_scope == Some(scan::MutationScope::DurableReadOnly)
+                    && placement
+                        .physical_directory
+                        .as_deref()
+                        .or(placement.link_target.as_deref())
+                        .is_some_and(|directory| directory.starts_with(root))
+            })
+        })
+        .map(|fact| fact.permission_id.clone())
+        .collect()
 }
 
 fn require_content_identity(scan: &ScanResult) -> Result<()> {
@@ -9894,6 +10032,16 @@ fn snapshot_rescan_action() -> SuggestedAction {
         false,
         false,
         "verified_mutation_requires_rescan",
+    )
+}
+
+fn source_root_snapshot_rescan_action() -> SuggestedAction {
+    action(
+        "scan",
+        &["scan", "--summary", "--json"],
+        false,
+        false,
+        "source_root_permission_changed_requires_rescan",
     )
 }
 
