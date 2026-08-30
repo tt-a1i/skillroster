@@ -494,6 +494,12 @@ pub struct ScanResult {
     /// drift, even if a later path check appears active again.
     #[serde(default)]
     pub durable_read_drifted_permission_ids: BTreeSet<String>,
+    /// Durable permissions that actually authorized at least one completely
+    /// observed Skill placement in this Snapshot. `None` identifies payloads
+    /// written before this dependency fact existed; readers infer those
+    /// conservatively from the retained placement authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_read_used_permission_ids: Option<BTreeSet<String>>,
 }
 
 impl ScanResult {
@@ -972,6 +978,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     let mut result = ScanResult {
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
         identity_path_coverage: IdentityPathCoverage::Complete,
+        durable_read_used_permission_ids: Some(BTreeSet::new()),
         ..ScanResult::default()
     };
     let known = known_agent_roots(&options.home);
@@ -2068,6 +2075,14 @@ fn materialize_candidates_with_hook(
         } else {
             MutationScope::Mutable
         };
+        if safe_to_read && mutation_scope == MutationScope::DurableReadOnly {
+            if let Some(root) = durable_anchor {
+                result
+                    .durable_read_used_permission_ids
+                    .get_or_insert_default()
+                    .insert(root.permission_id.clone());
+            }
+        }
         result.placements.push(SkillPlacement {
             id: format!("placement_{}", stable_digest(placement_basis.as_bytes())),
             skill_id,

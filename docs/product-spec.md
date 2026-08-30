@@ -269,6 +269,11 @@ entirely between checkpoints; descriptor/handle-bound traversal is tracked as
 separate security hardening. The persisted object epoch is conservative:
 platform metadata changes that could indicate object reuse may require an
 explicit revoke and reconfirm rather than silently retaining read access.
+Revoking a permission used by the latest Snapshot, or observing persistent
+identity drift after that Scan, immediately makes the Snapshot
+`rescan_required`. Current-Snapshot commands fail closed with the affected
+permission IDs and a typed Scan continuation; an old `find --load` may not use
+the Snapshot as continuing read authority.
 
 The escaping-link Finding keeps legacy resolution fields for schema
 compatibility and adds the canonical `decision_code` plus two explicitly

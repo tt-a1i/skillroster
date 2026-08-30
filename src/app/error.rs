@@ -2,7 +2,10 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
-use super::{action, physical_identity_rescan_action, snapshot_rescan_action};
+use super::{
+    action, physical_identity_rescan_action, snapshot_rescan_action,
+    source_root_snapshot_rescan_action,
+};
 use crate::action_context::ActionContext;
 use crate::model::{ApiError, FindingId, JsonEnvelope, PlanId, ReceiptId, ScanId};
 use crate::scan;
@@ -94,6 +97,25 @@ impl std::fmt::Display for SnapshotRescanRequired {
 }
 
 impl std::error::Error for SnapshotRescanRequired {}
+
+#[derive(Debug)]
+pub(super) struct SourceRootSnapshotRescanRequired {
+    pub(super) snapshot_id: ScanId,
+    pub(super) permission_ids: Vec<String>,
+}
+
+impl std::fmt::Display for SourceRootSnapshotRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Snapshot {} relied on {} source-root permission(s) that are no longer active; run skillroster scan --summary --json before using current inventory facts",
+            self.snapshot_id,
+            self.permission_ids.len()
+        )
+    }
+}
+
+impl std::error::Error for SourceRootSnapshotRescanRequired {}
 
 #[derive(Debug)]
 pub(super) struct PlanEvidenceScopeMismatch {
@@ -204,6 +226,41 @@ pub fn error_json_with_context(
             },
         );
         envelope.suggested_actions = vec![snapshot_rescan_action()];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
+    if let Some(required) = error.downcast_ref::<SourceRootSnapshotRescanRequired>() {
+        const PREVIEW_LIMIT: usize = 10;
+        let permission_ids = required
+            .permission_ids
+            .iter()
+            .take(PREVIEW_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut relevant_ids = vec![required.snapshot_id.to_string()];
+        relevant_ids.extend(permission_ids.iter().cloned());
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "source_root_snapshot_rescan_required".into(),
+                message: error.to_string(),
+                retryable: true,
+                relevant_ids,
+                paths: Vec::new(),
+                details: Some(json!({
+                    "reason": "source_root_permission_no_longer_active",
+                    "snapshot_id": required.snapshot_id,
+                    "permission_ids": permission_ids,
+                    "permission_count": required.permission_ids.len(),
+                    "permission_ids_truncated": required.permission_ids.len() > PREVIEW_LIMIT,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "next_action": "scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![source_root_snapshot_rescan_action()];
         action_context.apply(&mut envelope.suggested_actions);
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());

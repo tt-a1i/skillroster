@@ -358,7 +358,10 @@ action without adding the confirmed path as `--source-root`. Alternatively, it
 can skip durable confirmation and use temporary `--source-root` flags for one
 Scan. These paths are never combined. Neither decision endorses content or
 authorizes a Plan; unconfirmed, revoked, or identity-drifted sources remain
-excluded. Drift detection
+excluded. A revoke or persistent identity drift invalidates any latest
+Snapshot that relied on that durable permission: Home and `status` return
+`rescan_required`, and current-Snapshot commands expose a typed Scan
+continuation without returning external Skill content. Drift detection
 uses bounded identity and entrypoint-binding checks around discovery and
 content consumption; it detects accidental or persistent changes, not a
 malicious same-user ABA race completed entirely between checkpoints.

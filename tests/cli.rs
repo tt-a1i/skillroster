@@ -11054,6 +11054,29 @@ fn escaping_link_resolution_separates_durable_and_temporary_read_paths() {
         0
     );
     let temporary_snapshot = temporary_scan["result"]["snapshot_id"].as_str().unwrap();
+    let temporary_status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(temporary_status["result"]["snapshot_state"], "current");
+    assert_eq!(temporary_status["result"]["state"], "report_required");
+    let temporary_load = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "external-0 fixture",
+                "--require-snapshot",
+                temporary_snapshot,
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        temporary_load["result"]["loaded_skill"]["selection"]["name"],
+        "external-0"
+    );
     let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
     let load_payload = |snapshot| {
         database
@@ -11597,6 +11620,400 @@ fn escaping_link_finding_requests_exact_read_permission_instead_of_a_plan() {
             .unwrap()
             .iter()
             .any(|finding| finding["title"] == "Skill links escape an approved root")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn revoked_durable_source_root_invalidates_snapshot_reads_immediately() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source = temp.path().join("trusted-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("SKILL.md"),
+        "---\nname: revocable-external\ndescription: revocation boundary fixture\n---\nprivate revocation boundary content\n",
+    )
+    .unwrap();
+    let source = fs::canonicalize(source).unwrap();
+    std::os::unix::fs::symlink(&source, root.join("revocable-external")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                source.to_str().unwrap(),
+                "report",
+                "--finding",
+                finding_id,
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let confirm = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "confirm_source_root_read_permission")
+        .unwrap();
+    let confirmed = json_output(&run_suggested_action(confirm));
+    let permission_id = confirmed["result"]["permission"]["permission_id"]
+        .as_str()
+        .unwrap();
+
+    let rescanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot_id = rescanned["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_payload: Value = serde_json::from_str(&payload).unwrap();
+    assert!(
+        legacy_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_read_used_permission_ids")
+            .is_some()
+    );
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            [legacy_payload.to_string(), snapshot_id.to_owned()],
+        )
+        .unwrap();
+    drop(database);
+    let load_args = [
+        "find",
+        "revocation boundary",
+        "--require-snapshot",
+        snapshot_id,
+        "--load",
+        "--limit",
+        "1",
+    ];
+    let loaded = json_output(&run(&[&common[..], &load_args].concat(), None));
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["selection"]["name"],
+        "revocable-external"
+    );
+
+    json_output(&run(
+        &[&common[..], &["source-root", "revoke", permission_id]].concat(),
+        None,
+    ));
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["state"], "rescan_required");
+    assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_source_root_permission_ids"],
+        json!([permission_id])
+    );
+    assert!(
+        status["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action["action"] == "scan"
+                && action["reason_code"] == "source_root_permission_changed_requires_rescan")
+    );
+
+    let stale_load = run(&[&common[..], &load_args].concat(), None);
+    assert!(!stale_load.status.success());
+    let stale_stdout = stale_load.stdout;
+    let stale_load: Value = serde_json::from_slice(&stale_stdout).unwrap();
+    assert_eq!(
+        stale_load["error"]["code"],
+        "source_root_snapshot_rescan_required"
+    );
+    assert_eq!(
+        stale_load["error"]["details"]["reason"],
+        "source_root_permission_no_longer_active"
+    );
+    assert_eq!(
+        stale_load["error"]["details"]["permission_ids"],
+        json!([permission_id])
+    );
+    assert_eq!(stale_load["error"]["retryable"], true);
+    assert_eq!(stale_load["error"]["details"]["permission_count"], 1);
+    assert_eq!(
+        stale_load["error"]["details"]["permission_ids_truncated"],
+        false
+    );
+    assert_eq!(stale_load["error"]["details"]["files_changed"], false);
+    assert_eq!(stale_load["error"]["details"]["state_files_changed"], false);
+    assert_eq!(stale_load["error"]["details"]["snapshot_id"], snapshot_id);
+    let scan_action = &stale_load["suggested_actions"][0];
+    assert_eq!(scan_action["action"], "scan");
+    assert_eq!(scan_action["mutates"], false);
+    assert_eq!(scan_action["requires_confirmation"], false);
+    let scan_argv = scan_action["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(scan_argv[0], env!("CARGO_BIN_EXE_skillroster"));
+    assert!(
+        scan_argv
+            .windows(2)
+            .any(|pair| pair == ["--home", home.to_str().unwrap()])
+    );
+    assert!(
+        scan_argv
+            .windows(2)
+            .any(|pair| pair == ["--state-dir", state.to_str().unwrap()])
+    );
+    assert!(
+        scan_argv
+            .windows(2)
+            .any(|pair| pair == ["scan", "--summary"])
+    );
+    assert!(
+        !String::from_utf8_lossy(&stale_stdout).contains("private revocation boundary content")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_source_root_identity_drift_invalidates_snapshot_reads_immediately() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source = temp.path().join("trusted-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&source).unwrap();
+    let skill_content = "---\nname: driftable-external\ndescription: identity drift boundary fixture\n---\nidentity drift private content\n";
+    fs::write(source.join("SKILL.md"), skill_content).unwrap();
+    let source = fs::canonicalize(source).unwrap();
+    std::os::unix::fs::symlink(&source, root.join("driftable-external")).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                source.to_str().unwrap(),
+                "report",
+                "--finding",
+                finding_id,
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let confirm = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "confirm_source_root_read_permission")
+        .unwrap();
+    let confirmed = json_output(&run_suggested_action(confirm));
+    let permission_id = confirmed["result"]["permission"]["permission_id"]
+        .as_str()
+        .unwrap();
+    let rescanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot_id = rescanned["result"]["snapshot_id"].as_str().unwrap();
+
+    let original = temp.path().join("original-source");
+    fs::rename(&source, &original).unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("SKILL.md"), skill_content).unwrap();
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["state"], "rescan_required");
+    assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_source_root_permission_ids"],
+        json!([permission_id])
+    );
+    let stale_load = run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "identity drift boundary",
+                "--require-snapshot",
+                snapshot_id,
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    );
+    assert!(!stale_load.status.success());
+    assert!(
+        !String::from_utf8_lossy(&stale_load.stdout).contains("identity drift private content")
+    );
+    let stale_load: Value = serde_json::from_slice(&stale_load.stdout).unwrap();
+    assert_eq!(
+        stale_load["error"]["code"],
+        "source_root_snapshot_rescan_required"
+    );
+    assert_eq!(
+        stale_load["error"]["details"]["permission_ids"],
+        json!([permission_id])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn revoking_an_unused_source_root_does_not_invalidate_the_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".codex/skills");
+    let source = temp.path().join("trusted-source");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(source.join("nested")).unwrap();
+    fs::write(
+        source.join("nested/SKILL.md"),
+        "---\nname: unused-external\ndescription: unused permission fixture\n---\n",
+    )
+    .unwrap();
+    let source = fs::canonicalize(source).unwrap();
+    let linked = root.join("unused-external");
+    std::os::unix::fs::symlink(&source, &linked).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    let finding_id = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Skill links escape an approved root")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let detail = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "--source-root",
+                source.to_str().unwrap(),
+                "report",
+                "--finding",
+                finding_id,
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let confirm = detail["suggested_actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["action"] == "confirm_source_root_read_permission")
+        .unwrap();
+    let confirmed = json_output(&run_suggested_action(confirm));
+    let permission_id = confirmed["result"]["permission"]["permission_id"]
+        .as_str()
+        .unwrap();
+
+    fs::remove_file(linked).unwrap();
+    fs::remove_file(source.join("nested/SKILL.md")).unwrap();
+    let rescanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(rescanned["result"]["skill_count"], 0);
+    assert_eq!(
+        rescanned["result"]["source_root_policy"]["permissions"][0]["state"],
+        "active"
+    );
+    let snapshot_id = rescanned["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy_payload: Value = serde_json::from_str(&payload).unwrap();
+    assert!(
+        legacy_payload
+            .as_object_mut()
+            .unwrap()
+            .remove("durable_read_used_permission_ids")
+            .is_some()
+    );
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1 WHERE scan_id = ?2",
+            [legacy_payload.to_string(), snapshot_id.to_owned()],
+        )
+        .unwrap();
+    drop(database);
+    json_output(&run(
+        &[&common[..], &["source-root", "revoke", permission_id]].concat(),
+        None,
+    ));
+
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["snapshot_state"], "current");
+    assert_eq!(status["result"]["state"], "report_required");
+    assert_eq!(
+        status["result"]["snapshot_invalidated_by_source_root_permission_ids"],
+        json!([])
     );
 }
 
