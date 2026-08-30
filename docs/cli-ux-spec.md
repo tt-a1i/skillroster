@@ -144,8 +144,12 @@ the deterministic confidence floor are omitted instead of filling the first
 view with incidental body-token matches. Empty results are calm, successful
 output. `--load` is an Agent-oriented opt-in that returns the complete verified
 Top-1 `SKILL.md` in JSON after roster, trust, path, 128 KiB transport bound,
-identity, and drift checks. A load blocker fails the whole command without
-partial instructions. Find/load never implies activation or task success.
+identity, and drift checks. For an unhinted CJK task, load also requires strong
+direct metadata evidence or correlated CJK evidence; otherwise it returns the
+typed `cjk_hint_required_for_weak_match` blocker instead of upgrading a weak
+lexical candidate into complete instructions. A load blocker fails the whole
+command without partial instructions. Find/load never implies activation or
+task success.
 
 ### `plan`
 

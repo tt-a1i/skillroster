@@ -2710,6 +2710,10 @@ fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
     has_direct_metadata_evidence || has_correlated_cjk_evidence
 }
 
+pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
+    has_protectable_task_evidence(matched) || has_direct_hint_evidence(matched)
+}
+
 fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
     let has_complete_single_token_name = tokens(&matched.name).len() == 1
         && match_reason_count(matched, "name_tokens:").is_some_and(|count| count == 1);
@@ -3668,6 +3672,30 @@ mod tests {
         );
         assert!(fused[1].ranking_adjustments.is_empty());
         assert!(fused[2].ranking_adjustments.is_empty());
+    }
+
+    #[test]
+    fn verified_load_strength_distinguishes_weak_overlap_from_direct_or_cjk_evidence() {
+        assert!(!has_strong_verified_load_evidence(&matched(
+            "request-refactor-plan",
+            1,
+            &["name_tokens:1", "all_text_tokens:1"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "archify",
+            1,
+            &["name_tokens:1", "all_text_tokens:1"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "code-review",
+            1,
+            &["name_tokens:2", "all_text_tokens:2"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "humanizer-zh",
+            1,
+            &["cjk_description_bigrams:1", "cjk_all_text_bigrams:3"],
+        )));
     }
 
     #[test]
