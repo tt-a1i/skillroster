@@ -1938,6 +1938,11 @@ pub(crate) fn find_matching_with_evidence(
         .map(|part| part.trim().to_lowercase())
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
+    let query_phrase_tokens = query_phrases
+        .iter()
+        .map(|phrase| tokens(phrase))
+        .filter(|phrase_tokens| phrase_tokens.len() >= 2)
+        .collect::<Vec<_>>();
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
     for skill in scan
@@ -2042,6 +2047,12 @@ pub(crate) fn find_matching_with_evidence(
             {
                 score += 25.0;
                 reasons.push("description_phrase".into());
+            }
+            if query_phrase_tokens
+                .iter()
+                .any(|phrase_tokens| phrase_tokens.is_subset(&description_tokens))
+            {
+                reasons.push("description_token_phrase".into());
             }
             if name_overlap > 0 {
                 reasons.push(format!("name_tokens:{name_overlap}"));
@@ -2721,8 +2732,7 @@ pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
     let has_specific_description_phrase = matched
         .match_reasons
         .iter()
-        .any(|reason| reason == "description_phrase")
-        && match_reason_count(matched, "description_tokens:").is_some_and(|count| count >= 2);
+        .any(|reason| reason == "description_token_phrase");
     has_exact_metadata_phrase || has_complete_name_tokens || has_specific_description_phrase
 }
 
@@ -3707,6 +3717,11 @@ mod tests {
             &["name_tokens:2", "all_text_tokens:2"],
         )));
         assert!(!has_strong_verified_load_evidence(&matched(
+            "github-code-review",
+            1,
+            &["name_tokens:2", "description_tokens:4"],
+        )));
+        assert!(!has_strong_verified_load_evidence(&matched(
             "humanizer-zh",
             1,
             &["cjk_description_bigrams:1", "cjk_all_text_bigrams:3"],
@@ -3716,7 +3731,7 @@ mod tests {
             1,
             &["name_phrase", "name_tokens:1"],
         )));
-        assert!(has_strong_verified_load_evidence(&matched(
+        assert!(!has_strong_verified_load_evidence(&matched(
             "native-review",
             1,
             &[
@@ -3724,6 +3739,11 @@ mod tests {
                 "description_tokens:4",
                 "cjk_description_bigrams:4",
             ],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "github-code-review",
+            1,
+            &["description_token_phrase", "description_tokens:4"],
         )));
     }
 

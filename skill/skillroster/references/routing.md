@@ -36,9 +36,12 @@ Roster, or authorize a later Plan.
 For `no_routable_match`, retry once with a refined capability hint. For
 `cjk_hint_required_for_weak_match`, keep `TASK` unchanged, author the one
 faithful English capability hint required by the root Route gate, and retry
-once. For drift, legacy Snapshot, unreadable, oversized, escaping, or
-untrusted-source reasons, follow `error.details.next_action`; never bypass the
-check or recover partial instructions. A successful load returns complete
+once. For `hint_direct_selection_evidence_required`, keep `TASK` unchanged and
+refine the existing hint once with the target surface, object, operation, and
+state; do not add a guessed Skill name. For drift, legacy Snapshot, unreadable,
+oversized, escaping, or untrusted-source reasons, follow
+`error.details.next_action`; never bypass the check or recover partial
+instructions. A successful load returns complete
 instructions but does not activate, install, authorize, endorse, or establish
 task success.
 

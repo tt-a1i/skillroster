@@ -594,6 +594,10 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "retry_with_agent_authored_english_hint",
                 "agent_correction_required",
             ),
+            "hint_direct_selection_evidence_required" => (
+                "refine_agent_authored_hint_with_direct_capability_evidence",
+                "agent_correction_required",
+            ),
             "untrusted_external_source" => (
                 "confirm_exact_source_root_then_scan",
                 "user_decision_required",
