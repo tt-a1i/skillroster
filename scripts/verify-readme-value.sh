@@ -51,3 +51,4 @@ require_literal "$readme_zh" "| SkillRoster Apply 后 | **$roster_exposure** | *
 require_literal "$readme_zh" "Undo 按字节恢复 Agent tree"
 require_literal "$readme_zh" "不是对 token、人工成本、生产性能、模型质量"
 require_literal "$readme_zh" "Core / On-demand 划分普遍优越性的证明"
+require_literal "$readme_zh" 'skillroster find --hint "review a Pull Request on GitHub" --load --limit 1 --json -- "审查这个 Pull Request"'

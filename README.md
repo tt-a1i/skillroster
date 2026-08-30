@@ -156,7 +156,7 @@ skillroster scan --summary --json
 skillroster report --findings --limit 20 --json
 
 # 检索并完整加载一份经过指纹校验的 Skill
-skillroster find --load --limit 1 --json -- "审查这个 Pull Request"
+skillroster find --hint "review a Pull Request on GitHub" --load --limit 1 --json -- "审查这个 Pull Request"
 
 # 预览为已检测 Agent 安装引导 Skill 的方案
 skillroster setup --json
