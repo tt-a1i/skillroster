@@ -414,12 +414,15 @@ verified Top-1 content result. It requires one unambiguous routable identity, a
 current non-Archived roster state, an eligible placement, complete package and
 entrypoint digests from the latest Snapshot, a regular file contained by an
 approved root, valid UTF-8, and at most 128 KiB of raw `SKILL.md` bytes. The
-load also abstains when a CJK task has no Agent-authored hint and Top-1 has
-neither strong direct metadata evidence nor correlated CJK metadata and body
-evidence. Ordinary Find still returns the bounded lexical candidates and its
-actionable hint warning; the blocked load returns no partial instructions.
-An explicit single-token Skill name remains direct evidence, so this boundary
-does not prevent deliberate mixed-language selection. The
+load also abstains when a CJK task has no Agent-authored hint and Top-1 has no
+direct selection evidence. Direct selection requires an exact declared name or
+trigger, complete Skill-name token coverage, or an exact description phrase
+with at least two matching tokens. Broad description-token or CJK bigram
+overlap may preserve an ordinary lexical candidate but cannot authorize
+complete instruction loading. Ordinary Find still returns the bounded lexical
+candidates and its actionable hint warning; the blocked load returns no partial
+instructions. An explicit complete Skill name remains direct evidence, so this
+boundary does not prevent deliberate mixed-language selection. The
 loaded placement is selected only after identity ranking: an eligible
 `default_exposed` placement outranks inventory-only exact copies, with path as
 the deterministic tie-breaker; when no exposed placement exists, the same

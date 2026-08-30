@@ -1487,6 +1487,98 @@ fn find_load_abstains_from_a_weak_unhinted_cross_language_match() {
 }
 
 #[test]
+fn find_load_abstains_from_broad_native_cjk_overlap_without_direct_evidence() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "diagnose",
+            "---\nname: diagnose\ndescription: Reproduce product bugs, rank falsifiable root-cause hypotheses, fix them, and add regression tests.\n---\nUse a deterministic feedback loop before changing code.\n",
+        ),
+        (
+            "site-publisher",
+            "---\nname: site-publisher\ndescription: 创建有价值的网站应用，发现需求问题，分析并修复网页发布结果，持续改进发布体验。\n---\n创建、部署和更新网站。\n",
+        ),
+    ] {
+        let skill = skill_root.join(directory);
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "发现有价值的问题，分析根因，修复并复盘";
+    let unhinted = json_output(&run(
+        &[&common[..], &["find", task, "--limit", "5"]].concat(),
+        None,
+    ));
+    assert_eq!(unhinted["result"]["matches"][0]["name"], "site-publisher");
+    let reasons = unhinted["result"]["matches"][0]["match_reasons"]
+        .as_array()
+        .unwrap();
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.as_str().unwrap().starts_with("description_tokens:"))
+    );
+    assert!(reasons.iter().all(|reason| !matches!(
+        reason.as_str().unwrap(),
+        "exact_name" | "name_phrase" | "declared_trigger" | "description_phrase"
+    )));
+    assert!(
+        unhinted["result"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("--hint"))
+    );
+
+    let blocked = run(
+        &[&common[..], &["find", task, "--load", "--limit", "5"]].concat(),
+        None,
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "verified_skill_load_blocked");
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "cjk_hint_required_for_weak_match"
+    );
+    assert_eq!(blocked["error"]["details"]["files_changed"], false);
+    assert!(blocked["result"].is_null());
+
+    let hinted = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                task,
+                "--hint",
+                "reproduce product bugs, diagnose root causes, fix them, and add regression tests",
+                "--load",
+                "--limit",
+                "5",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(hinted["result"]["matches"][0]["name"], "diagnose");
+    assert_eq!(
+        hinted["result"]["loaded_skill"]["selection"]["name"],
+        "diagnose"
+    );
+}
+
+#[test]
 fn find_load_keeps_strong_native_cjk_and_explicit_name_routes() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
