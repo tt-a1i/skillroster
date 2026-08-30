@@ -11206,8 +11206,9 @@ fn find_load_prefers_an_agent_exposed_placement_over_hidden_inventory_copy() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
-    let hidden = home.join(".codex/skills/.bak-sync/code-review");
-    let exposed = home.join(".codex/skills/code-review");
+    let skill_root = home.join(".codex").join("skills");
+    let hidden = skill_root.join(".bak-sync").join("code-review");
+    let exposed = skill_root.join("code-review");
     let content = "---\nname: code-review\ndescription: Review a repository change against its specification.\n---\n\nReview the exact diff and report reproducible findings.\n";
     for directory in [&hidden, &exposed] {
         fs::create_dir_all(directory).unwrap();
