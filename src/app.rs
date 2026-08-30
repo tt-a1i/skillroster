@@ -5853,7 +5853,11 @@ fn verified_top_skill_load(
         .iter()
         .filter(|placement| placement.skill_id == matched.skill_id)
         .collect::<Vec<_>>();
-    placements.sort_by(|left, right| left.entrypoint.cmp(&right.entrypoint));
+    // Identity ranking is already complete; prefer the Agent's active surface
+    // over inventory-only exact copies before applying the existing safety gates.
+    placements.sort_by(|left, right| {
+        (!left.default_exposed, &left.entrypoint).cmp(&(!right.default_exposed, &right.entrypoint))
+    });
     if placements.is_empty() {
         return Err(blocked("placement_missing_from_snapshot", None, None, None).into());
     }

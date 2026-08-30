@@ -403,6 +403,11 @@ verified Top-1 content result. It requires one unambiguous routable identity, a
 current non-Archived roster state, an eligible placement, complete package and
 entrypoint digests from the latest Snapshot, a regular file contained by an
 approved root, valid UTF-8, and at most 128 KiB of raw `SKILL.md` bytes. The
+loaded placement is selected only after identity ranking: an eligible
+`default_exposed` placement outranks inventory-only exact copies, with path as
+the deterministic tie-breaker; when no exposed placement exists, the same
+deterministic eligible fallback keeps source-only Skills loadable. Hidden and
+nested exact copies remain inventory facts. The
 success result separates selection, complete content, governance, and
 verification facts. Digest or path drift, legacy Snapshot data, ambiguity,
 Archived state, untrusted source, unreadable content, escape, or oversize fails

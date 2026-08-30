@@ -2759,6 +2759,18 @@ fn gitignore_only_copies_share_routing_identity_but_keep_integrity_drift_checks(
             .as_str()
             .unwrap(),
     );
+    let found_again = json_output(&run(
+        &[
+            &common[..],
+            &["find", "exact route fixture", "--load", "--limit", "1"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        found_again["result"]["loaded_skill"]["content"]["path"],
+        found["result"]["loaded_skill"]["content"]["path"]
+    );
     fs::write(
         loaded_entrypoint.parent().unwrap().join(".gitignore"),
         "changed after scan\n",
@@ -11187,6 +11199,99 @@ fn find_preserves_leading_hyphen_tasks_and_replayable_variant_actions() {
                 argv[argv.len() - 2..] == [json!("--"), json!(option_shaped_task)]
             })
     );
+}
+
+#[test]
+fn find_load_prefers_an_agent_exposed_placement_over_hidden_inventory_copy() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let hidden = home.join(".codex/skills/.bak-sync/code-review");
+    let exposed = home.join(".codex/skills/code-review");
+    let content = "---\nname: code-review\ndescription: Review a repository change against its specification.\n---\n\nReview the exact diff and report reproducible findings.\n";
+    for directory in [&hidden, &exposed] {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "review a repository change against its specification",
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "code-review");
+    assert_eq!(
+        found["result"]["matches"][0]["paths"],
+        json!([hidden.join("SKILL.md"), exposed.join("SKILL.md")])
+    );
+    assert_eq!(
+        found["result"]["loaded_skill"]["content"]["path"],
+        exposed.join("SKILL.md").to_str().unwrap()
+    );
+    assert_eq!(found["result"]["files_changed"], false);
+}
+
+#[test]
+fn find_load_keeps_a_source_only_skill_loadable_without_an_exposed_placement() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let source = temp.path().join("source-only");
+    let skill = source.join("private-review");
+    fs::create_dir_all(&skill).unwrap();
+    let content = "---\nname: private-review\ndescription: Review a private source package.\n---\n\nRead-only source instructions.\n";
+    fs::write(skill.join("SKILL.md"), content).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--source-root",
+        source.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "review a private source package",
+                "--load",
+                "--limit",
+                "1",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "private-review");
+    let expected_path = fs::canonicalize(skill.join("SKILL.md")).unwrap();
+    assert_eq!(
+        found["result"]["loaded_skill"]["content"]["path"],
+        expected_path.to_str().unwrap()
+    );
+    assert_eq!(found["result"]["files_changed"], false);
 }
 
 #[test]
