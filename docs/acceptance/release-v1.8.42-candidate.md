@@ -1,6 +1,6 @@
-# SkillRoster v1.8.42 candidate
+# SkillRoster v1.8.42 release receipt
 
-## Release notes draft
+## Outcome
 
 SkillRoster 1.8.42 prevents broad native-CJK lexical overlap from authorizing
 the complete instructions of an unrelated Skill.
@@ -35,9 +35,9 @@ This patch changes bounded lexical Find loading only. SQLite remains at schema
 12, the JSON envelope remains at schema 1, and bundled Bootstrap content remains
 at version 1.8.29. It does not mutate Agent or Skill files.
 
-## Preparation evidence
+## Source and review chain
 
-Candidate preparation starts from exact `origin/main` revision
+Release preparation started from exact `origin/main` revision
 `dbf673b636a557de4b08e70d1d6e28d03ab3d841`.
 
 [#355](https://github.com/tt-a1i/skillroster/pull/355) separated rank-preservation
@@ -62,25 +62,75 @@ acceptance tests, 117 CLI tests, and 152 Node harness tests, plus strict Clippy,
 formatting, installation-surface validation, archive README validation, the
 change-scope self-test, and `git diff --check`.
 
-The source candidate and Cargo package are versioned as 1.8.42. Public install
-examples, the checked-in Formula, website current-release label, and README
-release evidence deliberately remain at v1.8.41 until the v1.8.42 tag,
-artifacts, checksums, and Homebrew package actually exist.
+[#356](https://github.com/tt-a1i/skillroster/pull/356) prepared version 1.8.42
+at exact head `0fa88bcac559d100bdcfadb167439c5233649fff` and merged as exact
+release source revision `b365824bb49ec55cb77501368d913e77f958ee8c`.
+The PR [CI run 33314498797](https://github.com/tt-a1i/skillroster/actions/runs/33314498797)
+and exact-main [CI run 33314804782](https://github.com/tt-a1i/skillroster/actions/runs/33314804782)
+passed change scope, Linux x86_64, Windows x86_64, macOS arm64, macOS x86_64,
+and the aggregate CI gate at their exact revisions.
 
-## Candidate gates
+## Published release
 
-The candidate is not accepted until one exact final source revision passes:
+Annotated tag `v1.8.42` has tag object
+`5d422a8aebd0d34ef2f7ab08c89db66628b59696` and resolves to exact source
+revision `b365824bb49ec55cb77501368d913e77f958ee8c`. The tag
+[release workflow](https://github.com/tt-a1i/skillroster/actions/runs/33315010094)
+passed the strict repository gate, all four supported-platform jobs, each
+governance smoke, and WSL2 at that exact revision.
 
-- `cargo fmt --all --check`;
-- `cargo clippy --locked --all-targets --all-features -- -D warnings`;
-- `cargo test --locked --all-targets --all-features`;
-- the public CLI acceptance suite and Node harnesses;
-- `git diff --check`, installation-surface validation, archive README
-  validation, and the CI change-scope self-test;
-- four platform build and governance jobs plus the WSL2 governance smoke;
-- downloaded checksum verification and an external four-archive comparison
-  against the checked-in README Git blob.
+The public [GitHub Release](https://github.com/tt-a1i/skillroster/releases/tag/v1.8.42)
+contains four archives and four adjacent checksum files:
 
-Candidate preparation does not create or push a tag, publish a GitHub Release,
-update Homebrew, or mutate an existing public release asset. Those operations
-remain separately evidenced after candidate acceptance.
+| Target | SHA-256 |
+| --- | --- |
+| `aarch64-apple-darwin` | `d1f40d6add081edbb7403dbe04ede75abff7d7fca8fcb84235cde6b9662926c8` |
+| `x86_64-apple-darwin` | `37cf9efafa19268832687c3b122576a280831a1451f464d4ede481ab1bd29b16` |
+| `x86_64-pc-windows-msvc` | `c767a52d413c0975dae444f353064863490d58b6be42be0526e7fc9eecf7f117` |
+| `x86_64-unknown-linux-gnu` | `ae308cbc0747aa38e7cc6e2b8ac3e34039b3bfb8634cce4aafdbff1c6dcd264b` |
+
+All adjacent checksums passed, and every archive README and LICENSE matched
+the checked-in Git blobs byte-for-byte. The public asset inventory contained
+exactly those eight files with matching service-side archive digests. An
+anonymous macOS arm64 download passed its adjacent checksum, matched the tag
+workflow artifact byte-for-byte, reported `skillroster 1.8.42`, and passed the
+full release governance smoke in isolated temporary directories. The released
+binary also replayed the two-Skill regression: the broad unhinted CJK load
+returned the typed blocker with no result, while a faithful diagnostic hint
+loaded `diagnose` completely.
+
+## Homebrew
+
+The public [Homebrew tap](https://github.com/tt-a1i/homebrew-skillroster)
+updated through [PR #16](https://github.com/tt-a1i/homebrew-skillroster/pull/16)
+at exact head `4e3c68ab0f99aa53a0d54e6647706290e60490e0`. The
+[brew test-bot run](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33316203246)
+built and tested macOS arm64 and Linux x86_64 bottles at that PR head. The
+[brew pr-pull run](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/33316532993)
+was dispatched from tap `main` at
+`b19d9841db8a08dc420516079ffc3e7258e66476` after test-bot passed. It closed
+the PR without a regular merge commit, created equivalent Formula commit
+`d6c2fbfb6010ffe2d0c3ee8562c8ee24ce6b8868`, published both bottles, and
+advanced tap `main` through bottle commit
+`6019feffa842324cdf0687b95b7ed9b16c5977ed`.
+
+| Bottle | SHA-256 |
+| --- | --- |
+| `arm64_tahoe` | `e7400b165a7d63ee2f8c63ed71709acf32bf85696f316a9a3f85b9b19cc8044e` |
+| `x86_64_linux` | `78c1e00bf22453dca157a3eb2b0f9a3718d378e8cd8f2132ad0643e060fee3b8` |
+
+Both public bottles were downloaded without repository credentials and
+matched their Formula checksums. The arm64 bottle reported version 1.8.42 and
+passed the release governance smoke. Verification extracted the bottles in
+isolated temporary directories and did not mutate the user's installed
+Homebrew package.
+
+## Boundaries
+
+- The stricter load boundary applies to unhinted CJK lexical routing; it is not
+  a general semantic translation or intent-resolution engine.
+- WSL2 is verified with the Linux archive. WSL1 remains fail-closed for Apply
+  and Undo because it lacks the required atomic no-replace rename primitive.
+- The release does not claim native Linux arm64 or Windows arm64 artifacts.
+- Publishing this release did not migrate state, modify Agent or Skill files,
+  or change the Bootstrap content version.

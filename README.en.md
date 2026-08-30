@@ -214,7 +214,7 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-Public release v1.8.41 implements the complete local governance loop. Every
+Public release v1.8.42 implements the complete local governance loop. Every
 Agent continuation stays bound to the SkillRoster executable that emitted it
 instead of silently handing control to an older version on `PATH`. The loop
 includes discovery, normalized inventory, conservative usage evidence, bounded
@@ -222,7 +222,7 @@ reporting, local retrieval, immutable planning, Apply/Undo, recovery, lifecycle
 controls, and eight direct agent adapters.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
-- [v1.8.41 release and platform evidence](docs/acceptance/release-v1.8.41-candidate.md)
+- [v1.8.42 release and platform evidence](docs/acceptance/release-v1.8.42-candidate.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)
 - [Canonical vocabulary](CONTEXT.md)

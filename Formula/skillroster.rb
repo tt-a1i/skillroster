@@ -2,8 +2,8 @@ class Skillroster < Formula
   desc "Local skill governance for AI agents"
   homepage "https://github.com/tt-a1i/skillroster"
   url "https://github.com/tt-a1i/skillroster.git",
-      revision: "97784d4c1faf4253e802e273b8404603aa108263"
-  version "1.8.41"
+      revision: "b365824bb49ec55cb77501368d913e77f958ee8c"
+  version "1.8.42"
   license "Apache-2.0"
 
   depends_on "rust" => :build
@@ -13,7 +13,7 @@ class Skillroster < Formula
   end
 
   test do
-    assert_match "skillroster 1.8.41", shell_output("#{bin}/skillroster --version")
+    assert_match "skillroster 1.8.42", shell_output("#{bin}/skillroster --version")
     assert_match "One library. The right roster for every agent.", shell_output("#{bin}/skillroster --help")
   end
 end
