@@ -8,6 +8,9 @@ use cap_std::fs::{Dir, OpenOptions, Permissions};
 use sha2::{Digest, Sha256};
 
 use crate::durable_fs::DirectorySync;
+use crate::package_fingerprint::{
+    MAX_SKILL_PACKAGE_DEPTH, PackageHashBuilder, ignored_package_entry_name,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -694,6 +697,87 @@ impl<'a> AnchoredFs<'a> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok("missing".into()),
             Err(error) => Err(error),
         }
+    }
+
+    pub(crate) fn package_fingerprint(&self, path: &Path) -> io::Result<String> {
+        let (anchor, relative) = self.resolve(path)?;
+        let metadata = match anchor.dir.symlink_metadata(&relative) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("missing".into());
+            }
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Skill package path is not a directory",
+            ));
+        }
+        let mut hashes = PackageHashBuilder::new();
+        Self::hash_package_relative(anchor, &relative, Path::new(""), 0, &mut hashes)?;
+        Ok(format!("package:sha256:{}", hashes.finish().digest))
+    }
+
+    fn hash_package_relative(
+        anchor: &Anchor,
+        directory: &Path,
+        package_relative: &Path,
+        depth: usize,
+        hashes: &mut PackageHashBuilder,
+    ) -> io::Result<()> {
+        if depth > MAX_SKILL_PACKAGE_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Skill package fingerprint exceeds depth {MAX_SKILL_PACKAGE_DEPTH}"),
+            ));
+        }
+        let mut entries = anchor
+            .dir
+            .read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        entries.sort();
+        for name in entries {
+            if ignored_package_entry_name(&name) {
+                continue;
+            }
+            let child = directory.join(&name);
+            let relative_child = package_relative.join(&name);
+            let relative_text = relative_child.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "non-Unicode path cannot participate in stable identity",
+                )
+            })?;
+            let metadata = anchor.dir.symlink_metadata(&child)?;
+            if metadata.is_dir() {
+                Self::hash_package_relative(anchor, &child, &relative_child, depth + 1, hashes)?;
+            } else if metadata.is_symlink() {
+                let target = anchor.dir.read_link_contents(&child)?;
+                let target = target.to_str().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "non-Unicode path cannot participate in stable identity",
+                    )
+                })?;
+                hashes.add_symlink(relative_text, target);
+            } else if metadata.is_file() {
+                let mut bytes = Vec::new();
+                anchor
+                    .dir
+                    .open(&child)?
+                    .take(hashes.remaining_bytes().saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                hashes.add_regular_file(relative_text, &bytes)?;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Skill package contains an unsupported file type",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn fingerprint_relative(anchor: &Anchor, relative: &Path) -> io::Result<String> {

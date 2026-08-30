@@ -301,6 +301,19 @@ bounded decision fields is not equivalent: it remains immutable and auditable,
 while Setup creates one decision-complete replacement. Both can temporarily
 appear as pending; the Agent presents only the newly returned Plan ID.
 
+The affected scope applies the normal Skill identity rules to the projected
+package after Apply: declared source plus version/revision takes precedence;
+otherwise identity comes from content, excluding `.gitignore`. The content
+projection includes preserved unmanaged files and the normalized bytes of
+managed files that Setup will write. Content-derived identities remain distinct
+when identity-relevant preserved content differs. Package-level before and
+after fingerprints bind that projection to Apply, so drift in preserved files
+fails closed instead of producing a different post-Apply identity. Package
+binding reuses the same depth and byte bounds and excludes `.git`, `target`,
+`node_modules`, and `.DS_Store`, matching Scan's package boundary. Placement
+counts retain every logical Agent target even when filesystem operations share
+one physical root.
+
 Detection is Snapshot-bound and explicit. `existing_skill_root` means the
 Agent's fixed Skill root already exists. `included_session_root` means the
 current completed Snapshot included that Agent's fixed session root while its

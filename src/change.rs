@@ -3,7 +3,7 @@
 //! The module deliberately has no "force" path. A plan is prepared against exact
 //! fingerprints, and every apply/undo obtains the same process write lock.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
@@ -16,6 +16,10 @@ use sha2::{Digest, Sha256};
 
 use crate::anchored_fs::AnchoredFs;
 use crate::durable_fs::{DirectorySync, SystemDirectorySync};
+use crate::package_fingerprint::{
+    MAX_SKILL_PACKAGE_DEPTH, PackageHashBuilder, ignored_package_entry_name,
+    normalized_relative_package_path,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -150,6 +154,16 @@ pub struct PlanInput {
     pub source_updates: Vec<SourceUpdateAction>,
     #[serde(default)]
     pub library_changes: Vec<LibraryChangeAction>,
+    #[serde(default)]
+    pub path_projections: Vec<PathProjection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PathProjection {
+    pub path: PathBuf,
+    pub expected_before_fingerprint: String,
+    pub expected_after_fingerprint: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,6 +313,8 @@ pub struct PreparedPlan {
     pub roster_changes: Vec<RosterChange>,
     pub source_updates: Vec<SourceUpdateAction>,
     pub library_changes: Vec<LibraryChangeAction>,
+    #[serde(default)]
+    pub path_projections: Vec<PathProjection>,
     pub approved_roots: Vec<PathBuf>,
     pub state_dir: PathBuf,
 }
@@ -477,6 +493,14 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
             "Agent-authored Plans must reference Evidence from the latest Snapshot",
         ));
     }
+    if !matches!(ctx.operation_policy, OperationPolicy::BootstrapSetup { .. })
+        && !input.path_projections.is_empty()
+    {
+        return Err(ChangeError::new(
+            "invalid_path_projection",
+            "path projections are reserved for trusted Bootstrap Setup Plans",
+        ));
+    }
 
     let state_dir = canonical_directory(&ctx.state_dir, "state_dir")?;
     let roots = normalize_roots(&ctx.approved_roots, &state_dir)?;
@@ -522,6 +546,7 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
         ));
     }
 
+    let raw_path_projections = input.path_projections;
     let mut targets = HashSet::new();
     let mut operations = Vec::with_capacity(input.operations.len());
     let mut projected_missing = HashSet::new();
@@ -583,15 +608,57 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
         ));
     }
 
-    let digest_payload = serde_json::to_vec(&(
-        input.scan_id.as_str(),
+    let allowed_projection_paths = operations
+        .iter()
+        .filter_map(|operation| bootstrap_skill_directory(operation.target()))
+        .map(Path::to_path_buf)
+        .collect::<HashSet<_>>();
+    let mut projection_paths = HashSet::new();
+    let mut path_projections = Vec::with_capacity(raw_path_projections.len());
+    for projection in raw_path_projections {
+        let path = normalize_target(&projection.path, &roots)?;
+        if !allowed_projection_paths.contains(&path) {
+            return Err(ChangeError::new(
+                "invalid_path_projection",
+                format!(
+                    "Bootstrap projection {} is not a planned fixed package",
+                    path.display()
+                ),
+            ));
+        }
+        if !projection_paths.insert(path.clone()) {
+            return Err(ChangeError::new(
+                "ambiguous_path_projection",
+                format!("multiple projections bind {}", path.display()),
+            ));
+        }
+        let actual = package_fingerprint(&path)?;
+        if actual != projection.expected_before_fingerprint {
+            return Err(ChangeError::new(
+                "plan_drifted",
+                format!(
+                    "{} expected {}, found {actual}",
+                    path.display(),
+                    projection.expected_before_fingerprint
+                ),
+            ));
+        }
+        path_projections.push(PathProjection {
+            path,
+            expected_before_fingerprint: projection.expected_before_fingerprint,
+            expected_after_fingerprint: projection.expected_after_fingerprint,
+        });
+    }
+
+    let digest_payload = plan_digest_payload(
+        &input.scan_id,
         &input.evidence_ids,
         &operations,
         &input.roster_changes,
         &input.source_updates,
         &input.library_changes,
-    ))
-    .map_err(|error| ChangeError::new("plan_encoding_failed", error.to_string()))?;
+        &path_projections,
+    )?;
     let digest = format!("sha256:{}", hex::encode(Sha256::digest(digest_payload)));
     Ok(PreparedPlan {
         id: format!("plan_{}", ulid::Ulid::new()),
@@ -602,6 +669,7 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
         roster_changes: input.roster_changes,
         source_updates: input.source_updates,
         library_changes: input.library_changes,
+        path_projections,
         approved_roots: roots,
         state_dir,
     })
@@ -634,6 +702,7 @@ fn apply_locked_with_anchored(
 ) -> Result<ApplyOutcome> {
     validate_prepared_plan(plan)?;
     run_before_sequence_validation_hook();
+    validate_path_projections_anchored(&plan.path_projections, &anchored, false)?;
     validate_operation_sequence_anchored(&plan.operations, &anchored)?;
     reject_unresolved_recovery_except(&anchored, &plan.state_dir, "")?;
     anchored
@@ -780,6 +849,26 @@ fn apply_locked_with_anchored(
         }
     }
 
+    if let Err(error) = validate_path_projections_anchored(&plan.path_projections, &anchored, true)
+    {
+        receipt.error = Some(error.to_string());
+        let rollback = compensate_all(&receipt, &anchored);
+        receipt.status = if rollback.is_ok() {
+            ReceiptStatus::FailedRolledBack
+        } else {
+            ReceiptStatus::RecoveryRequired
+        };
+        finalize_rollback_results(&mut receipt, rollback.is_ok(), &anchored);
+        if let Err(rollback_error) = rollback {
+            receipt.error = Some(format!("{error}; compensation failed: {rollback_error}"));
+        }
+        persist_journal_with(&receipt, &anchored)?;
+        return Ok(ApplyOutcome {
+            receipt,
+            verification_passed: false,
+        });
+    }
+
     receipt.status = ReceiptStatus::Applied;
     if let Err(error) = persist_journal_with(&receipt, &anchored) {
         receipt.status = ReceiptStatus::RecoveryRequired;
@@ -796,6 +885,43 @@ fn apply_locked_with_anchored(
         receipt,
         verification_passed: true,
     })
+}
+
+fn validate_path_projections_anchored(
+    projections: &[PathProjection],
+    anchored: &AnchoredFs<'_>,
+    after_apply: bool,
+) -> Result<()> {
+    for projection in projections {
+        let expected = if after_apply {
+            &projection.expected_after_fingerprint
+        } else {
+            &projection.expected_before_fingerprint
+        };
+        let actual = anchored
+            .package_fingerprint(&projection.path)
+            .map_err(|error| {
+                ChangeError::io(
+                    "inspect package through approved root handle",
+                    &projection.path,
+                    error,
+                )
+            })?;
+        if actual != *expected {
+            return Err(ChangeError::new(
+                if after_apply {
+                    "plan_postcondition_failed"
+                } else {
+                    "plan_drifted"
+                },
+                format!(
+                    "{} expected {expected}, found {actual}",
+                    projection.path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn undo(receipt: &ChangeReceipt) -> Result<ApplyOutcome> {
@@ -1229,10 +1355,13 @@ fn validate_bootstrap_operation_target(
 }
 
 fn bootstrap_skill_root(target: &Path) -> Option<&Path> {
+    bootstrap_skill_directory(target).and_then(Path::parent)
+}
+
+fn bootstrap_skill_directory(target: &Path) -> Option<&Path> {
     target
         .ancestors()
         .find(|ancestor| ancestor.file_name() == Some(OsStr::new("skillroster")))
-        .and_then(Path::parent)
 }
 
 fn validate_current_state(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
@@ -1983,16 +2112,48 @@ fn remove_expected_anchored_file_if_present(
         .map_err(|error| ChangeError::io(action, path, error))
 }
 
+fn plan_digest_payload(
+    scan_id: &str,
+    evidence_ids: &[String],
+    operations: &[Operation],
+    roster_changes: &[RosterChange],
+    source_updates: &[SourceUpdateAction],
+    library_changes: &[LibraryChangeAction],
+    path_projections: &[PathProjection],
+) -> Result<Vec<u8>> {
+    if path_projections.is_empty() {
+        serde_json::to_vec(&(
+            scan_id,
+            evidence_ids,
+            operations,
+            roster_changes,
+            source_updates,
+            library_changes,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            scan_id,
+            evidence_ids,
+            operations,
+            roster_changes,
+            source_updates,
+            library_changes,
+            path_projections,
+        ))
+    }
+    .map_err(|error| ChangeError::new("plan_encoding_failed", error.to_string()))
+}
+
 fn validate_prepared_plan(plan: &PreparedPlan) -> Result<()> {
-    let payload = serde_json::to_vec(&(
-        plan.scan_id.as_str(),
+    let payload = plan_digest_payload(
+        &plan.scan_id,
         &plan.evidence_ids,
         &plan.operations,
         &plan.roster_changes,
         &plan.source_updates,
         &plan.library_changes,
-    ))
-    .map_err(|e| ChangeError::new("plan_encoding_failed", e.to_string()))?;
+        &plan.path_projections,
+    )?;
     let actual = format!("sha256:{}", hex::encode(Sha256::digest(payload)));
     if actual != plan.digest {
         return Err(ChangeError::new(
@@ -2058,6 +2219,167 @@ pub fn fingerprint(path: &Path) -> Result<String> {
         "unsupported_file_type",
         format!("{} is not a file, directory, or symlink", path.display()),
     ))
+}
+
+pub fn package_fingerprint(directory: &Path) -> Result<String> {
+    projected_package_fingerprint(directory, &BTreeMap::new())
+}
+
+pub fn projected_package_fingerprint(
+    directory: &Path,
+    regular_file_overrides: &BTreeMap<PathBuf, String>,
+) -> Result<String> {
+    let regular_file_overrides = regular_file_overrides
+        .iter()
+        .map(|(relative_path, content)| {
+            normalized_relative_package_path(relative_path)
+                .map(|relative_path| (relative_path, content.clone()))
+                .map_err(|_| {
+                    ChangeError::new(
+                        "invalid_path_projection",
+                        "projected file path must be a normalized relative path",
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ChangeError::io(
+                "inspect projected package",
+                directory,
+                error,
+            ));
+        }
+    };
+    if metadata.as_ref().is_some_and(|metadata| !metadata.is_dir()) {
+        return Err(ChangeError::new(
+            "unsupported_file_type",
+            format!("{} is not a directory", directory.display()),
+        ));
+    }
+    if metadata.is_none() && regular_file_overrides.is_empty() {
+        return Ok("missing".into());
+    }
+
+    let mut hashes = PackageHashBuilder::new();
+    project_package_files(
+        directory,
+        Path::new(""),
+        0,
+        &regular_file_overrides,
+        &mut hashes,
+    )?;
+    Ok(format!("package:sha256:{}", hashes.finish().digest))
+}
+
+fn project_package_files(
+    path: &Path,
+    relative_path: &Path,
+    depth: usize,
+    regular_file_overrides: &BTreeMap<PathBuf, String>,
+    hashes: &mut PackageHashBuilder,
+) -> Result<()> {
+    if depth > MAX_SKILL_PACKAGE_DEPTH {
+        return Err(ChangeError::new(
+            "package_fingerprint_bounded",
+            format!("Skill package fingerprint exceeds depth {MAX_SKILL_PACKAGE_DEPTH}"),
+        ));
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(ChangeError::io("inspect projected path", path, error)),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    if metadata.is_some() {
+        names.extend(
+            fs::read_dir(path)
+                .map_err(|error| ChangeError::io("read projected directory", path, error))?
+                .map(|entry| {
+                    entry
+                        .map(|entry| entry.file_name())
+                        .map_err(|error| ChangeError::io("read projected directory", path, error))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    for override_path in regular_file_overrides.keys() {
+        let Ok(remainder) = override_path.strip_prefix(relative_path) else {
+            continue;
+        };
+        if let Some(Component::Normal(name)) = remainder.components().next() {
+            names.insert(name.to_os_string());
+        }
+    }
+    for name in names {
+        if ignored_package_entry_name(&name) {
+            continue;
+        }
+        let child = path.join(&name);
+        let relative_child = relative_path.join(&name);
+        let relative_text = relative_child.to_str().ok_or_else(|| {
+            ChangeError::new(
+                "non_unicode_identity_path",
+                "non-Unicode path cannot participate in stable identity",
+            )
+        })?;
+        if let Some(content) = regular_file_overrides.get(&relative_child) {
+            hashes
+                .add_regular_file(relative_text, content.as_bytes())
+                .map_err(|error| ChangeError::io("hash projected package", &child, error))?;
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&child) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ChangeError::io("inspect projected path", &child, error)),
+        };
+        if metadata.as_ref().is_some_and(|metadata| metadata.is_dir())
+            || (metadata.is_none()
+                && regular_file_overrides
+                    .keys()
+                    .any(|override_path| override_path.starts_with(&relative_child)))
+        {
+            project_package_files(
+                &child,
+                &relative_child,
+                depth + 1,
+                regular_file_overrides,
+                hashes,
+            )?;
+        } else if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.file_type().is_symlink())
+        {
+            let target = fs::read_link(&child)
+                .map_err(|error| ChangeError::io("read projected symlink", &child, error))?;
+            let target = target.to_str().ok_or_else(|| {
+                ChangeError::new(
+                    "non_unicode_identity_path",
+                    "non-Unicode path cannot participate in stable identity",
+                )
+            })?;
+            hashes.add_symlink(relative_text, target);
+        } else if metadata.as_ref().is_some_and(|metadata| metadata.is_file()) {
+            let mut bytes = Vec::new();
+            File::open(&child)
+                .map_err(|error| ChangeError::io("open projected package file", &child, error))?
+                .take(hashes.remaining_bytes().saturating_add(1))
+                .read_to_end(&mut bytes)
+                .map_err(|error| ChangeError::io("read projected package file", &child, error))?;
+            hashes
+                .add_regular_file(relative_text, &bytes)
+                .map_err(|error| ChangeError::io("hash projected package", &child, error))?;
+        } else if metadata.is_some() {
+            return Err(ChangeError::new(
+                "unsupported_file_type",
+                format!("{} is not a file, directory, or symlink", child.display()),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_roots(roots: &[PathBuf], state_dir: &Path) -> Result<Vec<PathBuf>> {
@@ -2693,6 +3015,104 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unsupported.code, "unsupported_plan_schema");
+    }
+
+    #[test]
+    fn projected_package_fingerprint_matches_the_materialized_tree() {
+        let (_temp, root, _state) = fixture();
+        let package = root.join("skillroster");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("notes.local.md"), "preserved\n").unwrap();
+        let overrides = BTreeMap::from([
+            (PathBuf::from("SKILL.md"), "managed entrypoint\n".into()),
+            (
+                PathBuf::from("references/routing.md"),
+                "managed reference\n".into(),
+            ),
+        ]);
+
+        let projected = projected_package_fingerprint(&package, &overrides).unwrap();
+        fs::create_dir(package.join("references")).unwrap();
+        for (relative_path, content) in overrides {
+            fs::write(package.join(relative_path), content).unwrap();
+        }
+
+        assert_eq!(projected, package_fingerprint(&package).unwrap());
+    }
+
+    #[test]
+    fn package_projection_rejects_content_beyond_the_scan_byte_bound() {
+        let (_temp, root, _state) = fixture();
+        let package = root.join("skillroster");
+        fs::create_dir(&package).unwrap();
+        File::create(package.join("oversized.bin"))
+            .unwrap()
+            .set_len(crate::package_fingerprint::MAX_SKILL_PACKAGE_BYTES + 1)
+            .unwrap();
+
+        let error = package_fingerprint(&package).unwrap_err();
+
+        assert!(error.to_string().contains("byte fingerprint safety limit"));
+    }
+
+    #[test]
+    fn bootstrap_apply_rolls_back_when_package_projection_drifts_during_apply() {
+        let (_temp, root, state) = fixture();
+        let package = root.join("skillroster");
+        fs::create_dir(&package).unwrap();
+        let extra = package.join("notes.local.md");
+        fs::write(&extra, "before\n").unwrap();
+        let target = package.join("SKILL.md");
+        let overrides = BTreeMap::from([(PathBuf::from("SKILL.md"), "managed\n".into())]);
+        let input = serde_json::json!({
+            "schema_version": 1,
+            "scan_id": "scan_1",
+            "operations": [{
+                "kind": "write_file",
+                "target": target,
+                "content": "managed\n",
+                "expected_fingerprint": "missing"
+            }],
+            "path_projections": [{
+                "path": package,
+                "expected_before_fingerprint": package_fingerprint(&package).unwrap(),
+                "expected_after_fingerprint": projected_package_fingerprint(&package, &overrides).unwrap()
+            }]
+        })
+        .to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::BootstrapSetup {
+                    missing_skill_roots: vec![],
+                },
+            },
+        )
+        .unwrap();
+        BEFORE_EXECUTE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(extra, "after\n").unwrap();
+            }));
+        });
+
+        let outcome = apply(&plan).unwrap();
+
+        assert!(!outcome.verification_passed);
+        assert_eq!(outcome.receipt.status, ReceiptStatus::FailedRolledBack);
+        assert!(
+            outcome
+                .receipt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("plan_postcondition_failed"))
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(package.join("notes.local.md")).unwrap(),
+            "after\n"
+        );
     }
 
     #[test]

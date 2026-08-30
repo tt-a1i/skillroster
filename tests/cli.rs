@@ -5423,6 +5423,12 @@ fn setup_treats_a_package_with_no_managed_files_as_missing_and_preserves_extra_f
     assert_eq!(setup["result"]["operation_count"], 5);
     assert_eq!(setup["result"]["affected"]["agent_count"], 1);
     assert_eq!(setup["result"]["affected"]["agents"], json!(["codex"]));
+    assert_eq!(setup["result"]["affected"]["skill_count"], 1);
+    let projected_skill_id = setup["result"]["affected"]["skill_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(setup["result"]["affected"]["placement_count"], 1);
     let applied = json_output(&run(
         &[
             &common[..],
@@ -5434,6 +5440,17 @@ fn setup_treats_a_package_with_no_managed_files_as_missing_and_preserves_extra_f
     assert_eq!(fs::read_to_string(&extra).unwrap(), "keep me\n");
     assert!(package.join("SKILL.md").is_file());
     assert!(package.join("references/mutation.md").is_file());
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let observed_skill_id: String = database
+        .query_row(
+            "SELECT id FROM skills WHERE name = 'skillroster' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(projected_skill_id, observed_skill_id);
+    drop(database);
 
     let undone = json_output(&run(
         &[
@@ -5447,6 +5464,184 @@ fn setup_treats_a_package_with_no_managed_files_as_missing_and_preserves_extra_f
     assert_eq!(fs::read_to_string(&extra).unwrap(), "keep me\n");
     assert!(!package.join("SKILL.md").exists());
     assert!(!package.join("references").exists());
+}
+
+#[test]
+fn setup_apply_fails_closed_when_a_preserved_file_changes_after_planning() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let package = home.join(".codex/skills/skillroster");
+    fs::create_dir_all(&package).unwrap();
+    let extra = package.join("notes.local.md");
+    fs::write(&extra, "before\n").unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    let plan_id = setup["result"]["plan_id"].as_str().unwrap();
+    let detail = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(
+        detail["result"]["path_projections"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    fs::write(&extra, "after\n").unwrap();
+    let blocked = run(&[&common[..], &["apply", plan_id]].concat(), None);
+
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["code"], "plan_drifted");
+    assert_eq!(fs::read_to_string(&extra).unwrap(), "after\n");
+    assert!(!package.join("SKILL.md").exists());
+    assert!(!package.join("references").exists());
+    let status = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status["result"]["pending_plan_count"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn setup_projection_ignores_bounded_package_exclusions() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let package = home.join(".codex/skills/skillroster");
+    let dependencies = package.join("node_modules");
+    fs::create_dir_all(&dependencies).unwrap();
+    let fifo = dependencies.join("ignored.fifo");
+    let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_eq!(setup["result"]["affected"]["skill_count"], 1);
+    assert_eq!(setup["result"]["files_changed"], false);
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert!(package.join("SKILL.md").is_file());
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+}
+
+#[test]
+fn setup_reports_each_distinct_projected_identity_when_preserved_extras_differ() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let roots = [
+        home.join(".codex/skills"),
+        home.join(".config/opencode/skills"),
+    ];
+    for (index, root) in roots.iter().enumerate() {
+        let package = root.join("skillroster");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("notes.local.md"),
+            format!("preserved variant {index}\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+    assert_eq!(setup["result"]["state"], "preview_ready");
+    assert_eq!(setup["result"]["affected"]["agent_count"], 2);
+    assert_eq!(setup["result"]["affected"]["placement_count"], 2);
+    assert_eq!(setup["result"]["affected"]["skill_count"], 2);
+    let projected_skill_ids = setup["result"]["affected"]["skill_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(projected_skill_ids.len(), 2);
+
+    let applied = json_output(&run(
+        &[
+            &common[..],
+            &["apply", setup["result"]["plan_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let mut statement = database
+        .prepare("SELECT id FROM skills WHERE name = 'skillroster' ORDER BY id")
+        .unwrap();
+    let observed_skill_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(projected_skill_ids, observed_skill_ids);
+    drop(statement);
+    drop(database);
+
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    for (index, root) in roots.iter().enumerate() {
+        let package = root.join("skillroster");
+        assert_eq!(
+            fs::read_to_string(package.join("notes.local.md")).unwrap(),
+            format!("preserved variant {index}\n")
+        );
+        assert!(!package.join("SKILL.md").exists());
+        assert!(!package.join("references").exists());
+    }
 }
 
 #[cfg(unix)]
@@ -5560,6 +5755,16 @@ fn setup_deduplicates_shared_agent_roots_and_undo_restores_each_physical_root() 
             "pi"
         ])
     );
+    assert_eq!(setup["result"]["affected"]["skill_count"], 1);
+    assert_eq!(
+        setup["result"]["affected"]["skill_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(setup["result"]["affected"]["skill_ids_truncated"], false);
+    assert_eq!(setup["result"]["affected"]["placement_count"], 8);
 
     let plan_id = setup["result"]["plan_id"].as_str().unwrap();
     let detail = json_output(&run(
@@ -5870,7 +6075,7 @@ fn setup_does_not_reuse_an_incomplete_legacy_plan_summary() {
 }
 
 #[test]
-fn setup_does_not_reuse_a_legacy_zero_affected_agent_summary() {
+fn setup_does_not_reuse_a_legacy_incomplete_affected_summary() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -5898,10 +6103,21 @@ fn setup_does_not_reuse_a_legacy_zero_affected_agent_summary() {
     let mut legacy: Value = serde_json::from_str(&immutable).unwrap();
     legacy["input"]["summary"]["affected"]["agent_count"] = json!(0);
     legacy["input"]["summary"]["affected"]["agents"] = json!([]);
+    legacy["input"]["summary"]["affected"]["skill_count"] = json!(0);
+    legacy["input"]["summary"]["affected"]["skill_ids"] = json!([]);
+    legacy["input"]["summary"]["affected"]["placement_count"] = json!(0);
     legacy["input"]["reuse_identity"]
         .as_object_mut()
         .unwrap()
         .remove("affected_agents");
+    legacy["input"]["reuse_identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("affected_skill_ids");
+    legacy["input"]["reuse_identity"]
+        .as_object_mut()
+        .unwrap()
+        .remove("affected_placement_count");
     database
         .execute(
             "UPDATE plans SET immutable_json = ?1 WHERE id = ?2",
@@ -5915,6 +6131,15 @@ fn setup_does_not_reuse_a_legacy_zero_affected_agent_summary() {
     assert_ne!(retry["result"]["plan_id"], first["result"]["plan_id"]);
     assert_eq!(retry["result"]["affected"]["agent_count"], 1);
     assert_eq!(retry["result"]["affected"]["agents"], json!(["codex"]));
+    assert_eq!(retry["result"]["affected"]["skill_count"], 1);
+    assert_eq!(
+        retry["result"]["affected"]["skill_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(retry["result"]["affected"]["placement_count"], 1);
     assert!(!root.join("skillroster").exists());
 }
 

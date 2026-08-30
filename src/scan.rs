@@ -2,6 +2,12 @@ use crate::harness::{
     AgentKind, SessionSignal, SkillDiscoverySemantics, known_agent_roots,
     session_record_observations,
 };
+#[cfg(test)]
+use crate::package_fingerprint::MAX_SKILL_PACKAGE_BYTES;
+use crate::package_fingerprint::{
+    MAX_SKILL_FILE_BYTES, MAX_SKILL_PACKAGE_DEPTH, PackageHashBuilder, PackageHashes,
+    ignored_package_entry_name, normalized_relative_package_path,
+};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,8 +20,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const MAX_SKILL_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_SKILL_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
 pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-unicode-v2";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_ROOT: usize = 10_000;
@@ -1988,10 +1992,8 @@ fn materialize_candidates_with_hook(
             ));
             executable_files.clear();
         };
-        let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
-            (Some(source), Some(version), _) => format!("source:{source}@{version}"),
-            (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
-            _ if safe_to_read && !content.is_empty() => {
+        let identity_basis = declared_skill_identity_basis(&metadata).unwrap_or_else(|| {
+            if safe_to_read && !content.is_empty() {
                 content_identity_digest.as_ref().map_or_else(
                     || {
                         let entrypoint = candidate
@@ -2002,15 +2004,14 @@ fn materialize_candidates_with_hook(
                     },
                     |identity| format!("content:{identity}"),
                 )
-            }
-            _ => {
+            } else {
                 let entrypoint = candidate
                     .entrypoint
                     .to_str()
                     .expect("discovery excludes non-Unicode entrypoints");
                 format!("unreadable-link:{entrypoint}")
             }
-        };
+        });
         let skill_id = format!("skill_{}", stable_digest(identity_basis.as_bytes()));
         let name = metadata
             .name
@@ -2317,6 +2318,16 @@ fn stable_digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn declared_skill_identity_basis(metadata: &SkillMetadata) -> Option<String> {
+    Some(
+        match (&metadata.source, &metadata.version, &metadata.revision) {
+            (Some(source), Some(version), _) => format!("source:{source}@{version}"),
+            (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
+            _ => return None,
+        },
+    )
+}
+
 #[derive(Debug)]
 struct PackageFingerprint {
     digest: String,
@@ -2437,7 +2448,8 @@ fn package_file_checkpoints(
 
 fn package_checkpoint(directory: &Path) -> io::Result<Option<Vec<PackageFileCheckpoint>>> {
     let mut files = Vec::new();
-    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    let complete =
+        collect_skill_files(directory, directory, 0, MAX_SKILL_PACKAGE_DEPTH, &mut files)?;
     if !complete {
         return Ok(None);
     }
@@ -2479,61 +2491,17 @@ fn executable_files_from_checkpoints(checkpoints: &[PackageFileCheckpoint]) -> V
 
 fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
     let mut files = Vec::new();
-    let complete = collect_skill_files(directory, directory, 0, 8, &mut files)?;
+    let complete =
+        collect_skill_files(directory, directory, 0, MAX_SKILL_PACKAGE_DEPTH, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
     let checkpoints = package_file_checkpoints(&files)?;
     let executable_relative_files = executable_files_from_checkpoints(&checkpoints);
-
-    let mut digest = Sha256::new();
-    let mut content_identity_digest = Sha256::new();
-    let mut total_bytes = 0_u64;
-    for (relative_path, path, file_type) in files {
-        let is_source_control_metadata = relative_path == Path::new(".gitignore");
-        let relative_path_bytes = relative_path
-            .to_str()
-            .expect("package checkpoints reject non-Unicode paths");
-        digest.update(relative_path_bytes.as_bytes());
-        digest.update([0]);
-        if !is_source_control_metadata {
-            content_identity_digest.update(relative_path_bytes.as_bytes());
-            content_identity_digest.update([0]);
-        }
-        if file_type.is_symlink() {
-            let target = fs::read_link(path)?;
-            let target = target
-                .to_str()
-                .ok_or_else(|| non_unicode_identity_error(1))?;
-            digest.update(b"symlink\0");
-            digest.update(target.as_bytes());
-            if !is_source_control_metadata {
-                content_identity_digest.update(b"symlink\0");
-                content_identity_digest.update(target.as_bytes());
-            }
-        } else {
-            let metadata = fs::metadata(&path)?;
-            total_bytes = total_bytes.saturating_add(metadata.len());
-            if total_bytes > MAX_SKILL_PACKAGE_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "package exceeds {MAX_SKILL_PACKAGE_BYTES} byte fingerprint safety limit"
-                    ),
-                ));
-            }
-            let bytes = fs::read(path)?;
-            digest.update(&bytes);
-            if !is_source_control_metadata {
-                content_identity_digest.update(&bytes);
-            }
-        }
-        digest.update([0xff]);
-        if !is_source_control_metadata {
-            content_identity_digest.update([0xff]);
-        }
-    }
+    let hashes = hash_package_files(files.into_iter().map(|(relative_path, path, file_type)| {
+        (relative_path, ProjectedPackageFile::Disk(path, file_type))
+    }))?;
     Ok(PackageFingerprint {
-        digest: format!("{:x}", digest.finalize()),
-        content_identity_digest: format!("{:x}", content_identity_digest.finalize()),
+        digest: hashes.digest,
+        content_identity_digest: hashes.content_identity_digest,
         completeness: if complete {
             FingerprintCompleteness::Complete
         } else {
@@ -2543,6 +2511,94 @@ fn digest_skill_directory(directory: &Path) -> io::Result<PackageFingerprint> {
         checkpoint: complete.then_some(checkpoints),
         executable_relative_files,
     })
+}
+
+pub(crate) fn projected_skill_id(
+    directory: &Path,
+    regular_file_overrides: &BTreeMap<PathBuf, String>,
+) -> io::Result<String> {
+    let mut observed_files = Vec::new();
+    let complete = if directory.exists() {
+        collect_skill_files(
+            directory,
+            directory,
+            0,
+            MAX_SKILL_PACKAGE_DEPTH,
+            &mut observed_files,
+        )?
+    } else {
+        true
+    };
+    if !complete {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "projected Skill package fingerprint is bounded at depth 8",
+        ));
+    }
+
+    let mut files = observed_files
+        .into_iter()
+        .map(|(relative_path, path, file_type)| {
+            (relative_path, ProjectedPackageFile::Disk(path, file_type))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (relative_path, content) in regular_file_overrides {
+        let relative_path = normalized_relative_package_path(relative_path).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "projected Skill override path must be a relative package path",
+            )
+        })?;
+        files.insert(relative_path, ProjectedPackageFile::Regular(content));
+    }
+    let hashes = hash_package_files(files)?;
+    let skill_markdown = hashes.skill_markdown.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "projected Skill package has no SKILL.md entrypoint",
+        )
+    })?;
+    let metadata = parse_skill_markdown(&skill_markdown);
+    let identity_basis = declared_skill_identity_basis(&metadata)
+        .unwrap_or_else(|| format!("content:{}", hashes.content_identity_digest));
+    Ok(format!(
+        "skill_{}",
+        stable_digest(identity_basis.as_bytes())
+    ))
+}
+
+enum ProjectedPackageFile<'a> {
+    Disk(PathBuf, fs::FileType),
+    Regular(&'a str),
+}
+
+fn hash_package_files<'a>(
+    files: impl IntoIterator<Item = (PathBuf, ProjectedPackageFile<'a>)>,
+) -> io::Result<PackageHashes> {
+    let mut hashes = PackageHashBuilder::new();
+    for (relative_path, file) in files {
+        let relative_path_text = unicode_identity_path(&relative_path)?;
+        if let ProjectedPackageFile::Disk(path, file_type) = &file {
+            if file_type.is_symlink() {
+                let target = fs::read_link(path)?;
+                let target = unicode_identity_path(&target)?;
+                hashes.add_symlink(relative_path_text, target);
+                continue;
+            }
+        }
+        let bytes = match file {
+            ProjectedPackageFile::Disk(path, _) => {
+                let mut bytes = Vec::new();
+                File::open(path)?
+                    .take(hashes.remaining_bytes().saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+                bytes
+            }
+            ProjectedPackageFile::Regular(content) => content.as_bytes().to_vec(),
+        };
+        hashes.add_regular_file(relative_path_text, &bytes)?;
+    }
+    Ok(hashes.finish())
 }
 
 fn collect_skill_files(
@@ -2560,10 +2616,7 @@ fn collect_skill_files(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name();
-        if matches!(
-            name.to_str(),
-            Some(".git" | "target" | "node_modules" | ".DS_Store")
-        ) {
+        if ignored_package_entry_name(&name) {
             continue;
         }
         let path = entry.path();
@@ -3510,11 +3563,8 @@ pub(crate) fn inspect_skill_identity(entrypoint: &Path) -> io::Result<(String, S
         ));
     }
     let digest = fingerprint.digest;
-    let identity_basis = match (&metadata.source, &metadata.version, &metadata.revision) {
-        (Some(source), Some(version), _) => format!("source:{source}@{version}"),
-        (Some(source), _, Some(revision)) => format!("source:{source}@{revision}"),
-        _ => format!("content:{}", fingerprint.content_identity_digest),
-    };
+    let identity_basis = declared_skill_identity_basis(&metadata)
+        .unwrap_or_else(|| format!("content:{}", fingerprint.content_identity_digest));
     Ok((
         format!("skill_{}", stable_digest(identity_basis.as_bytes())),
         digest,
@@ -4819,6 +4869,38 @@ enabled = true
         assert_ne!(first_id, changed_id);
         let changed = scan(&options).unwrap();
         assert_eq!(changed.skills.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn projected_package_identity_matches_post_overlay_scan_with_crlf_and_extras() {
+        let root = temp_directory("projected-package-identity");
+        let skill = root.join("skillroster");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("references/routing.md"), "Routing.\r\n").unwrap();
+        fs::write(skill.join("notes.local.md"), "Preserved local note.\n").unwrap();
+        let overrides = BTreeMap::from([
+            (
+                PathBuf::from("SKILL.md"),
+                "---\nname: skillroster\ndescription: Fixture\n---\nInstructions.\n".into(),
+            ),
+            (
+                PathBuf::from("references/governance.md"),
+                "Governance.\n".into(),
+            ),
+            (
+                PathBuf::from("references/mutation.md"),
+                "Mutation.\n".into(),
+            ),
+        ]);
+
+        let predicted = projected_skill_id(&skill, &overrides).unwrap();
+        for (relative_path, content) in &overrides {
+            fs::write(skill.join(relative_path), content).unwrap();
+        }
+        let (observed, _) = inspect_skill_identity(&skill.join("SKILL.md")).unwrap();
+
+        assert_eq!(predicted, observed);
         fs::remove_dir_all(root).unwrap();
     }
 
