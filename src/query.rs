@@ -2717,11 +2717,7 @@ pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
         .match_reasons
         .iter()
         .any(|reason| matches!(reason.as_str(), "exact_name" | "declared_trigger"));
-    let has_complete_name_tokens = {
-        let name_token_count = tokens(&matched.name).len();
-        name_token_count > 0
-            && match_reason_count(matched, "name_tokens:") == Some(name_token_count)
-    };
+    let has_complete_name_tokens = has_complete_name_token_evidence(matched);
     let has_specific_description_phrase = matched
         .match_reasons
         .iter()
@@ -2731,11 +2727,14 @@ pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
 }
 
 fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
-    let has_complete_single_token_name = tokens(&matched.name).len() == 1
-        && match_reason_count(matched, "name_tokens:").is_some_and(|count| count == 1);
     has_direct_metadata_reason(matched)
-        || has_complete_single_token_name
+        || has_complete_name_token_evidence(matched)
         || match_reason_count(matched, "trigger_tokens:").is_some_and(|count| count >= 2)
+}
+
+fn has_complete_name_token_evidence(matched: &FindMatch) -> bool {
+    let name_token_count = tokens(&matched.name).len();
+    name_token_count > 0 && match_reason_count(matched, "name_tokens:") == Some(name_token_count)
 }
 
 fn has_direct_metadata_reason(matched: &FindMatch) -> bool {

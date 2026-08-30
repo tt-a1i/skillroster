@@ -1805,6 +1805,73 @@ fn public_find_does_not_treat_part_of_a_multi_token_name_as_direct_hint_evidence
 }
 
 #[test]
+fn public_find_prefers_a_complete_multi_token_name_hint_over_broad_native_overlap() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "simplify-codebase",
+            "---\nname: simplify-codebase\ndescription: Remove accidental codebase complexity through evidence-backed simplification.\n---\n",
+        ),
+        (
+            "workflow-manager",
+            "---\nname: workflow-manager\ndescription: 管理代码库复杂。\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let task = "分析当前代码库有哪些不必要的复杂度，提出最小化方案";
+    let unhinted = json_output(&run(
+        &[&common[..], &["find", task, "--limit", "3"]].concat(),
+        None,
+    ));
+    assert_eq!(unhinted["result"]["matches"][0]["name"], "workflow-manager");
+
+    let hinted = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                task,
+                "--hint",
+                "simplify codebase accidental complexity",
+                "--load",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(hinted["result"]["matches"][0]["name"], "simplify-codebase");
+    assert_eq!(hinted["result"]["matches"][0]["augmented_channel_rank"], 1);
+    assert!(
+        hinted["result"]["matches"][0]["match_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "name_tokens:2")
+    );
+    assert_eq!(
+        hinted["result"]["loaded_skill"]["selection"]["name"],
+        "simplify-codebase"
+    );
+}
+
+#[test]
 fn public_find_respects_a_chinese_do_not_use_clause() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
