@@ -18,6 +18,7 @@ pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
 const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "不要", "也不要"];
+const TASK_EXCLUSION_CONTEXT_TOKENS: &[&str] = &["code", "代码"];
 const TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT: usize = 10;
 
 fn normalize_skill_name(name: &str) -> String {
@@ -1928,18 +1929,8 @@ pub(crate) fn find_matching_with_evidence(
     }
     let query_tokens = tokens(&query_text);
     let positive_task_tokens = tokens(&query.positive_task_text);
-    let excluded_task_tokens = tokens(
-        &query
-            .excluded_task_phrases
-            .iter()
-            .map(|phrase| task_exclusion_body(phrase))
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
-    let excluded_only_task_tokens = excluded_task_tokens
-        .difference(&positive_task_tokens)
-        .cloned()
-        .collect::<BTreeSet<_>>();
+    let excluded_only_task_tokens =
+        task_exclusion_capability_tokens(&query.excluded_task_phrases, &positive_task_tokens);
     let query_phrases = query
         .phrases
         .iter()
@@ -2594,6 +2585,42 @@ fn task_routing_sections(task: &str) -> (String, Vec<String>) {
 
 fn task_exclusion_body(section: &str) -> &str {
     task_exclusion_marker(section).map_or(section, |marker| section[marker.len()..].trim())
+}
+
+fn task_exclusion_capability_tokens(
+    phrases: &[String],
+    positive_task_tokens: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    phrases
+        .iter()
+        .flat_map(|phrase| {
+            let body = task_exclusion_body(phrase);
+            let mut clause_tokens = tokens(body)
+                .difference(positive_task_tokens)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if clause_tokens.len() > 1 {
+                for context_token in TASK_EXCLUSION_CONTEXT_TOKENS {
+                    if task_exclusion_context_token_is_object(body, context_token) {
+                        clause_tokens.remove(*context_token);
+                    }
+                }
+            }
+            clause_tokens
+        })
+        .collect()
+}
+
+fn task_exclusion_context_token_is_object(body: &str, context_token: &str) -> bool {
+    if context_token.is_ascii() {
+        body.split(|character: char| !character.is_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .position(|part| part.eq_ignore_ascii_case(context_token))
+            .is_some_and(|position| position > 0)
+    } else {
+        body.find(context_token)
+            .is_some_and(|position| !body[..position].trim().is_empty())
+    }
 }
 
 fn task_exclusion_marker(section: &str) -> Option<&'static str> {

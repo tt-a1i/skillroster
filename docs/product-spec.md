@@ -344,6 +344,13 @@ Terms already present in the positive task remain shared object evidence; only
 the constraint-specific remainder may exclude a Skill whose positive name,
 trigger, or description declares the prohibited capability. Agent-authored
 hints remain separate positive evidence and cannot cancel a task exclusion.
+Within one bounded exclusion clause, `code` and `代码` remain shared task-object
+context when the same clause contains another searchable constraint token and
+the object follows earlier constraint material;
+they cannot by themselves exclude review or analysis Skills. When either is
+the clause's only capability token or leads the clause, it remains an effective
+exclusion. This filter is applied independently to each exclusion clause so
+one constraint cannot weaken another.
 `task_exclusion_effects` reports the exact affected candidate count plus a
 deterministic preview of at most 10 affected Skill identities, ordered by name
 and opaque Skill ID. Each preview item contains only the name, opaque ID, and

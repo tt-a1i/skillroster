@@ -1810,6 +1810,212 @@ fn public_find_does_not_route_to_an_english_do_not_constraint() {
 }
 
 #[test]
+fn public_find_keeps_shared_task_objects_out_of_capability_exclusions() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "code-review",
+            "---\nname: code-review\ndescription: Review code for correctness and defects. 审查代码正确性和缺陷。\n---\n",
+        ),
+        (
+            "simplify-codebase",
+            "---\nname: simplify-codebase\ndescription: Simplify and refactor code for maintainability. 简化和重构代码。\n---\n",
+        ),
+        (
+            "impact-gated-pr",
+            "---\nname: impact-gated-pr\ndescription: Run pull request workflows and compatibility review.\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let baseline = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Review this Rust release PR for correctness",
+                "--hint",
+                "code review",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let constrained = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Review this Rust release PR for correctness; do not simplify or refactor the code",
+                "--hint",
+                "code review",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let constrained_cjk = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "审查这个 Rust 发布 PR 的正确性，不要简化或重构代码",
+                "--hint",
+                "code review",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(baseline["result"]["matches"][0]["name"], "code-review");
+    assert_eq!(constrained["result"]["matches"][0]["name"], "code-review");
+    let names = constrained["result"]["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|matched| matched["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!names.contains(&"simplify-codebase"));
+    assert_eq!(
+        constrained["result"]["task_exclusions"],
+        json!(["do not simplify or refactor the code"])
+    );
+    let affected_names = constrained["result"]["task_exclusion_effects"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(affected_names.contains(&"simplify-codebase"));
+    assert!(!affected_names.contains(&"code-review"));
+    assert_eq!(constrained["result"]["files_changed"], false);
+    assert_eq!(
+        constrained_cjk["result"]["matches"][0]["name"],
+        "code-review"
+    );
+    assert!(
+        constrained_cjk["result"]["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|matched| matched["name"] != "simplify-codebase")
+    );
+    let affected_cjk_names = constrained_cjk["result"]["task_exclusion_effects"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(affected_cjk_names.contains(&"simplify-codebase"));
+    assert!(!affected_cjk_names.contains(&"code-review"));
+}
+
+#[test]
+fn public_find_keeps_single_token_exclusions_independent_across_clauses() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (directory, contents) in [
+        (
+            "inspect-worktree",
+            "---\nname: inspect-worktree\ndescription: Inspect worktree problems.\n---\n",
+        ),
+        (
+            "code-action",
+            "---\nname: code-action\ndescription: Code.\n---\n",
+        ),
+        (
+            "publish-action",
+            "---\nname: publish-action\ndescription: Publish.\n---\n",
+        ),
+    ] {
+        let path = skill_root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), contents).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Inspect worktree problems; do not code; do not publish",
+                "--hint",
+                "code publish",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    let coordinated = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "Inspect worktree problems; do not code or publish",
+                "--hint",
+                "code publish",
+                "--limit",
+                "3",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+
+    assert_eq!(found["result"]["matches"][0]["name"], "inspect-worktree");
+    let affected_names = found["result"]["task_exclusion_effects"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(affected_names, vec!["code-action", "publish-action"]);
+    let coordinated_affected_names = coordinated["result"]["task_exclusion_effects"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|effect| effect["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        coordinated_affected_names,
+        vec!["code-action", "publish-action"]
+    );
+}
+
+#[test]
 fn public_find_task_exclusion_constrains_a_conflicting_agent_hint() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
