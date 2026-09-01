@@ -94,8 +94,10 @@ contains four archives and four adjacent checksum files:
 | `x86_64-pc-windows-msvc` | `b2b8cb46f8c386ffab4160d0fc798bdd14707b1cab8f30dc336fb437406ca412` |
 | `x86_64-unknown-linux-gnu` | `608d5cb4884d2f02d52a42635c099c99c1dd4fa539a47e9498e5651970f4a407` |
 
-All adjacent checksums passed. Every archive contained only its versioned
-directory, binary, README, and LICENSE; each README and LICENSE matched the
+All adjacent checksums passed. Every archive kept its binary, README, and
+LICENSE under one versioned top-level directory or path prefix; the tar archives
+also contained an explicit directory entry, while the Windows ZIP contained
+only the three prefixed payload entries. Each README and LICENSE matched the
 checked-in Git blob byte-for-byte. The public asset inventory contained exactly
 those eight files. An anonymous macOS arm64 download matched its adjacent
 checksum and the tag-workflow artifact byte-for-byte, reported
