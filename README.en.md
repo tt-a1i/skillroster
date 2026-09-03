@@ -85,6 +85,9 @@ brew install tt-a1i/skillroster/skillroster
 skillroster --version
 ```
 
+Already installed? See [upgrade and executable-path checks](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses):
+an older copy earlier on PATH can still be selected after a Homebrew upgrade.
+
 Then ask your agent:
 
 > Use SkillRoster to inspect my local Skills, explain the biggest problems, and
