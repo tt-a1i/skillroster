@@ -44,7 +44,7 @@ pub(crate) fn set_after_symlink_source_open_hook(hook: impl FnOnce() + 'static) 
     AFTER_SYMLINK_SOURCE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn set_after_staging_file_open_hook(hook: impl FnOnce() + 'static) {
     AFTER_STAGING_FILE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
