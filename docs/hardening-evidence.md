@@ -106,7 +106,13 @@ every platform, in addition to the Unix readonly-directory test. On Windows,
 long-lived copy handles also retain no-delete-sharing protection for source
 and destination directories; they are deliberately separate from short-lived
 parent-sync handles. The test attempts to rename both directory trees and
-their nested directories during child-file copying and requires refusal.
+requires refusal before child enumeration, then attempts both trees and their
+nested directories during child-file copying. The earlier checkpoint caught
+an actual source-directory rename at test-only head `4031b25` in
+[Windows CI](https://github.com/tt-a1i/skillroster/actions/runs/33754471577/job/100645481705).
+The later child-file checkpoint alone passed before the explicit protection;
+that pass is not evidence that the earlier window was safe. This reproduces
+the missing rename protection, not a complete outside-root exploit.
 
 On Windows, replacement also closes its retained original-file handles after
 validated removal and before publishing the staged file. Otherwise the delete
