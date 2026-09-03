@@ -4665,6 +4665,40 @@ mod tests {
         fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
+    #[test]
+    fn recursive_directory_copy_and_undo_round_trip() {
+        let (_temp, root, state) = fixture();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file"), "retained").unwrap();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{
+            "kind":"copy","source":source,"target":target,"expected_fingerprint":fingerprint(&source).unwrap()
+        }]}).to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let applied = apply(&plan).unwrap();
+        assert!(applied.verification_passed, "{:?}", applied.receipt.error);
+        assert_eq!(
+            fs::read_to_string(target.join("nested/file")).unwrap(),
+            "retained"
+        );
+        let undone = undo(&applied.receipt).unwrap();
+        assert!(undone.verification_passed, "{:?}", undone.receipt.error);
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(source.join("nested/file")).unwrap(),
+            "retained"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn copy_and_replace_refuse_extended_attributes_without_losing_original() {

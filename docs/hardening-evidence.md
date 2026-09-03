@@ -93,3 +93,20 @@ same retained-handle implementation. No containment, identity, durability or
 rollback guard was removed. The source diff/commit can be reverted independently
 of any released artifacts; reverting source does not repair metadata already
 lost by an older binary or restore deleted release assets.
+
+## Cross-platform regression checks
+
+Independent review and the first platform CI run caught two handle-lifecycle
+regressions before merge. Linux directory capabilities may use `O_PATH`, which
+cannot inspect xattrs; Windows read-only directory handles cannot apply metadata
+or flush it. Copy now opens explicitly readable source directories and
+metadata-write/flush-capable destination directories, retaining no-follow and
+directory-type checks. `recursive_directory_copy_and_undo_round_trip` runs on
+every platform, in addition to the Unix readonly-directory test.
+
+On Windows, replacement also closes its retained original-file handles after
+validated removal and before publishing the staged file. Otherwise the delete
+disposition stays pending and the no-replace rename correctly refuses an
+apparently occupied destination. The existing readonly Replace/Undo, complete
+Bootstrap upgrade/Undo, and full operation-ledger tests exercise that lifecycle.
+See Microsoft's [delete-disposition contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_file_disposition_information_ex).

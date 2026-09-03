@@ -1017,6 +1017,11 @@ impl<'a> AnchoredFs<'a> {
         metadata.verify(&original_handle)?;
         self.require_opened_file_at(target_anchor, &target_relative, &original)?;
         self.remove_regular_file(target_anchor, &target_relative)?;
+        // Windows delete disposition remains pending until our retained source
+        // handles close. Keep them through validation/removal, but release them
+        // before syncing the removal and publishing the replacement name.
+        drop(original_handle);
+        drop(original);
         self.sync_parent(target_anchor, &target_relative)?;
         self.rename(temp, target)?;
         self.require_opened_file_at(target_anchor, &target_relative, &staged)?;
@@ -1302,7 +1307,7 @@ impl<'a> AnchoredFs<'a> {
                 "source is not a supported file type",
             ));
         }
-        let source_directory = source_anchor.dir.open_dir(source)?.into_std_file();
+        let source_directory = open_readable_directory(&source_anchor.dir, source)?;
         let copy_metadata = CopyMetadata::read(&source_directory)?;
         #[cfg(unix)]
         {
@@ -1313,7 +1318,7 @@ impl<'a> AnchoredFs<'a> {
         }
         #[cfg(not(unix))]
         target_anchor.dir.create_dir(target)?;
-        let opened = target_anchor.dir.open_dir(target)?.into_std_file();
+        let opened = open_directory_for_sync(&target_anchor.dir, target)?;
         copy_metadata.validate_destination(&opened)?;
         self.require_opened_directory_at(target_anchor, target, &opened)?;
         run_after_created_entry_first_check_hook();
@@ -1702,13 +1707,33 @@ fn open_directory_handle_bound(path: &Path) -> io::Result<Dir> {
 
 #[cfg(unix)]
 fn open_directory_for_sync(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
-    use cap_std::fs::OpenOptionsExt as _;
+    open_readable_directory(dir, relative)
+}
 
+fn open_readable_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY);
-    Ok(dir.open_with(relative, &options)?.into_std())
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = dir.open_with(relative, &options)?.into_std();
+    if !file.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened metadata source is not a directory",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -1720,6 +1745,7 @@ fn open_directory_for_sync(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
 
     let mut options = OpenOptions::new();
     options
+        .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
