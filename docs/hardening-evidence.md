@@ -102,7 +102,11 @@ cannot inspect xattrs; Windows read-only directory handles cannot apply metadata
 or flush it. Copy now opens explicitly readable source directories and
 metadata-write/flush-capable destination directories, retaining no-follow and
 directory-type checks. `recursive_directory_copy_and_undo_round_trip` runs on
-every platform, in addition to the Unix readonly-directory test.
+every platform, in addition to the Unix readonly-directory test. On Windows,
+long-lived copy handles also retain no-delete-sharing protection for source
+and destination directories; they are deliberately separate from short-lived
+parent-sync handles. The test attempts to rename both directory trees and
+their nested directories during child-file copying and requires refusal.
 
 On Windows, replacement also closes its retained original-file handles after
 validated removal and before publishing the staged file. Otherwise the delete

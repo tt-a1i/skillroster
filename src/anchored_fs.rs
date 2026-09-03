@@ -4,7 +4,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions, Permissions};
+#[cfg(unix)]
+use cap_std::fs::Permissions;
+use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
 
 use crate::copy_metadata::{CopyDestination, CopyMetadata};
@@ -1318,7 +1320,7 @@ impl<'a> AnchoredFs<'a> {
         }
         #[cfg(not(unix))]
         target_anchor.dir.create_dir(target)?;
-        let opened = open_directory_for_sync(&target_anchor.dir, target)?;
+        let opened = open_copy_destination_directory(&target_anchor.dir, target)?;
         copy_metadata.validate_destination(&opened)?;
         self.require_opened_directory_at(target_anchor, target, &opened)?;
         run_after_created_entry_first_check_hook();
@@ -1723,14 +1725,49 @@ fn open_readable_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
     #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Child copies still resolve names relative to the approved root.
+        // Deny renames/deletion for this directory throughout recursion.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
     }
     let file = dir.open_with(relative, &options)?.into_std();
     if !file.metadata()?.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "opened metadata source is not a directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_copy_destination_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
+    open_readable_directory(dir, relative)
+}
+
+#[cfg(windows)]
+fn open_copy_destination_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let file = dir.open_with(relative, &options)?.into_std();
+    if !file.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened copy destination is not a directory",
         ));
     }
     Ok(file)
@@ -1745,7 +1782,6 @@ fn open_directory_for_sync(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
 
     let mut options = OpenOptions::new();
     options
-        .read(true)
         .write(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);

@@ -125,6 +125,7 @@ impl CopyMetadata {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn permissions(&self) -> cap_std::fs::Permissions {
         cap_std::fs::Permissions::from_std(self.permissions.clone())
     }
