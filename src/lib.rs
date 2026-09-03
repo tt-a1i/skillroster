@@ -4,6 +4,7 @@ pub mod app;
 mod bootstrap;
 pub mod change;
 pub mod cli;
+mod copy_metadata;
 mod durable_fs;
 pub mod harness;
 pub mod model;

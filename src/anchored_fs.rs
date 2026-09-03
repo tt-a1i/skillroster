@@ -4,9 +4,12 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions, Permissions};
+#[cfg(unix)]
+use cap_std::fs::Permissions;
+use cap_std::fs::{Dir, OpenOptions};
 use sha2::{Digest, Sha256};
 
+use crate::copy_metadata::{CopyDestination, CopyMetadata};
 use crate::durable_fs::DirectorySync;
 use crate::package_fingerprint::{
     MAX_SKILL_PACKAGE_DEPTH, PackageHashBuilder, ignored_package_entry_name,
@@ -43,7 +46,7 @@ pub(crate) fn set_after_symlink_source_open_hook(hook: impl FnOnce() + 'static) 
     AFTER_SYMLINK_SOURCE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn set_after_staging_file_open_hook(hook: impl FnOnce() + 'static) {
     AFTER_STAGING_FILE_OPEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -73,7 +76,7 @@ pub(crate) fn set_after_created_symlink_first_check_hook(hook: impl FnOnce() + '
     AFTER_CREATED_SYMLINK_FIRST_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn set_after_created_entry_first_check_hook(hook: impl FnOnce() + 'static) {
     AFTER_CREATED_ENTRY_FIRST_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -1008,10 +1011,19 @@ impl<'a> AnchoredFs<'a> {
                 "replacement staging path must share the target anchor",
             ));
         }
-        let permissions = target_anchor.dir.metadata(&target_relative)?.permissions();
+        let original = target_anchor.dir.open(&target_relative)?;
+        let original_handle = original.try_clone()?.into_std();
+        let metadata = CopyMetadata::read(&original_handle)?;
         let staged =
-            self.create_file_with_permissions(temp_anchor, &temp_relative, content, permissions)?;
+            self.create_file_with_metadata(temp_anchor, &temp_relative, content, &metadata)?;
+        metadata.verify(&original_handle)?;
+        self.require_opened_file_at(target_anchor, &target_relative, &original)?;
         self.remove_regular_file(target_anchor, &target_relative)?;
+        // Windows delete disposition remains pending until our retained source
+        // handles close. Keep them through validation/removal, but release them
+        // before syncing the removal and publishing the replacement name.
+        drop(original_handle);
+        drop(original);
         self.sync_parent(target_anchor, &target_relative)?;
         self.rename(temp, target)?;
         self.require_opened_file_at(target_anchor, &target_relative, &staged)?;
@@ -1205,7 +1217,46 @@ impl<'a> AnchoredFs<'a> {
         })
     }
 
-    pub(crate) fn copy_file(&self, source: &Path, target: &Path) -> io::Result<u64> {
+    pub(crate) fn original_windows_security(&self, source: &Path) -> io::Result<Option<String>> {
+        let (anchor, relative) = self.resolve(source)?;
+        CopyMetadata::read(&anchor.dir.open(relative)?.into_std())
+            .map(|metadata| metadata.windows_security())
+    }
+
+    pub(crate) fn copy_private_backup(&self, source: &Path, target: &Path) -> io::Result<u64> {
+        self.copy_file_to(source, target, CopyDestination::PrivateBackup)
+    }
+
+    pub(crate) fn restore_private_backup(
+        &self,
+        source: &Path,
+        target: &Path,
+        original_security: Option<&str>,
+    ) -> io::Result<u64> {
+        self.copy_file_to(source, target, CopyDestination::Restore(original_security))
+    }
+
+    pub(crate) fn verify_restoration_metadata(
+        &self,
+        backup: &Path,
+        target: &Path,
+        original_security: Option<&str>,
+    ) -> io::Result<()> {
+        let (backup_anchor, backup_relative) = self.resolve(backup)?;
+        let backup = backup_anchor.dir.open(backup_relative)?.into_std();
+        let (target_anchor, target_relative) = self.resolve(target)?;
+        let target = target_anchor.dir.open(target_relative)?.into_std();
+        CopyMetadata::read(&backup)?
+            .for_destination(&target, CopyDestination::Restore(original_security))?
+            .verify(&target)
+    }
+
+    fn copy_file_to(
+        &self,
+        source: &Path,
+        target: &Path,
+        purpose: CopyDestination<'_>,
+    ) -> io::Result<u64> {
         let (source_anchor, source_relative) = self.resolve(source)?;
         let (target_anchor, target_relative) = self.resolve(target)?;
         self.copy_file_relative(
@@ -1213,6 +1264,7 @@ impl<'a> AnchoredFs<'a> {
             &source_relative,
             target_anchor,
             &target_relative,
+            purpose,
         )
     }
 
@@ -1242,7 +1294,13 @@ impl<'a> AnchoredFs<'a> {
             ));
         }
         if metadata.is_file() {
-            self.copy_file_relative(source_anchor, source, target_anchor, target)?;
+            self.copy_file_relative(
+                source_anchor,
+                source,
+                target_anchor,
+                target,
+                CopyDestination::Preserve,
+            )?;
             return Ok(());
         }
         if !metadata.is_dir() {
@@ -1251,8 +1309,19 @@ impl<'a> AnchoredFs<'a> {
                 "source is not a supported file type",
             ));
         }
+        let source_directory = open_readable_directory(&source_anchor.dir, source)?;
+        let copy_metadata = CopyMetadata::read(&source_directory)?;
+        #[cfg(unix)]
+        {
+            use cap_std::fs::DirBuilderExt;
+            let mut builder = cap_std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            target_anchor.dir.create_dir_with(target, &builder)?;
+        }
+        #[cfg(not(unix))]
         target_anchor.dir.create_dir(target)?;
-        let opened = target_anchor.dir.open_dir(target)?.into_std_file();
+        let opened = open_copy_destination_directory(&target_anchor.dir, target)?;
+        copy_metadata.validate_destination(&opened)?;
         self.require_opened_directory_at(target_anchor, target, &opened)?;
         run_after_created_entry_first_check_hook();
         self.sync_parent_preserving_identity(target_anchor, target, || {
@@ -1271,28 +1340,33 @@ impl<'a> AnchoredFs<'a> {
                 &target.join(name),
             )?;
         }
+        copy_metadata.verify(&source_directory)?;
+        copy_metadata.apply_to(&opened)?;
+        opened.sync_all()?;
         Ok(())
     }
 
-    fn create_file_with_permissions(
+    fn create_file_with_metadata(
         &self,
         anchor: &Anchor,
         relative: &Path,
         content: &[u8],
-        permissions: Permissions,
+        metadata: &CopyMetadata,
     ) -> io::Result<cap_std::fs::File> {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-            options.mode(permissions.mode() & 0o7777);
+            options.mode(metadata.permissions().mode() & 0o7777);
         }
         let mut file = anchor.dir.open_with(relative, &options)?;
         run_after_staging_file_open_hook();
+        let handle = file.try_clone()?.into_std();
+        metadata.apply_to(&handle)?;
         file.write_all(content)?;
-        file.set_permissions(permissions)?;
+        metadata.apply_to(&handle)?;
         file.sync_all()?;
         self.require_opened_file_at(anchor, relative, &file)?;
         run_after_created_entry_first_check_hook();
@@ -1308,21 +1382,28 @@ impl<'a> AnchoredFs<'a> {
         source: &Path,
         target_anchor: &Anchor,
         target: &Path,
+        purpose: CopyDestination<'_>,
     ) -> io::Result<u64> {
         let mut source_file = source_anchor.dir.open(source)?;
-        let permissions = source_file.metadata()?.permissions();
+        let source_handle = source_file.try_clone()?.into_std();
+        let metadata = CopyMetadata::read(&source_handle)?;
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use cap_std::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-            options.mode(permissions.mode() & 0o7777);
+            options.mode(metadata.permissions().mode() & 0o7777);
         }
         let mut target_file = target_anchor.dir.open_with(target, &options)?;
         run_after_staging_file_open_hook();
+        let target_handle = target_file.try_clone()?.into_std();
+        let destination_metadata = metadata.for_destination(&target_handle, purpose)?;
+        destination_metadata.apply_to(&target_handle)?;
         let copied = io::copy(&mut source_file, &mut target_file)?;
-        target_file.set_permissions(permissions)?;
+        metadata.verify(&source_handle)?;
+        destination_metadata.apply_to(&target_handle)?;
+        self.require_opened_file_at(source_anchor, source, &source_file)?;
         target_file.sync_all()?;
         self.require_opened_file_at(target_anchor, target, &target_file)?;
         run_after_created_entry_first_check_hook();
@@ -1628,13 +1709,68 @@ fn open_directory_handle_bound(path: &Path) -> io::Result<Dir> {
 
 #[cfg(unix)]
 fn open_directory_for_sync(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
+    open_readable_directory(dir, relative)
+}
+
+fn open_readable_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        // Child copies still resolve names relative to the approved root.
+        // Deny renames/deletion for this directory throughout recursion.
+        options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    let file = dir.open_with(relative, &options)?.into_std();
+    if !file.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened metadata source is not a directory",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_copy_destination_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
+    open_readable_directory(dir, relative)
+}
+
+#[cfg(windows)]
+fn open_copy_destination_directory(dir: &Dir, relative: &Path) -> io::Result<fs::File> {
     use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY);
-    Ok(dir.open_with(relative, &options)?.into_std())
+        .write(true)
+        ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    let file = dir.open_with(relative, &options)?.into_std();
+    if !file.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "opened copy destination is not a directory",
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(windows)]

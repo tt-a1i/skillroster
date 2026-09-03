@@ -17,6 +17,7 @@ pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
+const SEMANTIC_CANDIDATE_LIMIT: usize = 25;
 const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "不要", "也不要"];
 const TASK_EXCLUSION_COORDINATORS: &[&str] = &["but", "and", "yet", "但是", "不过", "但"];
 const TASK_EXCLUSION_CONTEXT_TOKENS: &[&str] = &["code", "代码"];
@@ -1320,7 +1321,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 }
 
-fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, usize) {
+fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, usize, usize) {
     for (skill_id, placements) in placements_by_skill(scan) {
         let Some(skill) = scan.skills.iter().find(|skill| skill.id == skill_id) else {
             continue;
@@ -1389,7 +1390,17 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
         .iter()
         .map(|skill| normalize_skill_name(&skill.name))
         .collect::<Vec<_>>();
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(SEMANTIC_CANDIDATE_LIMIT);
+    let mut candidate_peak = 0;
+    let compare = |left: &(f64, &ScannedSkill, &ScannedSkill),
+                   right: &(f64, &ScannedSkill, &ScannedSkill)| {
+        right
+            .0
+            .partial_cmp(&left.0)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+            .then_with(|| left.2.id.cmp(&right.2.id))
+    };
     let mut pair_comparison_count = 0usize;
     for (index, left) in scan.skills.iter().enumerate() {
         let left_tokens = &vocabularies[index];
@@ -1402,24 +1413,31 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
                 continue;
             }
             let right_tokens = &vocabularies[right_index];
-            let Some(basis) = semantic_overlap_basis_from_tokens(left_tokens, right_tokens) else {
+            let intersection_count = left_tokens.intersection(right_tokens).count();
+            if intersection_count < 3 {
                 continue;
-            };
-            let similarity = basis.score;
+            }
+            // Selection needs only a score. Full shared-term previews belong to
+            // the on-demand Finding detail, not every pair in the inventory.
+            let union_count = left_tokens.len() + right_tokens.len() - intersection_count;
+            let similarity = intersection_count as f64 / union_count as f64;
             if similarity >= 0.45 {
-                candidates.push((similarity, left, right));
+                let candidate = (similarity, left, right);
+                // Insert after equal keys, retaining the old stable-sort order.
+                // Discard the worst entry before insertion, never retaining >25.
+                let position = candidates
+                    .partition_point(|existing| compare(existing, &candidate) != Ordering::Greater);
+                if position < SEMANTIC_CANDIDATE_LIMIT {
+                    if candidates.len() == SEMANTIC_CANDIDATE_LIMIT {
+                        candidates.pop();
+                    }
+                    candidates.insert(position, candidate);
+                    candidate_peak = candidate_peak.max(candidates.len());
+                }
             }
         }
     }
-    candidates.sort_by(|left, right| {
-        right
-            .0
-            .partial_cmp(&left.0)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| left.1.id.cmp(&right.1.id))
-            .then_with(|| left.2.id.cmp(&right.2.id))
-    });
-    for (similarity, left, right) in candidates.into_iter().take(25) {
+    for (similarity, left, right) in candidates {
         push_finding(
             findings,
             FindingKind::SemanticOverlapCandidate,
@@ -1439,7 +1457,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
             EvidenceQuality::Inferred,
         );
     }
-    (vocabularies.len(), pair_comparison_count)
+    (vocabularies.len(), pair_comparison_count, candidate_peak)
 }
 
 fn physical_source_identity(
@@ -3249,7 +3267,7 @@ mod tests {
 
     #[test]
     fn semantic_overlap_work_stays_bounded_for_a_realistic_inventory() {
-        let (_, mut scan) = fixture();
+        let (root, mut scan) = fixture();
         let representative = scan.skills[0].clone();
         let shared_body = std::iter::repeat_n(
             "shared architecture workflow browser database agent skill governance local evidence",
@@ -3271,10 +3289,12 @@ mod tests {
         scan.usage.clear();
 
         let mut findings = Vec::new();
-        let (vocabulary_count, pair_comparison_count) = overlap_findings(&scan, &mut findings);
+        let (vocabulary_count, pair_comparison_count, candidate_peak) =
+            overlap_findings(&scan, &mut findings);
 
         assert_eq!(vocabulary_count, 193);
         assert_eq!(pair_comparison_count, 193 * 192 / 2);
+        assert!(candidate_peak <= 25, "retained {candidate_peak} candidates");
         assert_eq!(
             findings
                 .iter()
@@ -3282,6 +3302,103 @@ mod tests {
                 .count(),
             25
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "explicit scale measurement; not a machine-dependent timing gate"]
+    fn semantic_overlap_scale_measurement() {
+        let count = std::env::var("SKILLROSTER_BENCH_SKILLS")
+            .unwrap_or_else(|_| "1000".into())
+            .parse::<usize>()
+            .unwrap();
+        assert!([193, 1000, 5000].contains(&count));
+        let (root, mut scan) = fixture();
+        let representative = scan.skills[0].clone();
+        let body = "shared architecture workflow browser database agent governance local evidence "
+            .repeat(20);
+        scan.skills = (0..count)
+            .map(|index| {
+                let mut skill = representative.clone();
+                skill.id = format!("scale-{index:05}");
+                skill.name = skill.id.clone();
+                skill.content_digest = skill.id.clone();
+                skill.normalized_text = format!("{body} unique-{index:05}");
+                skill
+            })
+            .collect();
+        scan.placements.clear();
+        scan.usage.clear();
+        let start = std::time::Instant::now();
+        let mut findings = Vec::new();
+        let (vocabularies, pairs, retained) = overlap_findings(&scan, &mut findings);
+        let elapsed = start.elapsed();
+        assert_eq!(vocabularies, count);
+        assert_eq!(pairs, count * (count - 1) / 2);
+        assert_eq!(findings.len(), 25);
+        println!(
+            "skills={count} pairs={pairs} retained_candidates={retained} analysis_ms={}",
+            elapsed.as_millis()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_overlap_matches_full_sort_oracle() {
+        let (root, mut scan) = fixture();
+        let representative = scan.skills[0].clone();
+        for count in [0, 1, 7, 60, 120] {
+            scan.skills = (0..count)
+                .map(|index| {
+                    let mut skill = representative.clone();
+                    skill.id = format!("oracle-{:03}", (index * 37) % 127);
+                    skill.name = format!("variant-{}", index / 2);
+                    skill.content_digest = format!("digest-{}", index / 3);
+                    skill.metadata.description = None;
+                    skill.normalized_text = (0..24)
+                        .filter(|term| (term + index) % (index % 5 + 2) != 0)
+                        .map(|term| format!("term{term}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    skill
+                })
+                .collect();
+            scan.placements.clear();
+            scan.usage.clear();
+            let mut expected = Vec::new();
+            for (index, left) in scan.skills.iter().enumerate() {
+                for right in scan.skills.iter().skip(index + 1) {
+                    if normalize_skill_name(&left.name) == normalize_skill_name(&right.name)
+                        || left.content_digest == right.content_digest
+                    {
+                        continue;
+                    }
+                    if let Some(basis) = semantic_overlap_basis(left, right) {
+                        if basis.score >= 0.45 {
+                            expected.push((basis.score, vec![left.id.clone(), right.id.clone()]));
+                        }
+                    }
+                }
+            }
+            expected.sort_by(|left, right| {
+                right
+                    .0
+                    .partial_cmp(&left.0)
+                    .unwrap()
+                    .then(left.1.cmp(&right.1))
+            });
+            expected.truncate(25);
+            let mut findings = Vec::new();
+            let (_, _, peak) = overlap_findings(&scan, &mut findings);
+            assert!(peak <= 25);
+            assert_eq!(findings.len(), expected.len());
+            for (actual, (score, mut ids)) in findings.iter().zip(expected) {
+                ids.sort();
+                assert_eq!(actual.affected_skill_ids, ids);
+                assert!(actual.summary.contains(&format!("Jaccard {score:.2}")));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
