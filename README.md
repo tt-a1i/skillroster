@@ -79,6 +79,9 @@ brew install tt-a1i/skillroster/skillroster
 skillroster --version
 ```
 
+已经安装过？请先看[升级与执行路径检查](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)：
+升级 Homebrew 后，PATH 中排在前面的旧副本仍可能被 Agent 调用。
+
 然后直接告诉你的 Agent：
 
 > 使用 SkillRoster 检查我电脑上的 Skills，解释最需要处理的问题，并给出一套更安全的

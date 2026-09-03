@@ -83,6 +83,49 @@ installation does not require GitHub authentication. This is an upstream tap,
 not a Homebrew/core Formula. Never paste a GitHub token into a Formula or a
 command line.
 
+## Upgrade and verify the executable your Agent uses
+
+Pick one installation method to own future CLI upgrades. For Homebrew:
+
+```sh
+brew update
+brew upgrade tt-a1i/skillroster/skillroster
+```
+
+An upgraded package does not prove that `skillroster` selects it. A previous
+Release binary in `~/.local/bin`, a Cargo install in `~/.cargo/bin`, or a shell
+alias/function can take precedence. In the shell that launches your Agent,
+check the selected command, all resolutions, and the Homebrew copy separately:
+
+```sh
+command -v skillroster
+type -a skillroster
+skillroster --version
+"$(brew --prefix)/bin/skillroster" --version
+```
+
+`type -a` is supported by Bash and Zsh. In PowerShell, use
+`Get-Command skillroster -All` to inspect command precedence instead. Compare
+the CLI version with the release you intended to install, not with Bootstrap
+content version: those versions can intentionally differ.
+
+If the selected command is still old, inspect its ownership before changing
+anything. Do not delete every result from `type -a` or overwrite an alias,
+wrapper, package-manager link, or shell configuration automatically. For a
+confirmed standalone binary that you choose to retire, move that exact file
+to a recoverable backup outside command lookup. If existing callers need its
+old absolute path, a symlink at that path can point to the verified stable
+`$(brew --prefix)/bin/skillroster` entrypoint, rather than a versioned Cellar
+path. Keep the backup until the replacement is verified. Never point that
+entrypoint back to the retired path or create a link to a missing target.
+
+Open a fresh shell (or run `hash -r` in Bash / `rehash` in Zsh), then repeat the
+path and version checks. Restart the Agent that was launched with the old
+environment and ask it to run the checks too. A successful terminal check does
+not establish which binary an already-running Agent or saved absolute-path
+command uses. This verification does not authorize changes to Agent Skill
+files; Bootstrap upgrades still require the reviewed Setup Plan below.
+
 ## Install or upgrade the Agent bootstrap Skill
 
 After installing a new CLI version, refresh the local Snapshot and inspect all
