@@ -392,6 +392,8 @@ pub enum Compensation {
         expected_replacement: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         staged_replacement: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_windows_security: Option<String>,
     },
 }
 
@@ -1715,11 +1717,14 @@ fn stage_compensation(
             expected_fingerprint,
         } => {
             verify_anchored_fingerprint(anchored, target, expected_fingerprint)?;
+            let original_windows_security = anchored
+                .original_windows_security(target)
+                .map_err(|error| ChangeError::io("inspect replacement metadata", target, error))?;
             let directory = create_recovery_dir(anchored, state_dir, receipt_id)?;
             let backup = directory.join(format!("replace-{index}.backup"));
             require_anchored_missing(anchored, &backup)?;
             anchored
-                .copy_file(target, &backup)
+                .copy_private_backup(target, &backup)
                 .map_err(|error| ChangeError::io("persist replacement backup", target, error))?;
             let backup_fingerprint = anchored
                 .fingerprint(&backup)
@@ -1739,6 +1744,7 @@ fn stage_compensation(
                 expected_original: expected_fingerprint.clone(),
                 expected_replacement: file_content_fingerprint(content.as_bytes()),
                 staged_replacement: Some(replacement_temp_path(target, receipt_id, index)?),
+                original_windows_security,
             }))
         }
         Operation::RemoveSymlink { .. } => Ok(None),
@@ -2029,6 +2035,7 @@ fn compensate(
             expected_original,
             expected_replacement,
             staged_replacement,
+            original_windows_security,
         } => {
             if let Some(staged_replacement) = staged_replacement {
                 remove_expected_anchored_file_if_present(
@@ -2039,6 +2046,17 @@ fn compensate(
                 )?;
             }
             let actual = anchored_fingerprint(anchored, target)?;
+            if actual != "missing" {
+                anchored
+                    .verify_restoration_metadata(
+                        backup,
+                        target,
+                        original_windows_security.as_deref(),
+                    )
+                    .map_err(|error| {
+                        ChangeError::io("verify replacement restoration metadata", target, error)
+                    })?;
+            }
             if actual == *expected_original {
                 remove_expected_anchored_file_if_present(
                     anchored,
@@ -2066,7 +2084,7 @@ fn compensate(
             ));
             require_anchored_missing(anchored, &restore)?;
             anchored
-                .copy_file(backup, &restore)
+                .restore_private_backup(backup, &restore, original_windows_security.as_deref())
                 .map_err(|error| ChangeError::io("stage restored file", backup, error))?;
             if actual != "missing" {
                 anchored
@@ -3723,6 +3741,203 @@ mod tests {
     }
 
     #[test]
+    fn storage_errno_failures_keep_a_durable_recovery_boundary() {
+        struct StorageError {
+            path: PathBuf,
+            errno: i32,
+            persistent: bool,
+            failed: Cell<bool>,
+        }
+        impl DirectorySync for StorageError {
+            fn sync_directory(&self, path: &Path) -> io::Result<()> {
+                if path == self.path && (self.persistent || !self.failed.get()) {
+                    self.failed.set(true);
+                    Err(io::Error::from_raw_os_error(self.errno))
+                } else {
+                    SystemDirectorySync.sync_directory(path)
+                }
+            }
+        }
+        #[cfg(unix)]
+        let errors = [libc::ENOSPC, libc::EIO];
+        #[cfg(windows)]
+        let errors = [112, 1117]; // ERROR_DISK_FULL, ERROR_IO_DEVICE
+        for errno in errors {
+            for persistent in [false, true] {
+                for at_journal in [false, true] {
+                    let (_temp, root, state) = fixture();
+                    let target = root.join("target.md");
+                    let plan = prepared_write(&root, &state, &target);
+                    let sync = StorageError {
+                        path: if at_journal {
+                            state.join("receipts")
+                        } else {
+                            root.clone()
+                        },
+                        errno,
+                        persistent,
+                        failed: Cell::new(false),
+                    };
+                    let outcome = apply_locked_with(&plan, &sync);
+                    assert!(sync.failed.get());
+                    if at_journal {
+                        assert_eq!(outcome.unwrap_err().code, "filesystem_error");
+                        assert!(!target.exists());
+                    } else {
+                        let outcome = outcome.unwrap();
+                        assert!(!outcome.verification_passed);
+                        assert_eq!(outcome.receipt.status, ReceiptStatus::RecoveryRequired);
+                        assert!(
+                            outcome
+                                .receipt
+                                .error
+                                .unwrap()
+                                .contains(&format!("os error {errno}"))
+                        );
+                        assert_eq!(
+                            fs::read_to_string(&target).unwrap(),
+                            "published before injected barrier failure"
+                        );
+                    }
+                    let receipts = journals(&state).unwrap();
+                    assert_eq!(receipts.len(), 1);
+                    assert!(matches!(
+                        receipts[0].status,
+                        ReceiptStatus::Applying | ReceiptStatus::RecoveryRequired
+                    ));
+                    let next = prepared_write(&root, &state, &root.join("next.md"));
+                    assert_eq!(apply(&next).unwrap_err().code, "recovery_required");
+                    assert!(!root.join("next.md").exists());
+                }
+            }
+        }
+    }
+
+    // Subprocess entrypoint: these environment keys are read only by this test
+    // binary, never by the shipped CLI. Each child receives one disposable root.
+    #[test]
+    fn recovery_process_child() {
+        let Some(base) = std::env::var_os("SKILLROSTER_RECOVERY_TEST_ROOT") else {
+            return;
+        };
+        let base = PathBuf::from(base);
+        let root = base.join("root");
+        let state = base.join("state");
+        let role = std::env::var("SKILLROSTER_RECOVERY_TEST_ROLE").unwrap();
+        if role == "restart" {
+            let receipts = journals(&state).unwrap();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].status, ReceiptStatus::Applying);
+            let next = prepared_write(&root, &state, &root.join("next.md"));
+            assert_eq!(apply(&next).unwrap_err().code, "recovery_required");
+            assert!(!root.join("next.md").exists());
+            return;
+        }
+        let marker = base.join("checkpoint");
+        let stop = move || {
+            fs::write(marker, b"ready").unwrap();
+            // Parent kills this process; no destructor or compensation runs.
+            loop {
+                std::thread::park();
+            }
+        };
+        match role.as_str() {
+            "journal" => {
+                BEFORE_MUTATION_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(stop)))
+            }
+            "target" => {
+                struct StopAfterTargetSync {
+                    root: PathBuf,
+                    stop: std::cell::RefCell<Option<Box<dyn FnOnce()>>>,
+                }
+                impl DirectorySync for StopAfterTargetSync {
+                    fn sync_directory(&self, path: &Path) -> io::Result<()> {
+                        SystemDirectorySync.sync_directory(path)?;
+                        if path == self.root {
+                            if let Some(stop) = self.stop.borrow_mut().take() {
+                                stop();
+                            }
+                        }
+                        Ok(())
+                    }
+                }
+                let sync = StopAfterTargetSync {
+                    root: root.clone(),
+                    stop: std::cell::RefCell::new(Some(Box::new(stop))),
+                };
+                let plan = prepared_write(&root, &state, &root.join("target.md"));
+                let _lock = WriteLock::acquire(&state).unwrap();
+                apply_locked_with(&plan, &sync).unwrap();
+                panic!("target checkpoint was not reached");
+            }
+            _ => panic!("unknown subprocess role"),
+        }
+        let plan = prepared_write(&root, &state, &root.join("target.md"));
+        apply(&plan).unwrap();
+        panic!("journal checkpoint was not reached");
+    }
+
+    #[test]
+    fn killed_apply_blocks_new_writes_after_process_restart() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        for checkpoint in ["journal", "target"] {
+            let (temp, root, state) = fixture();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "change::tests::recovery_process_child",
+                    "--nocapture",
+                ])
+                .env(
+                    "SKILLROSTER_RECOVERY_TEST_ROOT",
+                    fs::canonicalize(temp.path()).unwrap(),
+                )
+                .env("SKILLROSTER_RECOVERY_TEST_ROLE", checkpoint)
+                .stdout(Stdio::null());
+            let mut child = command.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !temp.path().join("checkpoint").exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("child exited before {checkpoint}: {status}");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not reach {checkpoint}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            let status = child.wait().unwrap();
+            assert!(!status.success());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGKILL));
+            }
+            assert_eq!(root.join("target.md").exists(), checkpoint == "target");
+            let before = journals(&state).unwrap();
+            assert_eq!(before.len(), 1);
+            let receipt_path = state
+                .join("receipts")
+                .join(format!("{}.json", before[0].id));
+            let journal_bytes = fs::read(&receipt_path).unwrap();
+            command.env("SKILLROSTER_RECOVERY_TEST_ROLE", "restart");
+            let status = command.status().unwrap();
+            assert!(status.success());
+            assert_eq!(fs::read(receipt_path).unwrap(), journal_bytes);
+            if checkpoint == "target" {
+                assert_eq!(
+                    fs::read_to_string(root.join("target.md")).unwrap(),
+                    "published before injected barrier failure"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unsupported_atomic_rename_is_rejected_before_mutation_or_receipt() {
         let (_temp, root, state) = fixture();
         let target = root.join("not-created.md");
@@ -4396,6 +4611,123 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn replacement_undo_refuses_permission_drift() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, root, state) = fixture();
+        let target = root.join("target");
+        fs::write(&target, "original").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let input = serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[{
+            "kind":"replace_file","target":target,"content":"replacement","expected_fingerprint":fingerprint(&target).unwrap()
+        }]}).to_string();
+        let plan = prepare(
+            &input,
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::TestOnly,
+            },
+        )
+        .unwrap();
+        let applied = apply(&plan).unwrap();
+        assert!(applied.verification_passed);
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o400)).unwrap();
+        let undone = undo(&applied.receipt).unwrap();
+        assert_eq!(undone.receipt.status, ReceiptStatus::RecoveryRequired);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_copy_preserves_readonly_directory_mode_after_copying_children() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temp, root, state) = fixture();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), "retained").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o500)).unwrap();
+        let anchored = open_anchored_fs(&[root], &state, &SystemDirectorySync).unwrap();
+        anchored.copy_tree(&source, &target).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o500
+        );
+        assert_eq!(fs::read_to_string(target.join("file")).unwrap(), "retained");
+        // Only release the two test-owned readonly directories for fixture cleanup.
+        fs::set_permissions(source, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn copy_and_replace_refuse_extended_attributes_without_losing_original() {
+        use std::os::fd::AsRawFd;
+        for kind in ["copy", "replace_file"] {
+            let (_temp, root, state) = fixture();
+            let source = root.join("source.md");
+            let target = root.join("copy.md");
+            fs::write(&source, "original").unwrap();
+            let file = File::open(&source).unwrap();
+            let name = c"user.skillroster-test";
+            let value = b"user metadata";
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "fixture xattr: {}", io::Error::last_os_error());
+            let operation = if kind == "copy" {
+                serde_json::json!({"kind":kind,"source":source,"target":target,"expected_fingerprint":fingerprint(&source).unwrap()})
+            } else {
+                serde_json::json!({"kind":kind,"target":source,"content":"replacement","expected_fingerprint":fingerprint(&source).unwrap()})
+            };
+            let input =
+                serde_json::json!({"schema_version":1,"scan_id":"scan_1","operations":[operation]})
+                    .to_string();
+            let plan = prepare(
+                &input,
+                &PrepareContext {
+                    approved_roots: vec![root],
+                    state_dir: state,
+                    operation_policy: OperationPolicy::TestOnly,
+                },
+            )
+            .unwrap();
+            match apply(&plan) {
+                Err(error) => assert!(error.message.contains("metadata"), "{error}"),
+                Ok(outcome) => assert!(
+                    !outcome.verification_passed,
+                    "silently discarded extended metadata"
+                ),
+            }
+            assert_eq!(fs::read_to_string(&source).unwrap(), "original");
+            assert!(!target.exists());
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn replace_and_undo_preserve_readonly_state() {
@@ -4511,7 +4843,7 @@ mod tests {
         fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
         let anchored = open_anchored_fs(&[root], &state, &SystemDirectorySync).unwrap();
 
-        anchored.copy_file(&source, &staged).unwrap();
+        anchored.copy_tree(&source, &staged).unwrap();
 
         assert_eq!(
             fs::metadata(&staged).unwrap().permissions().mode() & 0o077,
@@ -4540,7 +4872,7 @@ mod tests {
         });
         let anchored = open_anchored_fs(&[root], &state, &SystemDirectorySync).unwrap();
 
-        let error = anchored.copy_file(&source, &target).unwrap_err();
+        let error = anchored.copy_tree(&source, &target).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(

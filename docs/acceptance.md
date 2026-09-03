@@ -112,10 +112,41 @@ those vocabularies for pair comparison. On the unchanged real Snapshot the
 unoptimized first report fell to 2.22 seconds and the optimized 1.7.1 build
 produced the complete report in 0.84 seconds. Normalized complete reports from
 the official 1.7.0 binary and the 1.7.1 build were byte-identical after removing
-random Run, Report, and Finding IDs. A 193-Skill core regression that previously
-took 75.32 seconds now completes in under one second and enforces a five-second
-upper bound in the unoptimized test profile. These measurements describe the
-recorded reference run, not a universal machine-performance guarantee.
+random Run, Report, and Finding IDs. The recorded 193-Skill core regression fell
+from 75.32 seconds to under one second. Its current deterministic assertions
+check one vocabulary per Skill, the exact pair count, and at most 25 retained
+candidates; there is no five-second wall-clock assertion. These historical
+measurements describe the recorded reference run, not a universal
+machine-performance guarantee.
+
+### Synthetic overlap scale baseline (release-hardening round)
+
+Run `bash scripts/benchmark-overlap.sh` to compile the optimized library test
+and measure each size in a separate process with `/usr/bin/time`. Compilation
+is excluded. `analysis_ms` covers overlap analysis; peak RSS covers the entire
+test process, including its synthetic Snapshot. The fixture uses distinct
+identities, dense shared routing vocabulary, and 20 repeats of the same body.
+It deliberately makes every pair a candidate; it is not a full Scan, database,
+CLI, or representative real-user latency benchmark.
+
+Single local measurements on macOS 26.5.2 arm64, Rust 1.98.0, comparing main
+`2beab5d` plus measurement instrumentation against bounded selection and
+score-only comparison:
+
+| Skills | Pairs | Before analysis | After analysis | Before peak RSS | After peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 193 | 18,528 | 13 ms | 5 ms | 10,452,992 B | 9,814,016 B |
+| 1,000 | 499,500 | 307 ms | 73 ms | 28,344,320 B | 14,712,832 B |
+| 5,000 | 12,497,500 | 7,752 ms | 1,558 ms | 339,918,848 B | 38,338,560 B |
+
+Changing only candidate retention reduced the 5,000-Skill peak RSS to
+38,174,720 B but took 8,055 ms. Removing unused pairwise explanation allocation
+then reduced analysis time. Selection retains at most 25 entries throughout;
+vocabulary storage still grows with the inventory, and pair enumeration is
+still quadratic. No latency or total-memory limit is promised. CI uses
+deterministic resource-count assertions and an independent full-sort oracle
+covering empty/small inputs, ties, reordered IDs, same-name variants, and equal
+digests. The timing experiment is opt-in and is not a flaky pass/fail gate.
 
 ## Agent session-evidence dogfood
 

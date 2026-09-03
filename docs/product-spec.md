@@ -190,8 +190,24 @@ handle and restores its platform permissions before publication. Unix
 permission bits and Windows file attributes, including readonly, must therefore
 survive both Apply and Undo, including an originally non-writable file. Windows
 removal uses a handle-bound disposition that ignores readonly without first
-weakening the original path's attributes. SkillRoster does not claim portable
-preservation of owner, ACLs, or extended attributes.
+weakening the original path's attributes. Copy-based mutations additionally
+validate observable metadata through retained handles: Unix owner/group and
+permission bits must survive; unsupported extended attributes and ACLs refuse
+the copy. macOS system provenance is accepted only when its exact value survives
+unchanged, while extended ACLs and other file flags are unsupported. Recursive
+copies finalize directory permissions after copying children. Windows ordinary
+file attributes, owner, group, and DACL must match at the destination; a copy
+across different inherited ACLs is refused instead of broadening access.
+Windows named streams, extended attributes, and non-ordinary file attributes
+are unsupported. Private replacement backups keep their private DACL; the
+original Windows owner/group/DACL evidence is saved in the private Receipt and
+checked against the restoration destination. Legacy Windows replacement
+Receipts without that evidence fail closed rather than guessing lost metadata.
+Replacement Undo refuses observable metadata drift from its recovery evidence.
+This is not a portable archive/backup contract for timestamps, hard-link
+topology, privileged audit policy (such as Windows SACLs), or metadata the OS
+does not expose to this process. See [hardening evidence](hardening-evidence.md)
+for precise failure-test and metadata boundaries.
 
 Apply, compensation, and Undo open approved roots and the private state root as
 directory capabilities before mutation. Filesystem paths are resolved relative
