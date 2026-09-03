@@ -74,7 +74,7 @@ pub(crate) fn set_after_created_symlink_first_check_hook(hook: impl FnOnce() + '
     AFTER_CREATED_SYMLINK_FIRST_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn set_after_created_entry_first_check_hook(hook: impl FnOnce() + 'static) {
     AFTER_CREATED_ENTRY_FIRST_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

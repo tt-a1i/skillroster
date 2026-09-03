@@ -4686,8 +4686,10 @@ mod tests {
         .unwrap();
         #[cfg(windows)]
         let rename_checks_ran = {
-            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let ran = std::rc::Rc::new(std::cell::Cell::new(0));
             let hook_ran = ran.clone();
+            let directory_hook_ran = ran.clone();
+            let directories = [source.clone(), target.clone()];
             let paths = [
                 source.clone(),
                 source.join("nested"),
@@ -4696,6 +4698,16 @@ mod tests {
             ];
             BEFORE_EXECUTE_HOOK.with(|slot| {
                 *slot.borrow_mut() = Some(Box::new(move || {
+                    crate::anchored_fs::set_after_created_entry_first_check_hook(move || {
+                        for path in directories {
+                            assert!(
+                                fs::rename(&path, path.with_extension("moved")).is_err(),
+                                "copy directory must be protected before children: {}",
+                                path.display()
+                            );
+                        }
+                        directory_hook_ran.set(directory_hook_ran.get() + 1);
+                    });
                     crate::anchored_fs::set_after_staging_file_open_hook(move || {
                         for path in paths {
                             assert!(
@@ -4704,7 +4716,7 @@ mod tests {
                                 path.display()
                             );
                         }
-                        hook_ran.set(true);
+                        hook_ran.set(hook_ran.get() + 1);
                     });
                 }));
             });
@@ -4713,7 +4725,7 @@ mod tests {
         let applied = apply(&plan).unwrap();
         assert!(applied.verification_passed, "{:?}", applied.receipt.error);
         #[cfg(windows)]
-        assert!(rename_checks_ran.get(), "nested file-copy checkpoint ran");
+        assert_eq!(rename_checks_ran.get(), 2, "both copy checkpoints ran");
         assert_eq!(
             fs::read_to_string(target.join("nested/file")).unwrap(),
             "retained"
