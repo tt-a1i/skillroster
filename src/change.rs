@@ -4684,8 +4684,36 @@ mod tests {
             },
         )
         .unwrap();
+        #[cfg(windows)]
+        let rename_checks_ran = {
+            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let hook_ran = ran.clone();
+            let paths = [
+                source.clone(),
+                source.join("nested"),
+                target.clone(),
+                target.join("nested"),
+            ];
+            BEFORE_EXECUTE_HOOK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    crate::anchored_fs::set_after_staging_file_open_hook(move || {
+                        for path in paths {
+                            assert!(
+                                fs::rename(&path, path.with_extension("moved")).is_err(),
+                                "copy directory must remain rename-protected: {}",
+                                path.display()
+                            );
+                        }
+                        hook_ran.set(true);
+                    });
+                }));
+            });
+            ran
+        };
         let applied = apply(&plan).unwrap();
         assert!(applied.verification_passed, "{:?}", applied.receipt.error);
+        #[cfg(windows)]
+        assert!(rename_checks_ran.get(), "nested file-copy checkpoint ran");
         assert_eq!(
             fs::read_to_string(target.join("nested/file")).unwrap(),
             "retained"
