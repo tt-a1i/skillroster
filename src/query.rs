@@ -311,7 +311,15 @@ pub struct Report {
     pub metrics: PrimaryMetrics,
     pub findings: Vec<Finding>,
     pub category_counts: BTreeMap<String, usize>,
+    pub semantic_overlap_candidates: SemanticOverlapCandidates,
     pub files_changed: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SemanticOverlapCandidates {
+    pub candidate_count: usize,
+    pub returned_count: usize,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -566,7 +574,7 @@ pub fn build_report(scan: &ScanResult) -> Report {
     layout_findings(scan, &mut findings);
     exposure_findings(scan, &mut findings);
     usage_findings(scan, &mut findings);
-    overlap_findings(scan, &mut findings);
+    let semantic_overlap_candidates = overlap_findings(scan, &mut findings);
     routing_findings(scan, &mut findings);
     lifecycle_findings(scan, &mut findings);
     prioritize_report_findings(&mut findings, 3);
@@ -581,6 +589,7 @@ pub fn build_report(scan: &ScanResult) -> Report {
         metrics,
         findings,
         category_counts,
+        semantic_overlap_candidates,
         files_changed: false,
     }
 }
@@ -1321,7 +1330,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 }
 
-fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, usize, usize) {
+fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> SemanticOverlapCandidates {
     for (skill_id, placements) in placements_by_skill(scan) {
         let Some(skill) = scan.skills.iter().find(|skill| skill.id == skill_id) else {
             continue;
@@ -1391,7 +1400,6 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
         .map(|skill| normalize_skill_name(&skill.name))
         .collect::<Vec<_>>();
     let mut candidates = Vec::with_capacity(SEMANTIC_CANDIDATE_LIMIT);
-    let mut candidate_peak = 0;
     let compare = |left: &(f64, &ScannedSkill, &ScannedSkill),
                    right: &(f64, &ScannedSkill, &ScannedSkill)| {
         right
@@ -1401,11 +1409,10 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
             .then_with(|| left.1.id.cmp(&right.1.id))
             .then_with(|| left.2.id.cmp(&right.2.id))
     };
-    let mut pair_comparison_count = 0usize;
+    let mut candidate_count = 0usize;
     for (index, left) in scan.skills.iter().enumerate() {
         let left_tokens = &vocabularies[index];
         for (right_index, right) in scan.skills.iter().enumerate().skip(index + 1) {
-            pair_comparison_count = pair_comparison_count.saturating_add(1);
             if normalized_names[index] == normalized_names[right_index] {
                 continue;
             }
@@ -1422,6 +1429,7 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
             let union_count = left_tokens.len() + right_tokens.len() - intersection_count;
             let similarity = intersection_count as f64 / union_count as f64;
             if similarity >= 0.45 {
+                candidate_count = candidate_count.saturating_add(1);
                 let candidate = (similarity, left, right);
                 // Insert after equal keys, retaining the old stable-sort order.
                 // Discard the worst entry before insertion, never retaining >25.
@@ -1432,11 +1440,11 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
                         candidates.pop();
                     }
                     candidates.insert(position, candidate);
-                    candidate_peak = candidate_peak.max(candidates.len());
                 }
             }
         }
     }
+    let returned_count = candidates.len();
     for (similarity, left, right) in candidates {
         push_finding(
             findings,
@@ -1457,7 +1465,11 @@ fn overlap_findings(scan: &ScanResult, findings: &mut Vec<Finding>) -> (usize, u
             EvidenceQuality::Inferred,
         );
     }
-    (vocabularies.len(), pair_comparison_count, candidate_peak)
+    SemanticOverlapCandidates {
+        candidate_count,
+        returned_count,
+        truncated: candidate_count > returned_count,
+    }
 }
 
 fn physical_source_identity(
@@ -3233,6 +3245,9 @@ mod tests {
                     && finding.affected_skill_ids.contains(&candidate_id)
             })
             .unwrap();
+        assert_eq!(report.semantic_overlap_candidates.candidate_count, 1);
+        assert_eq!(report.semantic_overlap_candidates.returned_count, 1);
+        assert!(!report.semantic_overlap_candidates.truncated);
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("review-only candidate evidence"));
         assert!(finding.summary.contains("not a confirmed duplicate"));
@@ -3289,12 +3304,11 @@ mod tests {
         scan.usage.clear();
 
         let mut findings = Vec::new();
-        let (vocabulary_count, pair_comparison_count, candidate_peak) =
-            overlap_findings(&scan, &mut findings);
+        let candidates = overlap_findings(&scan, &mut findings);
 
-        assert_eq!(vocabulary_count, 193);
-        assert_eq!(pair_comparison_count, 193 * 192 / 2);
-        assert!(candidate_peak <= 25, "retained {candidate_peak} candidates");
+        assert_eq!(candidates.candidate_count, 193 * 192 / 2);
+        assert_eq!(candidates.returned_count, 25);
+        assert!(candidates.truncated);
         assert_eq!(
             findings
                 .iter()
@@ -3331,13 +3345,16 @@ mod tests {
         scan.usage.clear();
         let start = std::time::Instant::now();
         let mut findings = Vec::new();
-        let (vocabularies, pairs, retained) = overlap_findings(&scan, &mut findings);
+        let candidates = overlap_findings(&scan, &mut findings);
         let elapsed = start.elapsed();
-        assert_eq!(vocabularies, count);
-        assert_eq!(pairs, count * (count - 1) / 2);
+        assert_eq!(candidates.candidate_count, count * (count - 1) / 2);
+        assert_eq!(candidates.returned_count, 25);
+        assert!(candidates.truncated);
         assert_eq!(findings.len(), 25);
         println!(
-            "skills={count} pairs={pairs} retained_candidates={retained} analysis_ms={}",
+            "skills={count} candidates={} retained_candidates={} analysis_ms={}",
+            candidates.candidate_count,
+            candidates.returned_count,
             elapsed.as_millis()
         );
         fs::remove_dir_all(root).unwrap();
@@ -3387,10 +3404,13 @@ mod tests {
                     .unwrap()
                     .then(left.1.cmp(&right.1))
             });
+            let candidate_count = expected.len();
             expected.truncate(25);
             let mut findings = Vec::new();
-            let (_, _, peak) = overlap_findings(&scan, &mut findings);
-            assert!(peak <= 25);
+            let candidates = overlap_findings(&scan, &mut findings);
+            assert_eq!(candidates.candidate_count, candidate_count);
+            assert_eq!(candidates.returned_count, expected.len());
+            assert_eq!(candidates.truncated, candidate_count > expected.len());
             assert_eq!(findings.len(), expected.len());
             for (actual, (score, mut ids)) in findings.iter().zip(expected) {
                 ids.sort();

@@ -494,6 +494,25 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
             }
         }
     }
+    if let Some(candidates) = value
+        .get("semantic_overlap_candidates")
+        .filter(|candidates| candidates["candidate_count"].as_u64().unwrap_or_default() > 0)
+    {
+        let qualifier = if candidates["truncated"].as_bool().unwrap_or(false) {
+            " · bounded"
+        } else {
+            ""
+        };
+        fact(
+            lines,
+            "Semantic candidates",
+            format!(
+                "{} of {} returned{qualifier}",
+                text(candidates, "returned_count"),
+                text(candidates, "candidate_count")
+            ),
+        );
+    }
     if let Some(counts) = value.get("category_counts").and_then(Value::as_object) {
         lines.push(String::new());
         lines.push("  Category totals".into());
@@ -2373,6 +2392,11 @@ mod tests {
                     "affected_placement_count": 0
                 }
             ],
+            "semantic_overlap_candidates": {
+                "candidate_count": 317,
+                "returned_count": 25,
+                "truncated": true
+            },
             "category_counts": {"layout": 1, "overlap": 1, "lifecycle": 1, "usage": 1}
         });
         for width in [60, 80, 120] {
@@ -2396,6 +2420,8 @@ mod tests {
                 "110 ×",
                 "110 Skills",
                 "561 placements",
+                "Semantic candidates",
+                "25 of 317 returned · bounded",
                 "Category totals",
             ] {
                 assert!(output.contains(expected), "{expected} missing at {width}");

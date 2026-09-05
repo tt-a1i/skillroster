@@ -2580,6 +2580,7 @@ fn report_command(
         "findings": compact_findings,
         "finding_rollups": finding_rollups,
         "category_counts": report.category_counts,
+        "semantic_overlap_candidates": report.semantic_overlap_candidates,
         "files_changed": false
     });
     store.save_report(
@@ -4627,6 +4628,7 @@ fn paged_finding_report(
         "matched_finding_count": total,
         "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
+        "semantic_overlap_candidates": report["semantic_overlap_candidates"],
         "filters": {
             "category": category.map(ReportCategory::id),
             "severity": severity.map(ReportSeverity::id)
@@ -4707,6 +4709,7 @@ fn compact_report(report: &Value) -> Value {
         "findings": compact_findings,
         "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
+        "semantic_overlap_candidates": report["semantic_overlap_candidates"],
         "files_changed": false
     })
 }
@@ -11011,6 +11014,31 @@ mod recovery_tests {
         assert_eq!(rollups[0]["finding_count"], 2);
         assert_eq!(rollups[0]["affected_skill_count"], 2);
         assert_eq!(rollups[0]["affected_placement_count"], 3);
+    }
+
+    #[test]
+    fn report_views_preserve_semantic_overlap_candidate_bounds() {
+        let report = json!({
+            "findings": [],
+            "category_counts": {},
+            "semantic_overlap_candidates": {
+                "candidate_count": 31,
+                "returned_count": 25,
+                "truncated": true
+            }
+        });
+
+        let compact = compact_report(&report);
+        assert_eq!(
+            compact["semantic_overlap_candidates"],
+            report["semantic_overlap_candidates"]
+        );
+
+        let paged = paged_finding_report(&report, None, None, 20, 0);
+        assert_eq!(
+            paged["semantic_overlap_candidates"],
+            report["semantic_overlap_candidates"]
+        );
     }
 
     #[test]
