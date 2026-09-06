@@ -494,6 +494,21 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
             }
         }
     }
+    semantic_overlap_bounds(value, lines);
+    if let Some(counts) = value.get("category_counts").and_then(Value::as_object) {
+        lines.push(String::new());
+        lines.push("  Category totals".into());
+        for (category, count) in counts {
+            lines.push(format!("  {category:<12} {count}"));
+        }
+    }
+    lines.extend(summary(
+        "Read-only · no Agent files changed",
+        "Review evidence before planning changes",
+    ));
+}
+
+fn semantic_overlap_bounds(value: &Value, lines: &mut Vec<String>) {
     if let Some(candidates) = value
         .get("semantic_overlap_candidates")
         .filter(|candidates| candidates["candidate_count"].as_u64().unwrap_or_default() > 0)
@@ -513,17 +528,6 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
             ),
         );
     }
-    if let Some(counts) = value.get("category_counts").and_then(Value::as_object) {
-        lines.push(String::new());
-        lines.push("  Category totals".into());
-        for (category, count) in counts {
-            lines.push(format!("  {category:<12} {count}"));
-        }
-    }
-    lines.extend(summary(
-        "Read-only · no Agent files changed",
-        "Review evidence before planning changes",
-    ));
 }
 
 fn finding_list(value: &Value, lines: &mut Vec<String>, width: usize) {
@@ -537,6 +541,7 @@ fn finding_list(value: &Value, lines: &mut Vec<String>, width: usize) {
     };
     fact(lines, "Finding page", range);
     fact(lines, "All Findings", text(value, "finding_count"));
+    semantic_overlap_bounds(value, lines);
     let category = value["filters"]["category"].as_str();
     let severity = value["filters"]["severity"].as_str();
     if category.is_some() || severity.is_some() {

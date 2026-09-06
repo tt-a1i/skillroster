@@ -128,6 +128,8 @@ routing-vocabulary Jaccard score, counts, and shared-term preview. Complete
 Skill bodies stay at the returned local paths. The calling Agent or person owns
 the semantic conclusion, and no Plan action is suggested from this evidence.
 
+Reports disclose semantic overlap candidate bounds as `semantic_overlap_candidates`: the total qualifying pair count, the retained count (at most 25), and whether candidates were truncated. These are analysis-wide bounds, independent of Finding filters or pagination, and appear in both JSON views and terminal summaries and Finding lists. Cached reports without these bounds are regenerated from the same Snapshot; a new Scan is not required.
+
 ### 4.3 Library and Rosters
 
 The Library is logical and does not require moving every Skill. Each discovered Skill begins as Observed. After approval it may become:

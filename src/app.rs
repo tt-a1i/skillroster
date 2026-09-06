@@ -2484,7 +2484,10 @@ fn report_command(
     let (scan_id, scan): (ScanId, ScanResult) = latest_scan(store)?;
     require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
-        if existing.scan_id == scan_id && report_supports_source_confirmation_kind(&existing) {
+        if existing.scan_id == scan_id
+            && report_supports_source_confirmation_kind(&existing)
+            && existing.summary["semantic_overlap_candidates"].is_object()
+        {
             return Ok(select_report_view(&existing.summary, request));
         }
     }
