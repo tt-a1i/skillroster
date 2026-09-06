@@ -13825,3 +13825,89 @@ fn historical_finding_detail_exposes_current_continuity_by_placement() {
         "latest_report_stale"
     );
 }
+
+#[test]
+fn report_refreshes_legacy_overlap_bounds_and_discloses_them_in_finding_lists() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    for index in 0..10 {
+        let root = home.join(format!(".claude/skills/example-{index}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: example-{index}\ndescription: shared architecture workflow database governance evidence\n---\nSkill {index}\n"),
+        ).unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ];
+    json_output(&run(&[&common[..], &["scan", "--json"]].concat(), None));
+    let first = json_output(&run(&[&common[..], &["report", "--json"]].concat(), None));
+    let bounds = json!({"candidate_count": 45, "returned_count": 25, "truncated": true});
+    assert_eq!(first["result"]["semantic_overlap_candidates"], bounds);
+
+    // Simulate a report persisted before the bounds field existed, without
+    // rescanning or changing any Skill files.
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let original_id = first["result"]["report_id"].as_str().unwrap();
+    let stored: String = database
+        .query_row(
+            "SELECT summary_json FROM reports WHERE id = ?1",
+            [original_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut legacy: Value = serde_json::from_str(&stored).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("semantic_overlap_candidates");
+    database
+        .execute(
+            "UPDATE reports SET summary_json = ?1 WHERE id = ?2",
+            rusqlite::params![legacy.to_string(), original_id],
+        )
+        .unwrap();
+    drop(database);
+
+    let refreshed = json_output(&run(&[&common[..], &["report", "--json"]].concat(), None));
+    assert_ne!(
+        refreshed["result"]["report_id"],
+        first["result"]["report_id"]
+    );
+    assert_eq!(
+        refreshed["result"]["snapshot_id"],
+        first["result"]["snapshot_id"]
+    );
+    assert_eq!(refreshed["result"]["semantic_overlap_candidates"], bounds);
+    let cached = json_output(&run(&[&common[..], &["report", "--json"]].concat(), None));
+    assert_eq!(
+        cached["result"]["report_id"],
+        refreshed["result"]["report_id"]
+    );
+
+    let list_args = [
+        "report",
+        "--findings",
+        "--category",
+        "overlap",
+        "--limit",
+        "100",
+    ];
+    let page = json_output(&run(&[&common[..], &list_args, &["--json"]].concat(), None));
+    assert_eq!(page["result"]["semantic_overlap_candidates"], bounds);
+    for width in [60, 80, 120] {
+        let output = run_with_columns(&[&common[..], &list_args].concat(), width);
+        assert!(output.status.success());
+        let rendered = String::from_utf8(output.stdout).unwrap();
+        assert!(rendered.contains("Semantic candidates"), "{rendered}");
+        assert!(
+            rendered.contains("25 of 45 returned · bounded"),
+            "{rendered}"
+        );
+    }
+}
