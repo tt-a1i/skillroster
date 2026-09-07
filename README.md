@@ -1,17 +1,17 @@
-<h1 align="center">SkillRoster</h1>
+<p align="center">
+  <img src="docs/assets/skillroster-hero.png" width="100%" alt="SkillRoster：一个能力库，为每个 Agent 配好合适的 Skills。Library 分别呈现 Codex、Claude Code、Pi 的精选 Roster，其余能力仍可按需查找；变更先预览，执行后可撤销。">
+</p>
 
 <p align="center">
   <strong>中文</strong> · <a href="README.en.md">English</a>
 </p>
 
-<p align="center">
-  <strong>别把所有 Skill 都塞给每个 Agent。</strong>
-</p>
+<h1 align="center">Skill 都留着，每个 Agent 只带上合适的。</h1>
 
 <p align="center">
-  SkillRoster 统一盘点散落在不同 Agent 里的 Skills，<br>
-  为每个 Agent 保留合适的默认能力，其他能力按需查找；文件整理先预览，执行后可撤销。<br>
-  一个 Library，为每个 Agent 配好合适的 Roster。
+  盘清散落的 Skills，找出重复版本和失效链接，<br>
+  为每个 Agent 配好常用能力，其余按需查找。<br>
+  <strong>先看方案，再确认变更；执行有凭据，整理可撤销。</strong>
 </p>
 
 <p align="center">
@@ -23,36 +23,47 @@
 </p>
 
 <p align="center">
-  <a href="#30-秒开始">快速开始</a> ·
-  <a href="#它能看见什么">实际效果</a> ·
-  <a href="#工作原理">工作原理</a> ·
-  <a href="docs/product-spec.md">产品规范</a> ·
-  <a href="docs/installation.md">全部安装方式</a>
+  <a href="#30-秒开始">立即开始</a> ·
+  <a href="#什么时候用-skillroster">使用场景</a> ·
+  <a href="#一眼看懂治理结果">实际效果</a> ·
+  <a href="docs/installation.md">安装指南</a>
 </p>
 
----
+## 什么时候用 SkillRoster
 
-## Skill 越装越多，Agent 不该越用越乱
+你同时用着几个编程 Agent，Skill 越装越多：同一个能力分散在几个目录，同名文件不一定是同一版本，偶尔才用的能力也挂在默认列表里。SkillRoster 先把本地事实查清楚，让 Agent 提出一份你能判断、能撤销的整理方案。
 
-Codex、Claude Code、Pi、OpenCode、Hermes、Cursor、Gemini CLI 和 GitHub
-Copilot 用久了，Skill 会散落在不同目录：同一个能力到处复制，版本逐渐不一致，
-链接失效，名字相同但内容不同。与此同时，一些很少用到的 Skill 仍占着每个 Agent
-的默认上下文，真正需要的能力反而更难选中。
-
-人工整理同样危险：你很难确定哪些正在使用、哪些只是没有观察到，也很难保证移动、
-替换或删除之后还能恢复。SkillRoster 先用确定性的本地 CLI 把事实查清楚，再让 Agent
-提出方案；没有完整 Plan 和用户确认，就不会修改 Agent 文件。
-
-| 看得清 | 配得准 | 改得回 |
+| 你的场景 | 可以这样告诉 Agent | 你会得到什么 |
 | --- | --- | --- |
-| 盘点 Skill、Placement、链接、来源、暴露范围和有边界的使用证据。 | 为每个 Agent 保留合适的 Core Skill，较窄的能力转为可检索的 On-demand Skill。 | 先预览不可变 Plan，确认后执行，留下 Receipt，需要时 Undo。 |
+| **几个 Agent，Skills 散得到处都是** | “查查哪些重复了、链接坏了、同名但版本不同。” | 带路径和证据的清单，先看清楚再决定保留哪份。 |
+| **默认能力太多，想精简又怕丢能力** | “帮我挑出 Codex 常用的 Skills，其余保留为按需查找。” | 按 Agent 规划的 Roster，以及整理前后的暴露变化，供你确认。 |
+| **想整理目录，又怕改坏现有环境** | “先告诉我会改哪些地方，以及怎么撤销。” | 变更前的完整 Plan、执行后的验证凭据 Receipt，以及有边界的 Undo。 |
 
-> **核心价值：让多个 Agent 的 Skill 环境从不可见、不可控，变成看得清、配得准、改得回。**
+**一个 Library，各自的 Roster。** Library 是已知 Skills 的逻辑全集，Roster 是某个 Agent 可见的精选视图；原始文件可以留在原处。宣传图中的能力搭配仅作示意，不代表 Codex、Claude Code 或 Pi 必须承担特定任务。
 
-SkillRoster 不提供 Marketplace，也不调用模型或运行 MCP Server。AI Agent 负责理解
-你的意图；SkillRoster 负责返回有边界的事实，并执行已经批准的变更。
+## 30 秒开始
 
-### 一眼看懂治理结果
+macOS 或 Linux 用户可通过 Homebrew 安装：
+
+```bash
+brew install tt-a1i/skillroster/skillroster
+skillroster --version
+```
+
+然后把这段话交给你的 Agent：
+
+> 使用 SkillRoster 检查我电脑上的 Skills。先解释最值得处理的三个问题和对应证据，再给我一份可以审阅的整理方案。在我确认完整 Plan 之前，不要修改 Agent 文件。
+
+第一步只做检查。你也可以直接在终端查看：
+
+```bash
+skillroster scan --summary
+skillroster report
+```
+
+[Windows、Cargo 和 Release 安装方式](docs/installation.md) · [升级并确认 Agent 使用的可执行文件](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)
+
+## 一眼看懂治理结果
 
 在同一份确定性的 120-Skill 清单上，公开 CLI 验收会实际执行 Scan、Report、Plan、
 Apply 和 Undo，而不是加载预先写好的结果：
@@ -70,59 +81,7 @@ Placement，并把变更限制在可验证、可撤销的 Receipt 内。完整�
 这是受控清单上的产品行为证据，不是对 token、人工成本、生产性能、模型质量，或
 Core / On-demand 划分普遍优越性的证明。
 
-## 30 秒开始
-
-使用 Homebrew 安装当前版本：
-
-```bash
-brew install tt-a1i/skillroster/skillroster
-skillroster --version
-```
-
-已经安装过？请先看[升级与执行路径检查](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)：
-升级 Homebrew 后，PATH 中排在前面的旧副本仍可能被 Agent 调用。
-
-然后直接告诉你的 Agent：
-
-> 使用 SkillRoster 检查我电脑上的 Skills，解释最需要处理的问题，并给出一套更安全的
-> 整理方案。在我确认完整 Plan 之前，不要修改任何文件。
-
-也可以先在终端运行：
-
-```bash
-skillroster scan --summary
-skillroster report
-```
-
-Agent 调用时加上 `--json`，即可得到一份稳定的机器可读结果。Release 压缩包、Cargo、
-Windows 安装和校验和验证请看[安装文档](docs/installation.md)。
-
-## 它能看见什么
-
-下面是 v1.8.28 在一台真实电脑上的只读 dogfood 结果。它只代表当时不断变化的本地
-Skill 环境，不是性能基准，也不代表所有用户都会有相同规模：
-
-```text
-SkillRoster · Report
-
-  Independent Skills     252
-  Placements             892
-  Default exposure       525
-  Observed-use Agents    3
-  Session sample         sampled 5/8 · complete 0/8
-
-  Top Findings
-  high    layout     Skill links escape an approved root
-  medium  exposure   Large default Rosters need review
-  medium  overlap    Exact duplicate Skill placements
-
-Read-only · no Agent files changed
-Review evidence before planning changes
-```
-
-这份结果同时写出了证据边界。覆盖不完整时，SkillRoster 会把限制放进结果，不会因为
-没有观察到使用记录，就断言某个 Skill “从未使用”。完整数据见
-[v1.8.28 发布验收记录](docs/acceptance/release-v1.8.28-candidate.md)。
+另有一份[真实环境的历史只读记录](docs/acceptance/release-v1.8.28-candidate.md)：252 个独立 Skills、892 个安装位置。那次会话覆盖不完整；没有观察到使用记录，不代表某个 Skill 没有用。
 
 ## 工作原理
 
@@ -151,7 +110,8 @@ flowchart LR
 主要调用者是 Agent。语义判断交给模型；身份识别、文件系统边界、持久化、校验和变更
 执行交给 CLI。
 
-## Agent 的主流程
+<details>
+<summary>Agent 集成：展开查看 CLI 主流程</summary>
 
 ```bash
 # 观察
@@ -177,6 +137,8 @@ skillroster status --json
 CLI 还支持 Finding 下钻、同名不同内容的精确选择、已确认的 Source Root，以及生命周期
 导出和保留策略。完整契约见[产品规范](docs/product-spec.md)。清理历史记录前，请先阅读
 [本地数据生命周期](docs/local-data-lifecycle.md)。
+
+</details>
 
 ## 安全约束
 
@@ -204,11 +166,7 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
-公开版本 v1.8.45 已实现完整的本地治理闭环；每一步 Agent 续接都会绑定到
-生成该续接指令的 SkillRoster 可执行文件，不会被 `PATH` 中的旧版本静默接管。
-能力包括发现、标准化 Inventory、保守的
-使用证据、有边界的报告、本地检索、不可变 Plan、Apply/Undo、恢复、生命周期控制，
-以及 8 个直接 Agent Adapter。
+当前公开版本为 **v1.8.45**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)
 - [v1.8.45 发布与平台证据](docs/acceptance/release-v1.8.45-candidate.md)
