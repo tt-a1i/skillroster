@@ -1,17 +1,17 @@
-<h1 align="center">SkillRoster</h1>
+<p align="center">
+  <img src="docs/assets/skillroster-hero.png" width="100%" alt="SkillRoster — one library, the right skills for every agent. A shared capability library feeds curated Codex, Claude Code, and Pi Rosters; other Skills stay discoverable on demand. Preview, Apply, Undo.">
+</p>
 
 <p align="center">
   <a href="README.md">中文</a> · <strong>English</strong>
 </p>
 
-<p align="center">
-  <strong>Stop giving every agent every Skill.</strong>
-</p>
+<h1 align="center">Keep the Skills. Curate what each agent sees.</h1>
 
 <p align="center">
-  SkillRoster inventories Skills scattered across your agents,<br>
-  keeps the right defaults for each one, and leaves the rest searchable on demand.<br>
-  File changes are previewed first and reversible afterward. One library. The right roster for every agent.
+  Inventory Skills across your agents, review duplicates and broken links,<br>
+  and keep the rest searchable beyond each agent’s everyday essentials.<br>
+  <strong>Preview every change. Approve the Plan. Undo with a Receipt.</strong>
 </p>
 
 <p align="center">
@@ -23,39 +23,47 @@
 </p>
 
 <p align="center">
-  <a href="#start-in-30-seconds">Install</a> ·
-  <a href="#what-it-sees">See it work</a> ·
-  <a href="#how-it-works">How it works</a> ·
-  <a href="docs/product-spec.md">Product spec</a> ·
-  <a href="docs/installation.md">All platforms</a>
+  <a href="#start-in-30-seconds">Get started</a> ·
+  <a href="#when-skillroster-helps">Use cases</a> ·
+  <a href="#the-governance-result-at-a-glance">See the evidence</a> ·
+  <a href="docs/installation.md">Installation guide</a>
 </p>
 
----
+## When SkillRoster helps
 
-## More Skills should not mean more agent clutter
+You use more than one coding agent. Skills pile up in different directories, the same name starts hiding different versions, and every agent sees capabilities you only need occasionally. SkillRoster gives your agent the local facts to propose a setup you can review.
 
-Skills accumulate across Codex, Claude Code, Pi, OpenCode, Hermes, Cursor,
-Gemini CLI, and GitHub Copilot. The same capability gets copied into several
-directories, versions drift, links break, and identical names hide different
-content. Narrow Skills stay in every default context, making the right capability
-harder to select.
-
-Manual cleanup is risky too. It is hard to distinguish unused Skills from Skills
-whose use was simply not observed, or to know whether a move, replacement, or
-deletion can be recovered. SkillRoster establishes local facts first, then lets
-the agent propose a Plan. It does not change agent files without that complete
-Plan and your confirmation.
-
-| See clearly | Configure precisely | Change reversibly |
+| Your situation | Ask your agent | What you get |
 | --- | --- | --- |
-| Inventory Skills, placements, links, sources, exposure, and bounded usage evidence. | Keep the right Core Skills for each agent and leave narrower ones searchable On-demand. | Preview immutable Plans, require confirmation, record Receipts, and Undo owned changes. |
+| **Skills scattered across agents** | “Find duplicate Skills, broken links, and same-name versions.” | An inventory with paths and evidence to inspect before choosing what to keep. |
+| **Too many default Skills** | “Help me choose the everyday Skills for Codex; keep the rest available on demand.” | A per-agent Roster Plan with the proposed exposure changes for your review. |
+| **Cleanup feels risky** | “Show me what will change and how I can undo it.” | A complete Plan before any Agent-file change, followed by a verified Receipt and bounded Undo. |
 
-> **Core value: turn a multi-agent Skill estate from invisible and uncontrolled into something you can see clearly, configure precisely, and change reversibly.**
+**One Library, different Rosters.** Your Library is the logical collection of known Skills; each Roster is an agent’s curated view. Canonical files can stay where they are. The banner illustrates possible selections, not prescribed roles for Codex, Claude Code, or Pi.
 
-It is **not** another marketplace, model, or MCP server. The AI agent interprets
-your intent; SkillRoster supplies bounded facts and executes approved changes.
+## Start in 30 seconds
 
-### The governance result at a glance
+Install with Homebrew on macOS or Linux:
+
+```bash
+brew install tt-a1i/skillroster/skillroster
+skillroster --version
+```
+
+Then give your agent this request:
+
+> Use SkillRoster to inspect my local Skills. Explain the three most important problems, with evidence, and propose a cleanup Plan I can review. Do not change Agent files until I approve the complete Plan.
+
+Your first step is read-only. You can also inspect the inventory directly:
+
+```bash
+skillroster scan --summary
+skillroster report
+```
+
+[Windows, Cargo, and release archives](docs/installation.md) · [Upgrade and verify the executable your agent uses](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)
+
+## The governance result at a glance
 
 On the same deterministic 120-Skill inventory, the public CLI acceptance path
 actually runs Scan, Report, Plan, Apply, and Undo instead of loading prepared
@@ -76,60 +84,7 @@ This is controlled-inventory product evidence. It does not prove token or labor
 savings, production performance, model quality, or universally superior Core
 and On-demand choices.
 
-## Start in 30 seconds
-
-Install the current release with Homebrew:
-
-```bash
-brew install tt-a1i/skillroster/skillroster
-skillroster --version
-```
-
-Already installed? See [upgrade and executable-path checks](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses):
-an older copy earlier on PATH can still be selected after a Homebrew upgrade.
-
-Then ask your agent:
-
-> Use SkillRoster to inspect my local Skills, explain the biggest problems, and
-> propose a safer setup. Do not change files until I approve the complete Plan.
-
-Or begin directly in the terminal:
-
-```bash
-skillroster scan --summary
-skillroster report
-```
-
-Agents add `--json` for one stable machine-readable document. Release archives,
-Cargo installation, Windows instructions, and checksum verification are in the
-[installation guide](docs/installation.md).
-
-## What it sees
-
-This is a real read-only v1.8.28 dogfood result from one changing local estate,
-not a benchmark or a universal inventory size:
-
-```text
-SkillRoster · Report
-
-  Independent Skills     252
-  Placements             892
-  Default exposure       525
-  Observed-use Agents    3
-  Session sample         sampled 5/8 · complete 0/8
-
-  Top Findings
-  high    layout     Skill links escape an approved root
-  medium  exposure   Large default Rosters need review
-  medium  overlap    Exact duplicate Skill placements
-
-Read-only · no Agent files changed
-Review evidence before planning changes
-```
-
-The important part is not the large numbers. It is the boundary: SkillRoster
-reports incomplete coverage instead of turning missing observations into an
-“unused” claim. See the full [release acceptance record](docs/acceptance/release-v1.8.28-candidate.md).
+A historical [read-only scan of a real environment](docs/acceptance/release-v1.8.28-candidate.md) also records 252 independent Skills across 892 placements. Its session coverage was incomplete: missing usage evidence is not proof that a Skill is unused.
 
 ## How it works
 
@@ -158,7 +113,8 @@ Three ideas keep the model simple:
 The primary caller is an agent. Semantic judgment stays with the model; identity,
 filesystem boundaries, persistence, validation, and mutation stay with the CLI.
 
-## The Agent-facing loop
+<details>
+<summary>CLI reference for Agent integrations</summary>
 
 ```bash
 # Observe
@@ -185,6 +141,8 @@ The CLI also supports Finding drilldown, exact same-name variants, confirmed
 source roots, lifecycle export and retention controls. Read the
 [product specification](docs/product-spec.md) for the complete contract and the
 [local data lifecycle](docs/local-data-lifecycle.md) before purging history.
+
+</details>
 
 ## Safety is product behavior
 
@@ -217,12 +175,7 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-Public release v1.8.45 implements the complete local governance loop. Every
-Agent continuation stays bound to the SkillRoster executable that emitted it
-instead of silently handing control to an older version on `PATH`. The loop
-includes discovery, normalized inventory, conservative usage evidence, bounded
-reporting, local retrieval, immutable planning, Apply/Undo, recovery, lifecycle
-controls, and eight direct agent adapters.
+The current public release is **v1.8.45**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
 - [v1.8.45 release and platform evidence](docs/acceptance/release-v1.8.45-candidate.md)
