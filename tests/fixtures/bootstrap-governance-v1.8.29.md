@@ -34,11 +34,6 @@ silently rescan between them. In `selection_evidence`, `target_agent` means the
 named Agent used that exact Skill identity. `cross_agent` means only the Agents
 listed in `evidence_agents` supplied evidence; describe it as “used elsewhere,”
 never as target-Agent usage. Similar names and paths do not transfer evidence.
-Every `stable_fallback` selection follows name and stable-ID order; it has no
-usage evidence and says nothing about usefulness. Explain this even when only
-one Core entry is a fallback. Review upcoming work and rare but important Skills
-with the user; use the existing `protected_skill_ids` for their choices. Keeping
-the current Roster is a valid outcome when the evidence is insufficient.
 
 ## Plan
 

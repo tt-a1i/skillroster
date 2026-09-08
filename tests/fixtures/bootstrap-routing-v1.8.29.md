@@ -1,6 +1,6 @@
 # Routing details
 
-The root search workflow is authoritative. Read this file for a wrong-domain result
+The root Route gate is authoritative. Read this file for a wrong-domain result
 or `verified_skill_load_blocked`. Keep `TASK` verbatim. A non-English or mixed
 task receives exactly one faithful English `--hint` on the first call.
 Build the hint from the desired surface, object, operation, and state; never
@@ -35,7 +35,7 @@ Roster, or authorize a later Plan.
 
 For `no_routable_match`, retry once with a refined capability hint. For
 `cjk_hint_required_for_weak_match`, keep `TASK` unchanged, author the one
-faithful English capability hint required by the root search workflow, and retry
+faithful English capability hint required by the root Route gate, and retry
 once. For `hint_direct_selection_evidence_required`, keep `TASK` unchanged and
 refine the existing hint once with the target surface, object, operation, and
 state; do not add a guessed Skill name. For drift, legacy Snapshot, unreadable,

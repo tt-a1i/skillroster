@@ -41,6 +41,10 @@ You use more than one coding agent. Skills pile up in different directories, the
 
 **One Library, different Rosters.** Your Library is the logical collection of known Skills; each Roster is an agent’s curated view. Canonical files can stay where they are. The banner illustrates possible selections, not prescribed roles for Codex, Claude Code, or Pi.
 
+With one agent and a small, clear native catalog, keeping your setup is a valid outcome. SkillRoster is most useful for cross-agent cleanup, version comparison, and changes you need to undo. Missing usage is not evidence of uselessness; Core entries filled by name order need review against your upcoming work.
+
+Ordinary tasks can use existing capabilities and search for specialized Skills when useful. No optional match need not interrupt the task. Claude's local exposure counts distinguish manual invocation, disabled entries, and name-only listings; they do not measure a running session's complete catalog or tokens. [Scope and validation](docs/practical-governance.md)
+
 ## Start in 30 seconds
 
 Install with Homebrew on macOS or Linux:

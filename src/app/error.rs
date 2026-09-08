@@ -66,6 +66,9 @@ pub(super) struct ContentIdentityRescanRequired {
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
+            "legacy_native_visibility_requires_rescan" | "native_visibility_settings_unavailable" | "native_visibility_settings_changed" => formatter.write_str(
+                "latest Snapshot's local Claude visibility evidence is missing or changed; run skillroster scan",
+            ),
             "non_unicode_identity_coverage_incomplete" => formatter.write_str(
                 "latest Snapshot excluded non-Unicode identity paths; resolve them and run skillroster scan",
             ),
@@ -328,6 +331,28 @@ pub fn error_json_with_context(
             "content_identity_rescan_required",
         )];
         action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
+    if let Some(blocked) = error.downcast_ref::<crate::roster_plan::NativeVisibilityConflict>() {
+        let envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "native_visibility_blocks_roster_change".into(),
+                message: blocked.to_string(),
+                retryable: false,
+                relevant_ids: vec![blocked.skill_id.clone()],
+                paths: Vec::new(),
+                details: Some(json!({
+                    "agent": "claude-code",
+                    "visibility": blocked.mode,
+                    "files_changed": false,
+                    "state_files_changed": false,
+                    "native_configuration_changed": false,
+                    "next_action": "review_native_visibility_then_scan"
+                })),
+            },
+        );
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
     }

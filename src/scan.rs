@@ -104,6 +104,8 @@ pub struct RootObservation {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SkillMetadata {
+    #[serde(default)]
+    pub model_invocation: crate::claude_visibility::ModelInvocation,
     pub name: Option<String>,
     pub description: Option<String>,
     pub source: Option<String>,
@@ -468,6 +470,8 @@ impl SessionCoverage {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
     pub placements: Vec<SkillPlacement>,
@@ -1132,6 +1136,8 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         &mut result,
     );
     result.freeze_observed_physical_mutation_paths();
+
+    crate::claude_visibility::observe(&options.home, &mut result);
 
     if options.include_session_evidence {
         for roots in &known {
@@ -2178,6 +2184,9 @@ pub fn parse_skill_markdown(markdown: &str) -> SkillMetadata {
         metadata_child_indentation = None;
         list_key = Some(key.to_owned());
         if value.is_empty() {
+            if key == "disable-model-invocation" {
+                metadata.model_invocation = crate::claude_visibility::ModelInvocation::Unknown;
+            }
             index += 1;
             continue;
         }
@@ -2252,6 +2261,10 @@ fn set_metadata_scalar(metadata: &mut SkillMetadata, key: &str, value: String) {
         return;
     }
     match key {
+        "disable-model-invocation" => {
+            metadata.model_invocation =
+                crate::claude_visibility::ModelInvocation::from_disable_scalar(&value);
+        }
         "name" => metadata.name = Some(value),
         "description" => metadata.description = Some(value),
         "source" | "repository" => metadata.source = Some(value),

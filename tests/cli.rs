@@ -11,6 +11,290 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[test]
+fn native_visibility_public_governance_lifecycle_preserves_sources_and_policy() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".claude/skills");
+    let mut original = BTreeMap::new();
+    for index in 0..51 {
+        let directory = root.join(format!("skill-{index:03}"));
+        fs::create_dir_all(&directory).unwrap();
+        let bytes = format!("---\nname: skill-{index:03}\n---\nDistinct capability {index}\n");
+        fs::write(directory.join("SKILL.md"), &bytes).unwrap();
+        original.insert(directory.join("SKILL.md"), bytes.into_bytes());
+    }
+    for (directory, metadata) in [
+        ("manual", "name: manual\ndisable-model-invocation: true"),
+        ("disabled-directory", "name: disabled-display-label"),
+    ] {
+        let path = root.join(directory);
+        fs::create_dir_all(&path).unwrap();
+        let bytes = format!("---\n{metadata}\n---\nNative policy fixture\n");
+        fs::write(path.join("SKILL.md"), &bytes).unwrap();
+        original.insert(path.join("SKILL.md"), bytes.into_bytes());
+    }
+    let codex_copy = home.join(".codex/skills/skill-050");
+    fs::create_dir_all(&codex_copy).unwrap();
+    let copy_bytes = fs::read(root.join("skill-050/SKILL.md")).unwrap();
+    fs::write(codex_copy.join("SKILL.md"), &copy_bytes).unwrap();
+    original.insert(codex_copy.join("SKILL.md"), copy_bytes);
+    let settings = home.join(".claude/settings.json");
+    let settings_bytes = r#"{"skillOverrides":{"disabled-directory":"off"}}"#;
+    fs::write(&settings, settings_bytes).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    assert_eq!(scan["result"]["placement_count"], 54);
+    let report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    assert_eq!(report["result"]["default_exposure"], 52);
+    assert_eq!(
+        report["result"]["native_visibility"]["state_counts"]["off"],
+        1
+    );
+    assert_eq!(
+        report["result"]["native_visibility"]["state_counts"]["user-invocable-only"],
+        1
+    );
+    for args in [vec!["report"], vec!["report", "--findings"]] {
+        let view = json_output(&run(&[&common[..], &args].concat(), None));
+        assert_eq!(
+            view["result"]["native_visibility"],
+            report["result"]["native_visibility"]
+        );
+    }
+    let protected = json_output(&run(
+        &[&common[..], &["find", "skill-050", "--limit", "1"]].concat(),
+        None,
+    ));
+    let protected_id = &protected["result"]["matches"][0]["skill_id"];
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["title"] == "Large default Rosters need review")
+        .unwrap();
+    let proposal = json!({"schema_version":1,"finding_roster_changes":[{
+        "finding_id":finding["id"], "core_budget":2, "protected_skill_ids":[protected_id]
+    }]});
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&proposal.to_string()),
+    ));
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    assert_eq!(plan["result"]["impact"]["after_default_exposure"], 3);
+    assert_eq!(plan["result"]["uncertainty"]["review_required"], true);
+    assert_eq!(
+        plan["result"]["uncertainty"]["code"],
+        "fallback_core_selection_requires_review"
+    );
+
+    // A Ready Plan is stale when native configuration changes, even if every
+    // Skill byte is unchanged. Returning to the exact observed config restores
+    // the prerequisite; no native settings are ever edited by Apply or Undo.
+    fs::write(&settings, "{}").unwrap();
+    let blocked = run(&[&common[..], &["apply", plan_id]].concat(), None);
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "native_visibility_settings_changed"
+    );
+    for (path, bytes) in &original {
+        assert_eq!(fs::read(path).unwrap(), *bytes);
+    }
+    fs::write(&settings, settings_bytes).unwrap();
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert_eq!(applied["result"]["verification"], "passed");
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let after = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(after["result"]["default_exposure"], 3);
+    assert_eq!(
+        fs::read(root.join("manual/SKILL.md")).unwrap(),
+        original[&root.join("manual/SKILL.md")]
+    );
+    assert_eq!(
+        fs::read(root.join("disabled-directory/SKILL.md")).unwrap(),
+        original[&root.join("disabled-directory/SKILL.md")]
+    );
+    let found = json_output(&run(
+        &[
+            &common[..],
+            &["find", "--load", "--limit", "1", "--", "skill-049"],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(found["result"]["matches"][0]["roster_state"], "on_demand");
+    assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
+    let undone = json_output(&run(
+        &[
+            &common[..],
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    for (path, bytes) in original {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(fs::read_to_string(settings).unwrap(), settings_bytes);
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let restored = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(restored["result"]["default_exposure"], 52);
+}
+
+#[test]
+fn native_visibility_legacy_snapshot_requires_rescan_before_reusing_report() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let directory = home.join(".claude/skills/manual");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("SKILL.md"),
+        "---\nname: manual\ndisable-model-invocation: true\n---\nFixture",
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    json_output(&run(&[&common[..], &["report"]].concat(), None));
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let raw: String = database
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&raw).unwrap();
+    payload.as_object_mut().unwrap().remove("native_visibility");
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json = ?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+    for args in [vec!["report"], vec!["find", "manual"]] {
+        let output = run(&[&common[..], &args].concat(), None);
+        assert!(!output.status.success());
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "legacy_native_visibility_requires_rescan"
+        );
+    }
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let report = json_output(&run(&[&common[..], &["report"]].concat(), None));
+    assert_eq!(report["result"]["default_exposure"], 0);
+}
+
+#[test]
+fn native_visibility_blocks_hidden_core_and_unknown_roster_changes() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let root = home.join(".claude/skills");
+    let codex_manual = home.join(".codex/skills/manual-codex");
+    fs::create_dir_all(&codex_manual).unwrap();
+    fs::write(
+        codex_manual.join("SKILL.md"),
+        "---\nname: manual-codex\ndisable-model-invocation: true\n---\nExplicit task\n",
+    )
+    .unwrap();
+    for (directory, metadata) in [
+        ("disabled", "name: renamed-display"),
+        (
+            "unknown",
+            "name: unknown\ndisable-model-invocation: perhaps",
+        ),
+    ] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+        fs::write(
+            root.join(directory).join("SKILL.md"),
+            format!("---\n{metadata}\n---\nFixture"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        home.join(".claude/settings.json"),
+        r#"{"skillOverrides":{"disabled":"off"}}"#,
+    )
+    .unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    for (name, requested) in [
+        ("renamed-display", "core"),
+        ("unknown", "on_demand"),
+        ("manual-codex", "core"),
+    ] {
+        let found = json_output(&run(
+            &[&common[..], &["find", name, "--limit", "1"]].concat(),
+            None,
+        ));
+        let skill_id = found["result"]["matches"][0]["skill_id"].as_str().unwrap();
+        let proposal = json!({"schema_version":1,"scan_id":snapshot,
+            "evidence_ids":[skill_evidence_id(&database,snapshot,skill_id)],
+            "roster_changes":[{"agent":"claude-code","skill_id":skill_id,"state":requested}]});
+        let output = run(
+            &[&common[..], &["plan", "--stdin"]].concat(),
+            Some(&proposal.to_string()),
+        );
+        assert!(!output.status.success());
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["error"]["code"],
+            "native_visibility_blocks_roster_change"
+        );
+        assert_eq!(
+            output["error"]["details"]["native_configuration_changed"],
+            false
+        );
+    }
+    assert!(root.join("disabled/SKILL.md").is_file());
+    assert!(root.join("unknown/SKILL.md").is_file());
+    assert!(!state.join("library").exists());
+
+    // Claude's unknown policy does not block keeping a separate Codex copy
+    // as Core. Physical shared-root conflicts retain their existing checks.
+    let codex_copy = home.join(".codex/skills/unknown");
+    fs::create_dir_all(&codex_copy).unwrap();
+    fs::copy(root.join("unknown/SKILL.md"), codex_copy.join("SKILL.md")).unwrap();
+    let scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+    let found = json_output(&run(
+        &[&common[..], &["find", "unknown", "--limit", "1"]].concat(),
+        None,
+    ));
+    let skill_id = found["result"]["matches"][0]["skill_id"].as_str().unwrap();
+    let proposal = json!({"schema_version":1,"scan_id":snapshot,
+        "evidence_ids":[skill_evidence_id(&database,snapshot,skill_id)],
+        "roster_changes":[{"agent":"codex","skill_id":skill_id,"state":"core"}]});
+    json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&proposal.to_string()),
+    ));
+}
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
@@ -152,8 +436,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.29");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.29");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.46");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.46");
 }
 
 #[cfg(unix)]
@@ -5036,7 +5320,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.29"
+        "1.8.46"
     );
 
     let undone = json_output(&run(
@@ -5126,111 +5410,137 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
 }
 
 #[test]
-fn setup_upgrades_the_public_v1_8_23_package_and_undo_restores_every_file() {
-    let temp = TempDir::new().unwrap();
-    let home = temp.path().join("home");
-    let state = temp.path().join("state");
-    let package = home.join(".codex/skills/skillroster");
-    let legacy_files = [
+fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
+    for (version, changed_count, legacy_files) in [
         (
-            "SKILL.md",
-            include_str!("fixtures/bootstrap-v1.8.23.md").to_owned(),
+            "1.8.23",
+            4,
+            [
+                ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.23.md")),
+                (
+                    "references/routing.md",
+                    include_str!("fixtures/bootstrap-routing-v1.8.23.md"),
+                ),
+                (
+                    "references/governance.md",
+                    include_str!("fixtures/bootstrap-governance-v1.8.23.md"),
+                ),
+                (
+                    "references/mutation.md",
+                    include_str!("fixtures/bootstrap-mutation-v1.8.23.md"),
+                ),
+            ],
         ),
         (
-            "references/routing.md",
-            include_str!("fixtures/bootstrap-routing-v1.8.23.md").to_owned(),
-        ),
-        (
-            "references/governance.md",
-            include_str!("fixtures/bootstrap-governance-v1.8.23.md").to_owned(),
-        ),
-        (
-            "references/mutation.md",
-            include_str!("fixtures/bootstrap-mutation-v1.8.23.md").to_owned(),
-        ),
-    ];
-    for (relative_path, content) in &legacy_files {
-        let target = package.join(relative_path);
-        fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::write(target, content).unwrap();
-    }
-    let common = [
-        "--home",
-        home.to_str().unwrap(),
-        "--state-dir",
-        state.to_str().unwrap(),
-        "--json",
-    ];
-    json_output(&run(&[&common[..], &["scan"]].concat(), None));
-
-    let preview = json_output(&run(&[&common[..], &["setup"]].concat(), None));
-    assert_eq!(preview["result"]["state"], "preview_ready");
-    assert_eq!(preview["result"]["outdated_count"], 1);
-    assert_eq!(preview["result"]["modified_count"], 0);
-    assert_eq!(
-        preview["result"]["targets"][0]["status"],
-        "official_outdated"
-    );
-    assert_eq!(
-        preview["result"]["targets"][0]["installed_version"],
-        "1.8.23"
-    );
-    assert_eq!(preview["result"]["operation_groups"]["replace_file"], 4);
-    assert_eq!(preview["result"]["files_changed"], false);
-
-    let plan_id = preview["result"]["plan_id"].as_str().unwrap();
-    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
-    assert_eq!(applied["result"]["verification"], "passed");
-    assert_eq!(applied["result"]["changed_path_count"], 4);
-    assert_eq!(
-        applied["result"]["changed_paths"].as_array().unwrap().len(),
-        4
-    );
-    assert_eq!(applied["result"]["changed_paths_truncated"], false);
-    for (relative_path, expected) in [
-        ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
-        (
-            "references/routing.md",
-            include_str!("../skill/skillroster/references/routing.md"),
-        ),
-        (
-            "references/governance.md",
-            include_str!("../skill/skillroster/references/governance.md"),
-        ),
-        (
-            "references/mutation.md",
-            include_str!("../skill/skillroster/references/mutation.md"),
+            "1.8.29",
+            3,
+            [
+                ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.29.md")),
+                (
+                    "references/routing.md",
+                    include_str!("fixtures/bootstrap-routing-v1.8.29.md"),
+                ),
+                (
+                    "references/governance.md",
+                    include_str!("fixtures/bootstrap-governance-v1.8.29.md"),
+                ),
+                (
+                    "references/mutation.md",
+                    include_str!("fixtures/bootstrap-mutation-v1.8.29.md"),
+                ),
+            ],
         ),
     ] {
-        assert_eq!(
-            fs::read_to_string(package.join(relative_path))
-                .unwrap()
-                .replace("\r\n", "\n"),
-            expected.replace("\r\n", "\n")
-        );
-    }
-    json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
-    let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
-    assert_eq!(current["result"]["state"], "up_to_date");
-    assert_eq!(
-        current["result"]["targets"][0]["installed_version"],
-        "1.8.29"
-    );
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let package = home.join(".codex/skills/skillroster");
+        for (relative_path, content) in &legacy_files {
+            let target = package.join(relative_path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, content).unwrap();
+        }
+        let common = [
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+        ];
+        json_output(&run(&[&common[..], &["scan"]].concat(), None));
 
-    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
-    let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
-    assert_eq!(undone["result"]["verification"], "passed");
-    assert_eq!(undone["result"]["changed_path_count"], 4);
-    assert_eq!(
-        undone["result"]["changed_paths"].as_array().unwrap().len(),
-        4
-    );
-    assert_eq!(undone["result"]["changed_paths_truncated"], false);
-    for (relative_path, expected) in legacy_files {
+        let preview = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+        assert_eq!(preview["result"]["state"], "preview_ready");
+        assert_eq!(preview["result"]["outdated_count"], 1);
+        assert_eq!(preview["result"]["modified_count"], 0);
         assert_eq!(
-            fs::read_to_string(package.join(relative_path)).unwrap(),
-            expected
+            preview["result"]["targets"][0]["status"],
+            "official_outdated"
         );
+        assert_eq!(
+            preview["result"]["targets"][0]["installed_version"],
+            version
+        );
+        assert_eq!(
+            preview["result"]["operation_groups"]["replace_file"],
+            changed_count
+        );
+        assert_eq!(preview["result"]["files_changed"], false);
+
+        let plan_id = preview["result"]["plan_id"].as_str().unwrap();
+        let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+        assert_eq!(applied["result"]["verification"], "passed");
+        assert_eq!(applied["result"]["changed_path_count"], changed_count);
+        assert_eq!(
+            applied["result"]["changed_paths"].as_array().unwrap().len(),
+            changed_count as usize
+        );
+        assert_eq!(applied["result"]["changed_paths_truncated"], false);
+        for (relative_path, expected) in [
+            ("SKILL.md", include_str!("../skill/skillroster/SKILL.md")),
+            (
+                "references/routing.md",
+                include_str!("../skill/skillroster/references/routing.md"),
+            ),
+            (
+                "references/governance.md",
+                include_str!("../skill/skillroster/references/governance.md"),
+            ),
+            (
+                "references/mutation.md",
+                include_str!("../skill/skillroster/references/mutation.md"),
+            ),
+        ] {
+            assert_eq!(
+                fs::read_to_string(package.join(relative_path))
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+                expected.replace("\r\n", "\n")
+            );
+        }
+        json_output(&run(&[&common[..], &["scan", "--summary"]].concat(), None));
+        let current = json_output(&run(&[&common[..], &["setup"]].concat(), None));
+        assert_eq!(current["result"]["state"], "up_to_date");
+        assert_eq!(
+            current["result"]["targets"][0]["installed_version"],
+            "1.8.46"
+        );
+
+        let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+        let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+        assert_eq!(undone["result"]["verification"], "passed");
+        assert_eq!(undone["result"]["changed_path_count"], changed_count);
+        assert_eq!(
+            undone["result"]["changed_paths"].as_array().unwrap().len(),
+            changed_count as usize
+        );
+        assert_eq!(undone["result"]["changed_paths_truncated"], false);
+        for (relative_path, expected) in legacy_files {
+            assert_eq!(
+                fs::read_to_string(package.join(relative_path)).unwrap(),
+                expected
+            );
+        }
     }
 }
 
