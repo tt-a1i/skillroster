@@ -1,15 +1,19 @@
 ---
 name: skillroster
 description: >
-  Inspect and govern local Skills: inventory, usage evidence, duplicates,
-  broken links, Core/On-demand proposals, Plans, Receipts, Apply, and Undo.
-  Also find a specialized local Skill when the user requests one or the task
-  would benefit from instructions beyond the visible catalog. Ordinary work
-  can proceed with the Agent's existing capabilities. Not for installing
+  Route tasks to specialized local Core and On-demand Skills, and govern the
+  local Skill roster. Before reading or changing the workspace for a task that
+  may need instructions not already visible, preserve the complete user message
+  verbatim as TASK. For non-English or mixed input, run
+  `skillroster find --hint "ONE FAITHFUL ENGLISH CAPABILITY PARAPHRASE" --load --limit 1 --json -- "TASK"`;
+  for English input omit `--hint`. Follow the complete verified SKILL.md in
+  `result.loaded_skill.content.text`. Also use
+  for inventory, usage evidence, duplicates, broken links, Core/On-demand
+  recommendations, Plans, Receipts, Apply, and Undo. Not for installing
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.46"
+  bootstrap-version: "1.8.29"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -22,15 +26,15 @@ command uses explicit `--json`. Validate `schema_version` and `ok` before using
 ## Choose one path
 
 - For SkillRoster inventory, evidence, governance, setup, Apply, Undo, lifecycle,
-  or recovery requests, read the matching reference below.
+  or recovery requests, skip the Route gate and read the matching reference
+  below. Do not route SkillRoster back to itself.
 - For another task, follow an already-visible exact Skill when one clearly
-  applies. Search below when a specialized Skill would help; otherwise proceed
-  with the Agent's normal tools and the user's task.
+  applies. Otherwise complete the Route gate.
 
-## Find a specialized Skill
+## Route gate
 
-Use this search before relying on a Skill that is absent from the visible
-catalog. Read-only task context may inform whether a search is useful.
+The Find call below must be the first task tool call. Before it, do not read or
+change the workspace and do not execute a non-routing command:
 
 1. Keep the complete user message as `TASK`, byte-for-byte in its original
    language, including paths, limits, and output requirements. Do not summarize,
@@ -54,15 +58,10 @@ catalog. Read-only task context may inform whether a search is useful.
    `task_success: not_evaluated` literally; only the task's own evidence can
    establish success.
 
-If the result is empty or clearly from another domain, retry at most once. Keep `TASK`
+If the result is empty or clearly from another domain, retry once. Keep `TASK`
 unchanged; refine the existing hint, or add one capability hint when the first
-English call had none. If no usable result remains and no particular Skill is
-required, continue the original task with normal tools. State that no suitable
-Skill was found only when it affects the result. If the user or applicable
-instructions require a particular Skill, explain its absence and request only
-the missing prerequisite. A permission denial, untrusted source, drift,
-ambiguity, or incomplete load follows its typed recovery action; it is not an
-ordinary no-match and cannot be bypassed by reading or executing the package.
+English call had none. If no usable result remains, stop and report a routing
+failure.
 
 ## Govern a roster
 

@@ -3,6 +3,7 @@ mod anchored_fs;
 pub mod app;
 mod bootstrap;
 pub mod change;
+pub mod claude_visibility;
 pub mod cli;
 mod copy_metadata;
 mod durable_fs;

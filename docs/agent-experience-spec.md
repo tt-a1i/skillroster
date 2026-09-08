@@ -80,7 +80,7 @@ The initial response should fit roughly one conversation viewport. It contains:
    proposed counts and affected Agents only from a validated Plan. Preserve each
    field's unit: source, placement, exposure, relink, and deletion counts are
    not interchangeable.
-5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty. For semantic Roster Plans, include forced, target-Agent, cross-Agent, and stable-fallback Core counts plus the bounded named Core preview and its reasons. Cross-Agent selections name the Agent that supplied exact-identity evidence and are described as used elsewhere, not as target-Agent usage. Fallback- or cross-Agent-dominated selection remains a review-required proposal.
+5. **Safety boundary:** read-only so far, canonical deletion count, reversibility, and uncertainty. For semantic Roster Plans, include forced, target-Agent, cross-Agent, and stable-fallback Core counts plus the bounded named Core preview and its reasons. Cross-Agent selections name the Agent that supplied exact-identity evidence and are described as used elsewhere, not as target-Agent usage. Every stable-fallback selection requires review, even when it is a minority of Core; it is name ordering without usage evidence, not evidence of usefulness. Cross-Agent-dominated selection also remains a review-required proposal.
 6. **One primary action:** the exact phrase the user can reply with.
 
 Do not lead with raw paths, every Finding, an aggregate health score, a wall of JSON, or unsupported token/performance estimates.
@@ -258,14 +258,14 @@ The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 - state whether files changed in every final response;
 - stop when drift, ambiguity, unsupported scope, or recovery-required state appears.
 
-The model-visible description and the minimal `find` then read route must
-precede governance instructions. Once the Bootstrap is invoked for such a
-task, Find is its first task action after loading the Bootstrap and before
-further workspace exploration. Retrieval remains read-only: it neither
-activates nor authorizes a Skill. Detailed ranking interpretation may remain in
-the later Find reference section, but the initial route cannot depend on the
-Agent discovering that section after it has already classified the task as
-unrelated.
+An ordinary task can use an already-visible Skill or the Agent's normal tools.
+Search when specialized instructions would help, including after reading task
+context. A genuine empty or wrong-domain result permits at most one refined
+search; without an explicitly required Skill, the Agent can then continue the
+original task normally. A missing required Skill needs its prerequisite.
+Permission denial, untrusted sources, drift, ambiguity, and incomplete loads
+retain their typed recovery paths and cannot be treated as ordinary no-match.
+Retrieval alone never authorizes a Skill's actions or proves task success.
 
 ## 9. CLI data needed by the Agent
 

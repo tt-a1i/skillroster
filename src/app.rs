@@ -1766,6 +1766,7 @@ fn scan_command(
             "agents_checked": agents_checked,
             "skill_count": result.skills.len(),
             "placement_count": result.placements.len(),
+            "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
             "roots": roots,
             "coverage": coverage,
             "source_root_policy": {
@@ -1937,6 +1938,7 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         "agents_checked": agents_checked,
         "skill_count": result.skills.len(),
         "placement_count": result.placements.len(),
+        "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "root_counts": root_counts,
         "root_issues": {
             "total": root_issues.len(),
@@ -2392,6 +2394,7 @@ fn report_command(
                         "link_target": placement.link_target,
                         "link_status": placement.link_status,
                         "default_exposed": placement.default_exposed,
+                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
                         "owned_by_agent": placement.owned_by_agent,
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
@@ -2487,6 +2490,8 @@ fn report_command(
         if existing.scan_id == scan_id
             && report_supports_source_confirmation_kind(&existing)
             && existing.summary["semantic_overlap_candidates"].is_object()
+            && (scan.native_visibility.is_none()
+                || existing.summary["native_visibility"].is_object())
         {
             return Ok(select_report_view(&existing.summary, request));
         }
@@ -2554,6 +2559,7 @@ fn report_command(
         "skill_count": report.metrics.independent_skills,
         "placement_count": report.metrics.placements,
         "default_exposure": report.metrics.default_exposure,
+        "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "observed_use_agent_count": report.metrics.agents_with_observed_usage,
         "coverage_reliable_agent_count": report.metrics.agents_with_reliable_session_denominator,
         "coverage_sampled_agent_count": report.metrics.agents_with_sampled_session_data,
@@ -3013,6 +3019,7 @@ fn add_semantic_overlap_comparison(
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
                         "default_exposed": placement.default_exposed,
+                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
                         "link_status": placement.link_status,
                         "fingerprint_completeness": placement.fingerprint_completeness,
                         "fingerprint_detail": placement.fingerprint_detail
@@ -3262,6 +3269,7 @@ fn finding_continuity(
                 bounded_vec_preview(&finding_ids, FINDING_CONTINUITY_ID_LIMIT);
             continuity_placement_json(
                 placement,
+                &current_scan,
                 &finding_id_preview,
                 finding_ids.len(),
                 finding_ids_truncated,
@@ -3310,6 +3318,7 @@ fn bounded_vec_preview(values: &[String], limit: usize) -> (Vec<String>, bool) {
 
 fn continuity_placement_json(
     placement: &scan::SkillPlacement,
+    scan: &ScanResult,
     current_finding_ids: &[String],
     current_finding_count: usize,
     current_finding_ids_truncated: bool,
@@ -3321,6 +3330,7 @@ fn continuity_placement_json(
         "agent": placement.agent.map(AgentKind::id),
         "link_status": placement.link_status,
         "default_exposed": placement.default_exposed,
+        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
         "fingerprint_completeness": placement.fingerprint_completeness.id(),
         "mutation_scope": placement.mutation_scope.map(scan::MutationScope::id),
         "governable": placement.is_mutable(),
@@ -3635,6 +3645,7 @@ fn finding_library_planning(
                     "path": placement.entrypoint,
                     "agent": placement.agent.map(AgentKind::id),
                     "default_exposed": placement.default_exposed,
+                    "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
                     "governable": placement.is_mutable(),
                     "owned_by_agent": placement.owned_by_agent,
                     "mutation_scope": placement.mutation_scope,
@@ -4618,6 +4629,7 @@ fn paged_finding_report(
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "native_visibility": report["native_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -4699,6 +4711,7 @@ fn compact_report(report: &Value) -> Value {
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "native_visibility": report["native_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -6712,7 +6725,9 @@ fn roster_selection_evidence(
             "cross_agent_dominated_agent_count": cross_agent_dominated_agent_count,
             "reason_counts": reason_counts,
             "agents": agents,
-            "absence_of_usage_evidence": "not_negative_evidence"
+            "absence_of_usage_evidence": "not_negative_evidence",
+            "fallback_basis": "name_then_stable_id_not_usefulness",
+            "fallback_review_question": "Which Skills must remain available by default for your upcoming work? Add their exact IDs to protected_skill_ids; keep the current Roster if the evidence is insufficient."
         })
     };
     let uncertainty = if fallback_dominated && cross_agent_dominated {
@@ -6751,6 +6766,14 @@ fn roster_selection_evidence(
             "cross_agent_signal_core_count": cross_agent_signal_core_count,
             "stable_fallback_core_count": stable_fallback_core_count,
             "cross_agent_dominated_agent_count": cross_agent_dominated_agent_count,
+            "absence_of_usage_evidence": "not_negative_evidence"
+        }))
+    } else if stable_fallback_core_count > 0 {
+        Some(json!({
+            "code": "fallback_core_selection_requires_review",
+            "review_required": true,
+            "core_selection_count": core_selection_count,
+            "stable_fallback_core_count": stable_fallback_core_count,
             "absence_of_usage_evidence": "not_negative_evidence"
         }))
     } else {
@@ -8359,8 +8382,8 @@ struct BootstrapPackageManifest<'a> {
     file_digests: &'a [(&'a str, &'a str)],
 }
 
-const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] =
-    &[BootstrapPackageManifest {
+const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
+    BootstrapPackageManifest {
         version: "1.8.23",
         file_digests: &[
             (
@@ -8380,7 +8403,29 @@ const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] =
                 "6490e355033f9fe6de5d027902241a514449a59fbf87831f7971ab1b98687927",
             ),
         ],
-    }];
+    },
+    BootstrapPackageManifest {
+        version: "1.8.29",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "c62bc41e54000a6191c781b45d082440cb5930bc26a1511dafc000cb1c1af5e3",
+            ),
+            (
+                "references/routing.md",
+                "9899e88dac1738584b6a8c615077b84f230a73292295a23e5614895628df0f22",
+            ),
+            (
+                "references/governance.md",
+                "3ba164010e51559708cb863abb9dfed450c065680256ddc348ec4677c7a01de8",
+            ),
+            (
+                "references/mutation.md",
+                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
+            ),
+        ],
+    },
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapFileStatus {
@@ -9095,6 +9140,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
+                "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
                 "governable": placement.is_mutable(),
                 "owned_by_agent": placement.owned_by_agent,
                 "mutation_scope": placement.mutation_scope,
@@ -9775,6 +9821,20 @@ fn require_content_identity(scan: &ScanResult) -> Result<()> {
     if scan.identity_path_coverage != scan::IdentityPathCoverage::Complete {
         return Err(ContentIdentityRescanRequired {
             reason: "non_unicode_identity_coverage_incomplete",
+        }
+        .into());
+    }
+    if let Some(visibility) = &scan.native_visibility {
+        visibility
+            .validate()
+            .map_err(|reason| ContentIdentityRescanRequired { reason })?;
+    } else if scan
+        .placements
+        .iter()
+        .any(|placement| placement.agent == Some(AgentKind::ClaudeCode))
+    {
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_native_visibility_requires_rescan",
         }
         .into());
     }
@@ -11141,7 +11201,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn roster_selection_uncertainty_requires_a_fallback_majority() {
+    fn roster_selection_uncertainty_reports_even_one_fallback() {
         let recommendation = crate::roster_recommendation::RosterRecommendation {
             changes: vec![],
             agents: vec![crate::roster_recommendation::AgentRecommendation {
@@ -11210,7 +11270,22 @@ mod recovery_tests {
                 .len(),
             3
         );
-        assert!(evidence.uncertainty.is_none());
+        assert_eq!(
+            evidence.uncertainty.as_ref().unwrap()["code"],
+            "fallback_core_selection_requires_review"
+        );
+        assert_eq!(
+            evidence.uncertainty.as_ref().unwrap()["review_required"],
+            true
+        );
+        assert_eq!(
+            evidence.summary["fallback_basis"],
+            "name_then_stable_id_not_usefulness"
+        );
+        assert_eq!(
+            evidence.full["fallback_basis"],
+            evidence.summary["fallback_basis"]
+        );
     }
 
     #[test]

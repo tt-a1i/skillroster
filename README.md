@@ -41,6 +41,10 @@
 
 **一个 Library，各自的 Roster。** Library 是已知 Skills 的逻辑全集，Roster 是某个 Agent 可见的精选视图；原始文件可以留在原处。宣传图中的能力搭配仅作示意，不代表 Codex、Claude Code 或 Pi 必须承担特定任务。
 
+如果只用一个 Agent、少量 Skills，原生列表已经清楚，可以保持现状。SkillRoster 更适合跨 Agent 整理、比较版本和需要撤销的变更。没有使用记录不等于没用；按名称补入的 Core 项也不代表更适合你，需要结合接下来的工作审阅。
+
+普通任务可以直接使用已有能力；需要专门的 Skill 时再查找。查不到合适的可选 Skill，不必因此中断任务。Claude 的本地暴露统计会区分手动调用、关闭和仅显示名称等状态；它不等于运行中会话的完整目录或 token 消耗。[统计范围与验证](docs/practical-governance.md)
+
 ## 30 秒开始
 
 macOS 或 Linux 用户可通过 Homebrew 安装：

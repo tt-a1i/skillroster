@@ -407,6 +407,7 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Default exposure", text(value, "default_exposure"));
+    native_visibility_basis(value, lines);
     fact(
         lines,
         "Observed-use Agents",
@@ -508,6 +509,32 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
     ));
 }
 
+fn native_visibility_basis(value: &Value, lines: &mut Vec<String>) {
+    if value
+        .pointer("/native_visibility/placement_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        > 0
+    {
+        fact(
+            lines,
+            "Visibility basis",
+            "local files; session catalog unobserved",
+        );
+        let unknown = value
+            .pointer("/native_visibility/unknown_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if unknown > 0 {
+            fact(
+                lines,
+                "Visibility unknown",
+                format!("{unknown} Claude placements; exposure includes possible entries"),
+            );
+        }
+    }
+}
+
 fn semantic_overlap_bounds(value: &Value, lines: &mut Vec<String>) {
     if let Some(candidates) = value
         .get("semantic_overlap_candidates")
@@ -541,6 +568,7 @@ fn finding_list(value: &Value, lines: &mut Vec<String>, width: usize) {
     };
     fact(lines, "Finding page", range);
     fact(lines, "All Findings", text(value, "finding_count"));
+    native_visibility_basis(value, lines);
     semantic_overlap_bounds(value, lines);
     let category = value["filters"]["category"].as_str();
     let severity = value["filters"]["severity"].as_str();
@@ -1429,6 +1457,9 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
         let review = match value.pointer("/uncertainty/code").and_then(Value::as_str) {
             Some("cross_agent_dominated_core_selection") => "cross-Agent-dominated Core selection",
             Some("mixed_evidence_dominated_core_selection") => "fallback + cross-Agent dominance",
+            Some("fallback_core_selection_requires_review") => {
+                "Core includes entries without usage evidence"
+            }
             _ => "fallback-dominated Core selection",
         };
         fact(lines, "Review required", review);
@@ -1491,7 +1522,7 @@ fn core_reason_label(reason: &str) -> &str {
         "cross_agent_unknown_quality_applied" => "elsewhere applied?",
         "cross_agent_unknown_quality_loaded" => "elsewhere loaded?",
         "cross_agent_unknown_quality_matched" => "elsewhere matched?",
-        "stable_fallback" => "fallback",
+        "stable_fallback" => "name order",
         _ => reason,
     }
 }

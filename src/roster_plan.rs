@@ -29,6 +29,24 @@ pub struct RosterPhysicalConflict {
 }
 
 #[derive(Debug)]
+pub struct NativeVisibilityConflict {
+    pub skill_id: String,
+    pub mode: crate::claude_visibility::CatalogVisibility,
+}
+
+impl std::fmt::Display for NativeVisibilityConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "local Claude visibility does not support the requested Roster exposure for Skill {}; review the native settings and frontmatter, then scan again",
+            self.skill_id
+        )
+    }
+}
+
+impl std::error::Error for NativeVisibilityConflict {}
+
+#[derive(Debug)]
 pub struct RosterDiscoveryIncomplete {
     pub agent: String,
     pub path: PathBuf,
@@ -790,6 +808,41 @@ pub fn derive(
         {
             placement.validated_physical_directory()?;
         }
+        if let Some(visibility) = scan
+            .native_visibility
+            .as_ref()
+            .filter(|_| desired.contains_key(&AgentKind::ClaudeCode))
+        {
+            use crate::claude_visibility::CatalogVisibility;
+            let modes = placements
+                .iter()
+                .filter_map(|placement| visibility.placements.get(&placement.id).copied())
+                .collect::<Vec<_>>();
+            let blocked = modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == CatalogVisibility::Unknown)
+                .or_else(|| {
+                    (desired.get(&AgentKind::ClaudeCode) == Some(&RosterState::Core)
+                        && !modes.iter().any(|mode| mode.listed()))
+                    .then(|| {
+                        modes.iter().copied().find(|mode| {
+                            matches!(
+                                mode,
+                                CatalogVisibility::Off | CatalogVisibility::UserInvocableOnly
+                            )
+                        })
+                    })
+                    .flatten()
+                });
+            if let Some(mode) = blocked {
+                return Err(NativeVisibilityConflict {
+                    skill_id: skill_id.into(),
+                    mode,
+                }
+                .into());
+            }
+        }
         ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
             .iter()
@@ -1061,6 +1114,28 @@ pub fn derive(
             }
             let target_root = agent_root(scan, requested_agent)?;
             let target = target_root.join(safe_name(&skill.name)?);
+            if requested_agent == AgentKind::ClaudeCode {
+                let mode = scan.native_visibility.as_ref().map_or(
+                    crate::claude_visibility::CatalogVisibility::Unknown,
+                    |visibility| {
+                        visibility.skill_visibility(
+                            &target_root,
+                            target
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .expect("safe Skill name"),
+                            skill.metadata.model_invocation,
+                        )
+                    },
+                );
+                if !mode.listed() {
+                    return Err(NativeVisibilityConflict {
+                        skill_id: skill_id.into(),
+                        mode,
+                    }
+                    .into());
+                }
+            }
             operations.push(OperationInput::CreateSymlink {
                 source,
                 target,
