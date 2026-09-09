@@ -66,6 +66,23 @@ blocker，Bootstrap 只规定如何保留 TASK、调用 CLI、验证 envelope �
 本轮没有证据证明缺少一个重复的 “Agent Brief” 命令或新的摘要层；除非未来
 明确指出某个缺失的机器字段，否则不新增该命令。
 
+## Bootstrap 边界决策（2026-09-09）
+
+本轮对 Bootstrap 的新增指引做了一次收敛。Bootstrap 是本地工具的运行时
+接缝，不是 SkillRoster 的产品说明书，也不是替宿主 Harness 规定通用工作法。
+它只保留会改变安全决策的内容：何时调用 CLI、如何保留原始任务、如何验证
+JSON、如何处理 typed blocker，以及 Plan、Apply、Receipt 的权限边界。
+
+`affected_agents`、`actionability` 和 `reversibility` 是 CLI 返回的事实。Bootstrap
+可以要求 Agent 原样传递并据此避免越权，但不应把它们变成价值分数、永久的
+模型匹配或固定的展示顺序。用户当前“值得先处理什么”的判断属于当前对话；
+四个核心指标、前三项 Finding、完整 usage 分类和各类 Plan 展示规则属于产品
+UX 与验收文档。
+
+因此，一次盲测能证明指引是否改变了 Agent 的调用和表达行为，但不能单独
+证明这些产品方法论应该长期写进 Skill。后续模型或 Harness 变化时，应重新
+评估行为；不要把一次 Bootstrap 的成功当成跨模型的永久结论。
+
 ### 大型 Skill 检索论文：可借鉴的问题，不可直接搬来的架构
 
 | 来源与证据级别 | 研究对象及直接结果 | 对 SkillRoster 的启示 | 非转移边界 |
