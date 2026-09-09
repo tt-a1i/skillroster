@@ -5,18 +5,19 @@
 Run `skillroster scan --summary --json`, then the bounded
 `skillroster report --json`. Use full `scan --json` only for deliberate root or
 coverage diagnostics.
-Use `finding_rollups` for complete group scale and the selected findings for the
-first decisions. Use `report --findings --limit 20 --json`, optionally narrowed
-by one category or severity, only when enumeration is needed. Follow
-`page.next_offset` while that decision remains open. Reserve `report --full`
-for deliberate exhaustive export.
+Use `finding_rollups` for group scale and the selected Findings for the first
+decisions. Use `report --findings --limit 20 --json`, optionally narrowed by
+category or severity, only when enumeration is needed. Follow `page.next_offset`
+while that decision remains open. Reserve `report --full` for deliberate
+exhaustive export; do not make extra calls just to satisfy a fixed presentation
+template.
 
-The initial diagnosis is complete when the bounded Report supplies the four
-core metrics, selected Findings, complete rollups, coverage, and a primary next
-action. Stop there. If one exact fact required to explain that primary action is
-absent, make one `report --finding` call for it. Help, status, Finding
-enumeration, other Finding drills, and full detail belong to a later user
-question; they are not initial-diagnosis checks.
+For each selected Finding, pass through these CLI facts without widening their
+scope: `affected_agents` is the observed Agent set, `actionability` describes
+what the CLI can support now, and `reversibility` describes the recovery path
+of a possible applied change. They constrain the next safe action; they are not
+a value score, and `reversibility` is not permission to Apply. Use the user's
+goal and the available evidence to decide what deserves attention.
 
 Usage evidence is five-stage and conservative. Read `session_coverage` before
 describing it. `sampled_agents` support bounded observed events;
@@ -119,19 +120,17 @@ Never infer a parent, sibling, descendant, alias, or wildcard.
 
 ## Present
 
-Show one bounded viewport with a one-sentence diagnosis and exactly these four
-core metrics: independent Skill count, placement count, default exposure, and
-observed-use count. Show the three highest-priority Findings plus compact
-rollups for the complete scale of every Finding group. Prioritize
-recommendations and keep each typed count's field meaning and unit. A Finding
-describes current affected scale: canonical candidates, physical sources,
-logical placements, default exposure, and relinks are distinct facts. Do not
-derive deletion or reduction counts from them. State measurable before/after
+Present a compact, evidence-backed first view using the report's available
+metrics, selected Findings, rollups, and typed safety facts. Include
+`affected_agents`, `actionability`, and `reversibility` when they are present,
+and keep each count's field meaning and unit. Do not derive deletion or
+reduction counts from current Finding scale. State measurable before/after
 impact only from a validated Plan, and actual impact only from its Receipt.
-Include uncertainties, evidence quality, safety risks, and whether confirmation
-is required. Name one primary next action. For a proposed change, include its
-measurable before/after impact, `change_summary`, operation groups, affected
-facts, uncertainty, reversibility, canonical deletion count, and Plan ID. Use
-`plan --show PLAN_ID --json` only when an exact operation, path, selection, or
-complete ID list is required. State explicitly that inspection and planning
-changed no Agent files.
+Include uncertainty, evidence quality, safety risks, and whether confirmation is
+required. Choose a primary next action when the evidence supports one; expand
+the view when the user's question or an unresolved decision requires it. For a
+proposed change, include its measurable before/after impact,
+`change_summary`, operation groups, affected facts, uncertainty,
+reversibility, canonical deletion count, and Plan ID. Use `plan --show PLAN_ID
+--json` only when an exact operation, path, selection, or complete ID list is
+required. State explicitly that inspection and planning changed no Agent files.

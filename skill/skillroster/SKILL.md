@@ -9,7 +9,7 @@ description: >
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.46"
+  bootstrap-version: "1.8.49"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -27,10 +27,20 @@ command uses explicit `--json`. Validate `schema_version` and `ok` before using
   applies. Search below when a specialized Skill would help; otherwise proceed
   with the Agent's normal tools and the user's task.
 
+SkillRoster is a local lookup and governance bridge, not a replacement for the
+host Agent's Harness. Its contract is the CLI and its JSON; the host still
+decides whether a Skill is listed, activated, or enforced. Do not call it for
+ordinary work that needs no specialized procedure.
+
 ## Find a specialized Skill
 
 Use this search before relying on a Skill that is absent from the visible
 catalog. Read-only task context may inform whether a search is useful.
+
+Find searches the latest completed local Snapshot, not only the default catalog.
+It may return an On-demand, provider, or source-only Skill. Loading one returns
+verified instructions to the caller; it does not activate, install, expose,
+endorse, or establish success for the user's task.
 
 1. Keep the complete user message as `TASK`, byte-for-byte in its original
    language, including paths, limits, and output requirements. Do not summarize,
@@ -53,6 +63,14 @@ catalog. Read-only task context may inform whether a search is useful.
 6. Follow the loaded instructions and perform the original task. Treat
    `task_success: not_evaluated` literally; only the task's own evidence can
    establish success.
+
+If Find returns `snapshot_required`, execute its returned `scan` action only when
+both `mutates` and `requires_confirmation` are false, then retry the identical
+Find call with the same `TASK` and `HINT`. The Scan changes SkillRoster's local
+Snapshot, not Agent or Skill files. If either flag says otherwise, ask the user
+first; these flags do not authorize a material change. For any other typed
+blocker, read `references/routing.md` and follow its bounded branch; execute a
+returned action only when one is present.
 
 If the result is empty or clearly from another domain, retry at most once. Keep `TASK`
 unchanged; refine the existing hint, or add one capability hint when the first

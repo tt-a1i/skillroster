@@ -497,6 +497,71 @@ fn all_eight_agent_fixtures_discover_one_skill_and_all_five_usage_stages() {
 }
 
 #[test]
+fn all_eight_agent_roots_share_the_cli_find_load_contract() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let contents = "---\nname: shared-workbook\ndescription: Create standalone spreadsheet workbooks\n---\nShared cross-agent fixture.\n";
+
+    for roots in known_agent_roots(&home) {
+        let skill = roots.skill_roots[0].join("shared-workbook");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), contents).unwrap();
+    }
+
+    let scanned = cli_json(&home, &state, &["scan"], None);
+    assert_eq!(scanned["result"]["skill_count"], 1);
+    assert_eq!(scanned["result"]["placement_count"], 8);
+
+    let loaded = cli_json(
+        &home,
+        &state,
+        &[
+            "find",
+            "--hint",
+            "create a standalone spreadsheet workbook",
+            "--load",
+            "--limit",
+            "1",
+            "--",
+            "制作一个独立的电子表格工作簿",
+        ],
+        None,
+    );
+    let mut expected_agents = AgentKind::ALL
+        .into_iter()
+        .map(|agent| agent.id())
+        .collect::<Vec<_>>();
+    expected_agents.sort_unstable();
+    let actual_agents = loaded["result"]["matches"][0]["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|agent| agent.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(actual_agents, expected_agents);
+    assert_eq!(loaded["result"]["matches"][0]["rank"], 1);
+    assert_eq!(
+        loaded["result"]["ranking_strategy"],
+        "task_hint_reciprocal_rank_fusion"
+    );
+    let skill = &loaded["result"]["loaded_skill"];
+    assert_eq!(skill["selection"]["rank"], 1);
+    assert_eq!(skill["content"]["complete"], true);
+    assert_eq!(skill["verification"]["identity_matches_snapshot"], true);
+    assert_eq!(
+        skill["verification"]["entrypoint_digest_matches_snapshot"],
+        true
+    );
+    assert_eq!(
+        skill["verification"]["package_fingerprint_matches_snapshot"],
+        true
+    );
+    assert_eq!(skill["task_success"], "not_evaluated");
+    assert_eq!(loaded["result"]["files_changed"], false);
+}
+
+#[test]
 fn reports_reuse_one_snapshot_but_scope_finding_ids_to_each_new_report() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

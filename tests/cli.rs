@@ -436,8 +436,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.46");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.46");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.49");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.49");
 }
 
 #[cfg(unix)]
@@ -3806,6 +3806,9 @@ fn same_name_divergent_finding_keeps_variant_paths_and_requires_a_choice() {
         .unwrap();
     assert_eq!(finding["affected_skill_count"], 2);
     assert_eq!(finding["affected_placement_count"], 2);
+    assert_eq!(finding["affected_agents"], json!(["claude-code", "codex"]));
+    assert_eq!(finding["actionability"], "review_required");
+    assert_eq!(finding["reversibility"], "manual_only");
     let finding_id = finding["id"].as_str().unwrap();
 
     let linked_find = json_output(&run(
@@ -5320,7 +5323,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.46"
+        "1.8.49"
     );
 
     let undone = json_output(&run(
@@ -5523,7 +5526,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.46"
+            "1.8.49"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
@@ -7101,6 +7104,75 @@ fn json_failure_is_one_parseable_document() {
     assert_eq!(invalid_value["command"], "cli");
     assert_eq!(invalid_value["error"]["code"], "invalid_cli_arguments");
     assert!(invalid.stderr.is_empty());
+}
+
+#[test]
+fn find_load_recovers_from_a_missing_snapshot_without_changing_agent_files() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill = home.join(".codex/skills/.on-demand/workbook");
+    fs::create_dir_all(&skill).unwrap();
+    let contents = "---\nname: workbook\ndescription: Create standalone spreadsheet workbooks\n---\nHidden on-demand fixture.\n";
+    fs::write(skill.join("SKILL.md"), contents).unwrap();
+    let entrypoint = skill.join("SKILL.md");
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let task = "帮我制作一个独立的电子表格工作簿";
+    let hint = "create a standalone spreadsheet workbook";
+    let find_args = ["find", "--hint", hint, "--load", "--limit", "1", "--", task];
+
+    let first = run(&[&common[..], &find_args].concat(), None);
+    assert!(!first.status.success());
+    assert!(first.stderr.is_empty());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["ok"], false);
+    assert_eq!(first["error"]["code"], "snapshot_required");
+    assert_eq!(first["error"]["retryable"], true);
+    assert_eq!(first["suggested_actions"][0]["action"], "scan");
+    assert_eq!(first["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        first["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+    assert_eq!(
+        first["suggested_actions"][0]["reason_code"],
+        "snapshot_required"
+    );
+    let before = fs::read(&entrypoint).unwrap();
+
+    let scanned = run_suggested_action(&first["suggested_actions"][0]);
+    let scanned = json_output(&scanned);
+    assert_eq!(scanned["result"]["files_changed"], false);
+    assert_eq!(scanned["result"]["placement_count"], 1);
+
+    let loaded = json_output(&run(&[&common[..], &find_args].concat(), None));
+    assert_eq!(loaded["result"]["task"], task);
+    assert_eq!(loaded["result"]["retrieval_hints"], json!([hint]));
+    assert_eq!(
+        loaded["result"]["ranking_strategy"],
+        "task_hint_reciprocal_rank_fusion"
+    );
+    let skill = &loaded["result"]["loaded_skill"];
+    assert_eq!(skill["selection"]["rank"], 1);
+    assert_eq!(skill["content"]["complete"], true);
+    assert_eq!(skill["verification"]["identity_matches_snapshot"], true);
+    assert_eq!(
+        skill["verification"]["entrypoint_digest_matches_snapshot"],
+        true
+    );
+    assert_eq!(
+        skill["verification"]["package_fingerprint_matches_snapshot"],
+        true
+    );
+    assert_eq!(skill["task_success"], "not_evaluated");
+    assert_eq!(loaded["result"]["files_changed"], false);
+    assert_eq!(fs::read(entrypoint).unwrap(), before);
 }
 
 #[test]
@@ -8778,6 +8850,12 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
     ));
     let planning = &detail["result"]["planning"];
     assert_eq!(planning["supported"], true);
+    assert_eq!(
+        detail["result"]["affected_agents"],
+        json!(["claude-code", "codex"])
+    );
+    assert_eq!(detail["result"]["actionability"], "plan_available");
+    assert_eq!(detail["result"]["reversibility"], "undo_after_apply");
     assert!(
         detail["suggested_actions"]
             .as_array()
@@ -8958,6 +9036,118 @@ fn exact_duplicate_finding_prepares_library_plan_from_semantic_choices() {
             .iter()
             .all(|action| action["action"] != "plan")
     );
+}
+
+#[test]
+fn messy_report_surfaces_agent_actionability_and_reversibility() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let codex_root = home.join(".codex/skills");
+    let claude_root = home.join(".claude/skills");
+    let shared = "---\nname: shared\ndescription: shared capability\n---\nshared body\n";
+    let choice_a = "---\nname: choice\ndescription: first variant\n---\nfirst body\n";
+    let choice_b = "---\nname: choice\ndescription: second variant\n---\nsecond body\n";
+    for (root, name, content) in [
+        (&codex_root, "shared", shared),
+        (&claude_root, "shared", shared),
+        (&codex_root, "choice", choice_a),
+        (&claude_root, "choice", choice_b),
+    ] {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("SKILL.md"), content).unwrap();
+    }
+    for index in 0..52 {
+        let directory = codex_root.join(format!("filler-{index:02}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: filler-{index:02}\n---\nfiller body {index}\n"),
+        )
+        .unwrap();
+    }
+
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let summary = json_output(&run(
+        &[&common[..], &["report", "--summary"]].concat(),
+        None,
+    ));
+    for finding in summary["result"]["findings"].as_array().unwrap() {
+        assert!(finding["affected_agents"].is_array());
+        assert!(finding["actionability"].is_string());
+        assert!(finding["reversibility"].is_string());
+    }
+
+    let findings = json_output(&run(
+        &[&common[..], &["report", "--findings"]].concat(),
+        None,
+    ));
+    let items = findings["result"]["items"].as_array().unwrap();
+    let duplicate = items
+        .iter()
+        .find(|finding| finding["title"] == "Exact duplicate Skill placements")
+        .unwrap();
+    assert_eq!(
+        duplicate["affected_agents"],
+        json!(["claude-code", "codex"])
+    );
+    assert_eq!(duplicate["actionability"], "plan_available");
+    assert_eq!(duplicate["reversibility"], "undo_after_apply");
+    let divergent = items
+        .iter()
+        .find(|finding| finding["title"] == "Same-name Skills have different content")
+        .unwrap();
+    assert_eq!(
+        divergent["affected_agents"],
+        json!(["claude-code", "codex"])
+    );
+    assert_eq!(divergent["actionability"], "review_required");
+    assert_eq!(divergent["reversibility"], "manual_only");
+
+    let duplicate_detail = json_output(&run(
+        &[
+            &common[..],
+            &["report", "--finding", duplicate["id"].as_str().unwrap()],
+        ]
+        .concat(),
+        None,
+    ));
+    assert_eq!(
+        duplicate_detail["result"]["affected_agents"],
+        json!(["claude-code", "codex"])
+    );
+    assert_eq!(
+        duplicate_detail["result"]["actionability"],
+        "plan_available"
+    );
+    assert_eq!(
+        duplicate_detail["result"]["reversibility"],
+        "undo_after_apply"
+    );
+
+    let human_common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ];
+    let human = run(
+        &[&human_common[..], &["report", "--findings"]].concat(),
+        None,
+    );
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("Action:"), "{human}");
+    assert!(human.contains("Undo:"), "{human}");
+    assert!(human.contains("Agents:"), "{human}");
 }
 
 #[test]
