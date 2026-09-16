@@ -462,6 +462,9 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
                 text(finding, "category"),
                 text(finding, "title")
             ));
+            if let Some(decision) = finding_decision_line(finding, width.saturating_sub(4)) {
+                lines.push(format!("    {decision}"));
+            }
         }
         if findings.is_empty() {
             lines.push("  none".into());
@@ -610,6 +613,9 @@ fn finding_list(value: &Value, lines: &mut Vec<String>, width: usize) {
                 "{detail_prefix}{}",
                 middle_truncate(&detail, width.saturating_sub(display_width(detail_prefix)))
             ));
+            if let Some(decision) = finding_decision_line(finding, width.saturating_sub(7)) {
+                lines.push(format!("{detail_prefix}{decision}"));
+            }
         }
         if items.is_empty() {
             lines.push("  none".into());
@@ -639,6 +645,27 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
         format!("{} · {}", text(value, "severity"), text(value, "category")),
     );
     fact(lines, "Evidence quality", text(value, "evidence_quality"));
+    if value.get("affected_agents").is_some() {
+        let agents = value
+            .get("affected_agents")
+            .and_then(Value::as_array)
+            .map(|agents| {
+                agents
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|agents| !agents.is_empty())
+            .unwrap_or_else(|| vec!["none".into()]);
+        fact_items(lines, "Affected Agents", agents, width);
+    }
+    if value.get("actionability").is_some() {
+        fact(lines, "Actionability", text(value, "actionability"));
+    }
+    if value.get("reversibility").is_some() {
+        fact(lines, "Reversibility", text(value, "reversibility"));
+    }
     fact(
         lines,
         "Affected",
@@ -762,6 +789,41 @@ fn finding_report(value: &Value, lines: &mut Vec<String>, width: usize) {
             "Use --full only when exact complete records are needed",
         ));
     }
+}
+
+fn finding_decision_line(value: &Value, width: usize) -> Option<String> {
+    let actionability = value.get("actionability").and_then(Value::as_str)?;
+    let reversibility = value.get("reversibility").and_then(Value::as_str)?;
+    let actionability_label = match actionability {
+        "plan_available" => "plan",
+        "review_required" => "review",
+        "blocked" => "blocked",
+        "read_only" => "read-only",
+        other => other,
+    };
+    let reversibility_label = match reversibility {
+        "undo_after_apply" => "undo",
+        "manual_only" => "manual",
+        "not_governable" => "not governed",
+        other => other,
+    };
+    let agents = value
+        .get("affected_agents")
+        .and_then(Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|agents| !agents.is_empty())
+        .unwrap_or_else(|| "none".into());
+    let prefix = format!("Action: {actionability_label} · Undo: {reversibility_label} · Agents: ");
+    Some(format!(
+        "{prefix}{}",
+        middle_truncate(&agents, width.saturating_sub(display_width(&prefix)).max(1))
+    ))
 }
 
 fn finding_evidence_paths(value: &Value, lines: &mut Vec<String>, width: usize) {

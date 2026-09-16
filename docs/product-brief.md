@@ -91,6 +91,8 @@ A record of an applied plan containing enough information to verify the result a
 - SQLite with FTS5 for local inventory, evidence, and search.
 - Adapter boundary per agent harness.
 - JSON output for agent callers; concise terminal output for people.
-- One thin bootstrap Skill that teaches agents when to call the CLI.
+- One thin bootstrap Skill that teaches agents when to call the CLI. Its runtime
+  boundary is documented in [the Bootstrap boundary decision](research/agent-skill-governance-and-routing.md),
+  while product presentation and evaluation rules stay outside the Skill.
 
 The normative requirements, command contract, privacy rules, and completion gates live in [product-spec.md](product-spec.md). Domain terms are defined in the repository's [CONTEXT.md](../CONTEXT.md).

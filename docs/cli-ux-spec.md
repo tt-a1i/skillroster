@@ -99,7 +99,11 @@ Lead with four counts: independent Skills, placements, default exposure, and obs
 Agent callers use selector-free `report --json` by default; `--summary` is an
 explicit alias. The compact payload
 contains those four metrics, total Finding count, category totals, and at most
-three complete Finding summaries. When the Agent needs another category or an
+three complete Finding summaries. Each Finding summary also states the affected
+Agent IDs, whether it has a deterministic next step (`plan_available`,
+`review_required`, `blocked`, or `read_only`), and whether an applied change can
+be undone (`undo_after_apply`, `manual_only`, or `not_governable`). These are
+bounded facts, not a semantic claim that the Skill is useful or safe. When the Agent needs another category or an
 exhaustive selection surface, it uses `report --findings --json`, optionally
 filtered by one `--category` and one `--severity`. That mode returns compact
 Finding summaries plus `page.next_offset`; it never suggests planning before a
@@ -122,9 +126,11 @@ per-Agent selection preview and the semantic `finding_roster_changes` shape;
 complete placement and Roster changes remain CLI-owned. An escaping-link Finding returns observed targets and a required
 trust decision instead of a Plan suggestion.
 
-Human Finding output shows the issue, severity, affected counts, bounded paths,
-and any required trust decision. It must not render a Finding as an empty
-aggregate report.
+Human Finding output shows the issue, severity, affected counts, affected
+Agents, actionability, reversibility, bounded paths, and any required trust
+decision. It must not render a Finding as an empty aggregate report. Finding
+lists show the same three decision facts in a shortened line so a person can
+decide which item to open next without reading every detail.
 
 Human `report --findings` output shows the matching range, active filters,
 stable IDs, impact counts, and next offset. Every line remains bounded at 60,

@@ -2304,6 +2304,8 @@ fn report_command(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let full_affected_skill_ids = affected_skill_ids.clone();
+            let full_affected_placement_ids = affected_placement_ids.clone();
             let affected_placement_id_set = affected_placement_ids
                 .iter()
                 .filter_map(Value::as_str)
@@ -2470,6 +2472,13 @@ fn report_command(
                 }),
             );
             add_finding_resolution(object, &observed_link_targets);
+            refresh_finding_decision_facts(
+                object,
+                &scan,
+                &full_affected_skill_ids,
+                &full_affected_placement_ids,
+                None,
+            );
             object.insert(
                 "detail".into(),
                 json!({
@@ -2489,6 +2498,7 @@ fn report_command(
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id
             && report_supports_source_confirmation_kind(&existing)
+            && report_supports_finding_decision_fields(&existing)
             && existing.summary["semantic_overlap_candidates"].is_object()
             && (scan.native_visibility.is_none()
                 || existing.summary["native_visibility"].is_object())
@@ -2508,7 +2518,7 @@ fn report_command(
                 .iter()
                 .map(|reference| evidence_id(&scan_id, reference))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(FindingRecord {
+            let mut record = FindingRecord {
                 details: finding_json(&id, finding, &evidence_ids, &scan),
                 id,
                 report_id: report_id.clone(),
@@ -2517,33 +2527,37 @@ fn report_command(
                 title: finding.title.clone(),
                 summary: finding.summary.clone(),
                 evidence_ids,
-            })
+            };
+            let planning = finding_roster_planning_decision(
+                store, &record, &scan_id, &scan_id, &scan, state_dir,
+            )?;
+            if let Some(object) = record.details.as_object_mut() {
+                let affected_skill_ids = finding
+                    .affected_skill_ids
+                    .iter()
+                    .map(|id| json!(id))
+                    .collect::<Vec<_>>();
+                let affected_placement_ids = finding
+                    .affected_placement_ids
+                    .iter()
+                    .map(|id| json!(id))
+                    .collect::<Vec<_>>();
+                refresh_finding_decision_facts(
+                    object,
+                    &scan,
+                    &affected_skill_ids,
+                    &affected_placement_ids,
+                    planning.as_ref(),
+                );
+            }
+            Ok(record)
         })
         .collect::<Result<Vec<_>>>()?;
-    let compact_findings = report
-        .findings
+    let full_findings = findings
         .iter()
-        .zip(&findings)
-        .map(|(finding, stored)| {
-            json!({
-                "id": stored.id,
-                "kind": stored.details["kind"],
-                "category": finding.category,
-                "severity": finding.severity,
-                "title": finding.title,
-                "summary": finding.summary,
-                "evidence_quality": finding.evidence_quality,
-                "evidence_ids": stored.evidence_ids,
-                "affected_skill_ids": finding.affected_skill_ids,
-                "affected_placement_ids": finding.affected_placement_ids,
-                "affected_skill_count": finding.affected_skill_ids.len(),
-                "affected_placement_count": finding.affected_placement_ids.len(),
-                "impact": finding_impact(finding),
-                "coverage": finding_coverage(finding, &scan)
-            })
-        })
+        .map(|stored| stored.details.clone())
         .collect::<Vec<_>>();
-    let finding_rollups = finding_rollups(&compact_findings);
+    let finding_rollups = finding_rollups(&full_findings);
     let session_coverage = json!({
         "supported_agents": AgentKind::ALL.len(),
         "roots_present_agents": report.metrics.agents_with_session_roots,
@@ -2586,7 +2600,7 @@ fn report_command(
                 }
             }
         },
-        "findings": compact_findings,
+        "findings": full_findings,
         "finding_rollups": finding_rollups,
         "category_counts": report.category_counts,
         "semantic_overlap_candidates": report.semantic_overlap_candidates,
@@ -2618,6 +2632,281 @@ fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
                 || finding.get("kind").and_then(Value::as_str)
                     == Some(crate::query::FindingKind::EscapingLinkSourceConfirmation.as_str())
         })
+}
+
+fn report_supports_finding_decision_fields(report: &ReportRecord) -> bool {
+    let Some(findings) = report.summary["findings"].as_array() else {
+        return false;
+    };
+    findings.iter().all(|finding| {
+        finding.get("affected_agents").is_some_and(Value::is_array)
+            && finding
+                .get("actionability")
+                .and_then(Value::as_str)
+                .is_some()
+            && finding
+                .get("reversibility")
+                .and_then(Value::as_str)
+                .is_some()
+            && match crate::query::finding_kind_from_stored_value(
+                finding.get("kind"),
+                finding.get("title").and_then(Value::as_str).unwrap_or(""),
+            ) {
+                Some(crate::query::FindingKind::LargeDefaultRoster) => matches!(
+                    (
+                        finding.get("actionability").and_then(Value::as_str),
+                        finding.get("reversibility").and_then(Value::as_str),
+                    ),
+                    (Some("plan_available"), Some("undo_after_apply"))
+                        | (Some("blocked"), Some("not_governable"))
+                ),
+                _ => true,
+            }
+    })
+}
+
+#[derive(Clone, Copy)]
+struct FindingDecisionState {
+    actionability: &'static str,
+    reversibility: &'static str,
+}
+
+fn finding_decision_state(
+    kind: Option<crate::query::FindingKind>,
+    affected_placement_ids: &[String],
+    scan: &ScanResult,
+) -> FindingDecisionState {
+    use crate::query::FindingKind;
+
+    match kind {
+        Some(FindingKind::ExactDuplicatePlacements) => {
+            let placement_ids = affected_placement_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let affected = scan
+                .placements
+                .iter()
+                .filter(|placement| placement_ids.contains(placement.id.as_str()))
+                .collect::<Vec<_>>();
+            let all_mutable =
+                !affected.is_empty() && affected.iter().all(|placement| placement.is_mutable());
+            let canonical_candidate = affected
+                .iter()
+                .any(|placement| placement_owns_physical_source(placement));
+            if all_mutable && canonical_candidate {
+                FindingDecisionState {
+                    actionability: "plan_available",
+                    reversibility: "undo_after_apply",
+                }
+            } else {
+                FindingDecisionState {
+                    actionability: "blocked",
+                    reversibility: "not_governable",
+                }
+            }
+        }
+        Some(
+            FindingKind::SameNameDivergentContent
+            | FindingKind::DeclaredIdentityDivergentContent
+            | FindingKind::LargeDefaultRoster
+            | FindingKind::SemanticOverlapCandidate
+            | FindingKind::MissingRoutingMetadata
+            | FindingKind::UnknownProvenance
+            | FindingKind::UpstreamDriftUnverified
+            | FindingKind::SourceVersionDivergence
+            | FindingKind::ManagementStateReview
+            | FindingKind::StaleArchiveCandidates
+            | FindingKind::DeclaredNameDirectoryMismatch,
+        ) => FindingDecisionState {
+            actionability: "review_required",
+            reversibility: "manual_only",
+        },
+        Some(
+            FindingKind::ConfiguredRootsInaccessible
+            | FindingKind::ConfiguredRootsBounded
+            | FindingKind::IncompletePackageFingerprints
+            | FindingKind::BrokenSkillLinks
+            | FindingKind::EscapingLinkSourceConfirmation,
+        ) => FindingDecisionState {
+            actionability: "blocked",
+            reversibility: "not_governable",
+        },
+        Some(
+            FindingKind::FiveStageUsageEvidence
+            | FindingKind::UsageCoverageIncomplete
+            | FindingKind::ExecutableScriptsPresent
+            | FindingKind::ArchiveCandidacyUnknown,
+        )
+        | None => FindingDecisionState {
+            actionability: "read_only",
+            reversibility: "not_governable",
+        },
+    }
+}
+
+fn finding_affected_agents(
+    kind: Option<crate::query::FindingKind>,
+    affected_skill_ids: &[String],
+    affected_placement_ids: &[String],
+    scan: &ScanResult,
+) -> Vec<String> {
+    let skill_ids = affected_skill_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let placement_ids = affected_placement_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut agents = BTreeSet::<&'static str>::new();
+
+    for placement in &scan.placements {
+        let matches = placement_ids.contains(placement.id.as_str())
+            || (placement_ids.is_empty() && skill_ids.contains(placement.skill_id.as_str()));
+        if matches {
+            if let Some(agent) = placement.agent {
+                agents.insert(agent.id());
+            }
+        }
+    }
+
+    match kind {
+        Some(crate::query::FindingKind::FiveStageUsageEvidence) => {
+            for usage in &scan.usage {
+                if skill_ids.is_empty() || skill_ids.contains(usage.skill_id.as_str()) {
+                    agents.insert(usage.agent.id());
+                }
+            }
+            for coverage in &scan.coverage {
+                agents.insert(coverage.agent.id());
+            }
+        }
+        Some(crate::query::FindingKind::UsageCoverageIncomplete)
+        | Some(crate::query::FindingKind::ArchiveCandidacyUnknown) => {
+            for coverage in &scan.coverage {
+                if !coverage.denominator_is_reliable() {
+                    agents.insert(coverage.agent.id());
+                }
+            }
+        }
+        Some(crate::query::FindingKind::ConfiguredRootsInaccessible) => {
+            for root in &scan.roots {
+                if root.kind == crate::scan::RootKind::Skills
+                    && root.status == crate::scan::RootStatus::Inaccessible
+                {
+                    if let Some(agent) = root.agent {
+                        agents.insert(agent.id());
+                    }
+                }
+            }
+        }
+        Some(crate::query::FindingKind::ConfiguredRootsBounded) => {
+            for root in &scan.roots {
+                if root.kind == crate::scan::RootKind::Skills
+                    && root.status == crate::scan::RootStatus::Included
+                    && !root.discovery_complete
+                {
+                    if let Some(agent) = root.agent {
+                        agents.insert(agent.id());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    agents.into_iter().map(str::to_owned).collect()
+}
+
+fn finding_decision_facts(
+    kind: Option<crate::query::FindingKind>,
+    affected_skill_ids: &[String],
+    affected_placement_ids: &[String],
+    scan: &ScanResult,
+    planning: Option<&Value>,
+    resolution: Option<&Value>,
+    comparison: Option<&Value>,
+) -> (Vec<String>, FindingDecisionState) {
+    let affected_agents =
+        finding_affected_agents(kind, affected_skill_ids, affected_placement_ids, scan);
+    let mut state = finding_decision_state(kind, affected_placement_ids, scan);
+
+    if let Some(planning) = planning {
+        if planning["supported"].as_bool() == Some(true) {
+            state = FindingDecisionState {
+                actionability: "plan_available",
+                reversibility: "undo_after_apply",
+            };
+        } else if planning.get("supported").is_some() {
+            state = FindingDecisionState {
+                actionability: "blocked",
+                reversibility: "not_governable",
+            };
+        }
+    }
+    if let Some(resolution) = resolution {
+        match resolution["decision"].as_str() {
+            Some("choose_same_name_variant") => {
+                state = FindingDecisionState {
+                    actionability: "review_required",
+                    reversibility: "manual_only",
+                };
+            }
+            Some("confirm_trusted_source_roots") => {
+                state = FindingDecisionState {
+                    actionability: "blocked",
+                    reversibility: "not_governable",
+                };
+            }
+            _ => {}
+        }
+    }
+    if let Some(comparison) = comparison {
+        if comparison["decision"].as_str() == Some("compare_skill_meaning") {
+            state = FindingDecisionState {
+                actionability: "review_required",
+                reversibility: "manual_only",
+            };
+        }
+    }
+    (affected_agents, state)
+}
+
+fn refresh_finding_decision_facts(
+    object: &mut serde_json::Map<String, Value>,
+    scan: &ScanResult,
+    affected_skill_ids: &[Value],
+    affected_placement_ids: &[Value],
+    planning_override: Option<&Value>,
+) {
+    let skill_ids = affected_skill_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let placement_ids = affected_placement_ids
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let kind = crate::query::finding_kind_from_stored_value(
+        object.get("kind"),
+        object.get("title").and_then(Value::as_str).unwrap_or(""),
+    );
+    let planning = planning_override.or_else(|| object.get("planning"));
+    let (affected_agents, state) = finding_decision_facts(
+        kind,
+        &skill_ids,
+        &placement_ids,
+        scan,
+        planning,
+        object.get("resolution"),
+        object.get("comparison"),
+    );
+    object.insert("affected_agents".into(), json!(affected_agents));
+    object.insert("actionability".into(), json!(state.actionability));
+    object.insert("reversibility".into(), json!(state.reversibility));
 }
 
 fn add_finding_resolution(
@@ -4070,6 +4359,36 @@ fn source_confirmation_finding_reference(
     Ok(reference)
 }
 
+#[derive(Clone, Copy)]
+struct FindingRosterPlanningOptions {
+    full: bool,
+    decision_facts_only: bool,
+}
+
+fn finding_roster_planning_decision(
+    store: &StateStore,
+    finding: &FindingRecord,
+    scan_id: &ScanId,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+    state_dir: &Path,
+) -> Result<Option<Value>> {
+    // Probe the same planning gates used by detail output without resolving
+    // report-linked continuation data before the new Report is persisted.
+    finding_roster_planning_impl(
+        store,
+        finding,
+        scan_id,
+        latest_scan_id,
+        scan,
+        state_dir,
+        FindingRosterPlanningOptions {
+            full: false,
+            decision_facts_only: true,
+        },
+    )
+}
+
 fn finding_roster_planning(
     store: &StateStore,
     finding: &FindingRecord,
@@ -4079,6 +4398,33 @@ fn finding_roster_planning(
     state_dir: &Path,
     full: bool,
 ) -> Result<Option<Value>> {
+    finding_roster_planning_impl(
+        store,
+        finding,
+        scan_id,
+        latest_scan_id,
+        scan,
+        state_dir,
+        FindingRosterPlanningOptions {
+            full,
+            decision_facts_only: false,
+        },
+    )
+}
+
+fn finding_roster_planning_impl(
+    store: &StateStore,
+    finding: &FindingRecord,
+    scan_id: &ScanId,
+    latest_scan_id: &ScanId,
+    scan: &ScanResult,
+    state_dir: &Path,
+    options: FindingRosterPlanningOptions,
+) -> Result<Option<Value>> {
+    let FindingRosterPlanningOptions {
+        full,
+        decision_facts_only,
+    } = options;
     if !crate::roster_recommendation::is_large_roster_finding(finding) {
         return Ok(None);
     }
@@ -4168,6 +4514,9 @@ fn finding_roster_planning(
         })
         .collect::<Vec<_>>();
     let blocked_change_count = supported.exclusions.len();
+    if decision_facts_only && blocked_change_count > 0 {
+        return Ok(Some(json!({"supported": false})));
+    }
     let blocked_changes = supported
         .exclusions
         .iter()
@@ -4344,6 +4693,9 @@ fn finding_roster_planning(
         if let Some(conflict) =
             error.downcast_ref::<crate::roster_plan::RosterLibraryTargetClaimConflict>()
         {
+            if decision_facts_only {
+                return Ok(Some(json!({"supported": false})));
+            }
             let conflict_skill_ids = conflict
                 .claimants
                 .iter()
@@ -4428,7 +4780,19 @@ fn finding_roster_planning(
                 "state_files_changed": false
             })));
         }
-        return Err(error);
+        // A rejected candidate Plan is a Finding blocker, not a failure to
+        // read the Report. Keep the same decision in summary and detail views.
+        return Ok(Some(json!({
+            "supported": false,
+            "reason": "roster_plan_preconditions_failed",
+            "detail": error.to_string(),
+            "snapshot_id": scan_id,
+            "files_changed": false,
+            "state_files_changed": false
+        })));
+    }
+    if decision_facts_only {
+        return Ok(Some(json!({"supported": true})));
     }
     Ok(Some(json!({
         "supported": true,
@@ -4484,7 +4848,7 @@ fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
 }
 
 fn compact_finding_summary(finding: &Value) -> Value {
-    json!({
+    let mut compact = json!({
         "id": finding["id"],
         "kind": finding["kind"],
         "category": finding["category"],
@@ -4497,7 +4861,15 @@ fn compact_finding_summary(finding: &Value) -> Value {
         "affected_placement_count": finding["affected_placement_count"],
         "impact": finding["impact"],
         "coverage": finding["coverage"]
-    })
+    });
+    if let Some(object) = compact.as_object_mut() {
+        for key in ["affected_agents", "actionability", "reversibility"] {
+            if let Some(value) = finding.get(key) {
+                object.insert(key.to_owned(), value.clone());
+            }
+        }
+    }
+    compact
 }
 
 struct FindingRollup {
@@ -4508,6 +4880,7 @@ struct FindingRollup {
     finding_count: usize,
     skill_ids: BTreeSet<String>,
     placement_ids: BTreeSet<String>,
+    agent_ids: BTreeSet<String>,
 }
 
 fn finding_rollups(findings: &[Value]) -> Vec<Value> {
@@ -4531,6 +4904,7 @@ fn finding_rollups(findings: &[Value]) -> Vec<Value> {
                     finding_count: 0,
                     skill_ids: BTreeSet::new(),
                     placement_ids: BTreeSet::new(),
+                    agent_ids: BTreeSet::new(),
                 });
                 rollups.len() - 1
             });
@@ -4552,6 +4926,14 @@ fn finding_rollups(findings: &[Value]) -> Vec<Value> {
         {
             rollup.placement_ids.insert(id.to_owned());
         }
+        for id in finding["affected_agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            rollup.agent_ids.insert(id.to_owned());
+        }
     }
     rollups
         .into_iter()
@@ -4562,7 +4944,9 @@ fn finding_rollups(findings: &[Value]) -> Vec<Value> {
                 "title": rollup.title,
                 "finding_count": rollup.finding_count,
                 "affected_skill_count": rollup.skill_ids.len(),
-                "affected_placement_count": rollup.placement_ids.len()
+                "affected_placement_count": rollup.placement_ids.len(),
+                "affected_agents": rollup.agent_ids,
+                "affected_agent_count": rollup.agent_ids.len()
             })
         })
         .collect()
@@ -4736,6 +5120,15 @@ fn finding_json(
     evidence_ids: &[EvidenceId],
     scan: &ScanResult,
 ) -> Value {
+    let (affected_agents, decision) = finding_decision_facts(
+        Some(finding.kind),
+        &finding.affected_skill_ids,
+        &finding.affected_placement_ids,
+        scan,
+        None,
+        None,
+        None,
+    );
     let mut value = json!({
         "id": id,
         "kind": finding.kind,
@@ -4747,6 +5140,11 @@ fn finding_json(
         "evidence_ids": evidence_ids,
         "affected_skill_ids": finding.affected_skill_ids,
         "affected_placement_ids": finding.affected_placement_ids,
+        "affected_skill_count": finding.affected_skill_ids.len(),
+        "affected_placement_count": finding.affected_placement_ids.len(),
+        "affected_agents": affected_agents,
+        "actionability": decision.actionability,
+        "reversibility": decision.reversibility,
         "impact": finding_impact(finding),
         "coverage": finding_coverage(finding, scan),
         "files_changed": false
@@ -8425,6 +8823,69 @@ const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] =
             ),
         ],
     },
+    BootstrapPackageManifest {
+        version: "1.8.46",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "8e6a7eacea3aea3fa7c11f6f1d73af06f5ca8b98cd287ab82004acd7b0fa938b",
+            ),
+            (
+                "references/routing.md",
+                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
+            ),
+            (
+                "references/governance.md",
+                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
+            ),
+            (
+                "references/mutation.md",
+                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
+            ),
+        ],
+    },
+    BootstrapPackageManifest {
+        version: "1.8.47",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "01f346450b239524658f1082e701144c396119ac0ef0278739928c5d797253a0",
+            ),
+            (
+                "references/routing.md",
+                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
+            ),
+            (
+                "references/governance.md",
+                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
+            ),
+            (
+                "references/mutation.md",
+                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
+            ),
+        ],
+    },
+    BootstrapPackageManifest {
+        version: "1.8.48",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "9b95e854f583f646b5aac0d2d839d249cd78651d9fb47a386f9c4d0c513a9e77",
+            ),
+            (
+                "references/routing.md",
+                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
+            ),
+            (
+                "references/governance.md",
+                "b121cfdbc3050efedbf2a603b2c7b61632285ea61a686204fcc855aeb115169e",
+            ),
+            (
+                "references/mutation.md",
+                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
+            ),
+        ],
+    },
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10733,6 +11194,31 @@ mod recovery_tests {
     }
 
     #[test]
+    fn legacy_large_roster_decision_facts_require_report_rebuild() {
+        let mut report = ReportRecord {
+            id: ReportId::new(),
+            scan_id: ScanId::new(),
+            created_at: 0,
+            summary: json!({
+                "findings": [{
+                    "kind": "large_default_roster",
+                    "affected_agents": [],
+                    "actionability": "review_required",
+                    "reversibility": "manual_only"
+                }]
+            }),
+        };
+
+        assert!(!report_supports_finding_decision_fields(&report));
+        report.summary["findings"][0]["actionability"] = json!("plan_available");
+        report.summary["findings"][0]["reversibility"] = json!("undo_after_apply");
+        assert!(report_supports_finding_decision_fields(&report));
+        report.summary["findings"][0]["actionability"] = json!("blocked");
+        report.summary["findings"][0]["reversibility"] = json!("not_governable");
+        assert!(report_supports_finding_decision_fields(&report));
+    }
+
+    #[test]
     fn summary_actions_keep_direct_drilldowns_when_every_finding_fits() {
         let result = json!({
             "finding_count": 2,
@@ -11969,26 +12455,32 @@ mod recovery_tests {
 
     #[test]
     fn released_complete_bootstrap_manifest_is_exact_and_recognized() {
-        let manifest = LEGACY_COMPLETE_BOOTSTRAP_PACKAGES
-            .iter()
-            .find(|package| package.version == "1.8.23")
-            .unwrap();
-        let observed = BOOTSTRAP_PACKAGE_FILES
-            .iter()
-            .map(|file| {
-                manifest
-                    .file_digests
-                    .iter()
-                    .find(|(relative_path, _)| *relative_path == file.relative_path)
-                    .map(|(_, digest)| (*digest).to_owned())
-            })
-            .collect::<Vec<_>>();
+        let observed_for = |version: &str| {
+            let manifest = LEGACY_COMPLETE_BOOTSTRAP_PACKAGES
+                .iter()
+                .find(|package| package.version == version)
+                .unwrap();
+            BOOTSTRAP_PACKAGE_FILES
+                .iter()
+                .map(|file| {
+                    manifest
+                        .file_digests
+                        .iter()
+                        .find(|(relative_path, _)| *relative_path == file.relative_path)
+                        .map(|(_, digest)| (*digest).to_owned())
+                })
+                .collect::<Vec<_>>()
+        };
 
-        assert_eq!(
-            legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
-            Some("1.8.23")
-        );
+        for version in ["1.8.23", "1.8.46", "1.8.47", "1.8.48"] {
+            let observed = observed_for(version);
+            assert_eq!(
+                legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
+                Some(version)
+            );
+        }
 
+        let observed = observed_for("1.8.23");
         let mut mixed = observed;
         mixed[2] = Some(current_bootstrap_package()[2].1.clone());
         assert_eq!(
