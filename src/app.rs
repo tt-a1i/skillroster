@@ -337,7 +337,15 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                     "plan_detail_available",
                 ));
             }
-            if result["state"].as_str() == Some("ready") {
+            if result["rescan_required"] == true {
+                actions.push(action(
+                    "scan",
+                    &["scan", "--summary", "--json"],
+                    false,
+                    false,
+                    "legacy_hermes_discovery_requires_rescan",
+                ));
+            } else if result["state"].as_str() == Some("ready") {
                 actions.push(action(
                     "apply",
                     &["apply", &id, "--json"],
@@ -6701,6 +6709,10 @@ fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
     let record = store
         .get_plan(&id)?
         .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
+    let hermes_rescan_required = record.status == PlanStatus::Ready
+        && store
+            .scan_payload::<ScanResult>(&record.scan_id)?
+            .is_some_and(|scan| require_hermes_discovery(&scan).is_err());
     let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
     let mut result = record
         .input
@@ -6718,6 +6730,13 @@ fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
     object.insert("report_id".into(), json!(record.report_id));
     object.insert("digest".into(), json!(prepared.digest));
     object.insert("state".into(), json!(record.status));
+    if hermes_rescan_required {
+        object.insert("rescan_required".into(), json!(true));
+        object.insert(
+            "rescan_reason".into(),
+            json!("legacy_hermes_discovery_requires_rescan"),
+        );
+    }
     object.insert("operations".into(), json!(prepared.operations));
     object.insert("roster_changes".into(), json!(prepared.roster_changes));
     object.insert("evidence_ids".into(), json!(prepared.evidence_ids));
@@ -10249,10 +10268,7 @@ fn validate_governance_operation_mutation_scopes(
     plan: &PreparedPlan,
     scan: &ScanResult,
 ) -> Result<()> {
-    let has_governance_changes = !plan.roster_changes.is_empty()
-        || !plan.source_updates.is_empty()
-        || !plan.library_changes.is_empty();
-    if !has_governance_changes || plan.operations.is_empty() {
+    if plan.operations.is_empty() {
         return Ok(());
     }
     for operation in &plan.operations {
@@ -10264,8 +10280,8 @@ fn validate_governance_operation_mutation_scopes(
             | Operation::WriteFile { target, .. }
             | Operation::ReplaceFile { target, .. }
             | Operation::RemoveSymlink { target, .. }
-            | Operation::Copy { target, .. } => vec![target.as_path()],
-            Operation::CreateDirectory { .. } => Vec::new(),
+            | Operation::Copy { target, .. }
+            | Operation::CreateDirectory { target, .. } => vec![target.as_path()],
         };
         for mutation_path in mutation_paths {
             let mut blocked_by_skill = BTreeMap::<&str, Vec<&scan::SkillPlacement>>::new();
@@ -10714,6 +10730,7 @@ fn legacy_used_source_root_permission_ids(scan: &ScanResult) -> BTreeSet<String>
 }
 
 fn require_content_identity(scan: &ScanResult) -> Result<()> {
+    require_hermes_discovery(scan)?;
     if scan.content_identity_algorithm.as_deref() != Some(scan::CONTENT_IDENTITY_ALGORITHM) {
         return Err(ContentIdentityRescanRequired {
             reason: "legacy_snapshot_requires_rescan",
@@ -10765,6 +10782,22 @@ fn require_content_identity(scan: &ScanResult) -> Result<()> {
     }) {
         return Err(ContentIdentityRescanRequired {
             reason: "placement_routing_identity_missing",
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn require_hermes_discovery(scan: &ScanResult) -> Result<()> {
+    if scan.hermes_discovery_contract_version != Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION)
+        && scan.roots.iter().any(|root| {
+            root.agent == Some(AgentKind::Hermes)
+                && root.kind == RootKind::Skills
+                && root.status == scan::RootStatus::Included
+        })
+    {
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_hermes_discovery_requires_rescan",
         }
         .into());
     }
@@ -11164,6 +11197,58 @@ mod recovery_tests {
     use super::*;
     use clap::Parser;
     use tempfile::TempDir;
+
+    #[test]
+    fn hermes_discovery_rescan_gate_binds_included_skill_roots_and_version() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes/skills")).unwrap();
+        let current = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+        require_content_identity(&current).unwrap();
+
+        let mut legacy_json = serde_json::to_value(&current).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("hermes_discovery_contract_version");
+        let legacy: ScanResult = serde_json::from_value(legacy_json).unwrap();
+        for marker in [
+            None,
+            Some(0),
+            Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION + 1),
+        ] {
+            let mut outdated = legacy.clone();
+            outdated.hermes_discovery_contract_version = marker;
+            let error = require_content_identity(&outdated).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ContentIdentityRescanRequired>()
+                    .unwrap()
+                    .reason,
+                "legacy_hermes_discovery_requires_rescan"
+            );
+        }
+
+        for status in [
+            scan::RootStatus::Missing,
+            scan::RootStatus::Inaccessible,
+            scan::RootStatus::Excluded,
+        ] {
+            let mut unrelated = legacy.clone();
+            for root in &mut unrelated.roots {
+                if root.agent == Some(AgentKind::Hermes) && root.kind == RootKind::Skills {
+                    root.status = status;
+                }
+            }
+            require_content_identity(&unrelated).unwrap();
+        }
+        let mut sessions_only = legacy;
+        for root in &mut sessions_only.roots {
+            if root.agent == Some(AgentKind::Hermes) {
+                root.kind = RootKind::Sessions;
+            }
+        }
+        require_content_identity(&sessions_only).unwrap();
+    }
 
     #[test]
     fn command_lock_mode_matches_state_production_boundary() {
@@ -12649,6 +12734,72 @@ mod recovery_tests {
     }
 
     #[test]
+    fn bootstrap_operations_enforce_observed_package_scope_without_governance_changes() {
+        let package = PathBuf::from("/fixture/physical/skillroster");
+        let mut prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![],
+            path_projections: vec![],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        for scope in [
+            None,
+            Some(scan::MutationScope::ProviderReadOnly),
+            Some(scan::MutationScope::SharedReadOnly),
+            Some(scan::MutationScope::DurableReadOnly),
+            Some(scan::MutationScope::UntrustedExternal),
+            Some(scan::MutationScope::Mutable),
+        ] {
+            let mut placement = placement_with_scope(
+                "placement_bootstrap",
+                "skill_bootstrap",
+                "/fixture/alias/skillroster",
+                scope,
+            );
+            placement.physical_directory = Some(package.clone());
+            let scan = ScanResult {
+                placements: vec![placement],
+                ..ScanResult::default()
+            };
+            for operation in [
+                Operation::ReplaceFile {
+                    target: package.join("SKILL.md"),
+                    content: "approved replacement".into(),
+                    expected_fingerprint: "sha256:before".into(),
+                },
+                Operation::CreateDirectory {
+                    target: package.join("references"),
+                    expected_fingerprint: "missing".into(),
+                },
+            ] {
+                prepared.operations = vec![operation];
+                let result = validate_governance_operation_mutation_scopes(&prepared, &scan);
+                assert_eq!(result.is_ok(), scope == Some(scan::MutationScope::Mutable));
+                if let Err(error) = result {
+                    assert!(
+                        error
+                            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+                            .is_some()
+                    );
+                }
+            }
+            prepared.operations = vec![Operation::WriteFile {
+                target: PathBuf::from("/fixture/unrelated/skillroster/SKILL.md"),
+                content: "approved replacement".into(),
+                expected_fingerprint: "missing".into(),
+            }];
+            validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap();
+        }
+    }
+
+    #[test]
     fn apply_validation_rejects_legacy_roster_operations_on_unknown_scope() {
         let placement_path = PathBuf::from("/fixture/root/legacy");
         let prepared = PreparedPlan {
@@ -13489,7 +13640,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn plan_detail_keeps_legacy_selection_evidence_without_full_selections() {
+    fn plan_detail_preserves_legacy_selection_and_inspects_outdated_hermes_snapshot() {
         let store = StateStore::open_in_memory().unwrap();
         let scan = ScanRun {
             id: ScanId::new(),
@@ -13537,6 +13688,34 @@ mod recovery_tests {
 
         assert_eq!(detail["selection_evidence"], legacy_selection);
         assert_eq!(detail["detail_level"], "full");
+
+        let mut outdated = ScanResult::default();
+        outdated.roots.push(scan::RootObservation {
+            agent: Some(AgentKind::Hermes),
+            kind: RootKind::Skills,
+            path: PathBuf::from("/fixture/.hermes/skills"),
+            status: scan::RootStatus::Included,
+            explicit: false,
+            shared: false,
+            detail: None,
+            discovery_complete: true,
+        });
+        store.save_scan_payload(&plan.scan_id, &outdated).unwrap();
+        let detail = plan_detail_command(&store, plan.id.as_str()).unwrap();
+        assert_eq!(detail["state"], "ready");
+        assert_eq!(detail["rescan_required"], true);
+        assert_eq!(detail["selection_evidence"], legacy_selection);
+        assert_eq!(detail["operations"], json!([]));
+
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applied)
+            .unwrap();
+        let historical = plan_detail_command(&store, plan.id.as_str()).unwrap();
+        assert_eq!(historical["state"], "applied");
+        assert!(historical.get("rescan_required").is_none());
     }
 
     #[test]

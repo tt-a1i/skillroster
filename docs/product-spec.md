@@ -123,7 +123,44 @@ Use this placement test for every capability: local truth, stable identity, repr
 
 ### 4.1 Inventory and identity
 
-A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently. Entrypoint discovery traverses root and category directories within its depth bound. Once a directory declares `SKILL.md`, arbitrary descendants are package support content rather than more entrypoint search space; only direct child directories that also declare `SKILL.md` continue the nested-Skill chain. Repository and build trees `.git`, `target`, and `node_modules` are excluded from entrypoint discovery. These exclusions do not weaken package fingerprints: support files remain identity- and drift-bearing under the independent fingerprint bounds.
+A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently. Entrypoint discovery traverses root and category directories within its depth bound. Unless an adapter has a verified different discovery rule, a directory declaring `SKILL.md` ends arbitrary descendant discovery; only direct child directories that also declare `SKILL.md` continue the nested-Skill chain. Repository trees `.git` and `node_modules` are excluded from entrypoint discovery. Build directories named `target` are also excluded except for Hermes, whose verified directory loader does not exclude that name. These exclusions do not weaken package fingerprints: support files remain identity- and drift-bearing under the independent fingerprint bounds.
+
+Hermes directory discovery follows the verified local loader's recursive rule:
+non-support descendants of a Skill package remain discoverable; the package's
+direct `references`, `templates`, `assets` and `scripts` directories remain
+non-exposed support areas. A same-named category outside a package remains
+discoverable. Approved directory links may contribute nested placements, within
+the existing depth limit and a per-branch physical-directory cycle guard.
+Unapproved, unreadable, cyclic or depth-bounded category discovery is incomplete,
+not an empty complete inventory. Directory identity changes during enumeration
+invalidate the affected candidates.
+
+A placement beneath a directory-link ancestor is shared read-only: changing
+that nested logical path would change the shared target. Other aliases of the
+same physical package inherit that protection. A direct link to a Skill package
+retains its existing placement contract. Read permission does not authorize
+mutation of a linked category's contents.
+
+When the Hermes Skill root itself is a directory link, the root and its
+placements are shared read-only; Bootstrap Setup and implicit Core creation do
+not choose it as a write destination. A normal ancestor path alias alone does
+not establish a shared root. Bootstrap operations, including directory creation,
+must pass the same read-only placement overlap validation during preparation
+and Apply as other mutations. Confirmed regular-file links do not contribute
+directory discovery branches.
+
+Fresh Snapshots record the Hermes discovery contract version. A legacy or
+incompatible Snapshot with an included Hermes Skill root requires one Scan before
+Report, Find, new planning, Apply or Setup, including its check mode. Existing
+immutable Plan details remain inspectable; a legacy Ready Plan offers a Scan
+continuation and cannot Apply from the old observations.
+
+This Hermes projection describes directory discovery, not an effective session
+catalog. Profile and extra-root configuration, disabled-name rules, platform and
+environment filters, organization gates, and name precedence require separate
+native observations before they can support a full visibility claim. The pinned
+source and local-loader evidence are recorded in
+[`research/hermes-skill-discovery.md`](research/hermes-skill-discovery.md).
 
 The immutable Scan payload is the historical Snapshot record. SQLite's
 normalized placement table is the current projection: when a stable placement

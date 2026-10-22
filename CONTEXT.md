@@ -67,9 +67,9 @@ _Avoid_: Source ownership, Trusted content
 A typed Snapshot fact describing whether a placement is Mutable,
 Provider-read-only, Shared-read-only, Durable-read-only, or Untrusted-external. Only Mutable may
 authorize placement mutation; a missing legacy fact remains unknown.
-Shared-read-only records a readable package used through a shared Agent root;
-observing it does not establish exclusive ownership or authorize changing its
-exposure for other consumers.
+Shared-read-only records a readable package used through a shared Agent root
+or beneath a directory-link ancestor. Observing it does not establish exclusive
+ownership or authorize changing its exposure for other consumers.
 _Avoid_: Governable reason, Trust level
 
 **Usage Observation**:

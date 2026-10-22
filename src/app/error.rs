@@ -83,6 +83,9 @@ pub(super) struct ContentIdentityRescanRequired {
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
+            "legacy_hermes_discovery_requires_rescan" => formatter.write_str(
+                "latest Snapshot uses outdated Hermes Skill discovery; run skillroster scan",
+            ),
             "legacy_native_visibility_requires_rescan" | "native_visibility_settings_unavailable" | "native_visibility_settings_changed" => formatter.write_str(
                 "latest Snapshot's local Claude visibility evidence is missing or changed; run skillroster scan",
             ),
@@ -1169,6 +1172,35 @@ mod tests {
         assert_eq!(
             envelope.pointer("/error/details/reason"),
             Some(&json!("non_unicode_identity_coverage_incomplete"))
+        );
+    }
+
+    #[test]
+    fn hermes_discovery_error_requires_one_scan_without_claiming_mutation() {
+        let error = ContentIdentityRescanRequired {
+            reason: "legacy_hermes_discovery_requires_rescan",
+        };
+        let envelope: Value = serde_json::from_str(&error_json("apply", &error)).unwrap();
+        assert_eq!(
+            envelope["error"]["code"],
+            "content_identity_rescan_required"
+        );
+        assert_eq!(
+            envelope["error"]["details"]["reason"],
+            "legacy_hermes_discovery_requires_rescan"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Hermes")
+        );
+        assert_eq!(envelope["error"]["details"]["files_changed"], false);
+        assert_eq!(envelope["error"]["details"]["state_files_changed"], false);
+        assert_eq!(envelope["suggested_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            envelope["suggested_actions"][0]["action"],
+            "refresh_snapshot_content_identity"
         );
     }
 
