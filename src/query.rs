@@ -18,9 +18,9 @@ pub const UNKNOWN_ARCHIVE_FINDING_TITLE: &str = "Archive candidacy is unknown";
 const SEMANTIC_SHARED_TERM_PREVIEW_LIMIT: usize = 20;
 const SEMANTIC_SHARED_TERM_CHARACTER_LIMIT: usize = 64;
 const SEMANTIC_CANDIDATE_LIMIT: usize = 25;
-const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "不要", "也不要"];
+const TASK_EXCLUSION_MARKERS: &[&str] = &["do not", "don't", "don’t", "不要", "也不要"];
 const TASK_EXCLUSION_COORDINATORS: &[&str] = &["but", "and", "yet", "但是", "不过", "但"];
-const TASK_EXCLUSION_CONTEXT_TOKENS: &[&str] = &["code", "代码"];
+const TASK_EXCLUSION_CONTEXT_TOKENS: &[&str] = &["code", "file", "代码", "文件"];
 const TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT: usize = 10;
 
 fn normalize_skill_name(name: &str) -> String {
@@ -2658,7 +2658,7 @@ fn task_exclusion_context_token_is_object(body: &str, context_token: &str) -> bo
     if context_token.is_ascii() {
         body.split(|character: char| !character.is_alphanumeric())
             .filter(|part| !part.is_empty())
-            .position(|part| part.eq_ignore_ascii_case(context_token))
+            .position(|part| normalize_token(part) == context_token)
             .is_some_and(|position| position > 0)
     } else {
         body.find(context_token)
@@ -2700,7 +2700,7 @@ fn strip_task_exclusion_coordinator<'a>(section: &'a str, coordinator: &str) -> 
 
 fn task_exclusion_marker_at_start(section: &str) -> Option<&'static str> {
     TASK_EXCLUSION_MARKERS.iter().copied().find(|marker| {
-        if marker.is_ascii() {
+        if marker.chars().next().is_some_and(|first| first.is_ascii()) {
             section
                 .get(..marker.len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case(marker))
@@ -3996,6 +3996,24 @@ mod tests {
                 "refactor it",
             ),
             (
+                "Review this PR, BUT DON'T simplify it",
+                "Review this PR",
+                "BUT DON'T simplify it",
+                "simplify it",
+            ),
+            (
+                "Review this PR, but don’t refactor it",
+                "Review this PR",
+                "but don’t refactor it",
+                "refactor it",
+            ),
+            (
+                "Review this PR, BUT DON’T refactor it",
+                "Review this PR",
+                "BUT DON’T refactor it",
+                "refactor it",
+            ),
+            (
                 "审查这个 PR，但是不要简化代码",
                 "审查这个 PR",
                 "但是不要简化代码",
@@ -4021,6 +4039,8 @@ mod tests {
         for task in [
             "do nothing unusual; inspect worktree problems",
             "diagnose why tests do not pass",
+            "don'tpanic; inspect worktree problems",
+            "don’tpanic; inspect worktree problems",
         ] {
             let (positive, excluded) = task_routing_sections(task);
 

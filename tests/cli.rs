@@ -2662,6 +2662,165 @@ fn public_find_keeps_shared_task_objects_out_of_capability_exclusions() {
                 .all(|matched| matched["name"] != "simplify-codebase")
         );
     }
+    for exclusion in [
+        "but don't simplify or refactor the code",
+        "but don’t simplify or refactor the code",
+    ] {
+        let task = format!("Review this Rust release PR for correctness, {exclusion}");
+        let found = json_output(&run(
+            &[
+                &common[..],
+                &[
+                    "find",
+                    "--hint",
+                    "code review",
+                    "--load",
+                    "--limit",
+                    "1",
+                    "--",
+                    &task,
+                ],
+            ]
+            .concat(),
+            None,
+        ));
+        assert_eq!(found["result"]["task"], task);
+        assert_eq!(found["result"]["task_exclusions"], json!([exclusion]));
+        assert_eq!(found["result"]["matches"][0]["name"], "code-review");
+        assert_eq!(
+            found["result"]["matches"][0]["score"],
+            baseline["result"]["matches"][0]["score"]
+        );
+        assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
+        assert!(
+            found["result"]["task_exclusion_effects"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|effect| effect["name"] == "simplify-codebase")
+        );
+        assert_eq!(found["result"]["files_changed"], false);
+    }
+}
+
+#[test]
+fn public_find_load_preserves_read_only_review_with_file_objects() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let skill_root = home.join(".codex/skills");
+    for (name, description) in [
+        (
+            "code-review",
+            "Review code for correctness and security. Inspect files for defects. 审查代码正确性与安全性并检查文件缺陷。",
+        ),
+        (
+            "file-editor",
+            "Modify files for code correctness and security. 修改文件以处理代码正确性与安全性。",
+        ),
+        ("file-action", "File code."),
+    ] {
+        let path = skill_root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\nComplete instructions.\n"),
+        )
+        .unwrap();
+    }
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    json_output(&run(&[&common[..], &["scan"]].concat(), None));
+
+    for (baseline_task, task, exclusion) in [
+        (
+            "Review this code for correctness and security",
+            "Review this code for correctness and security, do not modify files.",
+            "do not modify files",
+        ),
+        (
+            "Review this code for correctness and security",
+            "Review this code for correctness and security, do not modify file.",
+            "do not modify file",
+        ),
+        (
+            "审查代码正确性与安全性",
+            "审查代码正确性与安全性，不要修改文件。",
+            "不要修改文件",
+        ),
+    ] {
+        let find = |task| {
+            json_output(&run(
+                &[
+                    &common[..],
+                    &[
+                        "find",
+                        "--hint",
+                        "code review",
+                        "--load",
+                        "--limit",
+                        "1",
+                        "--",
+                        task,
+                    ],
+                ]
+                .concat(),
+                None,
+            ))
+        };
+        let baseline = find(baseline_task);
+        let constrained = find(task);
+        assert_eq!(constrained["result"]["task"], task);
+        assert_eq!(constrained["result"]["task_exclusions"], json!([exclusion]));
+        assert_eq!(constrained["result"]["matches"][0]["name"], "code-review");
+        assert_eq!(
+            constrained["result"]["matches"][0]["score"],
+            baseline["result"]["matches"][0]["score"]
+        );
+        assert_eq!(
+            constrained["result"]["loaded_skill"]["selection"]["name"],
+            "code-review"
+        );
+        assert_eq!(
+            constrained["result"]["loaded_skill"]["content"]["complete"],
+            true
+        );
+        let effects = constrained["result"]["task_exclusion_effects"]["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0]["name"], "file-editor");
+        assert_eq!(constrained["result"]["files_changed"], false);
+    }
+
+    // An object token used alone remains a capability exclusion.
+    let standalone = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "find",
+                "--hint",
+                "file",
+                "--json",
+                "--",
+                "Review this code for correctness and security; do not file",
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    assert!(
+        standalone["result"]["task_exclusion_effects"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["name"] == "file-action")
+    );
 }
 
 #[test]

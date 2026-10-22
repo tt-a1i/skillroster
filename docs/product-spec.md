@@ -383,22 +383,26 @@ exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars.
 
 An independent punctuation-delimited task clause that begins with `不要`, the
-parallel continuation `也不要`, or the complete ASCII marker `do not` remains
+parallel continuation `也不要`, or the English marker `do not`, `don't`, or `don’t` remains
 verbatim in `task` but does not contribute positive candidate or ranking
 evidence. The bounded coordinators `but`, `and`, `yet`, `但是`, `不过`, and `但`
 may immediately precede one of those markers; the original coordinated clause
 remains verbatim in `task_exclusions`. Prefixes such as `do nothing` are not
-markers, and a coordinator without an immediate marker remains positive task
+markers. English markers are case-insensitive and require an end or non-alphanumeric
+boundary, so `don'tpanic` and `don’tpanic` remain positive text. A coordinator
+without an immediate marker remains positive task
 text. `task_exclusions` returns the recognized clauses so the Agent can audit
 that deterministic split.
 Terms already present in the positive task remain shared object evidence; only
 the constraint-specific remainder may exclude a Skill whose positive name,
 trigger, or description declares the prohibited capability. Agent-authored
 hints remain separate positive evidence and cannot cancel a task exclusion.
-Within one bounded exclusion clause, `code` and `代码` remain shared task-object
+Within one bounded exclusion clause, `code`, `file` / `files`, `代码`, and `文件` remain shared task-object
 context when the same clause contains another searchable constraint token and
 the object follows earlier constraint material;
-they cannot by themselves exclude review or analysis Skills. When either is
+they cannot by themselves exclude review or analysis Skills. For example,
+`do not modify files` excludes a declared modification capability, but the word
+`files` alone does not exclude a Skill that inspects files. When an object token is
 the clause's only capability token or leads the clause, it remains an effective
 exclusion. This filter is applied independently to each exclusion clause so
 one constraint cannot weaken another.

@@ -535,6 +535,13 @@ was recruited or observed.
 
 ## Evidence boundary
 
+The [read-only task routing regression](acceptance/readonly-task-routing-2026-10-22.md)
+replays a published-binary false exclusion and its fix: a file object in
+`do not modify files` no longer removes a read-only review Skill, while
+prohibited modification capabilities remain excluded. It also covers bounded
+English contraction markers. This is CLI regression evidence, not a new
+live-Agent task-success claim.
+
 These checks establish deterministic routing and safe local governance; they do
 not claim model quality, token or labor savings, production performance, or
 access to arbitrary future Agent log formats. Final support additionally
