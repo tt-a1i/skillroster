@@ -486,6 +486,8 @@ pub struct ScanResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_visibility: Option<crate::codex_visibility::VisibilitySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hermes_visibility: Option<crate::hermes_visibility::VisibilitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
@@ -498,6 +500,10 @@ pub struct ScanResult {
     /// declared-source identity deduplication. None means unsupported or absent.
     #[serde(default)]
     pub verified_entrypoint_names: BTreeMap<String, Option<String>>,
+    /// Transient per-placement attributes parsed only from verified bytes.
+    #[serde(skip)]
+    pub(crate) verified_hermes_attributes:
+        BTreeMap<String, (PathBuf, crate::hermes_visibility::EntrypointAttributes)>,
     /// Physical mutation identities frozen while this Snapshot was scanned.
     /// Recommendation consumes only these immutable facts; Plan independently
     /// revalidates current filesystem identities before deriving operations.
@@ -568,6 +574,11 @@ impl ScanResult {
                 .get(&placement.id),
             Some(AgentKind::ClaudeCode) => self
                 .native_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            Some(AgentKind::Hermes) => self
+                .hermes_visibility
                 .as_ref()?
                 .placements
                 .get(&placement.id),
@@ -1222,6 +1233,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
 
     crate::claude_visibility::observe(&options.home, &mut result);
     crate::codex_visibility::observe(&options.home, &mut result);
+    crate::hermes_visibility::observe(&options.home, &mut result);
 
     if options.include_session_evidence {
         for roots in &known {
@@ -2379,6 +2391,15 @@ fn materialize_candidates_with_hook(
                 .then(|| crate::codex_visibility::parse_native_name(&content))
                 .flatten(),
         );
+        if safe_to_read && let Some(identity) = &candidate.expected_physical_entrypoint {
+            result.verified_hermes_attributes.insert(
+                placement_id.clone(),
+                (
+                    identity.clone(),
+                    crate::hermes_visibility::parse_entrypoint_attributes(&content),
+                ),
+            );
+        }
         result.placements.push(SkillPlacement {
             id: placement_id,
             skill_id,

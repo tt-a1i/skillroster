@@ -597,6 +597,7 @@ fn native_visibility_basis(value: &Value, lines: &mut Vec<String>) {
     for (key, agent) in [
         ("native_visibility", "Claude"),
         ("codex_visibility", "Codex"),
+        ("hermes_visibility", "Hermes"),
     ] {
         let Some(visibility) = value
             .get(key)
@@ -617,6 +618,13 @@ fn native_visibility_basis(value: &Value, lines: &mut Vec<String>) {
                 lines,
                 "Codex scope",
                 "user Skill rules; host config validity unverified",
+            );
+        }
+        if agent == "Hermes" {
+            fact(
+                lines,
+                "Hermes scope",
+                "supplied-Home global + host OS rules; host config validity unverified",
             );
         }
         let unknown = visibility
@@ -2274,6 +2282,22 @@ fn take_width(value: &str, budget: usize, reverse: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hermes_visibility_discloses_local_projection_and_unknown_exposure() {
+        let mut lines = Vec::new();
+        native_visibility_basis(
+            &serde_json::json!({
+                "hermes_visibility": {"placement_count": 2, "unknown_count": 1}
+            }),
+            &mut lines,
+        );
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("session catalog unobserved"));
+        assert!(rendered.contains("supplied-Home global + host OS rules"));
+        assert!(rendered.contains("host config validity unverified"));
+        assert!(rendered.contains("1 Hermes placements"));
+    }
 
     #[test]
     fn progress_is_limited_to_real_long_running_stages() {

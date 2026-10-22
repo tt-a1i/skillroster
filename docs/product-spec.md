@@ -99,6 +99,41 @@ Plan, or Apply reuses exposure facts. Settings contents are never mutated.
 See [the inspected scope and acceptance](practical-governance.md); this local
 projection does not observe an active session's catalog or permissions.
 
+For Hermes, `hermes_visibility` projects the supplied Home's
+`.hermes/config.yaml` and verified entrypoint bytes. It covers ordinary global
+disabled names and supported desktop OS restrictions. `on` means these local
+rules allow the placement, not that a running Hermes session offers it;
+`host_config_validity` remains `unverified` and `session_catalog_observed` is
+false. Off placements stay in inventory and remain available for explicit
+verified Find, but do not count as default exposure. Unknown placements retain
+possible exposure and cannot authorize affected governance.
+
+The projection does not infer a gateway channel from SkillRoster's process.
+Potential channel-specific restrictions, directory aliases, version-dependent
+selectors or essential exceptions, organization mirrors, additional-root
+precedence, unsupported configuration, and unobserved runtime conditions remain
+unknown. Each placement uses its own verified bytes rather than a representative
+name selected during identity deduplication. Configuration is read within a
+fixed bound; YAML nesting, node count and expanded scalar bytes are also bounded.
+Only needed typed controls, digests and path identities are retained, not the
+complete configuration or unrelated values.
+
+Snapshots freeze the Hermes local rules, host OS and root identities. Report,
+Find, Plan, Apply and Setup/check require a rescan after those inputs change.
+Old observations cannot authorize Bootstrap creation from a sessions-only
+installation either. Existing immutable Plan details remain inspectable and
+offer Scan recovery when their frozen contract is outdated. Core creation,
+source updates, Library consolidation, implicit retargeting and Bootstrap
+entrypoint replacement must preserve known native restrictions, including
+consumers belonging to an Agent absent from the original request. A parent
+package move must also preserve the paths of nested Hermes consumers with a
+different Skill identity; metadata equivalence alone cannot prove that their
+links survive. If no verified replacement preserves those paths, both Plan
+preparation and Apply refuse the move. No such operation edits the Hermes
+configuration. See the
+[pinned mechanism comparison](research/hermes-native-visibility.md) for the
+version and surface differences behind this scope.
+
 ## 3. Primary interaction
 
 ```text
@@ -155,11 +190,11 @@ Report, Find, new planning, Apply or Setup, including its check mode. Existing
 immutable Plan details remain inspectable; a legacy Ready Plan offers a Scan
 continuation and cannot Apply from the old observations.
 
-This Hermes projection describes directory discovery, not an effective session
-catalog. Profile and extra-root configuration, disabled-name rules, platform and
+The directory projection and the local visibility rules above do not constitute
+an effective session catalog. Profile and extra-root discovery, channel and
 environment filters, organization gates, and name precedence require separate
 native observations before they can support a full visibility claim. The pinned
-source and local-loader evidence are recorded in
+directory source and local-loader evidence are recorded in
 [`research/hermes-skill-discovery.md`](research/hermes-skill-discovery.md).
 
 The immutable Scan payload is the historical Snapshot record. SQLite's

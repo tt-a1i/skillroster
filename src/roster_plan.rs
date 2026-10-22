@@ -196,7 +196,7 @@ impl std::fmt::Display for RosterSafetyBlocker {
             ),
             Self::DependentSource { skill_id, .. } => write!(
                 formatter,
-                "Skill {skill_id} has a non-Agent source link that depends on a placement scheduled for removal"
+                "Skill {skill_id} has a dependent placement link that depends on a placement scheduled for removal"
             ),
         }
     }
@@ -870,6 +870,29 @@ pub fn derive(
                 }
             }
         }
+        if let Some(state) = desired.get(&AgentKind::Hermes) {
+            use crate::claude_visibility::CatalogVisibility;
+            for placement in placements
+                .iter()
+                .filter(|placement| placement.agent == Some(AgentKind::Hermes))
+            {
+                let mode = scan
+                    .hermes_visibility
+                    .as_ref()
+                    .and_then(|visibility| visibility.placements.get(&placement.id).copied())
+                    .unwrap_or(CatalogVisibility::Unknown);
+                if mode == CatalogVisibility::Unknown
+                    || (*state == RosterState::Core && mode != CatalogVisibility::On)
+                {
+                    return Err(NativeVisibilityConflict {
+                        agent: AgentKind::Hermes,
+                        skill_id: skill_id.into(),
+                        mode,
+                    }
+                    .into());
+                }
+            }
+        }
         ensure_physical_exposure_compatible(skill_id, &placements, &desired)?;
         let removal = placements
             .iter()
@@ -883,6 +906,61 @@ pub fn derive(
             .collect::<Vec<_>>();
         for placement in &removal {
             placement.validated_physical_directory()?;
+        }
+        // Retargeting below is scoped to this Skill's verified canonical package.
+        // A nested Skill has a separate identity and no derived replacement path.
+        if let Some(consumer) = scan.placements.iter().find(|placement| {
+            placement.skill_id != skill_id
+                && placement.agent == Some(AgentKind::Hermes)
+                && removal.iter().any(|removed| {
+                    let moved = physical_mutation_path(removed);
+                    placement
+                        .physical_directory_or_logical()
+                        .starts_with(&moved)
+                        // The Snapshot does not freeze arbitrary intermediate links.
+                        // A removed alias may occur anywhere in the resolution chain.
+                        || (is_symlink(&removed.directory)
+                            && placement.physical_directory_or_logical().starts_with(
+                                removed.physical_directory_or_logical(),
+                            ))
+                        || placement
+                            .link_target
+                            .as_ref()
+                            .is_some_and(|target| target.starts_with(&removed.directory))
+                })
+        }) {
+            return Err(RosterSafetyBlocker::DependentSource {
+                skill_id: consumer.skill_id.clone(),
+                placement_ids: vec![consumer.id.clone()],
+                paths: std::iter::once(consumer.directory.clone())
+                    .chain(
+                        removal
+                            .iter()
+                            .map(|removed| physical_mutation_path(removed)),
+                    )
+                    .collect(),
+            }
+            .into());
+        }
+        if let Some(placement) = placements.iter().find(|placement| {
+            placement.agent == Some(AgentKind::Hermes)
+                && !removal.iter().any(|removed| removed.id == placement.id)
+                && removal.iter().any(|removed| {
+                    physical_mutation_path(placement) == physical_mutation_path(removed)
+                })
+        }) {
+            return Err(RosterSafetyBlocker::DependentSource {
+                skill_id: skill_id.into(),
+                placement_ids: vec![placement.id.clone()],
+                paths: std::iter::once(placement.directory.clone())
+                    .chain(
+                        removal
+                            .iter()
+                            .map(|removed| physical_mutation_path(removed)),
+                    )
+                    .collect(),
+            }
+            .into());
         }
         let read_only_placement_ids =
             read_only_placements_on_physical_removal(&placements, &removal)
@@ -1056,6 +1134,55 @@ pub fn derive(
                         .into());
                     }
                 }
+                if placement.agent == Some(AgentKind::Hermes) {
+                    use crate::claude_visibility::CatalogVisibility;
+                    let original_source = migrated_source.as_ref().unwrap_or(&source);
+                    let same_content = placements.iter().any(|candidate| {
+                        candidate.physical_directory_or_logical() == original_source
+                            && candidate.fingerprint_completeness
+                                == FingerprintCompleteness::Complete
+                            && placement.fingerprint_completeness
+                                == FingerprintCompleteness::Complete
+                            && candidate.content_digest == placement.content_digest
+                            && candidate.entrypoint_digest.is_some()
+                            && candidate.entrypoint_digest == placement.entrypoint_digest
+                    });
+                    let (observed, projected) = scan.hermes_visibility.as_ref().map_or(
+                        (CatalogVisibility::Unknown, CatalogVisibility::Unknown),
+                        |visibility| {
+                            (
+                                visibility
+                                    .placements
+                                    .get(&placement.id)
+                                    .copied()
+                                    .unwrap_or(CatalogVisibility::Unknown),
+                                if same_content {
+                                    visibility
+                                        .visibility_for_preserved_entrypoint(&placement.entrypoint)
+                                } else {
+                                    visibility.visibility_for_replacement_source(
+                                        &placement.entrypoint,
+                                        &original_source.join("SKILL.md"),
+                                    )
+                                },
+                            )
+                        },
+                    );
+                    if !matches!(observed, CatalogVisibility::On | CatalogVisibility::Off)
+                        || observed != projected
+                    {
+                        return Err(NativeVisibilityConflict {
+                            agent: AgentKind::Hermes,
+                            skill_id: skill_id.into(),
+                            mode: if observed == CatalogVisibility::On {
+                                projected
+                            } else {
+                                observed
+                            },
+                        }
+                        .into());
+                    }
+                }
                 needs_backup_root |= !backup_root.exists();
                 before_exposure += usize::from(placement.default_exposed);
                 after_exposure += usize::from(placement.default_exposed);
@@ -1216,6 +1343,27 @@ pub fn derive(
                     .into_iter()
                     .find(|mode| *mode != CatalogVisibility::On)
                 {
+                    return Err(NativeVisibilityConflict {
+                        agent: requested_agent,
+                        skill_id: skill_id.into(),
+                        mode,
+                    }
+                    .into());
+                }
+            }
+            if requested_agent == AgentKind::Hermes {
+                use crate::claude_visibility::CatalogVisibility;
+                let original_source = migrated_source.as_ref().unwrap_or(&source);
+                let mode = scan.hermes_visibility.as_ref().map_or(
+                    CatalogVisibility::Unknown,
+                    |visibility| {
+                        visibility.visibility_for_core_target_entrypoint(
+                            &target.join("SKILL.md"),
+                            &original_source.join("SKILL.md"),
+                        )
+                    },
+                );
+                if mode != CatalogVisibility::On {
                     return Err(NativeVisibilityConflict {
                         agent: requested_agent,
                         skill_id: skill_id.into(),
@@ -2029,7 +2177,7 @@ mod tests {
 
         let error = derive(&snapshot, &state, &changes).unwrap_err();
 
-        assert!(error.to_string().contains("non-Agent source link"));
+        assert!(error.to_string().contains("dependent placement link"));
         assert!(shared_skill.join("SKILL.md").is_file());
         assert!(source_root.join("shared/SKILL.md").is_file());
         assert!(fs::read_dir(&state).unwrap().next().is_none());
@@ -2624,6 +2772,356 @@ mod tests {
             assert!(!codex_root.join("shared").exists());
             assert_eq!(
                 fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_roster_requests_refuse_disabled_core_and_unknown_rules() {
+        use crate::claude_visibility::CatalogVisibility;
+        for (config, state, expected) in [
+            (
+                "skills:\n  disabled: [shared]\n",
+                "core",
+                CatalogVisibility::Off,
+            ),
+            ("skills: [\n", "on_demand", CatalogVisibility::Unknown),
+            (
+                "skills:\n  platform_disabled:\n    telegram: [shared]\n",
+                "core",
+                CatalogVisibility::Unknown,
+            ),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let skill = home.join(".hermes/skills/shared");
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(skill.join("SKILL.md"), "---\nname: shared\n---\nbody\n").unwrap();
+            fs::write(home.join(".hermes/config.yaml"), config).unwrap();
+            let mut options = ScanOptions::for_home(&home);
+            options.include_session_evidence = false;
+            let snapshot = scan(&options).unwrap();
+            let state_dir = temp.path().join("state");
+            fs::create_dir(&state_dir).unwrap();
+            let error = derive(
+                &snapshot,
+                &state_dir,
+                &[RosterChange {
+                    agent: "hermes".into(),
+                    skill_id: snapshot.skills[0].id.clone(),
+                    state: state.into(),
+                }],
+            )
+            .unwrap_err();
+            let conflict = error.downcast_ref::<NativeVisibilityConflict>().unwrap();
+            assert_eq!(conflict.agent, AgentKind::Hermes);
+            assert_eq!(conflict.mode, expected);
+            assert!(skill.join("SKILL.md").is_file());
+            assert!(fs::read_dir(&state_dir).unwrap().next().is_none());
+            assert_eq!(
+                fs::read_to_string(home.join(".hermes/config.yaml")).unwrap(),
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn another_agent_request_cannot_move_a_disabled_hermes_physical_alias() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".hermes/skills");
+        let skill = root.join("shared");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: shared\n---\nbody\n").unwrap();
+        fs::write(
+            home.join(".hermes/config.yaml"),
+            "skills:\n  disabled: [shared]\n",
+        )
+        .unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: AgentKind::Pi,
+                path: root,
+            });
+        let snapshot = scan(&options).unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let error = derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "pi".into(),
+                skill_id: snapshot.skills[0].id.clone(),
+                state: "on_demand".into(),
+            }],
+        )
+        .unwrap_err();
+        let conflict = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+        assert!(
+            matches!(conflict, RosterSafetyBlocker::DependentSource { paths, .. } if paths.contains(&skill))
+        );
+        assert!(skill.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn hermes_new_core_projects_verified_source_before_implicit_migration() {
+        use crate::claude_visibility::CatalogVisibility;
+        for (config, expected) in [
+            ("{}\n", CatalogVisibility::On),
+            ("skills:\n  disabled: [shared]\n", CatalogVisibility::Off),
+            ("skills: [\n", CatalogVisibility::Unknown),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let hermes_root = home.join(".hermes/skills");
+            let canonical = home.join(".claude/skills/shared");
+            fs::create_dir_all(&hermes_root).unwrap();
+            fs::create_dir_all(&canonical).unwrap();
+            fs::write(canonical.join("SKILL.md"), "---\nname: shared\n---\nbody\n").unwrap();
+            fs::write(home.join(".hermes/config.yaml"), config).unwrap();
+            let mut options = ScanOptions::for_home(&home);
+            options.include_session_evidence = false;
+            let snapshot = scan(&options).unwrap();
+            let state = temp.path().join("state");
+            fs::create_dir(&state).unwrap();
+            let result = derive(
+                &snapshot,
+                &state,
+                &[
+                    RosterChange {
+                        agent: "claude-code".into(),
+                        skill_id: snapshot.skills[0].id.clone(),
+                        state: "on_demand".into(),
+                    },
+                    RosterChange {
+                        agent: "hermes".into(),
+                        skill_id: snapshot.skills[0].id.clone(),
+                        state: "core".into(),
+                    },
+                ],
+            );
+            if expected == CatalogVisibility::On {
+                let plan = result.unwrap();
+                assert!(plan.operations.iter().any(|operation| matches!(
+                    operation,
+                    OperationInput::CreateSymlink { source, target, .. }
+                        if source == &state.join("library/shared")
+                            && target == &hermes_root.join("shared")
+                )));
+                assert_eq!(plan.implicit_library_changes.len(), 1);
+            } else {
+                let error = result.unwrap_err();
+                let conflict = error.downcast_ref::<NativeVisibilityConflict>().unwrap();
+                assert_eq!(conflict.agent, AgentKind::Hermes);
+                assert_eq!(conflict.mode, expected);
+            }
+            assert!(canonical.join("SKILL.md").is_file());
+            assert!(!hermes_root.join("shared").exists());
+            assert!(fs::read_dir(&state).unwrap().next().is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_alias_demotion_refuses_unproven_hermes_child_resolution_chains() {
+        // A direct canonical consumer is also refused: the Snapshot does not
+        // prove that an arbitrary multi-hop chain avoids the removed alias.
+        for indirect in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let canonical = home.join(".pi/agent/skills/parent");
+            let parent = home.join(".claude/skills/parent");
+            let child = canonical.join("child");
+            let consumer = home.join(".hermes/skills/child");
+            fs::create_dir_all(&child).unwrap();
+            fs::create_dir_all(parent.parent().unwrap()).unwrap();
+            fs::create_dir_all(consumer.parent().unwrap()).unwrap();
+            fs::write(
+                canonical.join("SKILL.md"),
+                "---\nname: parent\n---\nparent\n",
+            )
+            .unwrap();
+            fs::write(child.join("SKILL.md"), "---\nname: child\n---\nchild\n").unwrap();
+            std::os::unix::fs::symlink(&canonical, &parent).unwrap();
+            let target = if indirect {
+                let alias = home.join("indirect-child");
+                std::os::unix::fs::symlink(parent.join("child"), &alias).unwrap();
+                alias
+            } else {
+                child.clone()
+            };
+            std::os::unix::fs::symlink(&target, &consumer).unwrap();
+            let mut options = ScanOptions::for_home(&home);
+            options.include_session_evidence = false;
+            let snapshot = scan(&options).unwrap();
+            let parent_id = snapshot
+                .placements
+                .iter()
+                .find(|placement| placement.directory == parent)
+                .unwrap()
+                .skill_id
+                .clone();
+            let consumer_id = snapshot
+                .placements
+                .iter()
+                .find(|placement| placement.directory == consumer)
+                .unwrap()
+                .id
+                .clone();
+            let state = temp.path().join("state");
+            fs::create_dir(&state).unwrap();
+            let error = derive(
+                &snapshot,
+                &state,
+                &[RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id: parent_id,
+                    state: "on_demand".into(),
+                }],
+            )
+            .unwrap_err();
+            let parent_link_path = fs::canonicalize(parent.parent().unwrap())
+                .unwrap()
+                .join("parent");
+            let conflict = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+            assert!(
+                matches!(conflict, RosterSafetyBlocker::DependentSource { placement_ids, paths, .. }
+                if placement_ids.as_slice() == std::slice::from_ref(&consumer_id)
+                    && paths.contains(&consumer)
+                    && paths.contains(&parent_link_path))
+            );
+            assert!(fs::read_dir(&state).unwrap().next().is_none());
+            assert_eq!(fs::read_link(&parent).unwrap(), canonical);
+            assert_eq!(fs::read_link(&consumer).unwrap(), target);
+            assert!(consumer.join("SKILL.md").is_file());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_demotion_refuses_to_break_a_distinct_hermes_child_consumer() {
+        use crate::claude_visibility::CatalogVisibility;
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let parent = home.join(".claude/skills/parent");
+        let child = parent.join("child");
+        let consumer = home.join(".hermes/skills/child");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(consumer.parent().unwrap()).unwrap();
+        fs::write(parent.join("SKILL.md"), "---\nname: parent\n---\nparent\n").unwrap();
+        fs::write(child.join("SKILL.md"), "---\nname: child\n---\nchild\n").unwrap();
+        std::os::unix::fs::symlink(&child, &consumer).unwrap();
+        fs::write(home.join(".hermes/config.yaml"), "skills: {}\n").unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let snapshot = scan(&options).unwrap();
+        let child_placement = snapshot
+            .placements
+            .iter()
+            .find(|placement| {
+                placement.agent == Some(AgentKind::Hermes) && placement.directory == consumer
+            })
+            .unwrap();
+        assert!(child_placement.is_mutable());
+        assert_eq!(
+            snapshot.hermes_visibility.as_ref().unwrap().placements[&child_placement.id],
+            CatalogVisibility::On
+        );
+        let parent_id = snapshot
+            .placements
+            .iter()
+            .find(|placement| placement.directory == parent)
+            .unwrap()
+            .skill_id
+            .clone();
+        assert_ne!(parent_id, child_placement.skill_id);
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let error = derive(
+            &snapshot,
+            &state,
+            &[RosterChange {
+                agent: "claude-code".into(),
+                skill_id: parent_id,
+                state: "on_demand".into(),
+            }],
+        )
+        .unwrap_err();
+        let conflict = error.downcast_ref::<RosterSafetyBlocker>().unwrap();
+        assert!(
+            matches!(conflict, RosterSafetyBlocker::DependentSource { skill_id, placement_ids, paths }
+            if skill_id == &child_placement.skill_id
+                && placement_ids.as_slice() == std::slice::from_ref(&child_placement.id)
+                && paths.contains(&consumer)
+                && paths.contains(&fs::canonicalize(&parent).unwrap()))
+        );
+        assert!(fs::read_dir(&state).unwrap().next().is_none());
+        assert!(parent.join("SKILL.md").is_file());
+        assert!(child.join("SKILL.md").is_file());
+        assert_eq!(fs::read_link(&consumer).unwrap(), child);
+        let unchanged = scan(&options).unwrap();
+        assert_eq!(
+            unchanged.hermes_visibility.as_ref().unwrap().placements[&child_placement.id],
+            CatalogVisibility::On
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_hermes_retarget_preserves_disabled_rules_and_refuses_unknown() {
+        use crate::claude_visibility::CatalogVisibility;
+        for (config, expected) in [
+            ("{}\n", CatalogVisibility::On),
+            ("skills:\n  disabled: [shared]\n", CatalogVisibility::Off),
+            ("skills: [\n", CatalogVisibility::Unknown),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("home");
+            let canonical = home.join(".claude/skills/shared");
+            let hermes = home.join(".hermes/skills/shared");
+            fs::create_dir_all(&canonical).unwrap();
+            fs::create_dir_all(hermes.parent().unwrap()).unwrap();
+            fs::write(canonical.join("SKILL.md"), "---\nname: shared\n---\nbody\n").unwrap();
+            std::os::unix::fs::symlink(&canonical, &hermes).unwrap();
+            fs::write(home.join(".hermes/config.yaml"), config).unwrap();
+            let mut options = ScanOptions::for_home(&home);
+            options.include_session_evidence = false;
+            let snapshot = scan(&options).unwrap();
+            let state = temp.path().join("state");
+            fs::create_dir(&state).unwrap();
+            let result = derive(
+                &snapshot,
+                &state,
+                &[RosterChange {
+                    agent: "claude-code".into(),
+                    skill_id: snapshot.skills[0].id.clone(),
+                    state: "on_demand".into(),
+                }],
+            );
+            if expected == CatalogVisibility::Unknown {
+                let error = result.unwrap_err();
+                let conflict = error.downcast_ref::<NativeVisibilityConflict>().unwrap();
+                assert_eq!(conflict.agent, AgentKind::Hermes);
+                assert_eq!(conflict.mode, expected);
+            } else {
+                let plan = result.unwrap();
+                assert!(plan.operations.iter().any(|operation| matches!(
+                    operation,
+                    OperationInput::CreateSymlink { source, target, .. }
+                        if source == &state.join("library/shared") && target == &hermes
+                )));
+                let exposure = usize::from(expected == CatalogVisibility::On);
+                assert_eq!(plan.impact["after_default_exposure"], exposure);
+            }
+            assert_eq!(fs::read_link(&hermes).unwrap(), canonical);
+            assert!(canonical.join("SKILL.md").is_file());
+            assert!(fs::read_dir(&state).unwrap().next().is_none());
+            assert_eq!(
+                fs::read_to_string(home.join(".hermes/config.yaml")).unwrap(),
                 config
             );
         }

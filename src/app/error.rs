@@ -83,6 +83,12 @@ pub(super) struct ContentIdentityRescanRequired {
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
+            "legacy_hermes_visibility_requires_rescan"
+            | "hermes_visibility_settings_changed"
+            | "hermes_visibility_root_identity_changed"
+            | "hermes_visibility_host_platform_changed" => formatter.write_str(
+                "latest Snapshot's local Hermes visibility evidence is missing or changed; run skillroster scan",
+            ),
             "legacy_hermes_discovery_requires_rescan" => formatter.write_str(
                 "latest Snapshot uses outdated Hermes Skill discovery; run skillroster scan",
             ),

@@ -9,6 +9,7 @@ pub mod codex_visibility;
 mod copy_metadata;
 mod durable_fs;
 pub mod harness;
+pub mod hermes_visibility;
 pub mod model;
 mod package_fingerprint;
 pub mod present;
