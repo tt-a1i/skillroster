@@ -219,6 +219,10 @@ pub struct FindArgs {
     #[arg(long, value_name = "SKILL_ID")]
     pub variant_skill_id: Option<String>,
 
+    /// Load one exact observed placement within the current Top-1 capability group.
+    #[arg(long, value_name = "PLACEMENT_ID", requires = "load")]
+    pub variant_placement_id: Option<String>,
+
     /// Fail closed unless the latest Snapshot still matches this opaque ID.
     #[arg(long, value_name = "SCAN_ID")]
     pub require_snapshot: Option<String>,

@@ -1202,6 +1202,17 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                     text(item, "variant_count"),
                 ));
             }
+            if item
+                .pointer("/content_choice/content_selection_required")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                lines.push(format!(
+                    "     content choices {} · explicit placement selection required",
+                    item.pointer("/content_choice/content_group_count")
+                        .unwrap_or(&Value::Null)
+                ));
+            }
             lines.push(format!("     reasons {reasons}"));
             if let Some(variants) = variant_details {
                 for variant in variants.iter().take(3) {

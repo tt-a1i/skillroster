@@ -160,6 +160,10 @@ pub struct SkillPlacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_directory: Option<PathBuf>,
     pub content_digest: String,
+    /// Routing payload identity observed for this placement before logical
+    /// identity deduplication. Never use this for mutation or drift checks.
+    #[serde(default)]
+    pub content_identity_digest: Option<String>,
     /// SHA-256 of the exact SKILL.md bytes observed during Scan. Missing on
     /// legacy Snapshots cannot authorize a verified load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +485,10 @@ pub struct ScanResult {
     pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
+    /// Additional content observations sharing a logical declared identity.
+    /// Some (including empty) marks placement-bound routing observations.
+    #[serde(default)]
+    pub skill_content_variants: Option<Vec<ScannedSkill>>,
     pub placements: Vec<SkillPlacement>,
     /// Placement-bound native manifest names captured from verified bytes before
     /// declared-source identity deduplication. None means unsupported or absent.
@@ -522,6 +530,28 @@ pub struct ScanResult {
 }
 
 impl ScanResult {
+    pub(crate) fn routing_skills(&self) -> impl Iterator<Item = &ScannedSkill> {
+        self.skills
+            .iter()
+            .chain(self.skill_content_variants.iter().flatten())
+    }
+
+    pub(crate) fn observed_skill_for_placement(
+        &self,
+        placement: &SkillPlacement,
+    ) -> Option<&ScannedSkill> {
+        if self.skill_content_variants.is_none() {
+            return self
+                .skills
+                .iter()
+                .find(|skill| skill.id == placement.skill_id);
+        }
+        self.routing_skills().find(|skill| {
+            skill.id == placement.skill_id
+                && skill.content_identity_digest == placement.content_identity_digest
+        })
+    }
+
     pub(crate) fn placement_native_visibility(
         &self,
         placement: &SkillPlacement,
@@ -1015,6 +1045,7 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     require_unicode_scan_options(options)?;
     let mut result = ScanResult {
+        skill_content_variants: Some(Vec::new()),
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
         identity_path_coverage: IdentityPathCoverage::Complete,
         durable_read_used_permission_ids: Some(BTreeSet::new()),
@@ -1915,6 +1946,7 @@ fn materialize_candidates_with_hook(
     mut before_read: impl FnMut(&Path),
 ) -> usize {
     let mut skills = BTreeMap::<String, ScannedSkill>::new();
+    let mut content_variants = BTreeMap::new();
     let mut physical_packages = BTreeMap::<PathBuf, PhysicalPackageObservation>::new();
     let mut drifted_physical_packages = BTreeMap::<PathBuf, String>::new();
     let mut physical_package_observations = 0;
@@ -2133,19 +2165,26 @@ fn materialize_candidates_with_hook(
                     .is_some_and(|name| declared.eq_ignore_ascii_case(name))
             })
         });
-        skills
-            .entry(skill_id.clone())
-            .or_insert_with(|| ScannedSkill {
-                id: skill_id.clone(),
-                name,
-                metadata,
-                content_digest: digest.clone(),
-                content_identity_digest: content_identity_digest.clone(),
-                digest_algorithm: "sha256-v1".into(),
-                summary: summarize_markdown(&content, 320),
-                normalized_text,
-                modified_at_unix: modified_at,
-            });
+        let observed_skill = || ScannedSkill {
+            id: skill_id.clone(),
+            name,
+            metadata,
+            content_digest: digest.clone(),
+            content_identity_digest: content_identity_digest.clone(),
+            digest_algorithm: "sha256-v1".into(),
+            summary: summarize_markdown(&content, 320),
+            normalized_text,
+            modified_at_unix: modified_at,
+        };
+        if let Some(primary) = skills.get(&skill_id) {
+            if primary.content_identity_digest != content_identity_digest {
+                content_variants
+                    .entry((skill_id.clone(), content_identity_digest.clone()))
+                    .or_insert_with(observed_skill);
+            }
+        } else {
+            skills.insert(skill_id.clone(), observed_skill());
+        }
         let root = candidate
             .root
             .to_str()
@@ -2196,6 +2235,7 @@ fn materialize_candidates_with_hook(
             entrypoint: candidate.entrypoint,
             physical_directory,
             content_digest: digest,
+            content_identity_digest,
             entrypoint_digest: safe_to_read.then(|| stable_digest(content.as_bytes())),
             fingerprint_completeness,
             fingerprint_detail,
@@ -2211,6 +2251,7 @@ fn materialize_candidates_with_hook(
         });
     }
     result.skills = skills.into_values().collect();
+    result.skill_content_variants = Some(content_variants.into_values().collect());
     physical_package_observations
 }
 
@@ -5048,6 +5089,76 @@ enabled = true
     }
 
     #[test]
+    fn declared_identity_retains_placement_bound_content_observations() {
+        let root = temp_directory("declared-content-observations");
+        for (name, instructions) in [
+            ("research", "Research papers and summarize findings."),
+            ("deploy", "Deploy services to production."),
+        ] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {name} capability\nsource: shared-source\nversion: 1\n---\n{instructions}"
+                ),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skill_content_variants.as_ref().unwrap().len(), 1);
+        assert_eq!(result.routing_skills().count(), 2);
+        assert_eq!(result.placements.len(), 2);
+        assert_ne!(
+            result.placements[0].content_identity_digest,
+            result.placements[1].content_identity_digest
+        );
+        for placement in &result.placements {
+            assert_eq!(placement.skill_id, result.skills[0].id);
+            let expected_digest = digest_skill_directory(&placement.directory)
+                .unwrap()
+                .content_identity_digest;
+            assert_eq!(
+                placement.content_identity_digest.as_deref(),
+                Some(expected_digest.as_str())
+            );
+            let observed = result.observed_skill_for_placement(placement).unwrap();
+            let expected_name = placement.directory.file_name().unwrap().to_str().unwrap();
+            assert_eq!(observed.name, expected_name);
+            assert_eq!(observed.metadata.name.as_deref(), Some(expected_name));
+            assert_eq!(
+                observed.metadata.description.as_deref(),
+                Some(format!("{expected_name} capability").as_str())
+            );
+            let instructions = if expected_name == "research" {
+                "Research papers and summarize findings."
+            } else {
+                "Deploy services to production."
+            };
+            assert!(observed.normalized_text.contains(instructions));
+            assert!(observed.summary.contains(instructions));
+        }
+        let restored: ScanResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(restored.routing_skills().count(), 2);
+        for placement in &restored.placements {
+            assert!(restored.observed_skill_for_placement(placement).is_some());
+        }
+        let mut unmatched = restored.placements[0].clone();
+        unmatched.content_identity_digest = Some("unobserved-content".into());
+        assert!(restored.observed_skill_for_placement(&unmatched).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn content_identity_ignores_gitignore_but_keeps_supporting_files() {
         let root = temp_directory("content-identity");
         let first = root.join("one");
@@ -5082,6 +5193,8 @@ enabled = true
             Some(CONTENT_IDENTITY_ALGORITHM)
         );
         assert_eq!(result.skills.len(), 1);
+        assert!(result.skill_content_variants.as_ref().unwrap().is_empty());
+        assert_eq!(result.routing_skills().count(), 1);
         assert_eq!(result.placements.len(), 2);
         let first_content_identity = digest_skill_directory(&first)
             .unwrap()
@@ -5090,6 +5203,13 @@ enabled = true
             result.skills[0].content_identity_digest.as_deref(),
             Some(first_content_identity.as_str())
         );
+        for placement in &result.placements {
+            assert_eq!(
+                placement.content_identity_digest.as_deref(),
+                Some(first_content_identity.as_str())
+            );
+            assert!(result.observed_skill_for_placement(placement).is_some());
+        }
 
         fs::write(second.join("run.sh"), "different behavior").unwrap();
         let (changed_id, _) = inspect_skill_identity(&second.join("SKILL.md")).unwrap();

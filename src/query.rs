@@ -333,6 +333,9 @@ pub struct FindMatch {
     pub rank: usize,
     pub skill_id: String,
     pub name: String,
+    /// Routing observation whose metadata produced this ranking evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_content_identity_digest: Option<String>,
     pub score: f64,
     pub paths: Vec<String>,
     pub agents: Vec<String>,
@@ -433,6 +436,8 @@ pub enum VariantFindingReason {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FindVariant {
     pub skill_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub paths: Vec<String>,
     pub agents: Vec<String>,
     pub roster_state: String,
@@ -824,13 +829,22 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 
     let mut by_name = BTreeMap::<String, Vec<&ScannedSkill>>::new();
-    for skill in &scan.skills {
+    for skill in scan.routing_skills() {
         by_name
             .entry(normalize_skill_name(&skill.name))
             .or_default()
             .push(skill);
     }
+    // Different names can expose the same logical variant set. Emit one covering
+    // Finding for that set, with all actual names and placement-bound evidence.
+    let mut divergent_sets = BTreeMap::<Vec<String>, Vec<(String, Vec<&ScannedSkill>)>>::new();
     for (name, skills) in by_name {
+        let affected_skill_ids = skills
+            .iter()
+            .map(|skill| skill.id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let content_identity_digests = skills
             .iter()
             .filter_map(|skill| skill.content_identity_digest.as_deref())
@@ -838,41 +852,63 @@ fn layout_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         let identity_complete = skills
             .iter()
             .all(|skill| skill.content_identity_digest.is_some());
-        if skills.len() > 1 && identity_complete && content_identity_digests.len() > 1 {
-            let affected_skill_ids = skills
-                .iter()
-                .map(|skill| skill.id.clone())
-                .collect::<Vec<_>>();
-            let affected_placement_ids = scan
-                .placements
-                .iter()
-                .filter(|placement| affected_skill_ids.contains(&placement.skill_id))
-                .map(|placement| placement.id.clone())
-                .collect::<Vec<_>>();
-            push_finding(
-                findings,
-                FindingKind::SameNameDivergentContent,
-                FindingCategory::Layout,
-                Severity::Medium,
-                SAME_NAME_DIVERGENT_FINDING_TITLE,
-                format!(
-                    "{name} resolves to {} distinct routing content identities.",
-                    content_identity_digests.len()
-                ),
-                affected_skill_ids,
-                affected_placement_ids,
-                skills
-                    .iter()
-                    .filter_map(|skill| {
-                        skill
-                            .content_identity_digest
-                            .as_deref()
-                            .map(|digest| format!("routing_content_digest:{digest}"))
-                    })
-                    .collect(),
-                EvidenceQuality::Observed,
-            );
+        if affected_skill_ids.len() > 1 && identity_complete && content_identity_digests.len() > 1 {
+            divergent_sets
+                .entry(affected_skill_ids)
+                .or_default()
+                .push((name, skills));
         }
+    }
+    for (affected_skill_ids, groups) in divergent_sets {
+        let names = groups
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<BTreeSet<_>>();
+        let digests = groups
+            .iter()
+            .flat_map(|(_, skills)| skills.iter())
+            .filter_map(|skill| skill.content_identity_digest.as_deref())
+            .collect::<BTreeSet<_>>();
+        let placements = scan
+            .placements
+            .iter()
+            .filter(|placement| {
+                affected_skill_ids.contains(&placement.skill_id)
+                    && scan
+                        .observed_skill_for_placement(placement)
+                        .is_some_and(|observed| {
+                            names.contains(normalize_skill_name(&observed.name).as_str())
+                        })
+            })
+            .collect::<Vec<_>>();
+        push_finding(
+            findings,
+            FindingKind::SameNameDivergentContent,
+            FindingCategory::Layout,
+            Severity::Medium,
+            SAME_NAME_DIVERGENT_FINDING_TITLE,
+            format!(
+                "Names: {} ({} total); {} distinct routing content identities across these names.",
+                names.iter().take(3).copied().collect::<Vec<_>>().join(", "),
+                names.len(),
+                digests.len()
+            ),
+            affected_skill_ids,
+            placements
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            digests
+                .iter()
+                .map(|digest| format!("routing_content_digest:{digest}"))
+                .chain(
+                    placements
+                        .iter()
+                        .map(|placement| format!("path:{}", placement.entrypoint.display())),
+                )
+                .collect(),
+            EvidenceQuality::Observed,
+        );
     }
 
     for (skill_id, placements) in placements_by_skill(scan) {
@@ -1976,8 +2012,7 @@ pub(crate) fn find_matching_with_evidence(
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
     for skill in scan
-        .skills
-        .iter()
+        .routing_skills()
         .filter(|skill| variant_eligible_ids.is_none_or(|ids| ids.contains(&skill.id)))
     {
         variants_by_name
@@ -1991,8 +2026,7 @@ pub(crate) fn find_matching_with_evidence(
     }
     let mut task_exclusion_effects = Vec::new();
     let mut matches = scan
-        .skills
-        .iter()
+        .routing_skills()
         .filter(|skill| candidate_ids.is_none_or(|ids| ids.contains(&skill.id)))
         .filter_map(|skill| {
             let name = skill.name.to_lowercase();
@@ -2163,14 +2197,25 @@ pub(crate) fn find_matching_with_evidence(
                 variant_skill_ids
                     .iter()
                     .filter_map(|variant_id| {
-                        let variant_skill = scan
-                            .skills
-                            .iter()
-                            .find(|candidate| candidate.id == *variant_id)?;
+                        let variant_skill = scan.routing_skills().find(|candidate| {
+                            candidate.id == *variant_id
+                                && normalize_skill_name(&candidate.name)
+                                    == normalize_skill_name(&name)
+                        })?;
                         let variant_placements = placement_groups
                             .get(variant_id.as_str())
                             .cloned()
-                            .unwrap_or_default();
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|placement| {
+                                scan.observed_skill_for_placement(placement).is_some_and(
+                                    |observed| {
+                                        normalize_skill_name(&observed.name)
+                                            == normalize_skill_name(&name)
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         let mut paths = variant_placements
                             .iter()
                             .map(|placement| placement.entrypoint.display().to_string())
@@ -2194,6 +2239,7 @@ pub(crate) fn find_matching_with_evidence(
                             placement_authority_facts(&variant_placements);
                         Some(FindVariant {
                             skill_id: variant_id.clone(),
+                            name: Some(variant_skill.name.clone()),
                             paths,
                             agents,
                             roster_state: "unknown".into(),
@@ -2214,6 +2260,7 @@ pub(crate) fn find_matching_with_evidence(
                 rank: 0,
                 skill_id: skill.id.clone(),
                 name: skill.name.clone(),
+                ranking_content_identity_digest: skill.content_identity_digest.clone(),
                 score,
                 paths,
                 agents,
@@ -2247,7 +2294,15 @@ pub(crate) fn find_matching_with_evidence(
             .unwrap_or(Ordering::Equal)
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.skill_id.cmp(&right.skill_id))
+            .then_with(|| {
+                left.ranking_content_identity_digest
+                    .cmp(&right.ranking_content_identity_digest)
+            })
     });
+    // Keep one complete observation's evidence for each logical identity. Combining
+    // tokens across its divergent contents would invent a match neither provides.
+    let mut matched_skill_ids = BTreeSet::new();
+    matches.retain(|matched| matched_skill_ids.insert(matched.skill_id.clone()));
     let mut capability_indexes: BTreeMap<String, usize> = BTreeMap::new();
     let mut capabilities: Vec<FindMatch> = Vec::new();
     for matched in matches {
@@ -2275,6 +2330,8 @@ pub(crate) fn find_matching_with_evidence(
             .cmp(&right.name)
             .then_with(|| left.skill_id.cmp(&right.skill_id))
     });
+    let mut affected_skill_ids = BTreeSet::new();
+    task_exclusion_effects.retain(|effect| affected_skill_ids.insert(effect.skill_id.clone()));
     let affected_candidate_count = task_exclusion_effects.len();
     let items_truncated = affected_candidate_count > TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT;
     task_exclusion_effects.truncate(TASK_EXCLUSION_EFFECT_PREVIEW_LIMIT);
@@ -2313,50 +2370,58 @@ pub(crate) fn fuse_retrieval_channels(
         has_protectable_task_evidence: bool,
     }
 
-    let mut fused = BTreeMap::<String, FusedMatch>::new();
+    let mut fused = Vec::<FusedMatch>::new();
     for matched in task_matches {
-        let capability = matched.name.trim().to_lowercase();
         let rank = matched.rank;
         let has_protectable_task_evidence = has_protectable_task_evidence(&matched);
-        fused.insert(
-            capability,
-            FusedMatch {
-                matched,
-                task_rank: Some(rank),
-                augmented_rank: None,
-                fused_score: 1.0 / (RECIPROCAL_RANK_OFFSET + rank as f64),
-                has_protectable_task_evidence,
-            },
-        );
+        fused.push(FusedMatch {
+            matched,
+            task_rank: Some(rank),
+            augmented_rank: None,
+            fused_score: 1.0 / (RECIPROCAL_RANK_OFFSET + rank as f64),
+            has_protectable_task_evidence,
+        });
     }
     for mut matched in augmented_matches {
         let capability = matched.name.trim().to_lowercase();
         let rank = matched.rank;
-        if let Some(existing) = fused.get_mut(&capability) {
-            matched
-                .match_reasons
-                .extend(existing.matched.match_reasons.iter().cloned());
-            matched.match_reasons.sort();
-            matched.match_reasons.dedup();
+        let existing_index = fused
+            .iter()
+            .position(|existing| existing.matched.skill_id == matched.skill_id)
+            .or_else(|| {
+                fused
+                    .iter()
+                    .position(|existing| normalize_skill_name(&existing.matched.name) == capability)
+            });
+        if let Some(existing) = existing_index.and_then(|index| fused.get_mut(index)) {
+            let same_observation = existing.matched.skill_id == matched.skill_id
+                && existing.matched.ranking_content_identity_digest
+                    == matched.ranking_content_identity_digest
+                && existing.matched.name == matched.name;
+            if same_observation {
+                matched
+                    .match_reasons
+                    .extend(existing.matched.match_reasons.iter().cloned());
+                matched.match_reasons.sort();
+                matched.match_reasons.dedup();
+            } else {
+                existing.has_protectable_task_evidence = false;
+            }
             existing.matched = matched;
             existing.augmented_rank = Some(rank);
             existing.fused_score +=
                 AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64);
         } else {
-            fused.insert(
-                capability,
-                FusedMatch {
-                    matched,
-                    task_rank: None,
-                    augmented_rank: Some(rank),
-                    fused_score: AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64),
-                    has_protectable_task_evidence: false,
-                },
-            );
+            fused.push(FusedMatch {
+                matched,
+                task_rank: None,
+                augmented_rank: Some(rank),
+                fused_score: AUGMENTED_CHANNEL_WEIGHT / (RECIPROCAL_RANK_OFFSET + rank as f64),
+                has_protectable_task_evidence: false,
+            });
         }
     }
 
-    let mut fused = fused.into_values().collect::<Vec<_>>();
     fused.sort_by(|left, right| {
         right
             .fused_score
@@ -2374,6 +2439,18 @@ pub(crate) fn fuse_retrieval_channels(
             })
             .then_with(|| left.matched.name.cmp(&right.matched.name))
             .then_with(|| left.matched.skill_id.cmp(&right.matched.skill_id))
+    });
+    let mut skill_ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    fused.retain(|candidate| {
+        if skill_ids.contains(&candidate.matched.skill_id)
+            || names.contains(&normalize_skill_name(&candidate.matched.name))
+        {
+            return false;
+        }
+        skill_ids.insert(candidate.matched.skill_id.clone());
+        names.insert(normalize_skill_name(&candidate.matched.name));
+        true
     });
     let leading_match_is_weak_augmented_only = fused.first().is_some_and(|matched| {
         matched.task_rank.is_none() && !has_direct_hint_evidence(&matched.matched)
@@ -2867,6 +2944,7 @@ mod tests {
             rank,
             skill_id: format!("skill_{name}"),
             name: name.into(),
+            ranking_content_identity_digest: None,
             score: 1.0,
             paths: Vec::new(),
             agents: Vec::new(),
@@ -2887,6 +2965,250 @@ mod tests {
             variants_truncated: false,
             variant_finding: None,
         }
+    }
+
+    fn scan_declared_content_observations(entries: &[(&str, &str, &str)]) -> ScanResult {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skillroster-query-observations-{nonce}"));
+        for (index, (name, description, source)) in entries.iter().enumerate() {
+            let directory = root.join(index.to_string());
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\nsource: {source}\nversion: 1\n---\n"),
+            ).unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("home"));
+        options
+            .explicit_skill_roots
+            .push(crate::scan::ExplicitSkillRoot {
+                agent: AgentKind::Codex,
+                path: root.clone(),
+            });
+        options.include_session_evidence = false;
+        let scan = scan(&options).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        scan
+    }
+
+    #[test]
+    fn declared_content_search_uses_the_winning_observations_name_and_digest() {
+        let scan = scan_declared_content_observations(&[
+            ("research", "Read papers", "shared"),
+            ("deploy", "Deploy services", "shared"),
+        ]);
+        assert_eq!(scan.skills.len(), 1);
+        for name in ["research", "deploy"] {
+            let matches = find(&scan, name, 10);
+            assert_eq!(matches.len(), 1);
+            let observation = scan
+                .routing_skills()
+                .find(|skill| skill.name == name)
+                .unwrap();
+            assert_eq!(matches[0].skill_id, scan.skills[0].id);
+            assert_eq!(matches[0].name, name);
+            assert_eq!(
+                matches[0].ranking_content_identity_digest,
+                observation.content_identity_digest
+            );
+        }
+    }
+
+    #[test]
+    fn declared_content_search_does_not_combine_partial_metadata_matches() {
+        let scan = scan_declared_content_observations(&[
+            ("capability", "alpha", "shared"),
+            ("capability", "beta", "shared"),
+        ]);
+        let matches = find(&scan, "alpha beta", 10);
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0]
+                .match_reasons
+                .contains(&"description_tokens:1".into())
+        );
+        assert!(
+            !matches[0]
+                .match_reasons
+                .contains(&"description_token_phrase".into())
+        );
+        assert!(!has_strong_verified_load_evidence(&matches[0]));
+        let mut reversed = scan.clone();
+        let supplemental = reversed.skill_content_variants.as_mut().unwrap();
+        std::mem::swap(&mut reversed.skills[0], &mut supplemental[0]);
+        let reversed_matches = find(&reversed, "alpha beta", 10);
+        assert_eq!(
+            matches[0].ranking_content_identity_digest,
+            reversed_matches[0].ranking_content_identity_digest
+        );
+        assert_eq!(matches[0].score, reversed_matches[0].score);
+    }
+
+    #[test]
+    fn excluding_one_content_observation_keeps_the_other_searchable() {
+        let scan = scan_declared_content_observations(&[
+            ("modify", "Modify files", "shared"),
+            ("inspect", "Inspect worktree", "shared"),
+        ]);
+        let query = RetrievalQuery::from_task_and_hints(
+            "inspect worktree, but do not modify files",
+            std::iter::empty::<&str>(),
+        );
+        let result = find_matching_with_evidence(&scan, &query, 10, None, None);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].name, "inspect");
+        assert_eq!(result.task_exclusion_effects.affected_candidate_count, 1);
+    }
+
+    #[test]
+    fn supplementary_names_keep_same_name_variants_scoped_to_real_observations() {
+        let scan = scan_declared_content_observations(&[
+            ("research", "Read papers", "shared"),
+            ("deploy", "Deploy services", "shared"),
+            ("deploy", "Ship production", "other"),
+        ]);
+        let matches = find(&scan, "deploy", 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].variant_count, 2);
+        assert_eq!(matches[0].variants.len(), 2);
+        for variant in &matches[0].variants {
+            assert_eq!(variant.name.as_deref(), Some("deploy"));
+            assert_eq!(variant.paths.len(), 1);
+        }
+        let report = build_report(&scan);
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.kind == FindingKind::SameNameDivergentContent)
+            .unwrap();
+        assert_eq!(finding.affected_skill_ids.len(), 2);
+        assert_eq!(finding.affected_placement_ids.len(), 2);
+        assert!(finding.summary.contains("Names: deploy (1 total)"));
+        assert!(!finding.summary.contains("research"));
+        assert!(
+            finding
+                .evidence
+                .iter()
+                .all(|reference| reference.starts_with("routing_content_digest:")
+                    || reference.starts_with("path:"))
+        );
+        let research = scan
+            .routing_skills()
+            .find(|skill| skill.name == "research")
+            .unwrap();
+        assert!(!finding.evidence.contains(&format!(
+            "routing_content_digest:{}",
+            research.content_identity_digest.as_ref().unwrap()
+        )));
+        for placement in &scan.placements {
+            let observed = scan.observed_skill_for_placement(placement).unwrap();
+            assert_eq!(
+                finding.affected_placement_ids.contains(&placement.id),
+                observed.name == "deploy"
+            );
+        }
+    }
+
+    #[test]
+    fn same_name_findings_count_logical_identities_and_cover_shared_name_sets_once() {
+        let one_identity = scan_declared_content_observations(&[
+            ("deploy", "Deploy services", "shared"),
+            ("deploy", "Ship production", "shared"),
+        ]);
+        assert!(
+            !build_report(&one_identity)
+                .findings
+                .iter()
+                .any(|finding| finding.kind == FindingKind::SameNameDivergentContent)
+        );
+        let scan = scan_declared_content_observations(&[
+            ("research", "Read papers", "shared"),
+            ("deploy", "Deploy services", "shared"),
+            ("research", "Summarize papers", "other"),
+            ("deploy", "Ship production", "other"),
+        ]);
+        let report = build_report(&scan);
+        let findings = report
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::SameNameDivergentContent)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].affected_skill_ids.len(), 2);
+        assert_eq!(findings[0].affected_placement_ids.len(), 4);
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .all(|reference| reference.starts_with("routing_content_digest:")
+                    || reference.starts_with("path:"))
+        );
+        assert_eq!(
+            findings[0]
+                .affected_skill_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            scan.skills.iter().map(|skill| skill.id.clone()).collect()
+        );
+        assert_eq!(
+            findings[0]
+                .affected_placement_ids
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            scan.placements
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect()
+        );
+        assert!(findings[0].summary.contains("(2 total)"));
+        assert!(findings[0].summary.contains("deploy, research"));
+    }
+
+    #[test]
+    fn fusion_keeps_different_observation_evidence_separate_for_one_identity() {
+        let mut task_match = matched("research", 1, &["exact_name"]);
+        task_match.ranking_content_identity_digest = Some("research-digest".into());
+        let mut hint_match = matched("deploy", 1, &["description_tokens:1"]);
+        hint_match.skill_id = task_match.skill_id.clone();
+        hint_match.ranking_content_identity_digest = Some("deploy-digest".into());
+        let task = RetrievalQuery::from_parts(["research"]);
+        let matches = fuse_retrieval_channels(vec![task_match], vec![hint_match], &task, 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "deploy");
+        assert_eq!(
+            matches[0].ranking_content_identity_digest.as_deref(),
+            Some("deploy-digest")
+        );
+        assert_eq!(matches[0].match_reasons, vec!["description_tokens:1"]);
+        assert!(!has_strong_verified_load_evidence(&matches[0]));
+        assert_eq!(matches[0].task_channel_rank, Some(1));
+        assert_eq!(matches[0].augmented_channel_rank, Some(1));
+    }
+
+    #[test]
+    fn fusion_does_not_overwrite_an_identity_when_its_winning_name_changes() {
+        let task_a = matched("alpha", 1, &["exact_name"]);
+        let task_b = matched("beta", 2, &["description_tokens:1"]);
+        let mut augmented_b = matched("beta", 1, &["exact_name"]);
+        augmented_b.skill_id = task_a.skill_id.clone();
+        let mut augmented_a = matched("alpha", 2, &["exact_name"]);
+        augmented_a.skill_id = "skill_third".into();
+        let matches = fuse_retrieval_channels(
+            vec![task_a.clone(), task_b],
+            vec![augmented_b, augmented_a],
+            &RetrievalQuery::from_parts(["alpha"]),
+            10,
+        );
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].skill_id, task_a.skill_id);
+        assert_eq!(matches[0].name, "beta");
+        assert_eq!(matches[1].skill_id, "skill_third");
+        assert_eq!(matches[1].name, "alpha");
     }
 
     #[test]
@@ -4431,6 +4753,7 @@ mod tests {
                     entrypoint: PathBuf::from(format!("/{}/skills/{index}/SKILL.md", agent.id())),
                     physical_directory: None,
                     content_digest: format!("digest_{index}"),
+                    content_identity_digest: None,
                     entrypoint_digest: None,
                     fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
                     fingerprint_detail: None,

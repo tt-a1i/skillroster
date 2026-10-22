@@ -1030,8 +1030,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.50");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.50");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.51");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.51");
 }
 
 #[cfg(unix)]
@@ -6070,7 +6070,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.50"
+        "1.8.51"
     );
 
     let undone = json_output(&run(
@@ -6163,6 +6163,25 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
 fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
     for (version, changed_count, legacy_files) in [
         (
+            "1.8.50",
+            2,
+            [
+                ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.50.md")),
+                (
+                    "references/routing.md",
+                    include_str!("fixtures/bootstrap-routing-v1.8.50.md"),
+                ),
+                (
+                    "references/governance.md",
+                    include_str!("fixtures/bootstrap-governance-v1.8.50.md"),
+                ),
+                (
+                    "references/mutation.md",
+                    include_str!("fixtures/bootstrap-mutation-v1.8.50.md"),
+                ),
+            ],
+        ),
+        (
             "1.8.23",
             4,
             [
@@ -6202,7 +6221,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         ),
         (
             "1.8.49",
-            3,
+            4,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.49.md")),
                 (
@@ -6292,7 +6311,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.50"
+            "1.8.51"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();

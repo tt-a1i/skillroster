@@ -161,6 +161,13 @@ Skill identity uses this precedence:
 
 Ambiguous Skills remain separate. SkillRoster never merges based only on a matching name or Agent interpretation.
 
+A declared source/version identity may have divergent local content. The
+Snapshot keeps every distinct routing-content observation with its own name,
+metadata and searchable text, and binds each Placement to that routing digest.
+These observations share the logical Skill ID used by Roster and usage records;
+one observation's metadata is not evidence for another observation's content.
+Older Snapshots missing these observations require one new Scan.
+
 ### 4.2 Analysis
 
 `report` covers seven categories:
@@ -295,7 +302,7 @@ The first complete command surface is:
 skillroster [--json]
 skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
-skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--require-snapshot <scan-id>] [--json] -- <task>
+skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--variant-placement-id <placement-id>] [--require-snapshot <scan-id>] [--json] -- <task>
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
@@ -553,6 +560,30 @@ evidence for the ranked capability group and is explicitly scoped as such; it
 is not attributed to the selected package identity. It supplies content facts
 for the model's comparison; it does not endorse, canonicalize, mutate, or
 establish task success.
+
+For divergent content under one declared identity, Find scores each observed
+content separately and keeps the strongest match for that logical ID. FTS may
+index the union solely to select candidate IDs; it never combines names,
+triggers or description tokens from different observations to justify loading.
+The matching routing digest identifies which observation supplied the evidence.
+
+`content_choice` lists bounded routing-content groups with each placement's
+observed name, path, digests, authority and current read state. Different
+routing digests require explicit content selection; package differences caused
+only by root `.gitignore` do not. `find --load` returns
+`declared_identity_content_ambiguous` with no partial body when selection is
+required. Its recovery opens the same Snapshot's ordinary Find choices rather
+than asking for repeated Scans. A declared-identity Finding exposes the same
+read-only comparison choices and full detail when the preview is truncated.
+
+`--variant-placement-id` requires `--load` and selects one exact placement from
+the current Top-1 capability group. If a Skill selector is also supplied, both
+selectors must agree. The actual name and placement ID identify the loaded
+content; its selection evidence is scoped to the ranked capability group.
+The selector preserves all source, Snapshot, digest, path, size, encoding and
+Archived-state checks and never falls back to a different placement on failure.
+A drifted or unreadable copy retains its own blocker even when another copy is
+healthy. Exact reading does not select canonical content or authorize governance.
 
 All JSON responses use a versioned envelope:
 
