@@ -1822,6 +1822,7 @@ fn scan_command(
 }
 
 const SCAN_SUMMARY_ROOT_ISSUE_LIMIT: usize = 10;
+const SESSION_COVERAGE_PRESENTATION_VERSION: u32 = 1;
 
 fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -> Result<Value> {
     let root_kinds = [scan::RootKind::Skills, scan::RootKind::Sessions];
@@ -2029,7 +2030,7 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
 }
 
 fn summary_coverage_state(coverage: &scan::SessionCoverage) -> &'static str {
-    if coverage.limitations.is_none() {
+    if coverage.limitations.is_none() || !coverage.has_current_parse_contract() {
         "legacy_unknown"
     } else if coverage.roots_inaccessible > 0 {
         "inaccessible"
@@ -2143,7 +2144,8 @@ const fn coverage_retry_disposition(
         | scan::SessionCoverageLimitationCode::FilePathNotUnicode
         | scan::SessionCoverageLimitationCode::JsonExtractionLimit
         | scan::SessionCoverageLimitationCode::JsonRecordLimit
-        | scan::SessionCoverageLimitationCode::LineAlignmentLoss => {
+        | scan::SessionCoverageLimitationCode::LineAlignmentLoss
+        | scan::SessionCoverageLimitationCode::FileParseFailure => {
             CoverageRetryDisposition::SameBoundaryExpected
         }
     }
@@ -2152,7 +2154,7 @@ const fn coverage_retry_disposition(
 fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     let mut details = serde_json::to_value(coverage)?;
     details["agent"] = json!(coverage.agent.id());
-    let legacy = coverage.limitations.is_none();
+    let legacy = coverage.limitations.is_none() || !coverage.has_current_parse_contract();
     let limitations = coverage.limitations.as_deref().unwrap_or_default();
     let denominator_reliable = coverage.denominator_is_reliable();
     details["denominator_reliable"] = json!(denominator_reliable);
@@ -2195,6 +2197,13 @@ fn session_coverage_actionability(
     }
     if legacy {
         next_steps.push("rescan_to_record_typed_limitations");
+        next_steps.push("rescan_to_record_parse_completeness");
+    }
+    if limitations
+        .iter()
+        .any(|limitation| limitation.code == scan::SessionCoverageLimitationCode::FileParseFailure)
+    {
+        next_steps.push("verify_session_record_format_before_rescan");
     }
     if !verify_before_rescan_codes.is_empty() {
         next_steps.push("verify_session_root_before_rescan");
@@ -2238,12 +2247,25 @@ fn normalize_public_coverage_details(details: &mut Value) -> Result<()> {
             *agent = json!(canonical);
         }
     }
-    if !object.contains_key("limitations") {
+    if !object.get("limitations").is_some_and(Value::is_array)
+        || object.get("parse_contract_version").and_then(Value::as_u64)
+            != Some(u64::from(scan::SESSION_PARSE_CONTRACT_VERSION))
+    {
         object.insert("denominator_reliable".into(), json!(false));
         object.insert("limitation_state".into(), json!("legacy_unknown"));
         object.insert(
             "actionability".into(),
-            session_coverage_actionability(true, false, &[])?,
+            session_coverage_actionability(
+                true,
+                false,
+                &object
+                    .get("limitations")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .map(serde_json::from_value::<Vec<scan::SessionCoverageLimitation>>)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )?,
         );
     }
     Ok(())
@@ -2321,6 +2343,30 @@ fn report_command(
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
             require_content_identity(&scan)?;
             let coverage_basis = stored_finding_coverage_basis(&stored, object)?;
+            let kind = crate::query::stored_finding_kind(&stored);
+            if kind == Some(crate::query::FindingKind::FiveStageUsageEvidence) {
+                let overview = crate::query::usage_overview(&scan);
+                object.insert(
+                    "summary".into(),
+                    json!(crate::query::usage_overview_summary(&overview)),
+                );
+                object.insert(
+                    "evidence_quality".into(),
+                    json!(if overview.coverage.complete_agent_count
+                        == overview.coverage.supported_agent_count
+                    {
+                        "observed"
+                    } else {
+                        "unknown"
+                    }),
+                );
+                object.insert("usage_overview".into(), json!(overview));
+            } else if kind == Some(crate::query::FindingKind::StaleArchiveCandidates)
+                && stored_archive_coverage_unreliable(object, &scan)
+            {
+                object.insert("summary".into(), json!("Coverage is insufficient to assess this historical archive candidate; rescan before using missing usage as archive evidence."));
+                object.insert("evidence_quality".into(), json!("unknown"));
+            }
             let evidence_quality = object
                 .get("evidence_quality")
                 .cloned()
@@ -2552,6 +2598,8 @@ fn report_command(
     require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id
+            && existing.summary["session_coverage_presentation_version"].as_u64()
+                == Some(u64::from(SESSION_COVERAGE_PRESENTATION_VERSION))
             && report_supports_source_confirmation_kind(&existing)
             && report_supports_finding_decision_fields(&existing)
             && existing.summary["overview"].is_object()
@@ -2629,6 +2677,7 @@ fn report_command(
     });
     let value = json!({
         "report_id": report_id,
+        "session_coverage_presentation_version": SESSION_COVERAGE_PRESENTATION_VERSION,
         "snapshot_id": scan_id,
         "skill_count": report.metrics.independent_skills,
         "placement_count": report.metrics.placements,
@@ -2965,7 +3014,35 @@ fn finding_decision_facts(
             };
         }
     }
+    if kind == Some(crate::query::FindingKind::StaleArchiveCandidates)
+        && (affected_skill_ids.is_empty()
+            || affected_skill_ids
+                .iter()
+                .any(|id| !crate::query::archive_skill_has_reliable_coverage(scan, id)))
+    {
+        state = FindingDecisionState {
+            actionability: "read_only",
+            reversibility: "not_governable",
+        };
+    }
     (affected_agents, state)
+}
+
+fn stored_archive_coverage_unreliable(
+    object: &serde_json::Map<String, Value>,
+    scan: &ScanResult,
+) -> bool {
+    object
+        .get("affected_skill_ids")
+        .and_then(Value::as_array)
+        .is_none_or(|ids| {
+            ids.is_empty()
+                || ids.iter().any(|id| {
+                    id.as_str().is_none_or(|id| {
+                        !crate::query::archive_skill_has_reliable_coverage(scan, id)
+                    })
+                })
+        })
 }
 
 fn refresh_finding_decision_facts(
@@ -12180,6 +12257,7 @@ mod recovery_tests {
                 files_observed: 0,
                 files_partially_observed: 0,
                 files_skipped: 0,
+                parse_contract_version: Some(scan::SESSION_PARSE_CONTRACT_VERSION),
                 denominator_reliable: false,
                 bytes_observed: 0,
                 lines_observed: 0,
@@ -12325,6 +12403,7 @@ mod recovery_tests {
             files_observed: 1,
             files_partially_observed: 1,
             files_skipped: 1,
+            parse_contract_version: Some(scan::SESSION_PARSE_CONTRACT_VERSION),
             denominator_reliable: false,
             bytes_observed: 4 * 1024 * 1024,
             lines_observed: 10,
@@ -12375,7 +12454,43 @@ mod recovery_tests {
             json!([])
         );
 
+        coverage.limitations.as_mut().unwrap()[0].code =
+            scan::SessionCoverageLimitationCode::FileParseFailure;
+        let parse_failure = session_coverage_details(&coverage).unwrap();
+        assert_eq!(
+            parse_failure["actionability"]["same_boundary_expected_codes"],
+            json!(["file_parse_failure"])
+        );
+        assert_eq!(
+            parse_failure["actionability"]["retry_may_resolve_codes"],
+            json!([])
+        );
+        assert!(
+            parse_failure["actionability"]["supported_next_steps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("verify_session_record_format_before_rescan"))
+        );
+
         coverage.denominator_reliable = true;
+        coverage.limitations = Some(Vec::new());
+        assert_eq!(
+            session_coverage_details(&coverage).unwrap()["limitation_state"],
+            "complete"
+        );
+        coverage.parse_contract_version = None;
+        let mut legacy_details = serde_json::to_value(&coverage).unwrap();
+        normalize_public_coverage_details(&mut legacy_details).unwrap();
+        assert_eq!(legacy_details["denominator_reliable"], false);
+        assert_eq!(legacy_details["limitation_state"], "legacy_unknown");
+        assert_eq!(summary_coverage_state(&coverage), "legacy_unknown");
+        assert_eq!(
+            session_coverage_details(&coverage).unwrap()["denominator_reliable"],
+            false
+        );
+        assert!(legacy_details["parse_contract_version"].is_null());
+
+        coverage.parse_contract_version = Some(scan::SESSION_PARSE_CONTRACT_VERSION);
         coverage.limitations = None;
         let legacy = session_coverage_details(&coverage).unwrap();
         assert_eq!(legacy["limitation_state"], "legacy_unknown");

@@ -256,6 +256,28 @@ Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence
 
 New session Scans record every completeness boundary at its trigger point as typed, multi-value Coverage limitations. Each fact freezes its code, root/file/Agent scope, count quality, observed value, active limit, unit, and scanner source; aggregate coverage fields remain compatibility projections. Repeated occurrences aggregate by code within one Agent without persisting session paths, and count quality states whether the reported observation is exact, a lower bound, or unknown. Public Coverage Evidence classifies which unchanged boundaries will recur, which local read failures may resolve, and which roots require verification before a rescan. Scanner caps are not configurable through the CLI. Legacy Snapshots without typed limitations remain `legacy_unknown` and never inherit the current binary's limits or claim a reliable denominator.
 
+Session parsing validates the original UTF-8 bytes and JSON syntax before any
+structured observation or name-based inference. Malformed JSONL/structured log
+records contribute no usage; valid neighboring records remain observable. A
+fully read `.json` file must contain a valid complete document; empty and
+whitespace-only documents are parsing failures. Bounded JSON tails may still contribute valid
+complete objects under the existing sampling limits. Blank JSONL/log lines are
+ignored; valid records without recognized Skill events, including unknown event
+shapes, are not parsing failures. Syntax validation does not prove that every
+Agent event kind is understood.
+
+Observed parsing failures produce `file_parse_failure`, counted once per
+affected file, and invalidate the usage denominator. Raw malformed content and
+parser error excerpts are not persisted. Coverage freezes
+`parse_contract_version`; a missing or unsupported version remains
+`legacy_unknown` even if an older Snapshot recorded empty limitations and a
+reliable denominator. Reports, cached summaries, historical Finding details and
+exported Coverage Evidence preserve this boundary without rewriting historical
+Snapshots. Historical usage summaries are recomputed conservatively; an old
+archive candidate whose relevant reliable coverage is no longer established
+becomes read-only and requests a rescan. A new Scan can establish the current contract. Historical usage
+observations remain historical; new Reports use their own Snapshot's usage.
+
 Finding coverage never mixes filesystem discovery with session observation.
 Inventory, layout, exposure, overlap, routing, and structural lifecycle
 Findings use `skill_root_scan`; known-missing Skill roots are observed absence,

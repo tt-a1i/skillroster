@@ -1265,8 +1265,7 @@ fn stronger_evidence_quality(left: EvidenceQuality, right: EvidenceQuality) -> E
     }
 }
 
-fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
-    let overview = usage_overview(scan);
+pub(crate) fn usage_overview_summary(overview: &UsageOverview) -> String {
     let stage_summaries = overview
         .stages
         .iter()
@@ -1285,6 +1284,29 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             )
         })
         .collect::<Vec<_>>();
+    let coverage = &overview.coverage;
+    format!(
+        "{}. Coverage: roots {}/{supported}, sampled {}/{supported}, complete {}/{supported}, missing {}/{supported}, inaccessible {}/{supported}; files discovered={}, observed={}, partial={}, skipped={}; bytes={}, lines={}, truncated={}, discovery_truncated={}.",
+        stage_summaries.join("; "),
+        coverage.roots_present_agent_count,
+        coverage.sampled_agent_count,
+        coverage.complete_agent_count,
+        coverage.missing_agent_count,
+        coverage.inaccessible_agent_count,
+        coverage.files_discovered,
+        coverage.files_observed,
+        coverage.files_partially_observed,
+        coverage.files_skipped,
+        coverage.bytes_observed,
+        coverage.lines_observed,
+        coverage.truncated,
+        coverage.discovery_truncated,
+        supported = coverage.supported_agent_count,
+    )
+}
+
+fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
+    let overview = usage_overview(scan);
     let evidence = scan
         .usage
         .iter()
@@ -1302,24 +1324,7 @@ fn usage_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         FindingCategory::Usage,
         Severity::Info,
         "Five-stage usage evidence",
-        format!(
-            "{}. Coverage: roots {}/{supported}, sampled {}/{supported}, complete {}/{supported}, missing {}/{supported}, inaccessible {}/{supported}; files discovered={}, observed={}, partial={}, skipped={}; bytes={}, lines={}, truncated={}, discovery_truncated={}.",
-            stage_summaries.join("; "),
-            coverage.roots_present_agent_count,
-            coverage.sampled_agent_count,
-            coverage.complete_agent_count,
-            coverage.missing_agent_count,
-            coverage.inaccessible_agent_count,
-            coverage.files_discovered,
-            coverage.files_observed,
-            coverage.files_partially_observed,
-            coverage.files_skipped,
-            coverage.bytes_observed,
-            coverage.lines_observed,
-            coverage.truncated,
-            coverage.discovery_truncated,
-            supported = coverage.supported_agent_count,
-        ),
+        usage_overview_summary(&overview),
         scan.usage
             .iter()
             .map(|usage| usage.skill_id.clone())
@@ -1578,6 +1583,21 @@ fn routing_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     }
 }
 
+pub(crate) fn archive_skill_has_reliable_coverage(scan: &ScanResult, skill_id: &str) -> bool {
+    let agents = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+        .filter_map(|placement| placement.agent)
+        .collect::<BTreeSet<_>>();
+    !agents.is_empty()
+        && agents.iter().all(|agent| {
+            scan.coverage
+                .iter()
+                .any(|coverage| coverage.agent == *agent && coverage.denominator_is_reliable())
+        })
+}
+
 fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
     let executable = scan
         .placements
@@ -1775,20 +1795,11 @@ fn lifecycle_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
         .skills
         .iter()
         .filter(|skill| {
-            let placement_agents = scan
-                .placements
-                .iter()
-                .filter(|placement| placement.skill_id == skill.id)
-                .filter_map(|placement| placement.agent)
-                .collect::<Vec<_>>();
             skill
                 .modified_at_unix
                 .is_some_and(|time| time < stale_cutoff)
                 && !scan.usage.iter().any(|usage| usage.skill_id == skill.id)
-                && !placement_agents.is_empty()
-                && placement_agents
-                    .iter()
-                    .all(|agent| reliable_agents.contains(agent))
+                && archive_skill_has_reliable_coverage(scan, &skill.id)
         })
         .collect::<Vec<_>>();
     if !stale_candidates.is_empty() {
@@ -3836,6 +3847,7 @@ mod tests {
             files_observed: 2,
             files_partially_observed: 0,
             files_skipped: 0,
+            parse_contract_version: Some(crate::scan::SESSION_PARSE_CONTRACT_VERSION),
             denominator_reliable: true,
             bytes_observed: 100,
             lines_observed: 10,
@@ -3855,8 +3867,9 @@ mod tests {
         assert_eq!(finding.evidence_quality, EvidenceQuality::Inferred);
         assert!(finding.summary.contains("candidate evidence only"));
 
-        scan.coverage[0].limitations = None;
+        scan.coverage[0].parse_contract_version = None;
         let legacy_report = build_report(&scan);
+        assert_eq!(usage_overview(&scan).coverage.complete_agent_count, 0);
         assert_eq!(
             legacy_report
                 .metrics
