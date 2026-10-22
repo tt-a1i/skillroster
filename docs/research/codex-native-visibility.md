@@ -1,12 +1,15 @@
 # Codex native discovery and visibility gap
 
-Inspected 2026-10-22. Research handoff only; implementation and product-spec changes are not part of this note.
+Inspected 2026-10-22. The initial gaps below describe installed SkillRoster 1.8.46
+and the pre-adapter repository. Later sections record native controls and
+working-tree comparisons. The implemented boundary and verification are in
+[the acceptance record](../acceptance/codex-user-skill-visibility-2026-10-22.md).
 
 ## Evidence boundary
 
 - Installed CLI: `codex-cli 0.163.0`, executable `/opt/homebrew/bin/codex`.
 - Native test: that executable's local `app-server --stdio`, initialized over JSON-RPC, then `skills/list` with an isolated project CWD and `forceReload: true`. No model turn or account API was called.
-- Comparison binary: installed `skillroster 1.8.46`. Its scan result agrees with the inspected repository implementation. It was not a fresh build of the working tree.
+- Initial comparison binary: installed `skillroster 1.8.46`, not a fresh working-tree build. The later selector and regression comparisons explicitly use the locally built candidate.
 - Both tools used temporary fixture directories. Codex HOME, CODEX_HOME, and XDG_CONFIG_HOME pointed into the fixture; SkillRoster used explicit `--home` and `--state-dir`. No user-home inventory or auth content was read.
 - This establishes CLI/app-server behavior, not the installed desktop application's version or an active conversation's catalog. The standard `/Applications/Codex.app` binary path was absent.
 
@@ -113,12 +116,63 @@ All results below are from the same installed **Codex 0.163.0** and isolated no-
 | Symlink entrypoint false, canonical entrypoint true | Enabled; aliases share the last-wins identity in this case |
 | Canonical entrypoint true, symlink entrypoint false | Disabled |
 | Symlink package directory or canonical package directory, false | Linked Skill remains enabled |
-| Entry missing `path`, false | Valid load; fixture Skills remain enabled |
+| Entry missing both `path` and `name`, false | Valid load; fixture Skills remain enabled |
 | Entry missing `enabled` | Per-CWD configuration reload error; no Skills returned for that CWD |
 | `enabled="false"` string | Per-CWD reload error: boolean required |
 | Malformed TOML | Per-CWD configuration reload error |
 
-The error cases still returned a JSON-RPC result envelope. The failure appears inside `result.data[].errors`, accompanied by `skills=[]`; consumers must not interpret it as a complete empty inventory. Missing `path` was accepted/ignored in this test, whereas missing `enabled` was rejected.
+The error cases still returned a JSON-RPC result envelope. The failure appears inside `result.data[].errors`, accompanied by `skills=[]`; consumers must not interpret it as a complete empty inventory. Missing both selectors was accepted/ignored in this test, whereas missing `enabled` was rejected. Missing only `path` does not establish an ignored entry: the follow-up matrix below confirms a supported `name` selector.
+
+### Name selectors and ordered matching
+
+A follow-up on 2026-10-22 used the same installed **Codex 0.163.0** and isolated no-model app-server protocol. Forty cases varied fixture manifests and user configuration; full native responses and error arrays were retained in the two result directories listed below. The frontmatter-name controls deliberately used a directory named `native-user` with `name: display-skill`.
+
+| User `skills.config` input or fixture control | Native result |
+| --- | --- |
+| `name="display-skill"`, false, no path | The Skill with that frontmatter name disabled |
+| `name="native-user"`, false, frontmatter name `display-skill` | Remains enabled; the directory name is not the selector |
+| `name="native-user"`, false, same frontmatter name | Disabled |
+| `name="NATIVE-USER"`, false | Remains enabled; case-sensitive matching |
+| Name surrounded by spaces, tabs/newlines, or Unicode NBSP | Surrounding whitespace ignored; matching Skill disabled |
+| `name="native user"` against `native-user`, or `name="*"` | Remains enabled; these do not match |
+| Empty name, no path | Valid load; fixture Skills remain enabled |
+| Same name twice, false then true / true then false | Enabled / disabled; last matching entry wins |
+| Name-only false then matching path-only true | Enabled |
+| Path-only false then matching name-only true | Enabled |
+| Name-only true then matching path-only false | Disabled |
+| Name-only false then unmatched name/path true | Remains disabled; unmatched entries do not reset the decision |
+| Both name and exact matching entrypoint path, false | Remains enabled; this is not a conjunction or a path fallback |
+| Both selectors, with name/path mismatch, empty or whitespace name, empty or nonexistent path | Valid load; fixture Skills remain enabled |
+| Matching name-only false then both matching selectors true | Remains disabled; the both-selector entry is inert |
+| Matching name-only false then neither selector true | Remains disabled; the selectorless entry is inert |
+| Symlink-path false then matching name-only true | Linked Skill enabled |
+| Name-only true then canonical source-path false | Linked Skill disabled |
+| Canonical source-path false then both name and symlink path true | Remains disabled; the both-selector entry is inert |
+| Identical frontmatter name in legacy and native user roots, name-only false | Both placements returned, both disabled |
+| Non-string name (integer or array), with or without a valid path | Per-CWD reload error; no Skills returned for that CWD |
+| Name-only entry missing `enabled` | Per-CWD reload error; no Skills returned for that CWD |
+
+The bounded observed rule is: validate each relevant entry's field types, then apply entries in file order. Exactly one present selector participates: trim the name selector's surrounding whitespace and compare it case-sensitively with the frontmatter name, or match a path to the canonical entrypoint under the existing path rules. Both-present and neither-present entries do not participate, even when a selector is empty. Retain the boolean from the last participating entry matching that placement; default to enabled when none matches. Name matching can affect multiple placements and must not be collapsed into a one-name/one-placement map. The same ordered evaluation must cover a proposed Core source's verified frontmatter name and canonical entrypoint identity.
+
+This is an observation of user Skills in 0.163.0, not a general selector schema for every Skill scope. The source has not been inspected to prove every possible Unicode whitespace code point; ASCII whitespace and NBSP controls support surrounding-whitespace trimming, while inner characters and case remain significant.
+
+Two additional placement-name controls confirm that the matching name must stay bound to the inspected entrypoint, rather than a logical identity's representative metadata:
+
+- Legacy and native manifests declared the same `source: fixture/shared` and `version: 1.0`, but retained distinct frontmatter names `legacy-user` and `native-user`. Native returned both placements and applied a name-only rule to only its matching name. Logical source/version grouping must not copy one placement's name onto another.
+- Valid YAML `name: native-user # fixture comment` and `name: "native-user" # fixture comment` both produced native name `native-user`; a matching name-only false rule disabled them. A quoted name with surrounding whitespace also produced `native-user`. Metadata read permission alone does not establish native-equivalent parsing; unsupported name syntax must remain unknown instead of silently bypassing name rules.
+- Valid YAML `name: native-user` followed by the indented continuation `  suffix` produced native name `native-user suffix`. A name-only false rule for that complete name disabled it. A bounded parser must reject unsupported scalar continuations as Unknown; skipping indented lines while trusting the initial scalar can incorrectly report On.
+
+A local working-tree binary comparison reused all 40 selector fixtures, explicitly approving each fixture's `source/` directory for content inspection. The 35 valid-config fixtures agreed with native On/Off decisions for all named user placements; four malformed Skill-control fixtures remained Unknown, and the unrelated invalid-host-field control retained the declared local-rule projection with host validity unverified. These cases do not replace the placement-name controls above. Results and native responses remain separately inspectable in the artifact list.
+
+A subsequent working-tree build with Snapshot visibility version `codex-user-skill-config-v3` repeated the 40-fixture comparison with the same outcome and correctly matched both source/version-name controls, both inline-comment controls, and the quoted-whitespace name control. The unsupported plain-scalar continuation above remains a separate regression boundary; passing the 40-fixture matrix alone does not establish it.
+
+### Skill controls versus host configuration validity
+
+A separate control set `model=4`, both alone and before a valid name-only disabling entry. Native 0.163.0 returned a per-CWD reload error (`invalid type: integer`, expected string) and no Skills. Thus successful TOML parsing and valid `skills.config` controls do **not** prove that the complete Codex configuration can load.
+
+A bounded adapter need not duplicate Codex's unrelated host schema. It can truthfully expose `skill_configuration_known` for the parsed user-Skill controls, with `host_config_validity="unverified"` and `session_catalog_observed=false`. In that contract, On means no participating local user rule disables the inspected placement; Off means the last matching local user rule disables it. Neither state guarantees a running Codex catalog, successful configuration reload, or the result of an arbitrary invocation. Malformed TOML, unreadable settings, and malformed relevant Skill-control fields remain Unknown because they prevent this local rule projection itself.
+
+Exposure counts and Core Plans may use that deliberately scoped local user-rule projection only if their public contract states this boundary and does not promise native runtime enablement. A request to establish an actually usable native catalog or running-session exposure additionally requires native validation in the exact invocation context. Renaming `configuration_known` without these state definitions and host-validity disclosure would leave the original ambiguity in place.
 
 The fixture's symlink target is deliberately outside the native Skill root but inside the isolated fixture. Native support for it establishes matching behavior only. SkillRoster must continue requiring its own approved-root or explicit durable-read authority before following such a target.
 
@@ -139,7 +193,7 @@ Observed conclusion: for these user Skills, the native list's enablement follows
 
 ### Supported observation scope
 
-A user-file visibility adapter can deterministically observe both legacy and native user entrypoints with the following verified rules: read typed TOML entries in order; resolve entrypoint paths from the config directory with fixture-HOME tilde expansion; match existing canonical entrypoint identities; retain the last matching entry's boolean; never treat package-directory settings as an entrypoint disable. Preserve ignored missing-path behavior only if deliberately adopting this version's parser contract. Reject or mark unknown malformed configuration rather than counting its empty native result as reliable absence.
+A user-file visibility adapter can deterministically observe both legacy and native user entrypoints with the following verified rules: read typed TOML entries in order; apply the exactly-one-selector rule above; match trimmed case-sensitive frontmatter names or resolve entrypoint paths from the config directory with fixture-HOME tilde expansion; match existing canonical entrypoint identities; retain the last matching entry's boolean; never treat package-directory settings as an entrypoint disable. Ignore selectorless and both-selector entries only when deliberately adopting this version's observed parser contract. Reject or mark Unknown malformed TOML or relevant Skill-control fields rather than counting an empty native result as reliable absence. Complete host-configuration validity remains a separate, unverified fact for a local-control-only adapter.
 
 Name the evidence basis **Codex user-Skill local-file configuration** and record the exact CODEX_HOME/context used. It is not a universal effective-session resolver. CLI overrides can reverse user settings, so this projection cannot assert an arbitrary live conversation is disabled. If an exposure-dependent Plan depends on this scoped fact, the public contract must declare that scope, bind its configuration observations and identities, and block unsupported contexts rather than invent precedence.
 
@@ -163,9 +217,9 @@ If the first implementation intentionally observes only user configuration, name
 
 ### Path identity and source trust
 
-The native matrix establishes entrypoint-only matching, config-directory-relative paths, tilde expansion, and canonical matching for existing symlinked entrypoints. Matching nonexistent targets, malformed paths, and identities changed during resolution remains unverified. Native canonicalization is not permission to resolve unapproved external sources.
+The native matrix establishes entrypoint-only matching, config-directory-relative paths, tilde expansion, and canonical matching for existing symlinked entrypoints. Matching nonexistent targets, malformed paths, and identities changed during resolution remains unverified. Canonicalization may observe metadata identity for configured paths, including external paths; it grants no permission to read external Skill contents.
 
-Match verified existing entrypoints by canonical identity within the declared observation scope. Resolve paths only within already approved read boundaries; a config value naming a path is not a grant to read or canonicalize arbitrary external content. Keep the placement path, resolved source identity, and settings match identity distinct. Ambiguous, missing, escaped, or retargeted matches must not authorize a mutation. Freeze and recheck identities at existing Plan/Apply boundaries.
+Match verified existing entrypoints by canonical identity within the declared observation scope. Reading Skill contents and obtaining a verified frontmatter name still require the existing approved-root or durable-read boundary; a configured path does not add trust or mutation authority. Keep the placement path, resolved source identity, and settings match identity distinct. Ambiguous, missing, escaped, or retargeted matches must not authorize a mutation. Freeze and recheck identities at existing Plan/Apply boundaries.
 
 ### Secondary shared root and reversible governance
 
@@ -194,5 +248,13 @@ Minimum staged approach: observe the secondary root without expanding automatic 
 - Base matrix results: `/private/tmp/skillroster-codex-matrix-oqmsk9kq/results.json`.
 - Trusted/untrusted layer readback: `/private/tmp/skillroster-codex-matrix-jpr5j87p/`.
 - Reverse and CLI override results: `/private/tmp/skillroster-codex-matrix-tiwhumxc/results.json`.
+- Name selector reproduction: `/private/tmp/skillroster-codex-name-selectors.py`; 28-case results and full per-case native responses: `/private/tmp/skillroster-codex-matrix-huo8jwh7/`.
+- Additional 12-case name whitespace, both-selector, selectorless, and malformed controls: `/private/tmp/skillroster-codex-matrix-gaoni8nf/`.
+- Host-config type-error control with `model=4` alone: `/private/tmp/skillroster-codex-matrix-b68tzivu/model-int/response.json`; the same host error before valid Skill controls is retained in the name-selector matrix's `host-model-invalid/response.json`.
+- Working-tree binary comparison script: `/private/tmp/skillroster-codex-name-compare.py`; 40-case scoped comparison results: `/private/tmp/skillroster-codex-name-compare-1792672594233910000/results.json`.
+- Distinct placement names under one declared source/version: `/private/tmp/skillroster-codex-matrix-8to9bouj/`; YAML inline-comment and quoted-whitespace name controls: `/private/tmp/skillroster-codex-matrix-kx60qnar/`. Each case retains its native `response.json` and a fixture-only `sr-state/` database from the working-tree comparison.
+- Version-v3 40-fixture comparison: `/private/tmp/skillroster-codex-name-compare-1792672925162856000/results.json`; five placement-name regression comparisons: `/private/tmp/skillroster-codex-name-v3-regressions-1792672940897460000/results.json`.
+- Native YAML plain-name continuation and version-v3 comparison: `/private/tmp/skillroster-codex-matrix-yw0k3gxw/name-plain-continuation/`.
+- Final 40-case replay: `/private/tmp/skillroster-codex-name-compare-1792673099521366000/results.json`, with no valid-config mismatches. The continuation fix was replayed against the same native fixture and correctly retained Unknown; receipt: `/var/folders/25/mpff0p7j7slgl5fj961tl7480000gp/T/skillroster-codex-continuation-final-5kfjezv5/acceptance.json`.
 
 No version-pinned upstream source was inspected. The installed 0.163.0 executable and saved native responses are the exact-version primary evidence; current official documentation supplies broader product guidance.

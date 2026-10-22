@@ -2897,6 +2897,7 @@ mod tests {
             path: PathBuf::from("/fixture/unavailable"),
             status: crate::scan::RootStatus::Inaccessible,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         };
@@ -2934,6 +2935,7 @@ mod tests {
                 path: PathBuf::from("/fixture/bounded"),
                 status: crate::scan::RootStatus::Included,
                 explicit: false,
+                shared: false,
                 detail: Some("Skill discovery was bounded at depth 5".into()),
                 discovery_complete: false,
             }],

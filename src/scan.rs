@@ -95,6 +95,9 @@ pub struct RootObservation {
     pub path: PathBuf,
     pub status: RootStatus,
     pub explicit: bool,
+    /// Shared discovery does not authorize an exclusive Agent write destination.
+    #[serde(default)]
+    pub shared: bool,
     pub detail: Option<String>,
     /// Whether discovery inspected the complete configured Skill-root depth.
     /// Session roots do not use this dimension and remain complete by default.
@@ -197,6 +200,7 @@ pub struct SkillPlacement {
 pub enum MutationScope {
     Mutable,
     ProviderReadOnly,
+    SharedReadOnly,
     DurableReadOnly,
     UntrustedExternal,
 }
@@ -206,6 +210,7 @@ impl MutationScope {
         match self {
             Self::Mutable => "mutable",
             Self::ProviderReadOnly => "provider_read_only",
+            Self::SharedReadOnly => "shared_read_only",
             Self::DurableReadOnly => "durable_read_only",
             Self::UntrustedExternal => "untrusted_external",
         }
@@ -471,10 +476,16 @@ impl SessionCoverage {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_visibility: Option<crate::codex_visibility::VisibilitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
     pub placements: Vec<SkillPlacement>,
+    /// Placement-bound native manifest names captured from verified bytes before
+    /// declared-source identity deduplication. None means unsupported or absent.
+    #[serde(default)]
+    pub verified_entrypoint_names: BTreeMap<String, Option<String>>,
     /// Physical mutation identities frozen while this Snapshot was scanned.
     /// Recommendation consumes only these immutable facts; Plan independently
     /// revalidates current filesystem identities before deriving operations.
@@ -511,6 +522,25 @@ pub struct ScanResult {
 }
 
 impl ScanResult {
+    pub(crate) fn placement_native_visibility(
+        &self,
+        placement: &SkillPlacement,
+    ) -> Option<&crate::claude_visibility::CatalogVisibility> {
+        match placement.agent {
+            Some(AgentKind::Codex) => self
+                .codex_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            Some(AgentKind::ClaudeCode) => self
+                .native_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            _ => None,
+        }
+    }
+
     pub(crate) fn observed_physical_mutation_path(
         &self,
         placement: &SkillPlacement,
@@ -575,6 +605,7 @@ struct PhysicalPackageObservation {
 
 #[derive(Clone, Debug)]
 struct SkillRootPolicy {
+    shared: bool,
     agent: Option<AgentKind>,
     explicit: bool,
     governable: bool,
@@ -1035,6 +1066,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
             observe_skill_root(
                 root,
                 SkillRootPolicy {
+                    shared: is_shared_skill_root(root, &options.home),
                     agent: Some(roots.agent),
                     explicit: false,
                     governable: true,
@@ -1052,6 +1084,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(root, &options.home),
                 agent: None,
                 explicit: false,
                 governable: true,
@@ -1068,6 +1101,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(root, &options.home),
                 agent: None,
                 explicit: true,
                 governable: true,
@@ -1084,6 +1118,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_durable_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(&root.path, &options.home),
                 agent: None,
                 explicit: true,
                 governable: false,
@@ -1100,6 +1135,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             &root.path,
             SkillRootPolicy {
+                shared: is_shared_skill_root(&root.path, &options.home),
                 agent: Some(root.agent),
                 explicit: true,
                 governable: true,
@@ -1116,6 +1152,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             &root.path,
             SkillRootPolicy {
+                shared: false,
                 agent: None,
                 explicit: false,
                 governable: false,
@@ -1135,9 +1172,11 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         &confirmed_source_roots,
         &mut result,
     );
+    classify_shared_placements(&options.home, &mut result);
     result.freeze_observed_physical_mutation_paths();
 
     crate::claude_visibility::observe(&options.home, &mut result);
+    crate::codex_visibility::observe(&options.home, &mut result);
 
     if options.include_session_evidence {
         for roots in &known {
@@ -1203,6 +1242,54 @@ fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBu
     Ok(normalized)
 }
 
+// Root aliases retain the shared location's read-only destination contract.
+fn is_shared_skill_root(path: &Path, home: &Path) -> bool {
+    let shared = home.join(".agents/skills");
+    path.starts_with(&shared)
+        || fs::canonicalize(&shared).ok().is_some_and(|shared| {
+            fs::canonicalize(path)
+                .ok()
+                .is_some_and(|path| path.starts_with(shared))
+        })
+}
+
+fn classify_shared_placements(home: &Path, result: &mut ScanResult) {
+    let shared = fs::canonicalize(home.join(".agents/skills")).ok();
+    // A shared placement may link to an approved canonical source. Explicit
+    // source/root aliases must not regain mutation authority over that package.
+    let shared_packages = result
+        .placements
+        .iter()
+        .filter(|placement| is_shared_skill_root(&placement.root, home))
+        .filter_map(|placement| placement.physical_directory.clone())
+        .collect::<BTreeSet<_>>();
+    for placement in &mut result.placements {
+        if matches!(
+            placement.mutation_scope,
+            Some(MutationScope::Mutable | MutationScope::DurableReadOnly)
+        ) && (is_shared_skill_root(&placement.root, home)
+            || placement.physical_directory.as_ref().is_some_and(|path| {
+                shared.as_ref().is_some_and(|root| path.starts_with(root))
+                    || shared_packages.contains(path)
+            }))
+        {
+            placement.mutation_scope = Some(
+                if placement.physical_directory.is_some()
+                    && !matches!(
+                        placement.link_status,
+                        LinkStatus::Broken | LinkStatus::EscapesRoot
+                    )
+                {
+                    MutationScope::SharedReadOnly
+                } else {
+                    MutationScope::UntrustedExternal
+                },
+            );
+            placement.governable = false;
+        }
+    }
+}
+
 fn observe_excluded_session_roots(
     agent: AgentKind,
     roots: &[PathBuf],
@@ -1216,6 +1303,7 @@ fn observe_excluded_session_roots(
             path: root.clone(),
             status: RootStatus::Excluded,
             explicit: false,
+            shared: false,
             detail: Some(detail.into()),
             discovery_complete: true,
         });
@@ -1241,6 +1329,7 @@ fn observe_skill_root(
         path: root.to_path_buf(),
         status,
         explicit: policy.explicit,
+        shared: policy.shared,
         detail: policy.detail.clone(),
         discovery_complete: true,
     });
@@ -1338,6 +1427,7 @@ fn observe_durable_skill_root_with_hook(
             path: root.path.clone(),
             status: RootStatus::Inaccessible,
             explicit: policy.explicit,
+            shared: policy.shared,
             detail: Some(detail.into()),
             discovery_complete: false,
         });
@@ -2090,8 +2180,15 @@ fn materialize_candidates_with_hook(
                     .insert(root.permission_id.clone());
             }
         }
+        let placement_id = format!("placement_{}", stable_digest(placement_basis.as_bytes()));
+        result.verified_entrypoint_names.insert(
+            placement_id.clone(),
+            safe_to_read
+                .then(|| crate::codex_visibility::parse_native_name(&content))
+                .flatten(),
+        );
         result.placements.push(SkillPlacement {
-            id: format!("placement_{}", stable_digest(placement_basis.as_bytes())),
+            id: placement_id,
             skill_id,
             agent: candidate.agent,
             root: candidate.root,
@@ -2776,6 +2873,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             path: root.clone(),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         });
@@ -3618,6 +3716,121 @@ mod tests {
         let path = std::env::temp_dir().join(format!("skillroster-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn codex_discovers_both_user_roots_with_shared_read_only_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for (root, name) in [(".codex/skills", "legacy"), (".agents/skills", "shared")] {
+            let directory = home.join(root).join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        let roots = result
+            .roots
+            .iter()
+            .filter(|root| root.agent == Some(AgentKind::Codex) && root.kind == RootKind::Skills)
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].path, home.join(".codex/skills"));
+        assert!(!roots[0].shared);
+        assert_eq!(roots[1].path, home.join(".agents/skills"));
+        assert!(roots[1].shared);
+        for placement in &result.placements {
+            assert!(placement.default_exposed);
+            assert_eq!(placement.owned_by_agent, Some(true));
+            let shared = placement.root == home.join(".agents/skills");
+            assert_eq!(
+                placement.mutation_scope,
+                Some(if shared {
+                    MutationScope::SharedReadOnly
+                } else {
+                    MutationScope::Mutable
+                })
+            );
+            assert_eq!(placement.is_mutable(), !shared);
+        }
+        assert_eq!(result.placements.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_shared_root_preserves_untrusted_links_and_read_only_physical_aliases() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let shared = home.join(".agents/skills");
+        let package = shared.join("shared");
+        let outside = temp.path().join("outside");
+        for directory in [&package, &outside] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("SKILL.md"), "---\nname: sample\n---\n").unwrap();
+        }
+        symlink(&outside, shared.join("escaping")).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&shared, &alias).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let untrusted = scan(&options).unwrap();
+        let escaped = untrusted
+            .placements
+            .iter()
+            .find(|placement| placement.directory == shared.join("escaping"))
+            .unwrap();
+        assert_eq!(
+            escaped.mutation_scope,
+            Some(MutationScope::UntrustedExternal)
+        );
+        assert_eq!(escaped.link_status, LinkStatus::EscapesRoot);
+        // Explicit Agent roots and source aliases cannot make shared packages mutable.
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::ClaudeCode,
+            path: alias.clone(),
+        });
+        options
+            .explicit_source_roots
+            .extend([alias.clone(), outside.clone()]);
+        let trusted = scan(&options).unwrap();
+        assert!(!trusted.placements.is_empty());
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .all(
+                    |placement| placement.mutation_scope == Some(MutationScope::SharedReadOnly)
+                        && !placement.is_mutable()
+                )
+        );
+        assert!(
+            trusted
+                .roots
+                .iter()
+                .filter(|root| root.path == alias && root.agent.is_some())
+                .all(|root| root.shared)
+        );
+        let outside_physical = fs::canonicalize(&outside).unwrap();
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .any(|placement| placement.agent.is_none()
+                    && placement.physical_directory.as_ref() == Some(&outside_physical))
+        );
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .filter(|placement| placement.directory == shared.join("escaping"))
+                .all(|placement| placement.link_status == LinkStatus::Valid)
+        );
     }
 
     #[test]
@@ -4773,6 +4986,7 @@ enabled = true
         observe_durable_skill_root_with_hook(
             &anchor,
             SkillRootPolicy {
+                shared: false,
                 agent: None,
                 explicit: true,
                 governable: false,

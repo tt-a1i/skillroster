@@ -71,7 +71,7 @@ pub enum SettingsObservation {
 }
 
 impl SettingsObservation {
-    fn from_read(read: &io::Result<Option<Vec<u8>>>) -> Self {
+    pub(crate) fn from_read(read: &io::Result<Option<Vec<u8>>>) -> Self {
         match read {
             Ok(Some(bytes)) => Self::Digest(hex::encode(Sha256::digest(bytes))),
             Ok(None) => Self::Missing,
@@ -283,7 +283,7 @@ fn parse_overrides(bytes: &[u8]) -> io::Result<BTreeMap<String, CatalogVisibilit
         .collect()
 }
 
-fn read_settings(path: &Path) -> io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_settings(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
     })?;

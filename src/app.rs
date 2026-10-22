@@ -1788,6 +1788,7 @@ fn scan_command(
             "skill_count": result.skills.len(),
             "placement_count": result.placements.len(),
             "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
+            "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
             "roots": roots,
             "coverage": coverage,
             "source_root_policy": {
@@ -1960,6 +1961,7 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         "skill_count": result.skills.len(),
         "placement_count": result.placements.len(),
         "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "root_counts": root_counts,
         "root_issues": {
             "total": root_issues.len(),
@@ -2417,7 +2419,7 @@ fn report_command(
                         "link_target": placement.link_target,
                         "link_status": placement.link_status,
                         "default_exposed": placement.default_exposed,
-                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                        "native_visibility": scan.placement_native_visibility(placement),
                         "owned_by_agent": placement.owned_by_agent,
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
@@ -2524,6 +2526,7 @@ fn report_command(
             && existing.summary["semantic_overlap_candidates"].is_object()
             && (scan.native_visibility.is_none()
                 || existing.summary["native_visibility"].is_object())
+            && (scan.codex_visibility.is_none() || existing.summary["codex_visibility"].is_object())
         {
             return Ok(select_report_view(&existing.summary, request));
         }
@@ -2596,6 +2599,7 @@ fn report_command(
         "placement_count": report.metrics.placements,
         "default_exposure": report.metrics.default_exposure,
         "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "observed_use_agent_count": report.metrics.agents_with_observed_usage,
         "coverage_reliable_agent_count": report.metrics.agents_with_reliable_session_denominator,
         "coverage_sampled_agent_count": report.metrics.agents_with_sampled_session_data,
@@ -3185,6 +3189,12 @@ fn read_only_placement_reason(
             "Keep provider-managed placements read-only.",
         );
     }
+    if scopes == BTreeSet::from([scan::MutationScope::SharedReadOnly]) {
+        return (
+            "shared_agent_root_read_only",
+            "This shared Skill root may serve other Agents; keep its contents and exposure unchanged.",
+        );
+    }
     if scopes == BTreeSet::from([scan::MutationScope::DurableReadOnly]) {
         return (
             "durable_source_read_only",
@@ -3363,7 +3373,7 @@ fn add_semantic_overlap_comparison(
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
                         "default_exposed": placement.default_exposed,
-                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                        "native_visibility": scan.placement_native_visibility(placement),
                         "link_status": placement.link_status,
                         "fingerprint_completeness": placement.fingerprint_completeness,
                         "fingerprint_detail": placement.fingerprint_detail
@@ -3674,7 +3684,7 @@ fn continuity_placement_json(
         "agent": placement.agent.map(AgentKind::id),
         "link_status": placement.link_status,
         "default_exposed": placement.default_exposed,
-        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+        "native_visibility": scan.placement_native_visibility(placement),
         "fingerprint_completeness": placement.fingerprint_completeness.id(),
         "mutation_scope": placement.mutation_scope.map(scan::MutationScope::id),
         "governable": placement.is_mutable(),
@@ -3987,7 +3997,7 @@ fn finding_library_planning(
                     "path": placement.entrypoint,
                     "agent": placement.agent.map(AgentKind::id),
                     "default_exposed": placement.default_exposed,
-                    "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                    "native_visibility": scan.placement_native_visibility(placement),
                     "governable": placement.is_mutable(),
                     "owned_by_agent": placement.owned_by_agent,
                     "mutation_scope": placement.mutation_scope,
@@ -5067,6 +5077,7 @@ fn paged_finding_report(
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
         "native_visibility": report["native_visibility"],
+        "codex_visibility": report["codex_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -5150,6 +5161,7 @@ fn compact_report(report: &Value) -> Value {
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
         "native_visibility": report["native_visibility"],
+        "codex_visibility": report["codex_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -6515,6 +6527,7 @@ fn verified_top_skill_load(
     let read_authority = match placement.mutation_scope {
         Some(scan::MutationScope::Mutable) => "agent_or_managed_root",
         Some(scan::MutationScope::ProviderReadOnly) => "provider_read_only",
+        Some(scan::MutationScope::SharedReadOnly) => "shared_agent_root_read_only",
         Some(scan::MutationScope::DurableReadOnly) => "confirmed_durable_read_only",
         Some(scan::MutationScope::UntrustedExternal) | None => unreachable!("filtered above"),
     };
@@ -7774,6 +7787,9 @@ fn normalize_agent_plan(
             SourceUpdateChoice::AdoptUpstream => "adopt_upstream",
             SourceUpdateChoice::PreserveBoth => "preserve_both",
         };
+        if matches!(choice, SourceUpdateChoice::AdoptUpstream) {
+            validate_source_update_native_visibility(scan, placement, &request.upstream_content)?;
+        }
         let expected_file_fingerprint = change::fingerprint(&placement.entrypoint)?.to_string();
         let action_target = placement.entrypoint.clone();
         match choice {
@@ -8038,6 +8054,8 @@ fn normalize_library_plan(
             }
         };
 
+        validate_library_native_visibility(scan, &request.skill_id, &link_source)?;
+
         let mut replacement_paths = Vec::new();
         if adds_hosted_library_placement {
             replacement_paths.push(canonical.directory.clone());
@@ -8149,6 +8167,105 @@ fn normalize_library_plan(
     input["operations"] = Value::Array(operations);
     input["library_changes"] = Value::Array(actions);
     Ok((input, impacts, PlanOrigin::LibraryGovernance))
+}
+
+fn require_preserved_codex_visibility(
+    scan: &ScanResult,
+    placement: &scan::SkillPlacement,
+    projected: crate::claude_visibility::CatalogVisibility,
+) -> Result<()> {
+    use crate::claude_visibility::CatalogVisibility;
+    let observed = scan
+        .codex_visibility
+        .as_ref()
+        .and_then(|visibility| visibility.placements.get(&placement.id).copied())
+        .unwrap_or(CatalogVisibility::Unknown);
+    // These changes retain every logical placement path and its discovery scope.
+    if observed == CatalogVisibility::NotDiscovered {
+        return Ok(());
+    }
+    if !matches!(observed, CatalogVisibility::On | CatalogVisibility::Off) || observed != projected
+    {
+        return Err(crate::roster_plan::NativeVisibilityConflict {
+            agent: AgentKind::Codex,
+            skill_id: placement.skill_id.clone(),
+            mode: if observed == CatalogVisibility::On {
+                projected
+            } else {
+                observed
+            },
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_library_native_visibility(
+    scan: &ScanResult,
+    skill_id: &str,
+    source: &Path,
+) -> Result<()> {
+    let package_sources = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+        .filter_map(|placement| placement.physical_directory.as_ref())
+        .collect::<Vec<_>>();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| placement.agent == Some(AgentKind::Codex))
+    {
+        let Some(physical) = placement.physical_directory.as_ref() else {
+            continue;
+        };
+        let Some(relative) = package_sources
+            .iter()
+            .filter_map(|root| {
+                physical
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| (root, relative))
+            })
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, relative)| relative)
+        else {
+            continue;
+        };
+        // Include unchanged canonical placements and nested package consumers:
+        // their path rules can join the new source identity after consolidation.
+        let projected_source = source.join(relative).join("SKILL.md");
+        let projected = scan.codex_visibility.as_ref().map_or(
+            crate::claude_visibility::CatalogVisibility::Unknown,
+            |visibility| {
+                visibility
+                    .visibility_for_retargeted_entrypoint(&placement.entrypoint, &projected_source)
+            },
+        );
+        require_preserved_codex_visibility(scan, placement, projected)?;
+    }
+    Ok(())
+}
+
+fn validate_source_update_native_visibility(
+    scan: &ScanResult,
+    source: &scan::SkillPlacement,
+    content: &str,
+) -> Result<()> {
+    let physical = source.validated_physical_directory()?;
+    for placement in scan.placements.iter().filter(|placement| {
+        placement.agent == Some(AgentKind::Codex)
+            && placement.physical_directory.as_ref() == Some(&physical)
+    }) {
+        let projected = scan.codex_visibility.as_ref().map_or(
+            crate::claude_visibility::CatalogVisibility::Unknown,
+            |visibility| {
+                visibility.visibility_for_updated_entrypoint(&placement.entrypoint, content)
+            },
+        );
+        require_preserved_codex_visibility(scan, placement, projected)?;
+    }
+    Ok(())
 }
 
 fn safe_skill_directory_name(name: &str) -> Result<String> {
@@ -8313,6 +8430,17 @@ fn prepare_plan(
     }
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
+    for change in &prepared.library_changes {
+        validate_library_native_visibility(
+            &scan,
+            &change.skill_id,
+            change
+                .library_path
+                .as_deref()
+                .unwrap_or(&change.canonical_path),
+        )?;
+    }
+
     validate_plan_evidence(store, &prepared, &scan_id)?;
     if finding_provenance.is_none() && !prepared.roster_changes.is_empty() {
         validate_raw_roster_evidence_scope(store, &prepared, &scan)?;
@@ -8440,6 +8568,8 @@ fn prepare_plan(
         "affected": affected,
         "diff_summary": diff_summary,
         "impact": impact,
+        "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "detail": {
             "available": true,
             "command": ["plan", "--show", prepared.id, "--json"],
@@ -8503,6 +8633,17 @@ fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
+    for change in &prepared.library_changes {
+        validate_library_native_visibility(
+            &scan,
+            &change.skill_id,
+            change
+                .library_path
+                .as_deref()
+                .unwrap_or(&change.canonical_path),
+        )?;
+    }
+
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     if Value::Array(roster_before.clone()) != record.input["roster_before"] {
@@ -9135,6 +9276,7 @@ fn setup_command_with_manifests<'a>(
         }));
     };
     require_loaded_snapshot_current(store, &snapshot_id, &snapshot)?;
+    require_content_identity(&snapshot)?;
     let current_package = current_bootstrap_package();
     let mut detected = Vec::new();
     let mut targets = Vec::new();
@@ -9167,6 +9309,16 @@ fn setup_command_with_manifests<'a>(
             .skill_roots
             .into_iter()
             .filter_map(|root| {
+                // Shared discovery does not establish a Codex installation or
+                // authorize Bootstrap writes into another Agent's catalog.
+                if snapshot.roots.iter().any(|observed| {
+                    observed.agent == Some(agent)
+                        && observed.kind == RootKind::Skills
+                        && observed.path == root
+                        && observed.shared
+                }) {
+                    return None;
+                }
                 if root.is_dir() {
                     return Some((root, "existing_skill_root"));
                 }
@@ -9714,7 +9866,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
-                "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                "native_visibility": scan.placement_native_visibility(placement),
                 "governable": placement.is_mutable(),
                 "owned_by_agent": placement.owned_by_agent,
                 "mutation_scope": placement.mutation_scope,
@@ -10108,6 +10260,20 @@ fn validate_source_update_preconditions(plan: &PreparedPlan, scan: &ScanResult) 
                 update.placement_id
             );
         }
+        if update.choice == "adopt_upstream" {
+            let physical_target = std::fs::canonicalize(&update.target)?;
+            let content = plan
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    Operation::ReplaceFile {
+                        target, content, ..
+                    } if target == &physical_target => Some(content),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("Source-update replacement operation is missing"))?;
+            validate_source_update_native_visibility(scan, placement, content)?;
+        }
         let actual = change::fingerprint(&update.target)?;
         if actual != update.expected_file_fingerprint {
             bail!("Source-update file drifted for {}", update.placement_id);
@@ -10395,6 +10561,18 @@ fn require_content_identity(scan: &ScanResult) -> Result<()> {
     if scan.identity_path_coverage != scan::IdentityPathCoverage::Complete {
         return Err(ContentIdentityRescanRequired {
             reason: "non_unicode_identity_coverage_incomplete",
+        }
+        .into());
+    }
+    if let Some(visibility) = &scan.codex_visibility {
+        visibility
+            .validate()
+            .map_err(|reason| ContentIdentityRescanRequired { reason })?;
+    } else {
+        // Every prior Snapshot needs the new root authority observation, even
+        // if shared content was recorded only as an Agent-less source.
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_codex_visibility_requires_rescan",
         }
         .into());
     }
@@ -10986,6 +11164,7 @@ mod recovery_tests {
             path: PathBuf::from(format!("/fixture/{suffix}")),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         };
@@ -10995,6 +11174,7 @@ mod recovery_tests {
             path: PathBuf::from(format!("/fixture/{suffix}")),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         };

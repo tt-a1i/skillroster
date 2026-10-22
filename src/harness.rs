@@ -395,7 +395,7 @@ pub fn known_agent_roots(home: &Path) -> Vec<AgentRoots> {
     vec![
         AgentRoots {
             agent: AgentKind::Codex,
-            skill_roots: vec![home.join(".codex/skills")],
+            skill_roots: vec![home.join(".codex/skills"), home.join(".agents/skills")],
             session_roots: vec![home.join(".codex/sessions")],
         },
         AgentRoots {

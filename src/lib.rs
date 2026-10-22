@@ -5,6 +5,7 @@ mod bootstrap;
 pub mod change;
 pub mod claude_visibility;
 pub mod cli;
+pub mod codex_visibility;
 mod copy_metadata;
 mod durable_fs;
 pub mod harness;

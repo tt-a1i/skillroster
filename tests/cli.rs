@@ -11,6 +11,600 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+fn codex_visibility_fixture_run(
+    temp: &TempDir,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> std::process::Output {
+    run(
+        &[
+            &[
+                "--home",
+                temp.path().join("home").to_str().unwrap(),
+                "--state-dir",
+                temp.path().join("state").to_str().unwrap(),
+                "--json",
+            ][..],
+            args,
+        ]
+        .concat(),
+        stdin,
+    )
+}
+
+fn codex_visibility_fixture() -> TempDir {
+    let temp = TempDir::new().unwrap();
+    for name in ["disabled", "active"] {
+        let directory = temp.path().join("home/.codex/skills").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\n---\nDistinct {name} capability\n"),
+        )
+        .unwrap();
+    }
+    temp
+}
+
+fn codex_visibility_proposal(temp: &TempDir, snapshot: &Value, name: &str, state: &str) -> Value {
+    let found = json_output(&codex_visibility_fixture_run(
+        temp,
+        &["find", name, "--limit", "1"],
+        None,
+    ));
+    let skill_id = found["result"]["matches"][0]["skill_id"].as_str().unwrap();
+    let snapshot_id = snapshot["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(temp.path().join("state/skillroster.db")).unwrap();
+    json!({"schema_version":1,"scan_id":snapshot_id,
+        "evidence_ids":[skill_evidence_id(&database,snapshot_id,skill_id)],
+        "roster_changes":[{"agent":"codex","skill_id":skill_id,"state":state}]})
+}
+
+#[test]
+fn codex_visibility_disabled_inventory_remains_loadable_and_unrelated_apply_undo_preserves_config()
+{
+    let temp = codex_visibility_fixture();
+    let config = temp.path().join("home/.codex/config.toml");
+    let config_bytes =
+        "# user-owned policy\n[[skills.config]]\npath='skills/disabled/SKILL.md'\nenabled=false\n";
+    fs::write(&config, config_bytes).unwrap();
+    let disabled = temp.path().join("home/.codex/skills/disabled/SKILL.md");
+    let disabled_bytes = fs::read(&disabled).unwrap();
+    let shared = temp.path().join("home/.agents/skills/shared-preserved");
+    fs::create_dir_all(&shared).unwrap();
+    let shared_bytes = "---\nname: shared-preserved\n---\nShared source remains user owned\n";
+    fs::write(shared.join("SKILL.md"), shared_bytes).unwrap();
+    let active = temp.path().join("home/.codex/skills/active/SKILL.md");
+    let active_bytes = fs::read(&active).unwrap();
+    json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    let found = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["find", "disabled", "--load", "--limit", "1"],
+        None,
+    ));
+    assert_eq!(found["result"]["loaded_skill"]["content"]["complete"], true);
+    let claude_copy = temp.path().join("home/.claude/skills/disabled");
+    fs::create_dir_all(&claude_copy).unwrap();
+    fs::write(claude_copy.join("SKILL.md"), &disabled_bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["placement_count"], 4);
+    assert_eq!(scan["result"]["codex_visibility"]["state_counts"]["off"], 1);
+    let report = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["report", "--full"],
+        None,
+    ));
+    assert_eq!(report["result"]["default_exposure"], 3);
+    assert_eq!(
+        report["result"]["codex_visibility"]["state_counts"]["off"],
+        1
+    );
+    assert_eq!(
+        report["result"]["codex_visibility"]["session_catalog_observed"],
+        false
+    );
+    for args in [vec!["report"], vec!["report", "--findings"]] {
+        let view = json_output(&codex_visibility_fixture_run(&temp, &args, None));
+        assert_eq!(
+            view["result"]["codex_visibility"],
+            report["result"]["codex_visibility"]
+        );
+    }
+    let finding = report["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["kind"] == "exact_duplicate_placements")
+        .unwrap();
+    let detail = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &[
+            "report",
+            "--finding",
+            finding["id"].as_str().unwrap(),
+            "--full",
+        ],
+        None,
+    ));
+    let placement = detail["result"]["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|placement| placement["agent"] == "codex")
+        .unwrap();
+    assert_eq!(placement["native_visibility"], "off");
+    assert_eq!(placement["default_exposed"], false);
+    let blocked_proposal = codex_visibility_proposal(&temp, &scan, "disabled", "core");
+    let blocked = codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&blocked_proposal.to_string()),
+    );
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["code"],
+        "native_visibility_blocks_roster_change"
+    );
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "on_demand");
+    let plan = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&proposal.to_string()),
+    ));
+    let applied = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        None,
+    ));
+    assert_eq!(applied["result"]["verification"], "passed");
+    assert_eq!(fs::read_to_string(&config).unwrap(), config_bytes);
+    assert_eq!(fs::read(&disabled).unwrap(), disabled_bytes);
+    assert_eq!(
+        fs::read_to_string(shared.join("SKILL.md")).unwrap(),
+        shared_bytes
+    );
+    assert!(!temp.path().join("home/.codex/skills/active").exists());
+    let undone = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+        None,
+    ));
+    assert_eq!(undone["result"]["verification"], "passed");
+    assert!(
+        temp.path()
+            .join("home/.codex/skills/active/SKILL.md")
+            .is_file()
+    );
+    assert_eq!(fs::read(active).unwrap(), active_bytes);
+    assert_eq!(fs::read_to_string(config).unwrap(), config_bytes);
+    assert_eq!(fs::read(disabled).unwrap(), disabled_bytes);
+    assert!(shared.is_dir());
+    assert_eq!(
+        fs::read_to_string(shared.join("SKILL.md")).unwrap(),
+        shared_bytes
+    );
+}
+
+#[test]
+fn codex_visibility_malformed_config_is_unknown_and_core_plan_is_refused() {
+    let temp = codex_visibility_fixture();
+    let config = temp.path().join("home/.codex/config.toml");
+    let bytes = "[[skills.config]]\npath='skills/active/SKILL.md'\nenabled='false'\n";
+    fs::write(&config, bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["codex_visibility"]["unknown_count"], 2);
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "core");
+    let blocked =
+        codex_visibility_fixture_run(&temp, &["plan", "--stdin"], Some(&proposal.to_string()));
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["code"],
+        "native_visibility_blocks_roster_change"
+    );
+    assert_eq!(fs::read_to_string(config).unwrap(), bytes);
+    assert!(!temp.path().join("state/library").exists());
+}
+
+#[test]
+fn codex_visibility_config_drift_and_legacy_snapshots_block_all_snapshot_consumers() {
+    for scenario in ["appeared", "edited", "legacy"] {
+        let temp = codex_visibility_fixture();
+        let config = temp.path().join("home/.codex/config.toml");
+        if scenario == "edited" {
+            fs::write(&config, "# original\n").unwrap();
+        }
+        let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+        // Cache a Report and a Ready Plan before the prerequisite changes.
+        json_output(&codex_visibility_fixture_run(&temp, &["report"], None));
+        let proposal = codex_visibility_proposal(&temp, &scan, "active", "on_demand");
+        let plan = json_output(&codex_visibility_fixture_run(
+            &temp,
+            &["plan", "--stdin"],
+            Some(&proposal.to_string()),
+        ));
+        let reason = if scenario == "legacy" {
+            let database =
+                rusqlite::Connection::open(temp.path().join("state/skillroster.db")).unwrap();
+            let raw: String = database
+                .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let mut payload: Value = serde_json::from_str(&raw).unwrap();
+            payload.as_object_mut().unwrap().remove("codex_visibility");
+            database
+                .execute(
+                    "UPDATE scan_payloads SET payload_json=?1",
+                    [payload.to_string()],
+                )
+                .unwrap();
+            "legacy_codex_visibility_requires_rescan"
+        } else {
+            fs::write(&config, "# changed\n").unwrap();
+            "codex_visibility_settings_changed"
+        };
+        for args in [
+            vec!["report"],
+            vec!["find", "active"],
+            vec!["plan", "--stdin"],
+            vec!["apply", plan["result"]["plan_id"].as_str().unwrap()],
+        ] {
+            let output = codex_visibility_fixture_run(&temp, &args, Some(&proposal.to_string()));
+            assert!(!output.status.success(), "{scenario}: {args:?}");
+            let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                output["error"]["code"], "content_identity_rescan_required",
+                "{scenario}: {args:?}: {output}"
+            );
+            assert_eq!(
+                output["error"]["details"]["reason"], reason,
+                "{scenario}: {args:?}"
+            );
+        }
+        assert!(
+            temp.path()
+                .join("home/.codex/skills/active/SKILL.md")
+                .is_file()
+        );
+        assert!(!temp.path().join("state/library").exists());
+        json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+        json_output(&codex_visibility_fixture_run(&temp, &["report"], None));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_visibility_configured_alias_retarget_invalidates_snapshot_and_ready_plan() {
+    let temp = codex_visibility_fixture();
+    let alias = temp.path().join("home/configured-alias");
+    let first = temp.path().join("home/.codex/skills/disabled");
+    let second = temp.path().join("home/.codex/skills/active");
+    std::os::unix::fs::symlink(&first, &alias).unwrap();
+    let config = temp.path().join("home/.codex/config.toml");
+    let bytes = "[[skills.config]]\npath='../configured-alias/SKILL.md'\nenabled=false\n";
+    fs::write(&config, bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["codex_visibility"]["state_counts"]["off"], 1);
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "on_demand");
+    let plan = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&proposal.to_string()),
+    ));
+    fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&second, &alias).unwrap();
+    for args in [
+        vec!["report"],
+        vec!["find", "active"],
+        vec!["plan", "--stdin"],
+        vec!["apply", plan["result"]["plan_id"].as_str().unwrap()],
+    ] {
+        let output = codex_visibility_fixture_run(&temp, &args, Some(&proposal.to_string()));
+        assert!(!output.status.success());
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "codex_visibility_path_identity_changed"
+        );
+    }
+    assert_eq!(fs::read_to_string(config).unwrap(), bytes);
+    assert!(second.join("SKILL.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_shared_root_is_loadable_but_cannot_install_or_mutate_through_aliases() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let shared = home.join(".agents/skills");
+    let package = shared.join("shared-only");
+    fs::create_dir_all(&package).unwrap();
+    let bytes = "---\nname: shared-only\n---\nShared capability\n";
+    fs::write(package.join("SKILL.md"), bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    let roots = scan["result"]["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|root| root["agent"] == "codex" && root["kind"] == "skills")
+        .collect::<Vec<_>>();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["path"], json!(home.join(".codex/skills")));
+    assert_eq!(roots[0]["status"], "missing");
+    assert_eq!(roots[0]["shared"], false);
+    assert_eq!(roots[1]["path"], json!(shared));
+    assert_eq!(roots[1]["shared"], true);
+    let loaded = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["find", "shared-only", "--load", "--limit", "1"],
+        None,
+    ));
+    assert_eq!(loaded["result"]["loaded_skill"]["content"]["text"], bytes);
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["governance"]["mutation_scope"],
+        "shared_read_only"
+    );
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["governance"]["governable"],
+        false
+    );
+    let setup = json_output(&codex_visibility_fixture_run(&temp, &["setup"], None));
+    assert_eq!(setup["result"]["state"], "no_supported_agent");
+    assert_eq!(setup["result"]["detected_agents"], json!([]));
+    assert!(setup["result"]["plan_id"].is_null());
+    assert!(!home.join(".codex").exists());
+    assert!(!shared.join("skillroster").exists());
+
+    fs::create_dir_all(home.join(".codex/skills")).unwrap();
+    let alias = home.join("explicit-alias");
+    std::os::unix::fs::symlink(&shared, &alias).unwrap();
+    let alias_root = format!("codex={}", alias.display());
+    for extra in [vec![], vec!["--root", alias_root.as_str()]] {
+        let scan = json_output(&codex_visibility_fixture_run(
+            &temp,
+            &[extra.as_slice(), &["scan"]].concat(),
+            None,
+        ));
+        let proposal = codex_visibility_proposal(&temp, &scan, "shared-only", "on_demand");
+        let blocked =
+            codex_visibility_fixture_run(&temp, &["plan", "--stdin"], Some(&proposal.to_string()));
+        assert!(!blocked.status.success());
+        let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert!(
+            blocked.to_string().contains("shared_read_only"),
+            "{blocked}"
+        );
+        let database =
+            rusqlite::Connection::open(temp.path().join("state/skillroster.db")).unwrap();
+        let raw: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id=?1",
+                [scan["result"]["snapshot_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&raw).unwrap();
+        let placements = payload["placements"].as_array().unwrap();
+        assert!(
+            placements
+                .iter()
+                .all(|placement| placement["mutation_scope"] == "shared_read_only")
+        );
+        let mut library_proposal = proposal;
+        library_proposal
+            .as_object_mut()
+            .unwrap()
+            .remove("roster_changes");
+        library_proposal["library_changes"] = json!([{
+            "skill_id": placements[0]["skill_id"],
+            "canonical_placement_id": placements[0]["id"],
+            "placement_ids": placements.iter().map(|placement| placement["id"].clone()).collect::<Vec<_>>(),
+            "requested_state": "managed"
+        }]);
+        let blocked = codex_visibility_fixture_run(
+            &temp,
+            &["plan", "--stdin"],
+            Some(&library_proposal.to_string()),
+        );
+        assert!(!blocked.status.success());
+        let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+        assert!(
+            blocked["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only"),
+            "{blocked}"
+        );
+        assert_eq!(fs::read_to_string(package.join("SKILL.md")).unwrap(), bytes);
+        assert!(package.is_dir());
+        assert!(!temp.path().join("state/library").exists());
+    }
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    let config = home.join(".codex/config.toml");
+    let config_bytes =
+        "[[skills.config]]\npath='../.agents/skills/shared-only/SKILL.md'\nenabled=false\n";
+    fs::write(&config, config_bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["codex_visibility"]["state_counts"]["off"], 1);
+    let report = json_output(&codex_visibility_fixture_run(&temp, &["report"], None));
+    assert_eq!(report["result"]["default_exposure"], 0);
+    let loaded = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["find", "shared-only", "--load", "--limit", "1"],
+        None,
+    ));
+    assert_eq!(loaded["result"]["loaded_skill"]["content"]["text"], bytes);
+    assert_eq!(fs::read_to_string(config).unwrap(), config_bytes);
+    assert_eq!(fs::read_to_string(package.join("SKILL.md")).unwrap(), bytes);
+}
+
+#[test]
+fn codex_visibility_legacy_source_only_snapshot_cannot_bypass_setup_or_planning_guards() {
+    let temp = TempDir::new().unwrap();
+    let package = temp.path().join("home/.agents/skills/legacy-source");
+    fs::create_dir_all(&package).unwrap();
+    let bytes = "---\nname: legacy-source\n---\nSource-only legacy fixture\n";
+    fs::write(package.join("SKILL.md"), bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    let database = rusqlite::Connection::open(temp.path().join("state/skillroster.db")).unwrap();
+    let raw: String = database
+        .query_row("SELECT payload_json FROM scan_payloads", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let mut payload: Value = serde_json::from_str(&raw).unwrap();
+    payload.as_object_mut().unwrap().remove("codex_visibility");
+    for root in payload["roots"].as_array_mut().unwrap() {
+        root.as_object_mut().unwrap().remove("shared");
+    }
+    for placement in payload["placements"].as_array_mut().unwrap() {
+        placement["agent"] = Value::Null;
+    }
+    database
+        .execute(
+            "UPDATE scan_payloads SET payload_json=?1",
+            [payload.to_string()],
+        )
+        .unwrap();
+    let proposal = json!({"schema_version":1,"scan_id":scan["result"]["snapshot_id"],"evidence_ids":[],"roster_changes":[]});
+    for args in [
+        vec!["report"],
+        vec!["plan", "--stdin"],
+        vec!["setup"],
+        vec!["setup", "--check"],
+    ] {
+        let output = codex_visibility_fixture_run(&temp, &args, Some(&proposal.to_string()));
+        assert!(!output.status.success(), "{args:?}");
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["error"]["code"], "content_identity_rescan_required",
+            "{args:?}: {output}"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "legacy_codex_visibility_requires_rescan"
+        );
+    }
+    assert_eq!(fs::read_to_string(package.join("SKILL.md")).unwrap(), bytes);
+    assert!(!temp.path().join("state/library").exists());
+    assert!(!package.parent().unwrap().join("skillroster").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_visibility_retargeted_empty_root_blocks_core_setup_and_ready_apply() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let codex = home.join(".codex/skills");
+    let shared = home.join(".agents/skills");
+    let source = home.join(".claude/skills/source-only");
+    for directory in [&codex, &shared, &source] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let bytes = "---\nname: source-only\n---\nSource available for Codex Core\n";
+    fs::write(source.join("SKILL.md"), bytes).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    let proposal = codex_visibility_proposal(&temp, &scan, "source-only", "core");
+    let plan = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&proposal.to_string()),
+    ));
+    fs::remove_dir(&codex).unwrap();
+    std::os::unix::fs::symlink(&shared, &codex).unwrap();
+    for args in [
+        vec!["plan", "--stdin"],
+        vec!["setup"],
+        vec!["setup", "--check"],
+        vec!["apply", plan["result"]["plan_id"].as_str().unwrap()],
+    ] {
+        let output = codex_visibility_fixture_run(&temp, &args, Some(&proposal.to_string()));
+        assert!(!output.status.success(), "{args:?}");
+        let output: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output["error"]["code"], "content_identity_rescan_required",
+            "{args:?}: {output}"
+        );
+        assert_eq!(
+            output["error"]["details"]["reason"],
+            "codex_visibility_root_identity_changed"
+        );
+    }
+    assert_eq!(fs::read_to_string(source.join("SKILL.md")).unwrap(), bytes);
+    assert_eq!(fs::read_dir(&shared).unwrap().count(), 0);
+    assert!(!temp.path().join("state/library").exists());
+
+    // Fresh observations of a Codex-root alias to the shared directory still
+    // grant no authority to install the bootstrap into that directory.
+    let fresh = TempDir::new().unwrap();
+    let home = fresh.path().join("home");
+    let shared = home.join(".agents/skills");
+    fs::create_dir_all(&shared).unwrap();
+    fs::create_dir_all(home.join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&shared, home.join(".codex/skills")).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&fresh, &["scan"], None));
+    assert!(
+        scan["result"]["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|root| root["agent"] == "codex" && root["kind"] == "skills")
+            .all(|root| root["shared"] == true)
+    );
+    for args in [vec!["setup"], vec!["setup", "--check"]] {
+        let setup = json_output(&codex_visibility_fixture_run(&fresh, &args, None));
+        assert_eq!(setup["result"]["state"], "no_supported_agent");
+        assert!(setup["result"]["plan_id"].is_null());
+    }
+    assert_eq!(fs::read_dir(shared).unwrap().count(), 0);
+}
+
+#[test]
+fn codex_visibility_name_controls_inventory_and_ordered_path_override() {
+    let temp = codex_visibility_fixture();
+    let config = temp.path().join("home/.codex/config.toml");
+    let name_rule = "[[skills.config]]\nname='active'\nenabled=false\n";
+    fs::write(&config, name_rule).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["codex_visibility"]["state_counts"]["off"], 1);
+    assert_eq!(
+        scan["result"]["codex_visibility"]["skill_configuration_known"],
+        true
+    );
+    let loaded = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["find", "active", "--load", "--limit", "1"],
+        None,
+    ));
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["content"]["complete"],
+        true
+    );
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "core");
+    let blocked =
+        codex_visibility_fixture_run(&temp, &["plan", "--stdin"], Some(&proposal.to_string()));
+    assert!(!blocked.status.success());
+    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(
+        blocked["error"]["code"],
+        "native_visibility_blocks_roster_change"
+    );
+    let ordered =
+        format!("{name_rule}[[skills.config]]\npath='skills/active/SKILL.md'\nenabled=true\n");
+    fs::write(&config, &ordered).unwrap();
+    let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
+    assert_eq!(scan["result"]["codex_visibility"]["state_counts"]["on"], 2);
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "core");
+    json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&proposal.to_string()),
+    ));
+    assert_eq!(fs::read_to_string(config).unwrap(), ordered);
+}
+
 #[test]
 fn native_visibility_public_governance_lifecycle_preserves_sources_and_policy() {
     let temp = TempDir::new().unwrap();
@@ -6675,7 +7269,7 @@ fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
     assert_eq!(
         scan["result"]["root_counts"],
         json!([
-            {"count": 8, "kind": "skills", "status": "missing"},
+            {"count": 9, "kind": "skills", "status": "missing"},
             {"count": 1, "kind": "sessions", "status": "included"},
             {"count": 7, "kind": "sessions", "status": "missing"}
         ])
@@ -8208,6 +8802,272 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
 }
 
 #[test]
+fn codex_library_consolidation_preserves_native_visibility() {
+    for policy in ["paths", "name", "none"] {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let state = temp.path().join("state");
+        let one = home.join(".codex/skills/one");
+        let two = home.join(".codex/skills/two");
+        let content = "---\nname: sample\n---\nfixture\n";
+        for directory in [&one, &two] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("SKILL.md"), content).unwrap();
+        }
+        let config = match policy {
+            "paths" => format!(
+                "[[skills.config]]\npath={}\nenabled=false\n[[skills.config]]\npath={}\nenabled=true\n",
+                serde_json::to_string(&one.join("SKILL.md")).unwrap(),
+                serde_json::to_string(&two.join("SKILL.md")).unwrap(),
+            ),
+            "name" => "[[skills.config]]\nname='sample'\nenabled=false\n".into(),
+            _ => String::new(),
+        };
+        fs::write(home.join(".codex/config.toml"), &config).unwrap();
+        let common = [
+            "--home",
+            home.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--json",
+        ];
+        let scanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+        let snapshot = scanned["result"]["snapshot_id"].as_str().unwrap();
+        let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+        let payload: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+                [snapshot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let canonical = payload["placements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|placement| placement["directory"] == json!(one))
+            .unwrap();
+        let skill_id = canonical["skill_id"].as_str().unwrap();
+        let evidence = skill_evidence_id(&database, snapshot, skill_id);
+        let request = json!({
+            "schema_version": 1, "scan_id": snapshot, "evidence_ids": [evidence],
+            "library_changes": [{
+                "skill_id": skill_id, "canonical_placement_id": canonical["id"],
+                "placement_ids": payload["placements"].as_array().unwrap().iter().map(|p| p["id"].clone()).collect::<Vec<_>>(),
+                "requested_state": "managed"
+            }]
+        });
+        let result = run(
+            &[&common[..], &["plan", "--stdin"]].concat(),
+            Some(&request.to_string()),
+        );
+        if policy == "paths" {
+            assert!(!result.status.success());
+            let error: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(
+                error["error"]["code"],
+                "native_visibility_blocks_roster_change"
+            );
+            assert_eq!(error["error"]["details"]["agent"], "codex");
+            for directory in [&one, &two] {
+                assert!(
+                    !fs::symlink_metadata(directory)
+                        .unwrap()
+                        .file_type()
+                        .is_symlink()
+                );
+                assert_eq!(
+                    fs::read_to_string(directory.join("SKILL.md")).unwrap(),
+                    content
+                );
+            }
+            assert!(!state.join("plan-backups").exists());
+        } else {
+            let plan = json_output(&result);
+            let applied = json_output(&run(
+                &[
+                    &common[..],
+                    &["apply", plan["result"]["plan_id"].as_str().unwrap()],
+                ]
+                .concat(),
+                None,
+            ));
+            assert_eq!(applied["result"]["verification"], "passed");
+            let after = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+            let visibility = &after["result"]["codex_visibility"];
+            if policy == "name" {
+                assert_eq!(visibility["state_counts"]["off"], 2, "{after}");
+            } else {
+                assert_eq!(visibility["state_counts"]["on"], 2, "{after}");
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+            config
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_library_consolidation_preserves_nested_consumer_visibility() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let one = home.join(".claude/skills/parent");
+    let two = home.join(".pi/agent/skills/parent");
+    let codex = home.join(".codex/skills/child");
+    for package in [&one, &two] {
+        fs::create_dir_all(package.join("nested")).unwrap();
+        fs::write(package.join("SKILL.md"), "---\nname: parent\n---\nparent\n").unwrap();
+        fs::write(
+            package.join("nested/SKILL.md"),
+            "---\nname: child\n---\nchild\n",
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(one.join("nested"), &codex).unwrap();
+    let config = format!(
+        "[[skills.config]]\npath={}\nenabled=false\n[[skills.config]]\npath={}\nenabled=true\n",
+        serde_json::to_string(&one.join("nested/SKILL.md")).unwrap(),
+        serde_json::to_string(&two.join("nested/SKILL.md")).unwrap(),
+    );
+    fs::write(home.join(".codex/config.toml"), &config).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scanned["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let canonical = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["directory"] == json!(one))
+        .unwrap();
+    let skill_id = canonical["skill_id"].as_str().unwrap();
+    let evidence = skill_evidence_id(&database, snapshot, skill_id);
+    let request = json!({
+        "schema_version": 1, "scan_id": snapshot, "evidence_ids": [evidence],
+        "library_changes": [{
+            "skill_id": skill_id, "canonical_placement_id": canonical["id"],
+            "placement_ids": payload["placements"].as_array().unwrap().iter().filter(|p| p["skill_id"] == skill_id).map(|p| p["id"].clone()).collect::<Vec<_>>(),
+            "requested_state": "managed"
+        }]
+    });
+    let result = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(
+        !result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let error: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        error["error"]["code"], "native_visibility_blocks_roster_change",
+        "{error}"
+    );
+    assert_eq!(fs::read_link(&codex).unwrap(), one.join("nested"));
+    assert!(!fs::symlink_metadata(&two).unwrap().file_type().is_symlink());
+    assert_eq!(
+        fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+        config
+    );
+    assert!(!state.join("plan-backups").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn source_update_cannot_reenable_a_codex_consumer_by_renaming() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    let source = home.join(".claude/skills/source-skill");
+    let codex = home.join(".codex/skills/alias");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let original =
+        "---\nname: sample\nsource: github:example/source-skill\nversion: v1\n---\nold\n";
+    let upstream =
+        "---\nname: renamed\nsource: github:example/source-skill\nversion: v2\n---\nnew\n";
+    fs::write(source.join("SKILL.md"), original).unwrap();
+    std::os::unix::fs::symlink(&source, &codex).unwrap();
+    let config = "[[skills.config]]\nname='sample'\nenabled=false\n";
+    fs::write(home.join(".codex/config.toml"), config).unwrap();
+    let common = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--json",
+    ];
+    let scanned = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let snapshot = scanned["result"]["snapshot_id"].as_str().unwrap();
+    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
+    let payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    let placement = payload["placements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["directory"] == json!(source))
+        .unwrap();
+    let skill_id = placement["skill_id"].as_str().unwrap();
+    let evidence = skill_evidence_id(&database, snapshot, skill_id);
+    let request = json!({
+        "schema_version": 1, "scan_id": snapshot, "evidence_ids": [evidence],
+        "source_updates": [{
+            "skill_id": skill_id, "placement_id": placement["id"], "source": "github:example/source-skill",
+            "current_revision": "v1", "current_fingerprint": placement["content_digest"],
+            "upstream_revision": "v2", "upstream_content": upstream,
+            "upstream_digest": format!("{:x}", Sha256::digest(upstream.as_bytes())),
+            "choice": "adopt_upstream"
+        }]
+    });
+    let result = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&request.to_string()),
+    );
+    assert!(!result.status.success());
+    let error: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        error["error"]["code"], "native_visibility_blocks_roster_change",
+        "{error}"
+    );
+    assert_eq!(
+        fs::read_to_string(source.join("SKILL.md")).unwrap(),
+        original
+    );
+    assert_eq!(fs::read_link(&codex).unwrap(), source);
+    assert_eq!(
+        fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+        config
+    );
+}
+
+#[test]
 fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -8793,7 +9653,11 @@ fn exact_duplicate_plan_deduplicates_shared_agent_roots_and_undo_restores_source
     assert!(!drifted_output.status.success());
     let drifted: Value = serde_json::from_slice(&drifted_output.stdout).unwrap();
     assert_eq!(drifted["ok"], false);
-    assert_eq!(drifted["error"]["code"], "state_drift");
+    assert_eq!(drifted["error"]["code"], "content_identity_rescan_required");
+    assert_eq!(
+        drifted["error"]["details"]["reason"],
+        "codex_visibility_root_identity_changed"
+    );
     fs::remove_file(&codex_root).unwrap();
     symlink(&shared_root, &codex_root).unwrap();
 
@@ -10500,7 +11364,7 @@ fn apply_rejects_a_legacy_ready_plan_without_mutation() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
-    let root = temp.path().join("skills");
+    let root = home.join(".codex/skills");
     let content = "---\nname: legacy-ready\n---\nComplete fixture.\n";
     for name in ["copy-a", "copy-b"] {
         let directory = root.join(name);
@@ -11011,10 +11875,13 @@ fn shared_physical_roster_plan_moves_once_and_blocks_conflicting_states() {
     let drifted_apply = run(&[&common[..], &["apply", plan_id]].concat(), None);
     assert!(!drifted_apply.status.success());
     let drifted_apply: Value = serde_json::from_slice(&drifted_apply.stdout).unwrap();
-    assert_eq!(drifted_apply["error"]["code"], "state_drift");
+    assert_eq!(
+        drifted_apply["error"]["code"],
+        "content_identity_rescan_required"
+    );
     assert_eq!(
         drifted_apply["error"]["details"]["reason"],
-        "physical_source_drift"
+        "codex_visibility_root_identity_changed"
     );
     assert_eq!(drifted_apply["error"]["details"]["files_changed"], false);
     assert!(shared_skill.join("SKILL.md").is_file());

@@ -344,7 +344,7 @@ pub fn error_json_with_context(
                 relevant_ids: vec![blocked.skill_id.clone()],
                 paths: Vec::new(),
                 details: Some(json!({
-                    "agent": "claude-code",
+                    "agent": blocked.agent.id(),
                     "visibility": blocked.mode,
                     "files_changed": false,
                     "state_files_changed": false,

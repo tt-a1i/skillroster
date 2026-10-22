@@ -32,9 +32,60 @@ primitive required by SkillRoster's handle-bound recovery model. A platform or
 Agent is not declared supported until its adapter passes fixtures and a
 real-environment acceptance run.
 
-SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
+SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `shared_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
 
 ### Local catalog visibility
+
+Codex discovery retains the legacy user `.codex/skills` root and includes
+`.agents/skills`. The latter is a shared root, not evidence of a Codex-only
+installation. Its readable placements and physical aliases have
+`mutation_scope: shared_read_only`; escaping or unreadable content retains its
+trust blocker. Explicit root/source aliases cannot restore mutation authority.
+Shared roots are not Bootstrap or implicit Core write destinations, and an
+eligible legacy or explicit mutable destination retains its previous order.
+
+For Codex user Skills, `codex_visibility` describes the supplied Home's
+`.codex/config.toml` Skill controls. It is a local rule projection, not a running
+Agent's catalog: `skill_configuration_known` covers only the inspected Skill
+rules, `host_config_validity` is `unverified`, and `session_catalog_observed` is
+false. Other Codex configuration types, CLI overrides, managed settings,
+profiles, and project runtime layers are not validated or inferred. `on` means
+these observed local rules do not disable the discovered placement; it does
+not prove that the complete host configuration can load or a task can use it.
+Arbitrary non-user Codex roots retain unknown native policy.
+
+Typed TOML rules are evaluated in order with the last matching rule winning.
+Exactly one of `name` or `path` must be present for a rule to participate;
+both/neither are inert but invalid field types remain unknown. Names match
+verified frontmatter names case-sensitively after trimming surrounding
+whitespace. Each name is bound to its verified placement bytes, not the
+representative metadata of a deduplicated Skill. Unsupported name syntax
+remains unknown when it can affect the rule result. Paths identify `SKILL.md`,
+not its directory, resolve relative to
+the configuration directory (or supplied Home for `~/`), and match canonical
+entrypoint identities. A missing-path disabling declaration also protects that
+future Core target. Unknown Skill names cannot silently bypass name rules.
+Configuration paths are resolved for metadata identity only; they never
+authorize content reads, add approved roots, or grant mutation authority.
+
+Disabled user Skills remain inventory and may be explicitly loaded through
+verified Find; their local default exposure is false. Unknown policy retains
+possible exposure and blocks changes that depend on resolving it. Core Plans
+must preserve native restrictions, including the destination and canonical
+source of a new link. Implicit canonical migration and retained-link retargeting
+must preserve affected Codex visibility even when only another Agent was named
+in the request. Library consolidation and source updates must also preserve
+affected Codex visibility. Uncertain projected path-policy changes fail closed.
+Scan, Report, and Plan summaries disclose the local-rule scope and unverified
+host configuration; their exposure counts do not promise a usable session catalog.
+
+Snapshots freeze configuration digests or absence, configured path identities,
+and Skill-root identities. Report, Find, Plan, Apply, and Setup (including
+`--check`) require a rescan after those inputs change. Every older Snapshot
+requires this new contract even if it contained only Agent-less sources; it
+cannot reuse pre-shared-root mutation authority. Neither scanning nor governance
+edits Codex configuration. The isolated native evidence and scope are in
+[the Codex mechanism record](research/codex-native-visibility.md).
 
 For Claude Code, `default_exposed` combines directory discovery with observed
 local frontmatter and `skillOverrides`. Manual-only and off entries remain in
