@@ -239,6 +239,17 @@ fn same_entrypoint_with_different_support_requires_choice_but_gitignore_does_not
                 "declared_identity_content_ambiguous",
             );
         } else {
+            assert!(
+                !found["suggested_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action["action"] == "load_exact_content_for_comparison")
+            );
+            assert_eq!(
+                found["result"]["matches"][0]["content_choice"]["groups"][0]["placement_count"],
+                2
+            );
             assert_eq!(
                 found["result"]["matches"][0]["content_choice"]["routing_equivalent"],
                 true
@@ -647,9 +658,28 @@ fn supplementary_name_finding_preserves_capability_scope_and_resolvable_evidence
         .as_array()
         .unwrap()
         .iter()
-        .filter(|action| action["action"] == "load_exact_content_for_comparison")
+        .filter(|action| {
+            matches!(
+                action["action"].as_str(),
+                Some("load_exact_content_for_comparison" | "load_exact_variant_for_comparison")
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(actions.len(), 3);
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action["action"] == "load_exact_content_for_comparison")
+            .count(),
+        2
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| action["action"] == "load_exact_variant_for_comparison")
+            .count(),
+        1
+    );
     for action in actions {
         let argv = action["argv"]
             .as_array()
@@ -677,6 +707,15 @@ fn supplementary_name_finding_preserves_capability_scope_and_resolvable_evidence
         let loaded: Value = serde_json::from_slice(&output.stdout).unwrap();
         let selected = &loaded["result"]["loaded_skill"];
         let path = selected["content"]["path"].as_str().unwrap();
+        if action["action"] == "load_exact_variant_for_comparison" {
+            assert!(argv.contains(&"--variant-skill-id"));
+            assert!(!argv.contains(&"--variant-placement-id"));
+            assert_eq!(path, other_deploy.join("SKILL.md").to_str().unwrap());
+        } else {
+            assert!(argv.contains(&"--variant-placement-id"));
+            assert!(!argv.contains(&"--variant-skill-id"));
+            assert_ne!(path, other_deploy.join("SKILL.md").to_str().unwrap());
+        }
         assert_eq!(
             selected["content"]["text"],
             fs::read_to_string(path).unwrap()
@@ -694,4 +733,57 @@ fn supplementary_name_finding_preserves_capability_scope_and_resolvable_evidence
             "ranked_capability_group"
         );
     }
+}
+
+#[test]
+fn singleton_find_omits_content_choices_and_still_revalidates_support_files() {
+    let fixture = Fixture::new();
+    let package = fixture.package(
+        "singleton",
+        "singleton",
+        "example/single",
+        "SINGLE_PRIVATE_INSTRUCTIONS",
+    );
+    fs::write(package.join("run.sh"), "original support\n").unwrap();
+    fixture.ok(&["scan"]);
+    let found = fixture.ok(&["find", "singleton"]);
+    assert!(
+        found["result"]["matches"][0]
+            .get("content_choice")
+            .is_none()
+    );
+    assert!(
+        !found["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| matches!(
+                action["action"].as_str(),
+                Some("load_exact_content_for_comparison" | "load_exact_variant_for_comparison")
+            ))
+    );
+    let loaded = fixture.ok(&["find", "singleton", "--load"]);
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["content"]["complete"],
+        true
+    );
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["verification"]["package_fingerprint_matches_snapshot"],
+        true
+    );
+    assert_eq!(
+        loaded["result"]["loaded_skill"]["content"]["text"],
+        fs::read_to_string(package.join("SKILL.md")).unwrap()
+    );
+    fs::write(package.join("run.sh"), "changed support\n").unwrap();
+    let changed = fixture.ok(&["find", "singleton"]);
+    assert_eq!(changed["result"]["rescan_required"], true);
+    assert_eq!(changed["result"]["matches"][0]["paths"], json!([]));
+    assert!(!changed["result"]["warnings"].as_array().unwrap().is_empty());
+    assert!(
+        changed["result"]["matches"][0]
+            .get("content_choice")
+            .is_none()
+    );
+    fixture.blocked(&["find", "singleton", "--load"], "package_identity_drift");
 }

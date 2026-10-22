@@ -5540,13 +5540,19 @@ fn find_command(
         crate::query::fuse_retrieval_channels(task_matches, augmented_matches, &task_query, limit)
     };
     let mut warnings = Vec::new();
+    let mut observations = content_choice::FindReadObservations::default();
     let mut rescan_required = false;
     for found in &mut matches {
         let mut drifted_variants = 0_usize;
         if found.variants.is_empty() {
             let skill_id = SkillId::parse(found.skill_id.clone())?;
             found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-            let current = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
+            let current = current_readable_skill_paths_with_observations(
+                &scan,
+                state_dir,
+                &found.skill_id,
+                &mut observations,
+            )?;
             found.paths = current.paths;
             drifted_variants += usize::from(current.drifted);
         } else {
@@ -5554,7 +5560,12 @@ fn find_command(
                 let skill_id = SkillId::parse(variant.skill_id.clone())?;
                 variant.roster_state =
                     current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-                let current = current_readable_skill_paths(&scan, state_dir, &variant.skill_id)?;
+                let current = current_readable_skill_paths_with_observations(
+                    &scan,
+                    state_dir,
+                    &variant.skill_id,
+                    &mut observations,
+                )?;
                 let group_paths = scan
                     .placements
                     .iter()
@@ -5606,6 +5617,7 @@ fn find_command(
         &scan,
         &routable_ids,
         &mut matches,
+        &mut observations,
     )?;
     rescan_required |= variant_rescan_required;
     let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
@@ -5831,6 +5843,7 @@ fn find_command(
         !load,
         &mut result,
         &mut actions,
+        &mut observations,
     )?;
     if let Some(loaded_skill) = loaded_skill {
         result["loaded_skill"] = loaded_skill;
@@ -5926,6 +5939,7 @@ fn bind_variant_findings(
     scan: &ScanResult,
     routable_ids: &BTreeSet<String>,
     matches: &mut [crate::query::FindMatch],
+    observations: &mut content_choice::FindReadObservations,
 ) -> Result<(Vec<SuggestedAction>, bool)> {
     let report = store
         .latest_report()?
@@ -5949,7 +5963,12 @@ fn bind_variant_findings(
         let mut variant_drifted = false;
         let mut source_confirmation_variant_ids = BTreeSet::new();
         for skill_id in &variant_ids {
-            let current = current_readable_skill_paths(scan, state_dir, skill_id)?;
+            let current = current_readable_skill_paths_with_observations(
+                scan,
+                state_dir,
+                skill_id,
+                observations,
+            )?;
             variant_drifted |= current.drifted;
             if current.source_confirmation_required {
                 source_confirmation_variant_ids.insert(skill_id.clone());
@@ -6230,6 +6249,20 @@ fn current_readable_skill_paths(
     state_dir: &Path,
     skill_id: &str,
 ) -> Result<CurrentSkillPaths> {
+    current_readable_skill_paths_with_observations(
+        scan,
+        state_dir,
+        skill_id,
+        &mut content_choice::FindReadObservations::default(),
+    )
+}
+
+fn current_readable_skill_paths_with_observations(
+    scan: &ScanResult,
+    state_dir: &Path,
+    skill_id: &str,
+    observations: &mut content_choice::FindReadObservations,
+) -> Result<CurrentSkillPaths> {
     let skill = scan
         .skills
         .iter()
@@ -6303,7 +6336,19 @@ fn current_readable_skill_paths(
         if !resolved.is_file() || !approved_roots.iter().any(|root| resolved.starts_with(root)) {
             continue;
         }
-        let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
+        // A SKILL.md file symlink may belong to a different logical package.
+        // Reuse only when resolving the directory preserves that package boundary.
+        let package_matches = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .as_deref()
+            == resolved.parent();
+        let identity = if package_matches {
+            observations.inspect(&resolved)
+        } else {
+            scan::inspect_skill_identity(&path).ok()
+        };
+        let Some((actual_id, actual_fingerprint)) = identity else {
             continue;
         };
         let expected_fingerprints = fingerprints_by_resolved_path
@@ -6345,7 +6390,12 @@ fn current_readable_skill_paths(
         drifted: (paths.is_empty() && !source_confirmation_required)
             || placements.iter().any(|placement| {
                 matches!(
-                    content_choice::placement_read_state(scan, state_dir, placement),
+                    content_choice::placement_read_state_with_observations(
+                        scan,
+                        state_dir,
+                        placement,
+                        observations
+                    ),
                     "physical_source_drift"
                         | "entrypoint_unreadable"
                         | "entrypoint_content_drift"

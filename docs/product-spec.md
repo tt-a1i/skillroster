@@ -567,8 +567,12 @@ index the union solely to select candidate IDs; it never combines names,
 triggers or description tokens from different observations to justify loading.
 The matching routing digest identifies which observation supplied the evidence.
 
-`content_choice` lists bounded routing-content groups with each placement's
-observed name, path, digests, authority and current read state. Different
+For identities with multiple placements, ordinary Find includes `content_choice`
+with bounded routing-content groups and each placement's observed name, path,
+digests, authority and current read state. A single-placement identity needs no
+choice bundle. Exact-placement comparison actions appear only when divergent
+contents require that choice; same-name Skill-ID comparison actions remain for
+identities that do not require a placement selector. Different
 routing digests require explicit content selection; package differences caused
 only by root `.gitignore` do not. `find --load` returns
 `declared_identity_content_ambiguous` with no partial body when selection is
@@ -584,6 +588,11 @@ The selector preserves all source, Snapshot, digest, path, size, encoding and
 Archived-state checks and never falls back to a different placement on failure.
 A drifted or unreadable copy retains its own blocker even when another copy is
 healthy. Exact reading does not select canonical content or authorize governance.
+
+Within one Find, advisory package observations may be reused for the same
+physical entrypoint after each placement's authority and path checks. They are
+discarded when the command ends. Verified loading always performs its own fresh
+package validation; advisory observations cannot authorize returning instructions.
 
 All JSON responses use a versioned envelope:
 

@@ -1,5 +1,20 @@
 use super::*;
 
+/// Advisory package observations live for one Find only. Exact loading never uses them.
+#[derive(Default)]
+pub(super) struct FindReadObservations {
+    packages: BTreeMap<PathBuf, Option<(String, String)>>,
+}
+
+impl FindReadObservations {
+    pub(super) fn inspect(&mut self, resolved: &Path) -> Option<(String, String)> {
+        self.packages
+            .entry(resolved.to_path_buf())
+            .or_insert_with(|| scan::inspect_skill_identity(resolved).ok())
+            .clone()
+    }
+}
+
 const DECLARED_CONTENT_FINDING: &str = "declared_identity_divergent_content";
 
 pub(super) fn declared_content_choice(
@@ -7,6 +22,22 @@ pub(super) fn declared_content_choice(
     state_dir: &Path,
     skill_id: &str,
     limit: usize,
+) -> Value {
+    declared_content_choice_with_observations(
+        scan,
+        state_dir,
+        skill_id,
+        limit,
+        &mut FindReadObservations::default(),
+    )
+}
+
+fn declared_content_choice_with_observations(
+    scan: &ScanResult,
+    state_dir: &Path,
+    skill_id: &str,
+    limit: usize,
+    observations: &mut FindReadObservations,
 ) -> Value {
     let mut groups = BTreeMap::<Option<&str>, Vec<&scan::SkillPlacement>>::new();
     for placement in scan.placements.iter().filter(|p| p.skill_id == skill_id) {
@@ -36,7 +67,7 @@ pub(super) fn declared_content_choice(
                 "owned_by_agent": placement.owned_by_agent,
                 "agent": placement.agent.map(AgentKind::id),
                 "provider": placement.provider,
-                "read_state": placement_read_state(scan, state_dir, placement),
+                "read_state": placement_read_state_with_observations(scan, state_dir, placement, observations),
             })
         }).collect::<Vec<_>>();
         json!({ "content_identity_digest": digest, "name": observed_name,
@@ -62,6 +93,20 @@ pub(super) fn placement_read_state(
     scan: &ScanResult,
     state_dir: &Path,
     placement: &scan::SkillPlacement,
+) -> &'static str {
+    placement_read_state_with_observations(
+        scan,
+        state_dir,
+        placement,
+        &mut FindReadObservations::default(),
+    )
+}
+
+pub(super) fn placement_read_state_with_observations(
+    scan: &ScanResult,
+    state_dir: &Path,
+    placement: &scan::SkillPlacement,
+    observations: &mut FindReadObservations,
 ) -> &'static str {
     if placement
         .mutation_scope
@@ -113,12 +158,12 @@ pub(super) fn placement_read_state(
     if std::str::from_utf8(&bytes).is_err() {
         return "entrypoint_not_utf8";
     }
-    match scan::inspect_skill_identity(&path) {
-        Ok((id, digest)) if id == placement.skill_id && digest == placement.content_digest => {
+    match observations.inspect(&path) {
+        Some((id, digest)) if id == placement.skill_id && digest == placement.content_digest => {
             "available"
         }
-        Ok(_) => "package_identity_drift",
-        Err(_) => "package_identity_unreadable",
+        Some(_) => "package_identity_drift",
+        None => "package_identity_unreadable",
     }
 }
 
@@ -297,10 +342,47 @@ pub(super) fn bind_content_choices(
     offer_load_actions: bool,
     result: &mut Value,
     actions: &mut Vec<SuggestedAction>,
+    observations: &mut FindReadObservations,
 ) -> Result<()> {
     let report = store.latest_report()?.filter(|r| r.scan_id == *scan_id);
+    let ids = matches
+        .iter()
+        .flat_map(|matched| {
+            std::iter::once(matched.skill_id.as_str())
+                .chain(matched.variants.iter().map(|v| v.skill_id.as_str()))
+        })
+        .collect::<BTreeSet<_>>();
+    let choices = ids
+        .into_iter()
+        .filter(|id| {
+            scan.placements
+                .iter()
+                .filter(|p| p.skill_id == *id)
+                .take(2)
+                .count()
+                > 1
+        })
+        .map(|id| {
+            (
+                id,
+                declared_content_choice_with_observations(scan, state_dir, id, 10, observations),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    actions.retain(|action| {
+        action.action != "load_exact_variant_for_comparison"
+            || !action.argv.windows(2).any(|args| {
+                args[0] == "--variant-skill-id"
+                    && choices
+                        .get(args[1].as_str())
+                        .is_some_and(|choice| choice["content_selection_required"] == true)
+            })
+    });
     for (index, matched) in matches.iter().enumerate() {
-        let mut choice = declared_content_choice(scan, state_dir, &matched.skill_id, 10);
+        let mut choice = choices
+            .get(matched.skill_id.as_str())
+            .cloned()
+            .unwrap_or(Value::Null);
         let mut inspect = None;
         if choice["content_selection_required"] == true {
             let expected_ids = scan
@@ -401,7 +483,12 @@ pub(super) fn bind_content_choices(
             let mut top_ids = BTreeSet::from([matched.skill_id.as_str()]);
             top_ids.extend(matched.variants.iter().map(|v| v.skill_id.as_str()));
             for skill_id in top_ids {
-                let identity_choice = declared_content_choice(scan, state_dir, skill_id, 10);
+                let Some(identity_choice) = choices
+                    .get(skill_id)
+                    .filter(|choice| choice["content_selection_required"] == true)
+                else {
+                    continue;
+                };
                 for group in identity_choice["groups"].as_array().into_iter().flatten() {
                     if let Some(placement) = group["placements"]
                         .as_array()
@@ -429,14 +516,18 @@ pub(super) fn bind_content_choices(
                 }
             }
         }
-        result["matches"][index]["content_choice"] = choice;
+        if !choice.is_null() {
+            result["matches"][index]["content_choice"] = choice;
+        }
         for variant in result["matches"][index]["variants"]
             .as_array_mut()
             .into_iter()
             .flatten()
         {
             if let Some(skill_id) = variant["skill_id"].as_str() {
-                variant["content_choice"] = declared_content_choice(scan, state_dir, skill_id, 10);
+                if let Some(choice) = choices.get(skill_id) {
+                    variant["content_choice"] = choice.clone();
+                }
             }
         }
     }
@@ -483,6 +574,84 @@ mod tests {
         let current = current_readable_skill_paths(&scan, temp.path(), skill_id).unwrap();
         assert!(current.drifted);
         assert_eq!(current.paths.len(), 1);
+    }
+
+    #[test]
+    fn advisory_package_reuse_never_authorizes_load_or_the_next_find() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let package = home.join(".codex/skills/research");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: research\ndescription: Research\n---\nInstructions\n",
+        )
+        .unwrap();
+        let support = package.join("reference.md");
+        std::fs::write(&support, "original support").unwrap();
+        let mut options = ScanOptions::for_home(home);
+        options.include_session_evidence = false;
+        let scan = scan::scan(&options).unwrap();
+        let placement = &scan.placements[0];
+        let mut observations = FindReadObservations::default();
+        let current = current_readable_skill_paths_with_observations(
+            &scan,
+            temp.path(),
+            &placement.skill_id,
+            &mut observations,
+        )
+        .unwrap();
+        assert!(!current.drifted);
+        assert_eq!(observations.packages.len(), 1);
+        assert_eq!(
+            placement_read_state_with_observations(
+                &scan,
+                temp.path(),
+                placement,
+                &mut observations
+            ),
+            "available"
+        );
+        assert_eq!(observations.packages.len(), 1);
+
+        // Only support content changes, so a cached package hash would conceal it.
+        std::fs::write(&support, "changed support").unwrap();
+        assert_eq!(
+            placement_read_state_with_observations(
+                &scan,
+                temp.path(),
+                placement,
+                &mut observations
+            ),
+            "available"
+        );
+        let query = crate::query::RetrievalQuery::from_task_and_hints(
+            "research",
+            std::iter::empty::<&str>(),
+        );
+        let matched = crate::query::find_matching(&scan, &query, 1, None, None).remove(0);
+        let error = verified_skill_placement_load(
+            &ScanId::parse("scan_fresh-load").unwrap(),
+            &scan,
+            temp.path(),
+            &matched,
+            None,
+            Some(&placement.id),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SkillLoadBlocked>().unwrap().reason,
+            "package_identity_drift"
+        );
+        let next = current_readable_skill_paths_with_observations(
+            &scan,
+            temp.path(),
+            &placement.skill_id,
+            &mut FindReadObservations::default(),
+        )
+        .unwrap();
+        assert!(next.drifted);
+        assert!(next.paths.is_empty());
     }
 
     #[test]
