@@ -8865,7 +8865,10 @@ fn codex_library_consolidation_preserves_native_visibility() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|placement| placement["directory"] == json!(one))
+            .find(|placement| {
+                let directory = placement["directory"].as_str().unwrap();
+                fs::canonicalize(directory).unwrap() == fs::canonicalize(&one).unwrap()
+            })
             .unwrap();
         let skill_id = canonical["skill_id"].as_str().unwrap();
         let evidence = skill_evidence_id(&database, snapshot, skill_id);
