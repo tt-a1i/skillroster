@@ -59,6 +59,23 @@ impl std::fmt::Display for SkillLoadBlocked {
 impl std::error::Error for SkillLoadBlocked {}
 
 #[derive(Debug)]
+pub(super) struct DeclaredIdentityContentAmbiguous {
+    pub(super) skill_id: String,
+    pub(super) content_choice: Value,
+    pub(super) retry_argv: Vec<String>,
+}
+impl std::fmt::Display for DeclaredIdentityContentAmbiguous {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "declared identity {} has multiple observed routing contents; choose an exact placement",
+            self.skill_id
+        )
+    }
+}
+impl std::error::Error for DeclaredIdentityContentAmbiguous {}
+
+#[derive(Debug)]
 pub(super) struct ContentIdentityRescanRequired {
     pub(super) reason: &'static str,
 }
@@ -66,6 +83,15 @@ pub(super) struct ContentIdentityRescanRequired {
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
+            "legacy_hermes_visibility_requires_rescan"
+            | "hermes_visibility_settings_changed"
+            | "hermes_visibility_root_identity_changed"
+            | "hermes_visibility_host_platform_changed" => formatter.write_str(
+                "latest Snapshot's local Hermes visibility evidence is missing or changed; run skillroster scan",
+            ),
+            "legacy_hermes_discovery_requires_rescan" => formatter.write_str(
+                "latest Snapshot uses outdated Hermes Skill discovery; run skillroster scan",
+            ),
             "legacy_native_visibility_requires_rescan" | "native_visibility_settings_unavailable" | "native_visibility_settings_changed" => formatter.write_str(
                 "latest Snapshot's local Claude visibility evidence is missing or changed; run skillroster scan",
             ),
@@ -344,7 +370,7 @@ pub fn error_json_with_context(
                 relevant_ids: vec![blocked.skill_id.clone()],
                 paths: Vec::new(),
                 details: Some(json!({
-                    "agent": "claude-code",
+                    "agent": blocked.agent.id(),
                     "visibility": blocked.mode,
                     "files_changed": false,
                     "state_files_changed": false,
@@ -391,6 +417,38 @@ pub fn error_json_with_context(
         return serde_json::to_string(&envelope)
             .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
     }
+    if let Some(blocked) = error.downcast_ref::<DeclaredIdentityContentAmbiguous>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "declared_identity_content_ambiguous".into(),
+                message: error.to_string(),
+                retryable: false,
+                relevant_ids: vec![blocked.skill_id.clone()],
+                paths: Vec::new(),
+                details: Some(
+                    json!({ "reason": "declared_identity_content_ambiguous", "skill_id": blocked.skill_id,
+                "content_choice": blocked.content_choice, "files_changed": false, "state_files_changed": false,
+                "next_action": "inspect_declared_identity_content", "retry_mode": "read_only_command_available" }),
+                ),
+            },
+        );
+        let argv = blocked
+            .retry_argv
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        envelope.suggested_actions = vec![action(
+            "inspect_declared_identity_content",
+            &argv,
+            false,
+            false,
+            "declared_identity_content_ambiguous",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(blocked) = error.downcast_ref::<SkillLoadBlocked>() {
         let classified = classify_error(error);
         let mut envelope = JsonEnvelope::<Value>::failure(
@@ -422,7 +480,9 @@ pub fn error_json_with_context(
             | "legacy_snapshot_requires_rescan"
             | "eligible_placement_missing"
             | "entrypoint_content_drift"
-            | "package_identity_drift" => Some((
+            | "package_identity_drift"
+            | "physical_source_drift"
+            | "placement_routing_identity_missing" => Some((
                 "refresh_snapshot",
                 vec!["scan".into(), "--summary".into(), "--json".into()],
                 "verified_skill_load_blocked",
@@ -608,7 +668,9 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             "variant_selector_requires_ambiguous_top_match" => {
                 ("remove_variant_selector", "agent_correction_required")
             }
-            "variant_not_in_top_match" => {
+            "variant_not_in_top_match"
+            | "variant_placement_not_in_top_match"
+            | "variant_selectors_disagree" => {
                 ("choose_exposed_top_match_variant", "agent_choice_required")
             }
             "no_routable_match" => (
@@ -652,7 +714,9 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             | "legacy_snapshot_requires_rescan"
             | "eligible_placement_missing"
             | "entrypoint_content_drift"
-            | "package_identity_drift" => ("scan", "read_only_command_available"),
+            | "package_identity_drift"
+            | "physical_source_drift"
+            | "placement_routing_identity_missing" => ("scan", "read_only_command_available"),
             _ => ("inspect_blocker", "manual_resolution_required"),
         };
         return ClassifiedError {
@@ -1114,6 +1178,35 @@ mod tests {
         assert_eq!(
             envelope.pointer("/error/details/reason"),
             Some(&json!("non_unicode_identity_coverage_incomplete"))
+        );
+    }
+
+    #[test]
+    fn hermes_discovery_error_requires_one_scan_without_claiming_mutation() {
+        let error = ContentIdentityRescanRequired {
+            reason: "legacy_hermes_discovery_requires_rescan",
+        };
+        let envelope: Value = serde_json::from_str(&error_json("apply", &error)).unwrap();
+        assert_eq!(
+            envelope["error"]["code"],
+            "content_identity_rescan_required"
+        );
+        assert_eq!(
+            envelope["error"]["details"]["reason"],
+            "legacy_hermes_discovery_requires_rescan"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Hermes")
+        );
+        assert_eq!(envelope["error"]["details"]["files_changed"], false);
+        assert_eq!(envelope["error"]["details"]["state_files_changed"], false);
+        assert_eq!(envelope["suggested_actions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            envelope["suggested_actions"][0]["action"],
+            "refresh_snapshot_content_identity"
         );
     }
 

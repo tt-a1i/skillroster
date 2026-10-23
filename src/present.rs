@@ -387,6 +387,7 @@ fn scan(value: &Value, lines: &mut Vec<String>) {
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Snapshot", text(value, "snapshot_id"));
+    native_visibility_basis(value, lines);
     lines.extend(summary(
         "Read-only · no Agent files changed",
         "Next: skillroster report",
@@ -592,26 +593,49 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
 }
 
 fn native_visibility_basis(value: &Value, lines: &mut Vec<String>) {
-    if value
-        .pointer("/native_visibility/placement_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-    {
-        fact(
-            lines,
-            "Visibility basis",
-            "local files; session catalog unobserved",
-        );
-        let unknown = value
-            .pointer("/native_visibility/unknown_count")
+    let mut observed = false;
+    for (key, agent) in [
+        ("native_visibility", "Claude"),
+        ("codex_visibility", "Codex"),
+        ("hermes_visibility", "Hermes"),
+    ] {
+        let Some(visibility) = value
+            .get(key)
+            .filter(|visibility| visibility["placement_count"].as_u64().unwrap_or(0) > 0)
+        else {
+            continue;
+        };
+        if !observed {
+            fact(
+                lines,
+                "Visibility basis",
+                "local files; session catalog unobserved",
+            );
+            observed = true;
+        }
+        if agent == "Codex" {
+            fact(
+                lines,
+                "Codex scope",
+                "user Skill rules; host config validity unverified",
+            );
+        }
+        if agent == "Hermes" {
+            fact(
+                lines,
+                "Hermes scope",
+                "supplied-Home global + host OS rules; host config validity unverified",
+            );
+        }
+        let unknown = visibility
+            .get("unknown_count")
             .and_then(Value::as_u64)
             .unwrap_or(0);
         if unknown > 0 {
             fact(
                 lines,
                 "Visibility unknown",
-                format!("{unknown} Claude placements; exposure includes possible entries"),
+                format!("{unknown} {agent} placements; exposure includes possible entries"),
             );
         }
     }
@@ -1186,6 +1210,17 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                     text(item, "variant_count"),
                 ));
             }
+            if item
+                .pointer("/content_choice/content_selection_required")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                lines.push(format!(
+                    "     content choices {} · explicit placement selection required",
+                    item.pointer("/content_choice/content_group_count")
+                        .unwrap_or(&Value::Null)
+                ));
+            }
             lines.push(format!("     reasons {reasons}"));
             if let Some(variants) = variant_details {
                 for variant in variants.iter().take(3) {
@@ -1293,6 +1328,7 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
 
 fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Plan", text(value, "plan_id"));
+    native_visibility_basis(value, lines);
     if let Some(items) = value.pointer("/impact/items").and_then(Value::as_array) {
         for item in items
             .iter()
@@ -2246,6 +2282,22 @@ fn take_width(value: &str, budget: usize, reverse: bool) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hermes_visibility_discloses_local_projection_and_unknown_exposure() {
+        let mut lines = Vec::new();
+        native_visibility_basis(
+            &serde_json::json!({
+                "hermes_visibility": {"placement_count": 2, "unknown_count": 1}
+            }),
+            &mut lines,
+        );
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("session catalog unobserved"));
+        assert!(rendered.contains("supplied-Home global + host OS rules"));
+        assert!(rendered.contains("host config validity unverified"));
+        assert!(rendered.contains("1 Hermes placements"));
+    }
 
     #[test]
     fn progress_is_limited_to_real_long_running_stages() {

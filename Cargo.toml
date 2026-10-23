@@ -1,6 +1,6 @@
 [package]
 name = "skillroster"
-version = "1.8.46"
+version = "1.8.47"
 edition = "2024"
 rust-version = "1.85"
 description = "Local skill governance for AI agents"
@@ -22,7 +22,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 ulid = { version = "1.2", features = ["serde"] }
+yaml_serde = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

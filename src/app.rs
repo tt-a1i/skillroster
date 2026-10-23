@@ -33,7 +33,13 @@ use crate::state_security;
 
 pub use crate::action_context::ActionContext;
 
+mod content_choice;
 mod error;
+
+use content_choice::{
+    add_declared_content_resolution, bind_content_choices, declared_content_choice,
+    select_top_match_variant,
+};
 
 use error::{
     ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
@@ -331,7 +337,17 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                     "plan_detail_available",
                 ));
             }
-            if result["state"].as_str() == Some("ready") {
+            if result["rescan_required"] == true {
+                actions.push(action(
+                    "scan",
+                    &["scan", "--summary", "--json"],
+                    false,
+                    false,
+                    result["rescan_reason"]
+                        .as_str()
+                        .unwrap_or("legacy_hermes_discovery_requires_rescan"),
+                ));
+            } else if result["state"].as_str() == Some("ready") {
                 actions.push(action(
                     "apply",
                     &["apply", &id, "--json"],
@@ -1788,6 +1804,8 @@ fn scan_command(
             "skill_count": result.skills.len(),
             "placement_count": result.placements.len(),
             "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
+            "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
+            "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
             "roots": roots,
             "coverage": coverage,
             "source_root_policy": {
@@ -1804,6 +1822,7 @@ fn scan_command(
 }
 
 const SCAN_SUMMARY_ROOT_ISSUE_LIMIT: usize = 10;
+const SESSION_COVERAGE_PRESENTATION_VERSION: u32 = 1;
 
 fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -> Result<Value> {
     let root_kinds = [scan::RootKind::Skills, scan::RootKind::Sessions];
@@ -1960,6 +1979,19 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         "skill_count": result.skills.len(),
         "placement_count": result.placements.len(),
         "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
+        "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| {
+            let summary = visibility.summary();
+            json!({
+                "basis": summary["basis"],
+                "placement_count": summary["placement_count"],
+                "state_counts": summary["state_counts"],
+                "unknown_count": summary["unknown_count"],
+                "skill_configuration_known": summary["skill_configuration_known"],
+                "host_config_validity": summary["host_config_validity"],
+                "session_catalog_observed": summary["session_catalog_observed"]
+            })
+        }),
         "root_counts": root_counts,
         "root_issues": {
             "total": root_issues.len(),
@@ -1998,7 +2030,7 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
 }
 
 fn summary_coverage_state(coverage: &scan::SessionCoverage) -> &'static str {
-    if coverage.limitations.is_none() {
+    if coverage.limitations.is_none() || !coverage.has_current_parse_contract() {
         "legacy_unknown"
     } else if coverage.roots_inaccessible > 0 {
         "inaccessible"
@@ -2112,7 +2144,8 @@ const fn coverage_retry_disposition(
         | scan::SessionCoverageLimitationCode::FilePathNotUnicode
         | scan::SessionCoverageLimitationCode::JsonExtractionLimit
         | scan::SessionCoverageLimitationCode::JsonRecordLimit
-        | scan::SessionCoverageLimitationCode::LineAlignmentLoss => {
+        | scan::SessionCoverageLimitationCode::LineAlignmentLoss
+        | scan::SessionCoverageLimitationCode::FileParseFailure => {
             CoverageRetryDisposition::SameBoundaryExpected
         }
     }
@@ -2121,7 +2154,7 @@ const fn coverage_retry_disposition(
 fn session_coverage_details(coverage: &scan::SessionCoverage) -> Result<Value> {
     let mut details = serde_json::to_value(coverage)?;
     details["agent"] = json!(coverage.agent.id());
-    let legacy = coverage.limitations.is_none();
+    let legacy = coverage.limitations.is_none() || !coverage.has_current_parse_contract();
     let limitations = coverage.limitations.as_deref().unwrap_or_default();
     let denominator_reliable = coverage.denominator_is_reliable();
     details["denominator_reliable"] = json!(denominator_reliable);
@@ -2164,6 +2197,13 @@ fn session_coverage_actionability(
     }
     if legacy {
         next_steps.push("rescan_to_record_typed_limitations");
+        next_steps.push("rescan_to_record_parse_completeness");
+    }
+    if limitations
+        .iter()
+        .any(|limitation| limitation.code == scan::SessionCoverageLimitationCode::FileParseFailure)
+    {
+        next_steps.push("verify_session_record_format_before_rescan");
     }
     if !verify_before_rescan_codes.is_empty() {
         next_steps.push("verify_session_root_before_rescan");
@@ -2207,12 +2247,25 @@ fn normalize_public_coverage_details(details: &mut Value) -> Result<()> {
             *agent = json!(canonical);
         }
     }
-    if !object.contains_key("limitations") {
+    if !object.get("limitations").is_some_and(Value::is_array)
+        || object.get("parse_contract_version").and_then(Value::as_u64)
+            != Some(u64::from(scan::SESSION_PARSE_CONTRACT_VERSION))
+    {
         object.insert("denominator_reliable".into(), json!(false));
         object.insert("limitation_state".into(), json!("legacy_unknown"));
         object.insert(
             "actionability".into(),
-            session_coverage_actionability(true, false, &[])?,
+            session_coverage_actionability(
+                true,
+                false,
+                &object
+                    .get("limitations")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .map(serde_json::from_value::<Vec<scan::SessionCoverageLimitation>>)
+                    .transpose()?
+                    .unwrap_or_default(),
+            )?,
         );
     }
     Ok(())
@@ -2290,6 +2343,30 @@ fn report_command(
                 .ok_or_else(|| anyhow!("Snapshot {} is no longer retained", report.scan_id))?;
             require_content_identity(&scan)?;
             let coverage_basis = stored_finding_coverage_basis(&stored, object)?;
+            let kind = crate::query::stored_finding_kind(&stored);
+            if kind == Some(crate::query::FindingKind::FiveStageUsageEvidence) {
+                let overview = crate::query::usage_overview(&scan);
+                object.insert(
+                    "summary".into(),
+                    json!(crate::query::usage_overview_summary(&overview)),
+                );
+                object.insert(
+                    "evidence_quality".into(),
+                    json!(if overview.coverage.complete_agent_count
+                        == overview.coverage.supported_agent_count
+                    {
+                        "observed"
+                    } else {
+                        "unknown"
+                    }),
+                );
+                object.insert("usage_overview".into(), json!(overview));
+            } else if kind == Some(crate::query::FindingKind::StaleArchiveCandidates)
+                && stored_archive_coverage_unreliable(object, &scan)
+            {
+                object.insert("summary".into(), json!("Coverage is insufficient to assess this historical archive candidate; rescan before using missing usage as archive evidence."));
+                object.insert("evidence_quality".into(), json!("unknown"));
+            }
             let evidence_quality = object
                 .get("evidence_quality")
                 .cloned()
@@ -2314,7 +2391,8 @@ fn report_command(
                 object.insert("planning".into(), planning);
             }
             add_semantic_overlap_comparison(object, &scan, state_dir)?;
-            add_same_name_resolution(object, &scan);
+            add_same_name_resolution(object, &scan, state_dir, full);
+            add_declared_content_resolution(object, &scan, state_dir, &report.scan_id, full)?;
             let affected_skill_ids = object
                 .get("affected_skill_ids")
                 .and_then(Value::as_array)
@@ -2417,12 +2495,14 @@ fn report_command(
                         "link_target": placement.link_target,
                         "link_status": placement.link_status,
                         "default_exposed": placement.default_exposed,
-                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                        "native_visibility": scan.placement_native_visibility(placement),
                         "owned_by_agent": placement.owned_by_agent,
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
                         "provider": placement.provider,
                         "content_digest": placement.content_digest,
+                        "content_identity_digest": placement.content_identity_digest,
+                        "observed_name": scan.observed_skill_for_placement(placement).map(|skill| &skill.name),
                         "fingerprint_completeness": placement.fingerprint_completeness,
                         "fingerprint_detail": placement.fingerprint_detail
                     })
@@ -2518,12 +2598,17 @@ fn report_command(
     require_content_identity(&scan)?;
     if let Some(existing) = store.latest_report()? {
         if existing.scan_id == scan_id
+            && existing.summary["session_coverage_presentation_version"].as_u64()
+                == Some(u64::from(SESSION_COVERAGE_PRESENTATION_VERSION))
             && report_supports_source_confirmation_kind(&existing)
             && report_supports_finding_decision_fields(&existing)
             && existing.summary["overview"].is_object()
             && existing.summary["semantic_overlap_candidates"].is_object()
             && (scan.native_visibility.is_none()
                 || existing.summary["native_visibility"].is_object())
+            && (scan.codex_visibility.is_none() || existing.summary["codex_visibility"].is_object())
+            && (scan.hermes_visibility.is_none()
+                || existing.summary["hermes_visibility"].is_object())
         {
             return Ok(select_report_view(&existing.summary, request));
         }
@@ -2554,6 +2639,7 @@ fn report_command(
                 store, &record, &scan_id, &scan_id, &scan, state_dir,
             )?;
             if let Some(object) = record.details.as_object_mut() {
+                add_declared_content_resolution(object, &scan, state_dir, &scan_id, false)?;
                 let affected_skill_ids = finding
                     .affected_skill_ids
                     .iter()
@@ -2591,11 +2677,14 @@ fn report_command(
     });
     let value = json!({
         "report_id": report_id,
+        "session_coverage_presentation_version": SESSION_COVERAGE_PRESENTATION_VERSION,
         "snapshot_id": scan_id,
         "skill_count": report.metrics.independent_skills,
         "placement_count": report.metrics.placements,
         "default_exposure": report.metrics.default_exposure,
         "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
+        "hermes_visibility": scan.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
         "observed_use_agent_count": report.metrics.agents_with_observed_usage,
         "coverage_reliable_agent_count": report.metrics.agents_with_reliable_session_denominator,
         "coverage_sampled_agent_count": report.metrics.agents_with_sampled_session_data,
@@ -2902,7 +2991,7 @@ fn finding_decision_facts(
     }
     if let Some(resolution) = resolution {
         match resolution["decision"].as_str() {
-            Some("choose_same_name_variant") => {
+            Some("choose_same_name_variant" | "choose_declared_identity_content") => {
                 state = FindingDecisionState {
                     actionability: "review_required",
                     reversibility: "manual_only",
@@ -2925,7 +3014,35 @@ fn finding_decision_facts(
             };
         }
     }
+    if kind == Some(crate::query::FindingKind::StaleArchiveCandidates)
+        && (affected_skill_ids.is_empty()
+            || affected_skill_ids
+                .iter()
+                .any(|id| !crate::query::archive_skill_has_reliable_coverage(scan, id)))
+    {
+        state = FindingDecisionState {
+            actionability: "read_only",
+            reversibility: "not_governable",
+        };
+    }
     (affected_agents, state)
+}
+
+fn stored_archive_coverage_unreliable(
+    object: &serde_json::Map<String, Value>,
+    scan: &ScanResult,
+) -> bool {
+    object
+        .get("affected_skill_ids")
+        .and_then(Value::as_array)
+        .is_none_or(|ids| {
+            ids.is_empty()
+                || ids.iter().any(|id| {
+                    id.as_str().is_none_or(|id| {
+                        !crate::query::archive_skill_has_reliable_coverage(scan, id)
+                    })
+                })
+        })
 }
 
 fn refresh_finding_decision_facts(
@@ -3052,7 +3169,12 @@ fn add_finding_resolution(
     );
 }
 
-fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &ScanResult) {
+fn add_same_name_resolution(
+    object: &mut serde_json::Map<String, Value>,
+    scan: &ScanResult,
+    state_dir: &Path,
+    full: bool,
+) {
     if object.get("kind").and_then(Value::as_str)
         != Some(crate::query::SAME_NAME_DIVERGENT_FINDING_KIND)
     {
@@ -3068,70 +3190,51 @@ fn add_same_name_resolution(object: &mut serde_json::Map<String, Value>, scan: &
         .collect::<Vec<_>>();
     affected_skill_ids.sort();
     affected_skill_ids.dedup();
+    let affected_placement_ids = object
+        .get("affected_placement_ids")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<BTreeSet<_>>();
     let variant_count = affected_skill_ids.len();
-    let variants = affected_skill_ids
-        .iter()
-        .take(10)
-        .filter_map(|skill_id| {
-            let skill = scan.skills.iter().find(|skill| skill.id == *skill_id)?;
-            let placements = scan
-                .placements
-                .iter()
-                .filter(|placement| placement.skill_id == *skill_id)
-                .collect::<Vec<_>>();
-            let content_digests = std::iter::once(skill.content_digest.clone())
-                .chain(
-                    placements
-                        .iter()
-                        .map(|placement| placement.content_digest.clone()),
-                )
-                .collect::<BTreeSet<_>>();
-            let paths = placements
-                .iter()
-                .map(|placement| placement.entrypoint.display().to_string())
-                .collect::<BTreeSet<_>>();
-            let path_count = paths.len();
-            let paths = paths.into_iter().take(10).collect::<Vec<_>>();
-            let paths_truncated = paths.len() < path_count;
-            let agents = placements
-                .iter()
-                .filter_map(|placement| placement.agent.map(AgentKind::id))
-                .collect::<BTreeSet<_>>();
-            let providers = placements
-                .iter()
-                .filter_map(|placement| placement.provider.clone())
-                .collect::<BTreeSet<_>>();
-            let roots = placements
-                .iter()
-                .map(|placement| placement.root.display().to_string())
-                .collect::<BTreeSet<_>>();
-            let governable = placements.iter().any(|placement| placement.is_mutable());
-            let authority = placement_authority_summary(&placements);
-            Some(json!({
-                "skill_id": skill_id,
-                "content_digests": content_digests,
-                "paths": paths,
-                "path_count": path_count,
-                "paths_truncated": paths_truncated,
-                "agents": agents,
-                "providers": providers,
-                "roots": roots,
-                "source": skill.metadata.source.clone(),
-                "governable": governable,
-                "owned_by_agent": authority.owned_by_agent,
-                "mutation_scopes": authority.mutation_scopes
-            }))
-        })
-        .collect::<Vec<_>>();
+    let limit = if full { usize::MAX } else { 10 };
+    let variants = affected_skill_ids.iter().take(limit).filter_map(|skill_id| {
+        let placements = scan.placements.iter().filter(|placement| placement.skill_id == *skill_id)
+            .filter(|placement| affected_placement_ids.contains(placement.id.as_str())).collect::<Vec<_>>();
+        let observed = placements.iter().find_map(|placement| scan.observed_skill_for_placement(placement))?;
+        let content_digests = placements.iter().map(|p| &p.content_digest).collect::<BTreeSet<_>>();
+        let content_identity_digests = placements.iter().filter_map(|p| p.content_identity_digest.as_deref()).collect::<BTreeSet<_>>();
+        let paths = placements.iter().map(|p| p.entrypoint.display().to_string()).collect::<BTreeSet<_>>();
+        let path_count = paths.len();
+        let paths = paths.into_iter().take(limit).collect::<Vec<_>>();
+        let observed_names = placements.iter().filter_map(|p| scan.observed_skill_for_placement(p).map(|s| &s.name)).collect::<BTreeSet<_>>();
+        let authority = placement_authority_summary(&placements);
+        let observations = placements.iter().take(limit).map(|p| json!({
+            "placement_id": p.id, "name": scan.observed_skill_for_placement(p).map(|s| &s.name),
+            "path": p.entrypoint, "content_identity_digest": p.content_identity_digest,
+            "package_fingerprint": p.content_digest, "mutation_scope": p.mutation_scope,
+            "read_state": content_choice::placement_read_state(scan, state_dir, p),
+        })).collect::<Vec<_>>();
+        Some(json!({
+            "skill_id": skill_id, "name": observed.name, "observed_names": observed_names,
+            "content_digests": content_digests, "content_identity_digests": content_identity_digests,
+            "paths": paths, "path_count": path_count, "paths_truncated": paths.len() < path_count,
+            "observations": observations, "observation_count": placements.len(), "observations_truncated": observations.len() < placements.len(),
+            "agents": placements.iter().filter_map(|p| p.agent.map(AgentKind::id)).collect::<BTreeSet<_>>(),
+            "providers": placements.iter().filter_map(|p| p.provider.as_deref()).collect::<BTreeSet<_>>(),
+            "roots": placements.iter().map(|p| &p.root).collect::<BTreeSet<_>>(),
+            "source": observed.metadata.source, "governable": placements.iter().any(|p| p.is_mutable()),
+            "owned_by_agent": authority.owned_by_agent, "mutation_scopes": authority.mutation_scopes,
+            "content_choice": declared_content_choice(scan, state_dir, skill_id, limit),
+        }))
+    }).collect::<Vec<_>>();
     object.insert(
         "resolution".into(),
         json!({
-            "decision": "choose_same_name_variant",
-            "automatic_change_supported": false,
-            "variant_count": variant_count,
-            "variants_truncated": variants.len() < variant_count,
-            "variants": variants,
-            "next_step": "compare_variant_content_and_choose_canonical"
+            "decision": "choose_same_name_variant", "automatic_change_supported": false,
+            "variant_count": variant_count, "variants_truncated": variants.len() < variant_count,
+            "variants": variants, "next_step": "compare_variant_content_and_choose_canonical"
         }),
     );
 }
@@ -3183,6 +3286,12 @@ fn read_only_placement_reason(
         return (
             "provider_managed_read_only",
             "Keep provider-managed placements read-only.",
+        );
+    }
+    if scopes == BTreeSet::from([scan::MutationScope::SharedReadOnly]) {
+        return (
+            "shared_agent_root_read_only",
+            "This shared Skill root may serve other Agents; keep its contents and exposure unchanged.",
         );
     }
     if scopes == BTreeSet::from([scan::MutationScope::DurableReadOnly]) {
@@ -3363,7 +3472,7 @@ fn add_semantic_overlap_comparison(
                         "mutation_scope": placement.mutation_scope,
                         "governable": placement.is_mutable(),
                         "default_exposed": placement.default_exposed,
-                        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                        "native_visibility": scan.placement_native_visibility(placement),
                         "link_status": placement.link_status,
                         "fingerprint_completeness": placement.fingerprint_completeness,
                         "fingerprint_detail": placement.fingerprint_detail
@@ -3674,7 +3783,7 @@ fn continuity_placement_json(
         "agent": placement.agent.map(AgentKind::id),
         "link_status": placement.link_status,
         "default_exposed": placement.default_exposed,
-        "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+        "native_visibility": scan.placement_native_visibility(placement),
         "fingerprint_completeness": placement.fingerprint_completeness.id(),
         "mutation_scope": placement.mutation_scope.map(scan::MutationScope::id),
         "governable": placement.is_mutable(),
@@ -3766,8 +3875,10 @@ fn report_actions(result: &Value, request: ReportRequest<'_>) -> Vec<SuggestedAc
             let page_limit = finding_page_limit(full, limit);
             let requires_trust_decision =
                 result["resolution"]["decision"].as_str() == Some("confirm_trusted_source_roots");
-            let requires_variant_decision =
-                result["resolution"]["decision"].as_str() == Some("choose_same_name_variant");
+            let requires_variant_decision = matches!(
+                result["resolution"]["decision"].as_str(),
+                Some("choose_same_name_variant" | "choose_declared_identity_content")
+            );
             let planning_supported = result["planning"]["supported"].as_bool() == Some(true);
             let mut actions = Vec::new();
             if let Some(next_offset) = result["page"]["next_offset"].as_u64() {
@@ -3987,7 +4098,7 @@ fn finding_library_planning(
                     "path": placement.entrypoint,
                     "agent": placement.agent.map(AgentKind::id),
                     "default_exposed": placement.default_exposed,
-                    "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                    "native_visibility": scan.placement_native_visibility(placement),
                     "governable": placement.is_mutable(),
                     "owned_by_agent": placement.owned_by_agent,
                     "mutation_scope": placement.mutation_scope,
@@ -5067,6 +5178,8 @@ fn paged_finding_report(
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
         "native_visibility": report["native_visibility"],
+        "codex_visibility": report["codex_visibility"],
+        "hermes_visibility": report["hermes_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -5150,6 +5263,8 @@ fn compact_report(report: &Value) -> Value {
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
         "native_visibility": report["native_visibility"],
+        "codex_visibility": report["codex_visibility"],
+        "hermes_visibility": report["hermes_visibility"],
         "observed_use_agent_count": report["observed_use_agent_count"],
         "coverage_reliable_agent_count": report["coverage_reliable_agent_count"],
         "coverage_sampled_agent_count": report["coverage_sampled_agent_count"],
@@ -5433,8 +5548,9 @@ fn find_command(
     let limit = usize::from(args.limit);
     let load = args.load;
     let variant_skill_id = args.variant_skill_id.as_deref();
+    let variant_placement_id = args.variant_placement_id.as_deref();
     let required_snapshot_id = args.require_snapshot.as_deref();
-    if variant_skill_id.is_some() && !load {
+    if (variant_skill_id.is_some() || variant_placement_id.is_some()) && !load {
         return Err(SkillLoadBlocked {
             reason: "variant_selector_requires_load",
             skill_id: variant_skill_id.unwrap_or_default().to_owned(),
@@ -5529,13 +5645,19 @@ fn find_command(
         crate::query::fuse_retrieval_channels(task_matches, augmented_matches, &task_query, limit)
     };
     let mut warnings = Vec::new();
+    let mut observations = content_choice::FindReadObservations::default();
     let mut rescan_required = false;
     for found in &mut matches {
         let mut drifted_variants = 0_usize;
         if found.variants.is_empty() {
             let skill_id = SkillId::parse(found.skill_id.clone())?;
             found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-            let current = current_readable_skill_paths(&scan, state_dir, &found.skill_id)?;
+            let current = current_readable_skill_paths_with_observations(
+                &scan,
+                state_dir,
+                &found.skill_id,
+                &mut observations,
+            )?;
             found.paths = current.paths;
             drifted_variants += usize::from(current.drifted);
         } else {
@@ -5543,8 +5665,29 @@ fn find_command(
                 let skill_id = SkillId::parse(variant.skill_id.clone())?;
                 variant.roster_state =
                     current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-                let current = current_readable_skill_paths(&scan, state_dir, &variant.skill_id)?;
-                variant.paths = current.paths;
+                let current = current_readable_skill_paths_with_observations(
+                    &scan,
+                    state_dir,
+                    &variant.skill_id,
+                    &mut observations,
+                )?;
+                let group_paths = scan
+                    .placements
+                    .iter()
+                    .filter(|placement| placement.skill_id == variant.skill_id)
+                    .filter(|placement| {
+                        scan.observed_skill_for_placement(placement)
+                            .is_some_and(|skill| {
+                                skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
+                            })
+                    })
+                    .map(|placement| placement.entrypoint.display().to_string())
+                    .collect::<BTreeSet<_>>();
+                variant.paths = current
+                    .paths
+                    .into_iter()
+                    .filter(|path| group_paths.contains(path))
+                    .collect();
                 drifted_variants += usize::from(current.drifted);
             }
             if let Some(representative) = found
@@ -5579,6 +5722,7 @@ fn find_command(
         &scan,
         &routable_ids,
         &mut matches,
+        &mut observations,
     )?;
     rescan_required |= variant_rescan_required;
     let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
@@ -5620,7 +5764,11 @@ fn find_command(
     if load {
         let weak_top_match = matches
             .first()
-            .filter(|ranked| ranked.variant_count == 1 || variant_skill_id.is_some())
+            .filter(|ranked| {
+                ranked.variant_count == 1
+                    || variant_skill_id.is_some()
+                    || variant_placement_id.is_some()
+            })
             .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
         let weak_match_reason = if cjk_hint_required {
             Some("cjk_hint_required_for_weak_match")
@@ -5659,14 +5807,43 @@ fn find_command(
                     Some(&scan_id),
                 )
             });
-        let selected = select_explicit_variant(ranked, variant_skill_id)?;
-        let mut loaded =
-            verified_top_skill_load(&scan_id, &scan, state_dir, &selected, ambiguity_retry_argv)?;
-        if let Some(skill_id) = variant_skill_id {
+        let selected = select_top_match_variant(
+            store,
+            &scan,
+            &routable_ids,
+            ranked,
+            variant_skill_id,
+            variant_placement_id,
+        )?;
+        let retry_argv = find_action_argv(
+            task,
+            &retrieval_hints,
+            FindActionKind::InspectVariants { limit },
+            Some(&scan_id),
+        );
+        let choice = declared_content_choice(&scan, state_dir, &selected.skill_id, 10);
+        if variant_placement_id.is_none() && choice["content_selection_required"] == true {
+            return Err(error::DeclaredIdentityContentAmbiguous {
+                skill_id: selected.skill_id.clone(),
+                content_choice: choice,
+                retry_argv,
+            }
+            .into());
+        }
+        let mut loaded = verified_skill_placement_load(
+            &scan_id,
+            &scan,
+            state_dir,
+            &selected,
+            ambiguity_retry_argv,
+            variant_placement_id,
+        )?;
+        if variant_skill_id.is_some() || variant_placement_id.is_some() {
             loaded["selection"]["ranking_evidence_scope"] = json!("ranked_capability_group");
             loaded["selection"]["variant_selection"] = json!({
-                "mode": "explicit_skill_id",
-                "requested_skill_id": skill_id,
+                "mode": if variant_placement_id.is_some() { "explicit_placement_id" } else { "explicit_skill_id" },
+                "requested_skill_id": variant_skill_id,
+                "requested_placement_id": variant_placement_id,
                 "ranked_capability_name": ranked.name,
                 "ranked_group_representative_skill_id": ranked.skill_id,
                 "ranked_variant_count": ranked.variant_count,
@@ -5760,6 +5937,19 @@ fn find_command(
         "warnings": warnings,
         "files_changed": false
     });
+    bind_content_choices(
+        store,
+        state_dir,
+        &scan_id,
+        &scan,
+        task,
+        &retrieval_hints,
+        &matches,
+        !load,
+        &mut result,
+        &mut actions,
+        &mut observations,
+    )?;
     if let Some(loaded_skill) = loaded_skill {
         result["loaded_skill"] = loaded_skill;
     }
@@ -5771,56 +5961,11 @@ fn find_command(
     Ok((result, actions))
 }
 
-fn select_explicit_variant(
-    ranked: &crate::query::FindMatch,
-    requested_skill_id: Option<&str>,
-) -> Result<crate::query::FindMatch> {
-    let Some(requested_skill_id) = requested_skill_id else {
-        return Ok(ranked.clone());
-    };
-    let blocked = |reason| SkillLoadBlocked {
-        reason,
-        skill_id: requested_skill_id.to_owned(),
-        skill_name: ranked.name.clone(),
-        path: None,
-        roster_state: "unknown".into(),
-        mutation_scopes: Vec::new(),
-        expected_digest: None,
-        actual_digest: None,
-        retry_argv: None,
-    };
-    if ranked.variant_count <= 1 {
-        return Err(blocked("variant_selector_requires_ambiguous_top_match").into());
-    }
-    let Some(variant) = ranked
-        .variants
-        .iter()
-        .find(|variant| variant.skill_id == requested_skill_id)
-    else {
-        return Err(blocked("variant_not_in_top_match").into());
-    };
-    let mut selected = ranked.clone();
-    selected.skill_id = variant.skill_id.clone();
-    selected.paths = variant.paths.clone();
-    selected.agents = variant.agents.clone();
-    selected.roster_state = variant.roster_state.clone();
-    selected.source = variant.source.clone();
-    selected.providers = variant.providers.clone();
-    selected.governable = variant.governable;
-    selected.owned_by_agent = variant.owned_by_agent;
-    selected.mutation_scopes = variant.mutation_scopes.clone();
-    selected.variant_skill_ids.clear();
-    selected.variants.clear();
-    selected.variant_count = 1;
-    selected.variants_truncated = false;
-    selected.variant_finding = None;
-    Ok(selected)
-}
-
 #[derive(Clone, Copy)]
 enum FindActionKind<'a> {
     InspectVariants { limit: usize },
     LoadVariant { skill_id: &'a str },
+    LoadPlacement { placement_id: &'a str },
 }
 
 fn find_action_argv(
@@ -5837,6 +5982,13 @@ fn find_action_argv(
         FindActionKind::InspectVariants { limit } => {
             argv.extend(["--limit".to_owned(), limit.to_string()]);
         }
+        FindActionKind::LoadPlacement { placement_id } => argv.extend([
+            "--load".to_owned(),
+            "--limit".to_owned(),
+            "1".to_owned(),
+            "--variant-placement-id".to_owned(),
+            placement_id.to_owned(),
+        ]),
         FindActionKind::LoadVariant { skill_id } => argv.extend([
             "--load".to_owned(),
             "--limit".to_owned(),
@@ -5892,6 +6044,7 @@ fn bind_variant_findings(
     scan: &ScanResult,
     routable_ids: &BTreeSet<String>,
     matches: &mut [crate::query::FindMatch],
+    observations: &mut content_choice::FindReadObservations,
 ) -> Result<(Vec<SuggestedAction>, bool)> {
     let report = store
         .latest_report()?
@@ -5907,8 +6060,7 @@ fn bind_variant_findings(
     {
         let capability_name = found.name.trim().to_lowercase();
         let variant_ids = scan
-            .skills
-            .iter()
+            .routing_skills()
             .filter(|skill| skill.name.trim().to_lowercase() == capability_name)
             .filter(|skill| routable_ids.contains(&skill.id))
             .map(|skill| skill.id.clone())
@@ -5916,7 +6068,12 @@ fn bind_variant_findings(
         let mut variant_drifted = false;
         let mut source_confirmation_variant_ids = BTreeSet::new();
         for skill_id in &variant_ids {
-            let current = current_readable_skill_paths(scan, state_dir, skill_id)?;
+            let current = current_readable_skill_paths_with_observations(
+                scan,
+                state_dir,
+                skill_id,
+                observations,
+            )?;
             variant_drifted |= current.drifted;
             if current.source_confirmation_required {
                 source_confirmation_variant_ids.insert(skill_id.clone());
@@ -6197,6 +6354,20 @@ fn current_readable_skill_paths(
     state_dir: &Path,
     skill_id: &str,
 ) -> Result<CurrentSkillPaths> {
+    current_readable_skill_paths_with_observations(
+        scan,
+        state_dir,
+        skill_id,
+        &mut content_choice::FindReadObservations::default(),
+    )
+}
+
+fn current_readable_skill_paths_with_observations(
+    scan: &ScanResult,
+    state_dir: &Path,
+    skill_id: &str,
+    observations: &mut content_choice::FindReadObservations,
+) -> Result<CurrentSkillPaths> {
     let skill = scan
         .skills
         .iter()
@@ -6270,7 +6441,19 @@ fn current_readable_skill_paths(
         if !resolved.is_file() || !approved_roots.iter().any(|root| resolved.starts_with(root)) {
             continue;
         }
-        let Ok((actual_id, actual_fingerprint)) = scan::inspect_skill_identity(&path) else {
+        // A SKILL.md file symlink may belong to a different logical package.
+        // Reuse only when resolving the directory preserves that package boundary.
+        let package_matches = path
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .as_deref()
+            == resolved.parent();
+        let identity = if package_matches {
+            observations.inspect(&resolved)
+        } else {
+            scan::inspect_skill_identity(&path).ok()
+        };
+        let Some((actual_id, actual_fingerprint)) = identity else {
             continue;
         };
         let expected_fingerprints = fingerprints_by_resolved_path
@@ -6309,7 +6492,22 @@ fn current_readable_skill_paths(
                 .is_some_and(|directory| directory == expected_directory)
         });
     Ok(CurrentSkillPaths {
-        drifted: paths.is_empty() && !source_confirmation_required,
+        drifted: (paths.is_empty() && !source_confirmation_required)
+            || placements.iter().any(|placement| {
+                matches!(
+                    content_choice::placement_read_state_with_observations(
+                        scan,
+                        state_dir,
+                        placement,
+                        observations
+                    ),
+                    "physical_source_drift"
+                        | "entrypoint_unreadable"
+                        | "entrypoint_content_drift"
+                        | "package_identity_drift"
+                        | "package_identity_unreadable"
+                )
+            }),
         source_confirmation_required,
         paths,
     })
@@ -6321,12 +6519,13 @@ struct CurrentSkillPaths {
     source_confirmation_required: bool,
 }
 
-fn verified_top_skill_load(
+fn verified_skill_placement_load(
     scan_id: &ScanId,
     scan: &ScanResult,
     state_dir: &Path,
     matched: &crate::query::FindMatch,
     ambiguity_retry_argv: Option<Vec<String>>,
+    selected_placement_id: Option<&str>,
 ) -> Result<Value> {
     let blocked = |reason, path, expected_digest, actual_digest| SkillLoadBlocked {
         reason,
@@ -6355,6 +6554,7 @@ fn verified_top_skill_load(
         .placements
         .iter()
         .filter(|placement| placement.skill_id == matched.skill_id)
+        .filter(|placement| selected_placement_id.is_none_or(|id| placement.id == id))
         .collect::<Vec<_>>();
     // Identity ranking is already complete; prefer the Agent's active surface
     // over inventory-only exact copies before applying the existing safety gates.
@@ -6379,7 +6579,9 @@ fn verified_top_skill_load(
     if placements
         .iter()
         .filter(|placement| {
-            placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+            placement
+                .mutation_scope
+                .is_some_and(|scope| scope != scan::MutationScope::UntrustedExternal)
                 && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
         })
         .all(|placement| placement.entrypoint_digest.is_none())
@@ -6390,11 +6592,24 @@ fn verified_top_skill_load(
     let placement = placements
         .into_iter()
         .find(|placement| {
-            placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+            placement
+                .mutation_scope
+                .is_some_and(|scope| scope != scan::MutationScope::UntrustedExternal)
                 && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
                 && placement.entrypoint_digest.is_some()
         })
         .ok_or_else(|| blocked("eligible_placement_missing", None, None, None))?;
+    let observed = scan
+        .observed_skill_for_placement(placement)
+        .filter(|_| placement.content_identity_digest.is_some())
+        .ok_or_else(|| {
+            blocked(
+                "placement_routing_identity_missing",
+                Some(placement.entrypoint.clone()),
+                None,
+                None,
+            )
+        })?;
     let path = placement.entrypoint.clone();
     let expected_entrypoint_digest = placement.entrypoint_digest.clone().ok_or_else(|| {
         blocked(
@@ -6429,6 +6644,12 @@ fn verified_top_skill_load(
             None,
         )
         .into());
+    }
+    placement
+        .validated_physical_directory()
+        .map_err(|_| blocked("physical_source_drift", Some(path.clone()), None, None))?;
+    if before.parent() != placement.physical_directory.as_deref() {
+        return Err(blocked("physical_source_drift", Some(path.clone()), None, None).into());
     }
     let metadata = std::fs::metadata(&before).map_err(|_| {
         blocked(
@@ -6515,6 +6736,7 @@ fn verified_top_skill_load(
     let read_authority = match placement.mutation_scope {
         Some(scan::MutationScope::Mutable) => "agent_or_managed_root",
         Some(scan::MutationScope::ProviderReadOnly) => "provider_read_only",
+        Some(scan::MutationScope::SharedReadOnly) => "shared_agent_root_read_only",
         Some(scan::MutationScope::DurableReadOnly) => "confirmed_durable_read_only",
         Some(scan::MutationScope::UntrustedExternal) | None => unreachable!("filtered above"),
     };
@@ -6522,7 +6744,9 @@ fn verified_top_skill_load(
         "selection": {
             "rank": matched.rank,
             "skill_id": matched.skill_id,
-            "name": matched.name,
+            "name": observed.name,
+            "placement_id": placement.id,
+            "content_identity_digest": placement.content_identity_digest,
             "snapshot_id": scan_id,
             "ranking_evidence": matched.match_reasons,
             "ranking_evidence_scope": "loaded_identity",
@@ -6582,6 +6806,21 @@ fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
     let record = store
         .get_plan(&id)?
         .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
+    let hermes_rescan_reason = if record.status == PlanStatus::Ready {
+        store
+            .scan_payload::<ScanResult>(&record.scan_id)?
+            .and_then(|scan| {
+                require_hermes_snapshot_contract(&scan)
+                    .err()
+                    .and_then(|error| {
+                        error
+                            .downcast_ref::<ContentIdentityRescanRequired>()
+                            .map(|error| error.reason)
+                    })
+            })
+    } else {
+        None
+    };
     let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
     let mut result = record
         .input
@@ -6599,6 +6838,10 @@ fn plan_detail_command(store: &StateStore, id: &str) -> Result<Value> {
     object.insert("report_id".into(), json!(record.report_id));
     object.insert("digest".into(), json!(prepared.digest));
     object.insert("state".into(), json!(record.status));
+    if let Some(reason) = hermes_rescan_reason {
+        object.insert("rescan_required".into(), json!(true));
+        object.insert("rescan_reason".into(), json!(reason));
+    }
     object.insert("operations".into(), json!(prepared.operations));
     object.insert("roster_changes".into(), json!(prepared.roster_changes));
     object.insert("evidence_ids".into(), json!(prepared.evidence_ids));
@@ -7774,6 +8017,9 @@ fn normalize_agent_plan(
             SourceUpdateChoice::AdoptUpstream => "adopt_upstream",
             SourceUpdateChoice::PreserveBoth => "preserve_both",
         };
+        if matches!(choice, SourceUpdateChoice::AdoptUpstream) {
+            validate_source_update_native_visibility(scan, placement, &request.upstream_content)?;
+        }
         let expected_file_fingerprint = change::fingerprint(&placement.entrypoint)?.to_string();
         let action_target = placement.entrypoint.clone();
         match choice {
@@ -8038,6 +8284,13 @@ fn normalize_library_plan(
             }
         };
 
+        validate_library_native_visibility(
+            scan,
+            &request.skill_id,
+            &link_source,
+            &canonical.directory,
+        )?;
+
         let mut replacement_paths = Vec::new();
         if adds_hosted_library_placement {
             replacement_paths.push(canonical.directory.clone());
@@ -8149,6 +8402,135 @@ fn normalize_library_plan(
     input["operations"] = Value::Array(operations);
     input["library_changes"] = Value::Array(actions);
     Ok((input, impacts, PlanOrigin::LibraryGovernance))
+}
+
+fn require_preserved_native_visibility(
+    scan: &ScanResult,
+    placement: &scan::SkillPlacement,
+    projected: crate::claude_visibility::CatalogVisibility,
+) -> Result<()> {
+    use crate::claude_visibility::CatalogVisibility;
+    let observed = match placement.agent {
+        Some(AgentKind::Codex) => scan
+            .codex_visibility
+            .as_ref()
+            .and_then(|v| v.placements.get(&placement.id).copied()),
+        Some(AgentKind::Hermes) => scan
+            .hermes_visibility
+            .as_ref()
+            .and_then(|v| v.placements.get(&placement.id).copied()),
+        _ => None,
+    }
+    .unwrap_or(CatalogVisibility::Unknown);
+    // These changes retain every logical placement path and its discovery scope.
+    if observed == CatalogVisibility::NotDiscovered {
+        return Ok(());
+    }
+    if !matches!(observed, CatalogVisibility::On | CatalogVisibility::Off) || observed != projected
+    {
+        return Err(crate::roster_plan::NativeVisibilityConflict {
+            agent: placement.agent.expect("native consumer has an Agent"),
+            skill_id: placement.skill_id.clone(),
+            mode: if observed == CatalogVisibility::On {
+                projected
+            } else {
+                observed
+            },
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_library_native_visibility(
+    scan: &ScanResult,
+    skill_id: &str,
+    source: &Path,
+    metadata_source: &Path,
+) -> Result<()> {
+    let package_sources = scan
+        .placements
+        .iter()
+        .filter(|placement| placement.skill_id == skill_id)
+        .filter_map(|placement| placement.physical_directory.as_ref())
+        .collect::<Vec<_>>();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| matches!(placement.agent, Some(AgentKind::Codex | AgentKind::Hermes)))
+    {
+        let Some(physical) = placement.physical_directory.as_ref() else {
+            continue;
+        };
+        let Some(relative) = package_sources
+            .iter()
+            .filter_map(|root| {
+                physical
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|relative| (root, relative))
+            })
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, relative)| relative)
+        else {
+            continue;
+        };
+        // Include unchanged canonical placements and nested package consumers:
+        // their path rules can join the new source identity after consolidation.
+        let projected_source = source.join(relative).join("SKILL.md");
+        let projected = if placement.agent == Some(AgentKind::Hermes) {
+            let verified_source = metadata_source.join(relative).join("SKILL.md");
+            scan.hermes_visibility.as_ref().map_or(
+                crate::claude_visibility::CatalogVisibility::Unknown,
+                |visibility| {
+                    visibility
+                        .visibility_for_replacement_source(&placement.entrypoint, &verified_source)
+                },
+            )
+        } else {
+            scan.codex_visibility.as_ref().map_or(
+                crate::claude_visibility::CatalogVisibility::Unknown,
+                |visibility| {
+                    visibility.visibility_for_retargeted_entrypoint(
+                        &placement.entrypoint,
+                        &projected_source,
+                    )
+                },
+            )
+        };
+        require_preserved_native_visibility(scan, placement, projected)?;
+    }
+    Ok(())
+}
+
+fn validate_source_update_native_visibility(
+    scan: &ScanResult,
+    source: &scan::SkillPlacement,
+    content: &str,
+) -> Result<()> {
+    let physical = source.validated_physical_directory()?;
+    for placement in scan.placements.iter().filter(|placement| {
+        matches!(placement.agent, Some(AgentKind::Codex | AgentKind::Hermes))
+            && placement.physical_directory.as_ref() == Some(&physical)
+    }) {
+        let projected = if placement.agent == Some(AgentKind::Hermes) {
+            scan.hermes_visibility.as_ref().map_or(
+                crate::claude_visibility::CatalogVisibility::Unknown,
+                |visibility| {
+                    visibility.visibility_for_updated_entrypoint(&placement.entrypoint, content)
+                },
+            )
+        } else {
+            scan.codex_visibility.as_ref().map_or(
+                crate::claude_visibility::CatalogVisibility::Unknown,
+                |visibility| {
+                    visibility.visibility_for_updated_entrypoint(&placement.entrypoint, content)
+                },
+            )
+        };
+        require_preserved_native_visibility(scan, placement, projected)?;
+    }
+    Ok(())
 }
 
 fn safe_skill_directory_name(name: &str) -> Result<String> {
@@ -8313,6 +8695,18 @@ fn prepare_plan(
     }
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
+    for change in &prepared.library_changes {
+        validate_library_native_visibility(
+            &scan,
+            &change.skill_id,
+            change
+                .library_path
+                .as_deref()
+                .unwrap_or(&change.canonical_path),
+            &change.canonical_path,
+        )?;
+    }
+
     validate_plan_evidence(store, &prepared, &scan_id)?;
     if finding_provenance.is_none() && !prepared.roster_changes.is_empty() {
         validate_raw_roster_evidence_scope(store, &prepared, &scan)?;
@@ -8440,6 +8834,9 @@ fn prepare_plan(
         "affected": affected,
         "diff_summary": diff_summary,
         "impact": impact,
+        "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
+        "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
+        "hermes_visibility": scan.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
         "detail": {
             "available": true,
             "command": ["plan", "--show", prepared.id, "--json"],
@@ -8499,10 +8896,23 @@ fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -
         .into());
     }
     require_content_identity(&scan)?;
+    validate_new_hermes_bootstrap_targets(&prepared, &scan, &record.input["reuse_identity"])?;
     validate_governance_fingerprint_completeness(&prepared, &scan)?;
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
     validate_roster_changes(store, &prepared, &scan)?;
     validate_source_update_preconditions(&prepared, &scan)?;
+    for change in &prepared.library_changes {
+        validate_library_native_visibility(
+            &scan,
+            &change.skill_id,
+            change
+                .library_path
+                .as_deref()
+                .unwrap_or(&change.canonical_path),
+            &change.canonical_path,
+        )?;
+    }
+
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     if Value::Array(roster_before.clone()) != record.input["roster_before"] {
@@ -8849,6 +9259,27 @@ struct BootstrapPackageManifest<'a> {
 
 const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
     BootstrapPackageManifest {
+        version: "1.8.50",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "2cb9d6aa446c8cba2a8cd57e36ed256edd6655110006e64df173bfb94bfddcd1",
+            ),
+            (
+                "references/routing.md",
+                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
+            ),
+            (
+                "references/governance.md",
+                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
+            ),
+            (
+                "references/mutation.md",
+                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
+            ),
+        ],
+    },
+    BootstrapPackageManifest {
         version: "1.8.49",
         file_digests: &[
             (
@@ -9135,6 +9566,7 @@ fn setup_command_with_manifests<'a>(
         }));
     };
     require_loaded_snapshot_current(store, &snapshot_id, &snapshot)?;
+    require_content_identity(&snapshot)?;
     let current_package = current_bootstrap_package();
     let mut detected = Vec::new();
     let mut targets = Vec::new();
@@ -9167,6 +9599,16 @@ fn setup_command_with_manifests<'a>(
             .skill_roots
             .into_iter()
             .filter_map(|root| {
+                // Shared discovery does not establish a Codex installation or
+                // authorize Bootstrap writes into another Agent's catalog.
+                if snapshot.roots.iter().any(|observed| {
+                    observed.agent == Some(agent)
+                        && observed.kind == RootKind::Skills
+                        && observed.path == root
+                        && observed.shared
+                }) {
+                    return None;
+                }
                 if root.is_dir() {
                     return Some((root, "existing_skill_root"));
                 }
@@ -9278,6 +9720,24 @@ fn setup_command_with_manifests<'a>(
                 || package_status == "official_outdated"
                 || (package_status == "modified"
                     && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
+            if should_install
+                && agent == AgentKind::Hermes
+                && observed_files.iter().any(|(path, status, _)| {
+                    *path == "SKILL.md" && matches!(status, BootstrapFileStatus::Missing)
+                })
+            {
+                let overrides = current_package
+                    .iter()
+                    .map(|(path, _, content)| (PathBuf::from(path), content.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let skill_id = scan::projected_skill_id(&physical_directory, &overrides)?;
+                require_new_hermes_bootstrap_visibility(
+                    &snapshot,
+                    &entrypoint,
+                    &overrides[Path::new("SKILL.md")],
+                    &skill_id,
+                )?;
+            }
             if should_install && !check {
                 planned_agents.insert(agent.id().to_owned());
                 if root_missing {
@@ -9573,6 +10033,13 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
 
     let mut skill_ids = std::collections::BTreeMap::new();
     let mut skill_names = std::collections::BTreeMap::new();
+    let mut routing_by_skill = BTreeMap::<&str, Vec<&scan::ScannedSkill>>::new();
+    for observation in scan.routing_skills() {
+        routing_by_skill
+            .entry(&observation.id)
+            .or_default()
+            .push(observation);
+    }
     for skill in &scan.skills {
         let id = SkillId::parse(skill.id.clone())?;
         let canonical_path = scan
@@ -9619,12 +10086,31 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 })?;
             }
         }
+        // FTS only selects candidate identities. The query scorer evaluates
+        // these content observations separately before attributing evidence.
+        let observations = &routing_by_skill[skill.id.as_str()];
         store.index_skill(
             &stored_id,
-            &skill.name,
-            skill.metadata.description.as_deref().unwrap_or_default(),
-            &skill.metadata.triggers.join(" "),
-            &skill.normalized_text,
+            &observations
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &observations
+                .iter()
+                .filter_map(|item| item.metadata.description.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &observations
+                .iter()
+                .flat_map(|item| item.metadata.triggers.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            &observations
+                .iter()
+                .map(|item| item.normalized_text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
         )?;
         skill_ids.insert(skill.id.clone(), stored_id.clone());
         skill_names.insert(skill.id.clone(), skill.name.clone());
@@ -9641,7 +10127,14 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
             json!({"algorithm": skill.digest_algorithm, "name": skill.name}),
             observed_at,
         )?;
-        if let Some(content_identity_digest) = skill.content_identity_digest.as_deref() {
+        for (observation, content_identity_digest) in
+            observations.iter().filter_map(|observation| {
+                observation
+                    .content_identity_digest
+                    .as_deref()
+                    .map(|digest| (observation, digest))
+            })
+        {
             save_reference_evidence(
                 store,
                 scan_id,
@@ -9654,7 +10147,7 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 Some(content_identity_digest.to_owned()),
                 json!({
                     "algorithm": scan::CONTENT_IDENTITY_ALGORITHM,
-                    "name": skill.name,
+                    "name": observation.name,
                     "scope": "routing_content_identity"
                 }),
                 observed_at,
@@ -9714,13 +10207,15 @@ fn persist_index(store: &StateStore, scan_id: &ScanId, scan: &ScanResult) -> Res
                 "link_status": placement.link_status,
                 "link_target": placement.link_target,
                 "default_exposed": placement.default_exposed,
-                "native_visibility": scan.native_visibility.as_ref().and_then(|visibility| visibility.placements.get(&placement.id)),
+                "native_visibility": scan.placement_native_visibility(placement),
                 "governable": placement.is_mutable(),
                 "owned_by_agent": placement.owned_by_agent,
                 "mutation_scope": placement.mutation_scope,
                 "provider": placement.provider,
                 "fingerprint_completeness": placement.fingerprint_completeness,
                 "fingerprint_detail": placement.fingerprint_detail,
+                "content_identity_digest": placement.content_identity_digest,
+                "observed_name": scan.observed_skill_for_placement(placement).map(|skill| &skill.name),
             }),
             observed_at,
         )?;
@@ -9880,6 +10375,8 @@ fn validate_roster_changes(
     scan: &ScanResult,
 ) -> Result<()> {
     validate_governance_operation_mutation_scopes(plan, scan)?;
+    validate_hermes_entrypoint_replacements(plan, scan)?;
+    validate_hermes_consumers_after_moves(plan, scan)?;
     let mut requested = std::collections::HashSet::new();
     for change in &plan.roster_changes {
         let agent = harness_agent(&change.agent)?;
@@ -9931,14 +10428,260 @@ fn validate_roster_changes(
     Ok(())
 }
 
+fn validate_hermes_consumers_after_moves(plan: &PreparedPlan, scan: &ScanResult) -> Result<()> {
+    for (move_index, operation) in plan.operations.iter().enumerate() {
+        let Operation::MoveRecoverable {
+            source,
+            target,
+            expected_fingerprint,
+        } = operation
+        else {
+            continue;
+        };
+        let linked_source = std::fs::symlink_metadata(source)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            .then(|| std::fs::canonicalize(source).ok())
+            .flatten();
+        for placement in scan
+            .placements
+            .iter()
+            .filter(|placement| placement.agent == Some(AgentKind::Hermes))
+        {
+            let Some(physical) = placement.physical_directory.as_ref() else {
+                continue;
+            };
+            let relative = physical
+                .strip_prefix(source)
+                .ok()
+                .or_else(|| {
+                    linked_source
+                        .as_ref()
+                        .and_then(|source| physical.strip_prefix(source).ok())
+                })
+                .or_else(|| {
+                    placement.link_target.as_ref().and_then(|link| {
+                        scan.placements
+                            .iter()
+                            .filter(|removed| {
+                                scan.observed_physical_mutation_path(removed)
+                                    == Some(source.as_path())
+                            })
+                            .find_map(|removed| link.strip_prefix(&removed.directory).ok())
+                    })
+                });
+            let Some(relative) = relative else {
+                continue;
+            };
+            if plan.roster_changes.iter().any(|change| {
+                change.agent == "hermes"
+                    && change.skill_id == placement.skill_id
+                    && change.state != "core"
+            }) {
+                continue;
+            }
+            let future = target.join(relative);
+            let consumer_path = scan
+                .observed_physical_mutation_path(placement)
+                .unwrap_or(&placement.directory);
+            let preserved = plan
+                .operations
+                .iter()
+                .enumerate()
+                .any(|(link_index, operation)| {
+                    let Operation::CreateSymlink {
+                        target: link,
+                        source: destination,
+                        expected_source_fingerprint,
+                        ..
+                    } = operation
+                    else {
+                        return false;
+                    };
+                    let provider_move =
+                        plan.operations
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, operation)| match operation {
+                                Operation::MoveRecoverable {
+                                    source,
+                                    target,
+                                    expected_fingerprint,
+                                } if index < link_index
+                                    && target == destination
+                                    && expected_fingerprint == expected_source_fingerprint
+                                    && std::fs::read_link(source)
+                                        .map_or(true, |path| path.is_absolute()) =>
+                                {
+                                    Some(index)
+                                }
+                                _ => None,
+                            });
+                    let trusted_destination = provider_move.is_some()
+                        || change::fingerprint(destination)
+                            .is_ok_and(|fingerprint| fingerprint == *expected_source_fingerprint);
+                    let restores_parent = link == source
+                        && expected_source_fingerprint == expected_fingerprint
+                        && trusted_destination;
+                    let retargets_consumer = link == consumer_path
+                        && ((destination == &future
+                            && std::fs::read_link(source).map_or(true, |path| path.is_absolute()))
+                            || trusted_destination)
+                        && change::fingerprint(physical)
+                            .is_ok_and(|fingerprint| fingerprint == *expected_source_fingerprint);
+                    let retained_physical = if restores_parent {
+                        destination.join(relative)
+                    } else {
+                        destination.clone()
+                    };
+                    link_index > move_index
+                        && (restores_parent || retargets_consumer)
+                        && !plan
+                            .operations
+                            .iter()
+                            .enumerate()
+                            .any(|(index, operation)| {
+                                if index == move_index
+                                    || index == link_index
+                                    || provider_move == Some(index)
+                                    || matches!(operation, Operation::CreateDirectory { .. })
+                                {
+                                    return false;
+                                }
+                                let mut paths = vec![operation.target()];
+                                if let Operation::MoveRecoverable { source, .. } = operation {
+                                    paths.push(source);
+                                }
+                                paths.into_iter().any(|path| {
+                                    paths_overlap(path, &retained_physical)
+                                        || (index > link_index && paths_overlap(path, link))
+                                })
+                            })
+                });
+            if !preserved {
+                return Err(crate::roster_plan::RosterSafetyBlocker::DependentSource {
+                    skill_id: placement.skill_id.clone(),
+                    placement_ids: vec![placement.id.clone()],
+                    paths: vec![placement.directory.clone(), source.clone(), target.clone()],
+                }
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn require_new_hermes_bootstrap_visibility(
+    scan: &ScanResult,
+    entrypoint: &Path,
+    content: &str,
+    skill_id: &str,
+) -> Result<()> {
+    use crate::claude_visibility::CatalogVisibility;
+    let mode = scan
+        .hermes_visibility
+        .as_ref()
+        .map_or(CatalogVisibility::Unknown, |visibility| {
+            visibility.visibility_for_updated_entrypoint(entrypoint, content)
+        });
+    if mode != CatalogVisibility::On {
+        return Err(crate::roster_plan::NativeVisibilityConflict {
+            agent: AgentKind::Hermes,
+            skill_id: skill_id.into(),
+            mode,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_new_hermes_bootstrap_targets(
+    plan: &PreparedPlan,
+    scan: &ScanResult,
+    reuse_identity: &Value,
+) -> Result<()> {
+    if reuse_identity.get("modified_choice").is_none()
+        || !reuse_identity["affected_agents"]
+            .as_array()
+            .is_some_and(|agents| agents.iter().any(|agent| agent == "hermes"))
+    {
+        return Ok(());
+    }
+    for root in scan.roots.iter().filter(|root| {
+        root.agent == Some(AgentKind::Hermes) && root.kind == RootKind::Skills && !root.explicit
+    }) {
+        let entrypoint = root.path.join("skillroster/SKILL.md");
+        let physical = resolve_path_with_missing_tail(&entrypoint);
+        for operation in &plan.operations {
+            let Operation::WriteFile {
+                target, content, ..
+            } = operation
+            else {
+                continue;
+            };
+            if *target != physical {
+                continue;
+            }
+            let directory = target.parent().expect("Bootstrap entrypoint has parent");
+            let overrides = plan
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::WriteFile {
+                        target, content, ..
+                    }
+                    | Operation::ReplaceFile {
+                        target, content, ..
+                    } => target
+                        .strip_prefix(directory)
+                        .ok()
+                        .map(|path| (path.to_path_buf(), content.clone())),
+                    _ => None,
+                })
+                .collect::<BTreeMap<_, _>>();
+            let skill_id = scan::projected_skill_id(directory, &overrides)?;
+            require_new_hermes_bootstrap_visibility(scan, &entrypoint, content, &skill_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_hermes_entrypoint_replacements(plan: &PreparedPlan, scan: &ScanResult) -> Result<()> {
+    for operation in &plan.operations {
+        let (target, content) = match operation {
+            Operation::ReplaceFile {
+                target, content, ..
+            }
+            | Operation::WriteFile {
+                target, content, ..
+            } if target.file_name().is_some_and(|name| name == "SKILL.md") => (target, content),
+            _ => continue,
+        };
+        for placement in scan.placements.iter().filter(|placement| {
+            placement.agent == Some(AgentKind::Hermes)
+                && (placement
+                    .physical_directory
+                    .as_ref()
+                    .is_some_and(|directory| directory.join("SKILL.md") == *target)
+                    || std::fs::canonicalize(&placement.entrypoint)
+                        .is_ok_and(|entrypoint| entrypoint == *target))
+        }) {
+            let projected = scan.hermes_visibility.as_ref().map_or(
+                crate::claude_visibility::CatalogVisibility::Unknown,
+                |visibility| {
+                    visibility.visibility_for_updated_entrypoint(&placement.entrypoint, content)
+                },
+            );
+            require_preserved_native_visibility(scan, placement, projected)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_governance_operation_mutation_scopes(
     plan: &PreparedPlan,
     scan: &ScanResult,
 ) -> Result<()> {
-    let has_governance_changes = !plan.roster_changes.is_empty()
-        || !plan.source_updates.is_empty()
-        || !plan.library_changes.is_empty();
-    if !has_governance_changes || plan.operations.is_empty() {
+    if plan.operations.is_empty() {
         return Ok(());
     }
     for operation in &plan.operations {
@@ -9950,8 +10693,8 @@ fn validate_governance_operation_mutation_scopes(
             | Operation::WriteFile { target, .. }
             | Operation::ReplaceFile { target, .. }
             | Operation::RemoveSymlink { target, .. }
-            | Operation::Copy { target, .. } => vec![target.as_path()],
-            Operation::CreateDirectory { .. } => Vec::new(),
+            | Operation::Copy { target, .. }
+            | Operation::CreateDirectory { target, .. } => vec![target.as_path()],
         };
         for mutation_path in mutation_paths {
             let mut blocked_by_skill = BTreeMap::<&str, Vec<&scan::SkillPlacement>>::new();
@@ -10107,6 +10850,20 @@ fn validate_source_update_preconditions(plan: &PreparedPlan, scan: &ScanResult) 
                 "Source-update preconditions drifted for {}",
                 update.placement_id
             );
+        }
+        if update.choice == "adopt_upstream" {
+            let physical_target = std::fs::canonicalize(&update.target)?;
+            let content = plan
+                .operations
+                .iter()
+                .find_map(|operation| match operation {
+                    Operation::ReplaceFile {
+                        target, content, ..
+                    } if target == &physical_target => Some(content),
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow!("Source-update replacement operation is missing"))?;
+            validate_source_update_native_visibility(scan, placement, content)?;
         }
         let actual = change::fingerprint(&update.target)?;
         if actual != update.expected_file_fingerprint {
@@ -10386,6 +11143,12 @@ fn legacy_used_source_root_permission_ids(scan: &ScanResult) -> BTreeSet<String>
 }
 
 fn require_content_identity(scan: &ScanResult) -> Result<()> {
+    require_hermes_snapshot_contract(scan)?;
+    if let Some(visibility) = &scan.hermes_visibility {
+        visibility
+            .validate()
+            .map_err(|reason| ContentIdentityRescanRequired { reason })?;
+    }
     if scan.content_identity_algorithm.as_deref() != Some(scan::CONTENT_IDENTITY_ALGORITHM) {
         return Err(ContentIdentityRescanRequired {
             reason: "legacy_snapshot_requires_rescan",
@@ -10395,6 +11158,18 @@ fn require_content_identity(scan: &ScanResult) -> Result<()> {
     if scan.identity_path_coverage != scan::IdentityPathCoverage::Complete {
         return Err(ContentIdentityRescanRequired {
             reason: "non_unicode_identity_coverage_incomplete",
+        }
+        .into());
+    }
+    if let Some(visibility) = &scan.codex_visibility {
+        visibility
+            .validate()
+            .map_err(|reason| ContentIdentityRescanRequired { reason })?;
+    } else {
+        // Every prior Snapshot needs the new root authority observation, even
+        // if shared content was recorded only as an Agent-less source.
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_codex_visibility_requires_rescan",
         }
         .into());
     }
@@ -10409,6 +11184,60 @@ fn require_content_identity(scan: &ScanResult) -> Result<()> {
     {
         return Err(ContentIdentityRescanRequired {
             reason: "legacy_native_visibility_requires_rescan",
+        }
+        .into());
+    }
+    if scan.skill_content_variants.is_none() {
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_content_observations_require_rescan",
+        }
+        .into());
+    }
+    if scan.placements.iter().any(|placement| {
+        placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+            && (placement.content_identity_digest.is_none()
+                || scan.observed_skill_for_placement(placement).is_none())
+    }) {
+        return Err(ContentIdentityRescanRequired {
+            reason: "placement_routing_identity_missing",
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn has_included_hermes_skill_root(scan: &ScanResult) -> bool {
+    scan.roots.iter().any(|root| {
+        root.agent == Some(AgentKind::Hermes)
+            && root.kind == RootKind::Skills
+            && root.status == scan::RootStatus::Included
+    })
+}
+
+fn require_hermes_snapshot_contract(scan: &ScanResult) -> Result<()> {
+    require_hermes_discovery(scan)?;
+    if scan.roots.iter().any(|root| {
+        root.agent == Some(AgentKind::Hermes) && root.status == scan::RootStatus::Included
+    }) {
+        let visibility = scan
+            .hermes_visibility
+            .as_ref()
+            .ok_or(ContentIdentityRescanRequired {
+                reason: "legacy_hermes_visibility_requires_rescan",
+            })?;
+        visibility
+            .validate_contract()
+            .map_err(|reason| ContentIdentityRescanRequired { reason })?;
+    }
+    Ok(())
+}
+
+fn require_hermes_discovery(scan: &ScanResult) -> Result<()> {
+    if scan.hermes_discovery_contract_version != Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION)
+        && has_included_hermes_skill_root(scan)
+    {
+        return Err(ContentIdentityRescanRequired {
+            reason: "legacy_hermes_discovery_requires_rescan",
         }
         .into());
     }
@@ -10810,6 +11639,423 @@ mod recovery_tests {
     use tempfile::TempDir;
 
     #[test]
+    #[cfg(unix)]
+    fn hermes_metadata_updates_preserve_shared_consumers_and_bootstrap_restrictions() {
+        use crate::claude_visibility::CatalogVisibility;
+        let home = TempDir::new().unwrap();
+        let source = home.path().join(".codex/skills/research");
+        let hermes_root = home.path().join(".hermes/skills");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&hermes_root).unwrap();
+        let original = "---\nname: research\ndescription: Research\n---\nOriginal\n";
+        std::fs::write(source.join("SKILL.md"), original).unwrap();
+        std::fs::create_dir_all(source.join("child")).unwrap();
+        std::fs::write(
+            source.join("child/SKILL.md"),
+            "---\nname: child\nplatforms: false\n---\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&source, hermes_root.join("research")).unwrap();
+        std::fs::write(
+            home.path().join(".hermes/config.yaml"),
+            "skills:\n  disabled: [research]\n",
+        )
+        .unwrap();
+        let observed = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+        let source_placement = observed
+            .placements
+            .iter()
+            .find(|p| p.agent == Some(AgentKind::Codex) && p.directory == source)
+            .unwrap();
+        let consumer = observed
+            .placements
+            .iter()
+            .find(|p| {
+                p.agent == Some(AgentKind::Hermes) && p.directory == hermes_root.join("research")
+            })
+            .unwrap();
+        assert_eq!(
+            observed.placement_native_visibility(consumer),
+            Some(&CatalogVisibility::Off)
+        );
+        validate_source_update_native_visibility(&observed, source_placement, original).unwrap();
+        let library_error = validate_library_native_visibility(
+            &observed,
+            &source_placement.skill_id,
+            &home.path().join("future-library/research"),
+            &source,
+        )
+        .unwrap_err();
+        let nested_conflict = library_error
+            .downcast_ref::<crate::roster_plan::NativeVisibilityConflict>()
+            .unwrap();
+        assert_eq!(nested_conflict.agent, AgentKind::Hermes);
+        assert_eq!(nested_conflict.mode, CatalogVisibility::Unknown);
+        let reactivated = "---\nname: skillroster\ndescription: replacement\n---\n";
+        let error =
+            validate_source_update_native_visibility(&observed, source_placement, reactivated)
+                .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::roster_plan::NativeVisibilityConflict>()
+                .unwrap()
+                .agent,
+            AgentKind::Hermes
+        );
+        let prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![Operation::ReplaceFile {
+                target: std::fs::canonicalize(source.join("SKILL.md")).unwrap(),
+                content: reactivated.into(),
+                expected_fingerprint: "sha256:before".into(),
+            }],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![],
+            path_projections: vec![],
+            approved_roots: vec![home.path().to_path_buf()],
+            state_dir: home.path().join("state"),
+        };
+        assert!(validate_hermes_entrypoint_replacements(&prepared, &observed).is_err());
+        assert_eq!(
+            std::fs::read_to_string(source.join("SKILL.md")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn old_ready_move_cannot_break_nested_hermes_consumer_but_hosted_restore_is_preserved() {
+        for alias_chain in [false, true] {
+            let home = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let parent = home.path().join(".claude/skills/parent");
+            let consumer = home.path().join(".hermes/skills/child");
+            let real = if alias_chain {
+                home.path().join(".pi/agent/skills/parent")
+            } else {
+                parent.clone()
+            };
+            std::fs::create_dir_all(real.join("child")).unwrap();
+            if alias_chain {
+                std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(&real, &parent).unwrap();
+            }
+            std::fs::create_dir_all(consumer.parent().unwrap()).unwrap();
+            std::fs::write(real.join("SKILL.md"), "---\nname: parent\n---\nParent\n").unwrap();
+            let child_bytes = "---\nname: child\n---\nChild bytes\n";
+            std::fs::write(real.join("child/SKILL.md"), child_bytes).unwrap();
+            let link_target = if alias_chain {
+                let indirect = home.path().join("indirect-child");
+                std::os::unix::fs::symlink(parent.join("child"), &indirect).unwrap();
+                indirect
+            } else {
+                parent.join("child")
+            };
+            std::os::unix::fs::symlink(link_target, &consumer).unwrap();
+            let mut observed = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+            // Recheck a same-contract Ready payload carrying the former mutable authority.
+            for placement in &mut observed.placements {
+                placement.mutation_scope = Some(scan::MutationScope::Mutable);
+                placement.governable = true;
+            }
+            let parent = std::fs::canonicalize(parent.parent().unwrap())
+                .unwrap()
+                .join("parent");
+            let target = state.path().join("library/parent");
+            let fingerprint = change::fingerprint(&parent).unwrap();
+            let scan_run = ScanRun {
+                id: ScanId::new(),
+                started_at: 1,
+                completed_at: Some(2),
+                status: ScanStatus::Completed,
+                coverage_notes: vec![],
+            };
+            let store = StateStore::open_in_memory().unwrap();
+            store.save_scan(&scan_run).unwrap();
+            store.save_scan_payload(&scan_run.id, &observed).unwrap();
+            let mut prepared = PreparedPlan {
+                id: PlanId::new().to_string(),
+                scan_id: scan_run.id.to_string(),
+                evidence_ids: vec![],
+                digest: "sha256:old-ready".into(),
+                operations: vec![Operation::MoveRecoverable {
+                    source: parent.clone(),
+                    target: target.clone(),
+                    expected_fingerprint: fingerprint.clone(),
+                }],
+                roster_changes: vec![],
+                source_updates: vec![],
+                library_changes: vec![],
+                path_projections: vec![],
+                approved_roots: vec![home.path().into()],
+                state_dir: state.path().into(),
+            };
+            let record = plan_record(
+                &prepared,
+                json!({}),
+                vec![],
+                vec![],
+                None,
+                vec![],
+                json!({}),
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+            store.save_plan(&record).unwrap();
+            let lock = change::StateLock::acquire_exclusive(state.path()).unwrap();
+            let error = apply_command(&store, record.id.as_str(), &lock).unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<crate::roster_plan::RosterSafetyBlocker>(),
+                    Some(crate::roster_plan::RosterSafetyBlocker::DependentSource { .. })
+                ),
+                "{error:#}"
+            );
+            let envelope: Value =
+                serde_json::from_str(&error_json("apply", error.as_ref())).unwrap();
+            assert_eq!(
+                envelope["error"]["code"],
+                "roster_dependent_source_conflict"
+            );
+            assert_eq!(
+                envelope["error"]["details"]["reason"],
+                "dependent_source_would_break"
+            );
+            assert_eq!(
+                envelope["error"]["details"]["next_action"],
+                "preserve_or_retarget_dependent_source"
+            );
+            assert_eq!(
+                envelope["error"]["details"]["paths"],
+                json!([consumer, parent, target])
+            );
+            assert_eq!(
+                store.get_plan(&record.id).unwrap().unwrap().status,
+                PlanStatus::Ready
+            );
+            assert_eq!(
+                std::fs::read_to_string(consumer.join("SKILL.md")).unwrap(),
+                child_bytes
+            );
+            assert!(parent.is_dir());
+            assert!(!target.exists());
+            prepared.operations.push(Operation::CreateSymlink {
+                target: parent.clone(),
+                source: target,
+                expected_fingerprint: "missing".into(),
+                expected_source_fingerprint: fingerprint,
+            });
+            validate_hermes_consumers_after_moves(&prepared, &observed).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_hermes_bootstrap_requires_local_on_at_setup_and_ready_apply_validation() {
+        for (config, allowed) in [
+            ("skills:\n  disabled: [skillroster]\n", false),
+            (
+                "skills:\n  platform_disabled:\n    telegram: [skillroster]\n",
+                false,
+            ),
+            ("skills: {}\n", true),
+        ] {
+            let home = TempDir::new().unwrap();
+            let state = TempDir::new().unwrap();
+            let root = home.path().join(".hermes/skills");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(home.path().join(".hermes/config.yaml"), config).unwrap();
+            let observed = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+            let store = StateStore::open_in_memory().unwrap();
+            let scan_run = ScanRun {
+                id: ScanId::new(),
+                started_at: 1,
+                completed_at: Some(2),
+                status: ScanStatus::Completed,
+                coverage_notes: vec![],
+            };
+            store.save_scan(&scan_run).unwrap();
+            store.save_scan_payload(&scan_run.id, &observed).unwrap();
+            let setup = setup_command(&store, home.path(), state.path(), None, false);
+            assert_eq!(setup.is_ok(), allowed);
+            if let Ok(result) = setup {
+                assert_eq!(result["state"], "preview_ready");
+            }
+            let content = current_bootstrap_package()
+                .into_iter()
+                .find(|(path, _, _)| *path == "SKILL.md")
+                .unwrap()
+                .2;
+            let plan = PreparedPlan {
+                id: PlanId::new().to_string(),
+                scan_id: scan_run.id.to_string(),
+                evidence_ids: vec![],
+                digest: "sha256:test".into(),
+                operations: vec![Operation::WriteFile {
+                    target: resolve_path_with_missing_tail(&root.join("skillroster/SKILL.md")),
+                    content,
+                    expected_fingerprint: "missing".into(),
+                }],
+                roster_changes: vec![],
+                source_updates: vec![],
+                library_changes: vec![],
+                path_projections: vec![],
+                approved_roots: vec![root.clone()],
+                state_dir: state.path().to_path_buf(),
+            };
+            let reuse = json!({"modified_choice": null, "affected_agents": ["hermes"]});
+            let result = validate_new_hermes_bootstrap_targets(&plan, &observed, &reuse);
+            assert_eq!(result.is_ok(), allowed);
+            if let Err(error) = result {
+                assert!(
+                    error
+                        .downcast_ref::<crate::roster_plan::NativeVisibilityConflict>()
+                        .is_some()
+                );
+            }
+            // A source-update WriteFile carries no Setup reuse identity.
+            validate_new_hermes_bootstrap_targets(&plan, &observed, &Value::Null).unwrap();
+            assert!(!root.join("skillroster").exists());
+        }
+    }
+
+    #[test]
+    fn hermes_sessions_only_setup_authority_requires_frozen_visibility() {
+        for existing_config in [false, true] {
+            let home = TempDir::new().unwrap();
+            std::fs::create_dir_all(home.path().join(".hermes/sessions")).unwrap();
+            let config = home.path().join(".hermes/config.yaml");
+            if existing_config {
+                std::fs::write(&config, "skills: {}\n").unwrap();
+            }
+            let mut observed = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+            assert!(!has_included_hermes_skill_root(&observed));
+            require_content_identity(&observed).unwrap();
+            let visibility = observed.hermes_visibility.take();
+            observed.hermes_discovery_contract_version = None;
+            let error = require_content_identity(&observed).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ContentIdentityRescanRequired>()
+                    .unwrap()
+                    .reason,
+                "legacy_hermes_visibility_requires_rescan"
+            );
+            observed.hermes_visibility = visibility;
+            std::fs::write(&config, "skills:\n  disabled: [skillroster]\n").unwrap();
+            let error = require_content_identity(&observed).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ContentIdentityRescanRequired>()
+                    .unwrap()
+                    .reason,
+                "hermes_visibility_settings_changed"
+            );
+            require_hermes_snapshot_contract(&observed).unwrap();
+            assert!(!home.path().join(".hermes/skills").exists());
+        }
+    }
+
+    #[test]
+    fn hermes_visibility_contract_and_settings_drift_require_rescan() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes/skills")).unwrap();
+        let mut observed = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+        require_content_identity(&observed).unwrap();
+        let visibility = observed.hermes_visibility.take();
+        let error = require_content_identity(&observed).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ContentIdentityRescanRequired>()
+                .unwrap()
+                .reason,
+            "legacy_hermes_visibility_requires_rescan"
+        );
+        observed.hermes_visibility = visibility;
+        std::fs::write(
+            home.path().join(".hermes/config.yaml"),
+            "skills:\n  disabled: [research]\n",
+        )
+        .unwrap();
+        let error = require_content_identity(&observed).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ContentIdentityRescanRequired>()
+                .unwrap()
+                .reason,
+            "hermes_visibility_settings_changed"
+        );
+        // Immutable contract inspection does not validate changed local files.
+        require_hermes_snapshot_contract(&observed).unwrap();
+        observed.hermes_visibility.as_mut().unwrap().version = "old-contract".into();
+        let error = require_hermes_snapshot_contract(&observed).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<ContentIdentityRescanRequired>()
+                .unwrap()
+                .reason,
+            "legacy_hermes_visibility_requires_rescan"
+        );
+    }
+
+    #[test]
+    fn hermes_discovery_rescan_gate_binds_included_skill_roots_and_version() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes/skills")).unwrap();
+        let current = scan::scan(&ScanOptions::for_home(home.path())).unwrap();
+        require_content_identity(&current).unwrap();
+
+        let mut legacy_json = serde_json::to_value(&current).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("hermes_discovery_contract_version");
+        let legacy: ScanResult = serde_json::from_value(legacy_json).unwrap();
+        for marker in [
+            None,
+            Some(0),
+            Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION + 1),
+        ] {
+            let mut outdated = legacy.clone();
+            outdated.hermes_discovery_contract_version = marker;
+            let error = require_content_identity(&outdated).unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<ContentIdentityRescanRequired>()
+                    .unwrap()
+                    .reason,
+                "legacy_hermes_discovery_requires_rescan"
+            );
+        }
+
+        for status in [
+            scan::RootStatus::Missing,
+            scan::RootStatus::Inaccessible,
+            scan::RootStatus::Excluded,
+        ] {
+            let mut unrelated = legacy.clone();
+            for root in &mut unrelated.roots {
+                if root.agent == Some(AgentKind::Hermes) && root.kind == RootKind::Skills {
+                    root.status = status;
+                }
+            }
+            require_content_identity(&unrelated).unwrap();
+        }
+        let mut sessions_only = legacy;
+        for root in &mut sessions_only.roots {
+            if root.agent == Some(AgentKind::Hermes) {
+                root.kind = RootKind::Sessions;
+            }
+        }
+        require_content_identity(&sessions_only).unwrap();
+    }
+
+    #[test]
     fn command_lock_mode_matches_state_production_boundary() {
         fn exclusive(args: &[&str]) -> bool {
             let cli =
@@ -10911,6 +12157,7 @@ mod recovery_tests {
             directory,
             physical_directory: None,
             content_digest: "legacy-digest".into(),
+            content_identity_digest: None,
             entrypoint_digest: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
@@ -10986,6 +12233,7 @@ mod recovery_tests {
             path: PathBuf::from(format!("/fixture/{suffix}")),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         };
@@ -10995,6 +12243,7 @@ mod recovery_tests {
             path: PathBuf::from(format!("/fixture/{suffix}")),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         };
@@ -11008,6 +12257,7 @@ mod recovery_tests {
                 files_observed: 0,
                 files_partially_observed: 0,
                 files_skipped: 0,
+                parse_contract_version: Some(scan::SESSION_PARSE_CONTRACT_VERSION),
                 denominator_reliable: false,
                 bytes_observed: 0,
                 lines_observed: 0,
@@ -11153,6 +12403,7 @@ mod recovery_tests {
             files_observed: 1,
             files_partially_observed: 1,
             files_skipped: 1,
+            parse_contract_version: Some(scan::SESSION_PARSE_CONTRACT_VERSION),
             denominator_reliable: false,
             bytes_observed: 4 * 1024 * 1024,
             lines_observed: 10,
@@ -11203,7 +12454,43 @@ mod recovery_tests {
             json!([])
         );
 
+        coverage.limitations.as_mut().unwrap()[0].code =
+            scan::SessionCoverageLimitationCode::FileParseFailure;
+        let parse_failure = session_coverage_details(&coverage).unwrap();
+        assert_eq!(
+            parse_failure["actionability"]["same_boundary_expected_codes"],
+            json!(["file_parse_failure"])
+        );
+        assert_eq!(
+            parse_failure["actionability"]["retry_may_resolve_codes"],
+            json!([])
+        );
+        assert!(
+            parse_failure["actionability"]["supported_next_steps"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("verify_session_record_format_before_rescan"))
+        );
+
         coverage.denominator_reliable = true;
+        coverage.limitations = Some(Vec::new());
+        assert_eq!(
+            session_coverage_details(&coverage).unwrap()["limitation_state"],
+            "complete"
+        );
+        coverage.parse_contract_version = None;
+        let mut legacy_details = serde_json::to_value(&coverage).unwrap();
+        normalize_public_coverage_details(&mut legacy_details).unwrap();
+        assert_eq!(legacy_details["denominator_reliable"], false);
+        assert_eq!(legacy_details["limitation_state"], "legacy_unknown");
+        assert_eq!(summary_coverage_state(&coverage), "legacy_unknown");
+        assert_eq!(
+            session_coverage_details(&coverage).unwrap()["denominator_reliable"],
+            false
+        );
+        assert!(legacy_details["parse_contract_version"].is_null());
+
+        coverage.parse_contract_version = Some(scan::SESSION_PARSE_CONTRACT_VERSION);
         coverage.limitations = None;
         let legacy = session_coverage_details(&coverage).unwrap();
         assert_eq!(legacy["limitation_state"], "legacy_unknown");
@@ -12038,6 +13325,7 @@ mod recovery_tests {
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
             physical_directory: None,
             content_digest: "digest_shared".into(),
+            content_identity_digest: None,
             entrypoint_digest: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
@@ -12150,6 +13438,7 @@ mod recovery_tests {
             entrypoint: PathBuf::from(format!("/fixture/{id}/SKILL.md")),
             physical_directory: None,
             content_digest: "same-fallback-digest".into(),
+            content_identity_digest: None,
             entrypoint_digest: None,
             fingerprint_completeness: completeness,
             fingerprint_detail: Some("package exceeded fingerprint limit".into()),
@@ -12257,6 +13546,7 @@ mod recovery_tests {
                 entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
                 physical_directory: None,
                 content_digest: "legacy-digest".into(),
+                content_identity_digest: None,
                 entrypoint_digest: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Unknown,
                 fingerprint_detail: None,
@@ -12284,6 +13574,72 @@ mod recovery_tests {
             blocked["error"]["details"]["remediation"]["required_before_rescan"],
             false
         );
+    }
+
+    #[test]
+    fn bootstrap_operations_enforce_observed_package_scope_without_governance_changes() {
+        let package = PathBuf::from("/fixture/physical/skillroster");
+        let mut prepared = PreparedPlan {
+            id: PlanId::new().to_string(),
+            scan_id: ScanId::new().to_string(),
+            evidence_ids: vec![],
+            digest: "sha256:test".into(),
+            operations: vec![],
+            roster_changes: vec![],
+            source_updates: vec![],
+            library_changes: vec![],
+            path_projections: vec![],
+            approved_roots: vec![PathBuf::from("/fixture")],
+            state_dir: PathBuf::from("/fixture/state"),
+        };
+        for scope in [
+            None,
+            Some(scan::MutationScope::ProviderReadOnly),
+            Some(scan::MutationScope::SharedReadOnly),
+            Some(scan::MutationScope::DurableReadOnly),
+            Some(scan::MutationScope::UntrustedExternal),
+            Some(scan::MutationScope::Mutable),
+        ] {
+            let mut placement = placement_with_scope(
+                "placement_bootstrap",
+                "skill_bootstrap",
+                "/fixture/alias/skillroster",
+                scope,
+            );
+            placement.physical_directory = Some(package.clone());
+            let scan = ScanResult {
+                placements: vec![placement],
+                ..ScanResult::default()
+            };
+            for operation in [
+                Operation::ReplaceFile {
+                    target: package.join("SKILL.md"),
+                    content: "approved replacement".into(),
+                    expected_fingerprint: "sha256:before".into(),
+                },
+                Operation::CreateDirectory {
+                    target: package.join("references"),
+                    expected_fingerprint: "missing".into(),
+                },
+            ] {
+                prepared.operations = vec![operation];
+                let result = validate_governance_operation_mutation_scopes(&prepared, &scan);
+                assert_eq!(result.is_ok(), scope == Some(scan::MutationScope::Mutable));
+                if let Err(error) = result {
+                    assert!(
+                        error
+                            .downcast_ref::<crate::roster_plan::RosterSafetyBlocker>()
+                            .is_some()
+                    );
+                }
+            }
+            prepared.operations = vec![Operation::WriteFile {
+                target: PathBuf::from("/fixture/unrelated/skillroster/SKILL.md"),
+                content: "approved replacement".into(),
+                expected_fingerprint: "missing".into(),
+            }];
+            validate_governance_operation_mutation_scopes(&prepared, &scan).unwrap();
+        }
     }
 
     #[test]
@@ -12320,6 +13676,7 @@ mod recovery_tests {
                 entrypoint: PathBuf::from("/fixture/root/legacy/SKILL.md"),
                 physical_directory: None,
                 content_digest: "legacy-digest".into(),
+                content_identity_digest: None,
                 entrypoint_digest: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Complete,
                 fingerprint_detail: None,
@@ -12585,7 +13942,7 @@ mod recovery_tests {
                 .collect::<Vec<_>>()
         };
 
-        for version in ["1.8.23", "1.8.46", "1.8.47", "1.8.48"] {
+        for version in ["1.8.23", "1.8.46", "1.8.47", "1.8.48", "1.8.49", "1.8.50"] {
             let observed = observed_for(version);
             assert_eq!(
                 legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
@@ -13126,7 +14483,7 @@ mod recovery_tests {
     }
 
     #[test]
-    fn plan_detail_keeps_legacy_selection_evidence_without_full_selections() {
+    fn plan_detail_preserves_legacy_selection_and_inspects_outdated_hermes_snapshot() {
         let store = StateStore::open_in_memory().unwrap();
         let scan = ScanRun {
             id: ScanId::new(),
@@ -13174,6 +14531,43 @@ mod recovery_tests {
 
         assert_eq!(detail["selection_evidence"], legacy_selection);
         assert_eq!(detail["detail_level"], "full");
+
+        let mut outdated = ScanResult::default();
+        outdated.roots.push(scan::RootObservation {
+            agent: Some(AgentKind::Hermes),
+            kind: RootKind::Skills,
+            path: PathBuf::from("/fixture/.hermes/skills"),
+            status: scan::RootStatus::Included,
+            explicit: false,
+            shared: false,
+            detail: None,
+            discovery_complete: true,
+        });
+        store.save_scan_payload(&plan.scan_id, &outdated).unwrap();
+        let detail = plan_detail_command(&store, plan.id.as_str()).unwrap();
+        assert_eq!(detail["state"], "ready");
+        assert_eq!(detail["rescan_required"], true);
+        assert_eq!(detail["selection_evidence"], legacy_selection);
+        assert_eq!(detail["operations"], json!([]));
+
+        outdated.hermes_discovery_contract_version = Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION);
+        store.save_scan_payload(&plan.scan_id, &outdated).unwrap();
+        let detail = plan_detail_command(&store, plan.id.as_str()).unwrap();
+        assert_eq!(detail["state"], "ready");
+        assert_eq!(
+            detail["rescan_reason"],
+            "legacy_hermes_visibility_requires_rescan"
+        );
+
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applied)
+            .unwrap();
+        let historical = plan_detail_command(&store, plan.id.as_str()).unwrap();
+        assert_eq!(historical["state"], "applied");
+        assert!(historical.get("rescan_required").is_none());
     }
 
     #[test]

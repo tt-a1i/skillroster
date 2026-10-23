@@ -32,9 +32,60 @@ primitive required by SkillRoster's handle-bound recovery model. A platform or
 Agent is not declared supported until its adapter passes fixtures and a
 real-environment acceptance run.
 
-SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
+SkillRoster scans only known directories for these eight Agents, the active SkillRoster-owned Library root, Skill roots from Codex plugins proven by either explicit local enablement or a valid local remote-plugin install marker, plus paths explicitly provided by the user. It never crawls the entire home directory or treats an arbitrary plugin cache as installed. Explicitly disabled plugins remain excluded. Discovered Codex plugin Skills are Observed, searchable, and provider-managed read-only: they cannot become mutation targets or canonical Library sources. Invalid install markers and ambiguous cached plugin versions fail closed. Every new Snapshot records two orthogonal placement facts: `owned_by_agent` describes only whether the placement path is structurally inside an Agent root, while `mutation_scope` is `mutable`, `provider_read_only`, `shared_read_only`, `durable_read_only`, or `untrusted_external`. Placement-path ownership never endorses linked source content. Compatibility field `governable` is true exactly for `mutable`; missing authority fields in legacy Snapshots remain unknown and cannot authorize mutation. Every Scan reports included, excluded, missing, and inaccessible roots. `--root AGENT=PATH` is an Agent placement root and contributes to exposure; `--source-root PATH` is an approved canonical source with no Agent identity and no default exposure. Source trust is explicit and scoped to the resolved canonical directory; a path and a symlink alias to that same directory have identical trust semantics.
 
 ### Local catalog visibility
+
+Codex discovery retains the legacy user `.codex/skills` root and includes
+`.agents/skills`. The latter is a shared root, not evidence of a Codex-only
+installation. Its readable placements and physical aliases have
+`mutation_scope: shared_read_only`; escaping or unreadable content retains its
+trust blocker. Explicit root/source aliases cannot restore mutation authority.
+Shared roots are not Bootstrap or implicit Core write destinations, and an
+eligible legacy or explicit mutable destination retains its previous order.
+
+For Codex user Skills, `codex_visibility` describes the supplied Home's
+`.codex/config.toml` Skill controls. It is a local rule projection, not a running
+Agent's catalog: `skill_configuration_known` covers only the inspected Skill
+rules, `host_config_validity` is `unverified`, and `session_catalog_observed` is
+false. Other Codex configuration types, CLI overrides, managed settings,
+profiles, and project runtime layers are not validated or inferred. `on` means
+these observed local rules do not disable the discovered placement; it does
+not prove that the complete host configuration can load or a task can use it.
+Arbitrary non-user Codex roots retain unknown native policy.
+
+Typed TOML rules are evaluated in order with the last matching rule winning.
+Exactly one of `name` or `path` must be present for a rule to participate;
+both/neither are inert but invalid field types remain unknown. Names match
+verified frontmatter names case-sensitively after trimming surrounding
+whitespace. Each name is bound to its verified placement bytes, not the
+representative metadata of a deduplicated Skill. Unsupported name syntax
+remains unknown when it can affect the rule result. Paths identify `SKILL.md`,
+not its directory, resolve relative to
+the configuration directory (or supplied Home for `~/`), and match canonical
+entrypoint identities. A missing-path disabling declaration also protects that
+future Core target. Unknown Skill names cannot silently bypass name rules.
+Configuration paths are resolved for metadata identity only; they never
+authorize content reads, add approved roots, or grant mutation authority.
+
+Disabled user Skills remain inventory and may be explicitly loaded through
+verified Find; their local default exposure is false. Unknown policy retains
+possible exposure and blocks changes that depend on resolving it. Core Plans
+must preserve native restrictions, including the destination and canonical
+source of a new link. Implicit canonical migration and retained-link retargeting
+must preserve affected Codex visibility even when only another Agent was named
+in the request. Library consolidation and source updates must also preserve
+affected Codex visibility. Uncertain projected path-policy changes fail closed.
+Scan, Report, and Plan summaries disclose the local-rule scope and unverified
+host configuration; their exposure counts do not promise a usable session catalog.
+
+Snapshots freeze configuration digests or absence, configured path identities,
+and Skill-root identities. Report, Find, Plan, Apply, and Setup (including
+`--check`) require a rescan after those inputs change. Every older Snapshot
+requires this new contract even if it contained only Agent-less sources; it
+cannot reuse pre-shared-root mutation authority. Neither scanning nor governance
+edits Codex configuration. The isolated native evidence and scope are in
+[the Codex mechanism record](research/codex-native-visibility.md).
 
 For Claude Code, `default_exposed` combines directory discovery with observed
 local frontmatter and `skillOverrides`. Manual-only and off entries remain in
@@ -47,6 +98,41 @@ Legacy Snapshots and changed settings require a new Scan before Report, Find,
 Plan, or Apply reuses exposure facts. Settings contents are never mutated.
 See [the inspected scope and acceptance](practical-governance.md); this local
 projection does not observe an active session's catalog or permissions.
+
+For Hermes, `hermes_visibility` projects the supplied Home's
+`.hermes/config.yaml` and verified entrypoint bytes. It covers ordinary global
+disabled names and supported desktop OS restrictions. `on` means these local
+rules allow the placement, not that a running Hermes session offers it;
+`host_config_validity` remains `unverified` and `session_catalog_observed` is
+false. Off placements stay in inventory and remain available for explicit
+verified Find, but do not count as default exposure. Unknown placements retain
+possible exposure and cannot authorize affected governance.
+
+The projection does not infer a gateway channel from SkillRoster's process.
+Potential channel-specific restrictions, directory aliases, version-dependent
+selectors or essential exceptions, organization mirrors, additional-root
+precedence, unsupported configuration, and unobserved runtime conditions remain
+unknown. Each placement uses its own verified bytes rather than a representative
+name selected during identity deduplication. Configuration is read within a
+fixed bound; YAML nesting, node count and expanded scalar bytes are also bounded.
+Only needed typed controls, digests and path identities are retained, not the
+complete configuration or unrelated values.
+
+Snapshots freeze the Hermes local rules, host OS and root identities. Report,
+Find, Plan, Apply and Setup/check require a rescan after those inputs change.
+Old observations cannot authorize Bootstrap creation from a sessions-only
+installation either. Existing immutable Plan details remain inspectable and
+offer Scan recovery when their frozen contract is outdated. Core creation,
+source updates, Library consolidation, implicit retargeting and Bootstrap
+entrypoint replacement must preserve known native restrictions, including
+consumers belonging to an Agent absent from the original request. A parent
+package move must also preserve the paths of nested Hermes consumers with a
+different Skill identity; metadata equivalence alone cannot prove that their
+links survive. If no verified replacement preserves those paths, both Plan
+preparation and Apply refuse the move. No such operation edits the Hermes
+configuration. See the
+[pinned mechanism comparison](research/hermes-native-visibility.md) for the
+version and surface differences behind this scope.
 
 ## 3. Primary interaction
 
@@ -72,7 +158,44 @@ Use this placement test for every capability: local truth, stable identity, repr
 
 ### 4.1 Inventory and identity
 
-A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently. Entrypoint discovery traverses root and category directories within its depth bound. Once a directory declares `SKILL.md`, arbitrary descendants are package support content rather than more entrypoint search space; only direct child directories that also declare `SKILL.md` continue the nested-Skill chain. Repository and build trees `.git`, `target`, and `node_modules` are excluded from entrypoint discovery. These exclusions do not weaken package fingerprints: support files remain identity- and drift-bearing under the independent fingerprint bounds.
+A read-only Scan discovers Skill roots, `SKILL.md` entry points, source metadata, links, configuration exposure, and supported local session sources. It normalizes paths without following links outside approved roots silently. Entrypoint discovery traverses root and category directories within its depth bound. Unless an adapter has a verified different discovery rule, a directory declaring `SKILL.md` ends arbitrary descendant discovery; only direct child directories that also declare `SKILL.md` continue the nested-Skill chain. Repository trees `.git` and `node_modules` are excluded from entrypoint discovery. Build directories named `target` are also excluded except for Hermes, whose verified directory loader does not exclude that name. These exclusions do not weaken package fingerprints: support files remain identity- and drift-bearing under the independent fingerprint bounds.
+
+Hermes directory discovery follows the verified local loader's recursive rule:
+non-support descendants of a Skill package remain discoverable; the package's
+direct `references`, `templates`, `assets` and `scripts` directories remain
+non-exposed support areas. A same-named category outside a package remains
+discoverable. Approved directory links may contribute nested placements, within
+the existing depth limit and a per-branch physical-directory cycle guard.
+Unapproved, unreadable, cyclic or depth-bounded category discovery is incomplete,
+not an empty complete inventory. Directory identity changes during enumeration
+invalidate the affected candidates.
+
+A placement beneath a directory-link ancestor is shared read-only: changing
+that nested logical path would change the shared target. Other aliases of the
+same physical package inherit that protection. A direct link to a Skill package
+retains its existing placement contract. Read permission does not authorize
+mutation of a linked category's contents.
+
+When the Hermes Skill root itself is a directory link, the root and its
+placements are shared read-only; Bootstrap Setup and implicit Core creation do
+not choose it as a write destination. A normal ancestor path alias alone does
+not establish a shared root. Bootstrap operations, including directory creation,
+must pass the same read-only placement overlap validation during preparation
+and Apply as other mutations. Confirmed regular-file links do not contribute
+directory discovery branches.
+
+Fresh Snapshots record the Hermes discovery contract version. A legacy or
+incompatible Snapshot with an included Hermes Skill root requires one Scan before
+Report, Find, new planning, Apply or Setup, including its check mode. Existing
+immutable Plan details remain inspectable; a legacy Ready Plan offers a Scan
+continuation and cannot Apply from the old observations.
+
+The directory projection and the local visibility rules above do not constitute
+an effective session catalog. Profile and extra-root discovery, channel and
+environment filters, organization gates, and name precedence require separate
+native observations before they can support a full visibility claim. The pinned
+directory source and local-loader evidence are recorded in
+[`research/hermes-skill-discovery.md`](research/hermes-skill-discovery.md).
 
 The immutable Scan payload is the historical Snapshot record. SQLite's
 normalized placement table is the current projection: when a stable placement
@@ -110,6 +233,13 @@ Skill identity uses this precedence:
 
 Ambiguous Skills remain separate. SkillRoster never merges based only on a matching name or Agent interpretation.
 
+A declared source/version identity may have divergent local content. The
+Snapshot keeps every distinct routing-content observation with its own name,
+metadata and searchable text, and binds each Placement to that routing digest.
+These observations share the logical Skill ID used by Roster and usage records;
+one observation's metadata is not evidence for another observation's content.
+Older Snapshots missing these observations require one new Scan.
+
 ### 4.2 Analysis
 
 `report` covers seven categories:
@@ -125,6 +255,28 @@ Ambiguous Skills remain separate. SkillRoster never merges based only on a match
 Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large active JSONL files contribute bounded complete-line tails, large monolithic JSON files contribute bounded complete nested objects from their tails, and the fixed byte budget is spread across multiple recent sessions. Reports distinguish missing, inaccessible, sampled-but-limited, and complete observable session roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
 
 New session Scans record every completeness boundary at its trigger point as typed, multi-value Coverage limitations. Each fact freezes its code, root/file/Agent scope, count quality, observed value, active limit, unit, and scanner source; aggregate coverage fields remain compatibility projections. Repeated occurrences aggregate by code within one Agent without persisting session paths, and count quality states whether the reported observation is exact, a lower bound, or unknown. Public Coverage Evidence classifies which unchanged boundaries will recur, which local read failures may resolve, and which roots require verification before a rescan. Scanner caps are not configurable through the CLI. Legacy Snapshots without typed limitations remain `legacy_unknown` and never inherit the current binary's limits or claim a reliable denominator.
+
+Session parsing validates the original UTF-8 bytes and JSON syntax before any
+structured observation or name-based inference. Malformed JSONL/structured log
+records contribute no usage; valid neighboring records remain observable. A
+fully read `.json` file must contain a valid complete document; empty and
+whitespace-only documents are parsing failures. Bounded JSON tails may still contribute valid
+complete objects under the existing sampling limits. Blank JSONL/log lines are
+ignored; valid records without recognized Skill events, including unknown event
+shapes, are not parsing failures. Syntax validation does not prove that every
+Agent event kind is understood.
+
+Observed parsing failures produce `file_parse_failure`, counted once per
+affected file, and invalidate the usage denominator. Raw malformed content and
+parser error excerpts are not persisted. Coverage freezes
+`parse_contract_version`; a missing or unsupported version remains
+`legacy_unknown` even if an older Snapshot recorded empty limitations and a
+reliable denominator. Reports, cached summaries, historical Finding details and
+exported Coverage Evidence preserve this boundary without rewriting historical
+Snapshots. Historical usage summaries are recomputed conservatively; an old
+archive candidate whose relevant reliable coverage is no longer established
+becomes read-only and requests a rescan. A new Scan can establish the current contract. Historical usage
+observations remain historical; new Reports use their own Snapshot's usage.
 
 Finding coverage never mixes filesystem discovery with session observation.
 Inventory, layout, exposure, overlap, routing, and structural lifecycle
@@ -244,7 +396,7 @@ The first complete command surface is:
 skillroster [--json]
 skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
-skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--require-snapshot <scan-id>] [--json] -- <task>
+skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--variant-placement-id <placement-id>] [--require-snapshot <scan-id>] [--json] -- <task>
 skillroster plan --stdin [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
@@ -383,22 +535,26 @@ exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars.
 
 An independent punctuation-delimited task clause that begins with `不要`, the
-parallel continuation `也不要`, or the complete ASCII marker `do not` remains
+parallel continuation `也不要`, or the English marker `do not`, `don't`, or `don’t` remains
 verbatim in `task` but does not contribute positive candidate or ranking
 evidence. The bounded coordinators `but`, `and`, `yet`, `但是`, `不过`, and `但`
 may immediately precede one of those markers; the original coordinated clause
 remains verbatim in `task_exclusions`. Prefixes such as `do nothing` are not
-markers, and a coordinator without an immediate marker remains positive task
+markers. English markers are case-insensitive and require an end or non-alphanumeric
+boundary, so `don'tpanic` and `don’tpanic` remain positive text. A coordinator
+without an immediate marker remains positive task
 text. `task_exclusions` returns the recognized clauses so the Agent can audit
 that deterministic split.
 Terms already present in the positive task remain shared object evidence; only
 the constraint-specific remainder may exclude a Skill whose positive name,
 trigger, or description declares the prohibited capability. Agent-authored
 hints remain separate positive evidence and cannot cancel a task exclusion.
-Within one bounded exclusion clause, `code` and `代码` remain shared task-object
+Within one bounded exclusion clause, `code`, `file` / `files`, `代码`, and `文件` remain shared task-object
 context when the same clause contains another searchable constraint token and
 the object follows earlier constraint material;
-they cannot by themselves exclude review or analysis Skills. When either is
+they cannot by themselves exclude review or analysis Skills. For example,
+`do not modify files` excludes a declared modification capability, but the word
+`files` alone does not exclude a Skill that inspects files. When an object token is
 the clause's only capability token or leads the clause, it remains an effective
 exclusion. This filter is applied independently to each exclusion clause so
 one constraint cannot weaken another.
@@ -498,6 +654,39 @@ evidence for the ranked capability group and is explicitly scoped as such; it
 is not attributed to the selected package identity. It supplies content facts
 for the model's comparison; it does not endorse, canonicalize, mutate, or
 establish task success.
+
+For divergent content under one declared identity, Find scores each observed
+content separately and keeps the strongest match for that logical ID. FTS may
+index the union solely to select candidate IDs; it never combines names,
+triggers or description tokens from different observations to justify loading.
+The matching routing digest identifies which observation supplied the evidence.
+
+For identities with multiple placements, ordinary Find includes `content_choice`
+with bounded routing-content groups and each placement's observed name, path,
+digests, authority and current read state. A single-placement identity needs no
+choice bundle. Exact-placement comparison actions appear only when divergent
+contents require that choice; same-name Skill-ID comparison actions remain for
+identities that do not require a placement selector. Different
+routing digests require explicit content selection; package differences caused
+only by root `.gitignore` do not. `find --load` returns
+`declared_identity_content_ambiguous` with no partial body when selection is
+required. Its recovery opens the same Snapshot's ordinary Find choices rather
+than asking for repeated Scans. A declared-identity Finding exposes the same
+read-only comparison choices and full detail when the preview is truncated.
+
+`--variant-placement-id` requires `--load` and selects one exact placement from
+the current Top-1 capability group. If a Skill selector is also supplied, both
+selectors must agree. The actual name and placement ID identify the loaded
+content; its selection evidence is scoped to the ranked capability group.
+The selector preserves all source, Snapshot, digest, path, size, encoding and
+Archived-state checks and never falls back to a different placement on failure.
+A drifted or unreadable copy retains its own blocker even when another copy is
+healthy. Exact reading does not select canonical content or authorize governance.
+
+Within one Find, advisory package observations may be reused for the same
+physical entrypoint after each placement's authority and path checks. They are
+discarded when the command ends. Verified loading always performs its own fresh
+package validation; advisory observations cannot authorize returning instructions.
 
 All JSON responses use a versioned envelope:
 

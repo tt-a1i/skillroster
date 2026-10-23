@@ -20,6 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+pub const HERMES_DISCOVERY_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_PARSE_CONTRACT_VERSION: u32 = 1;
 pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-unicode-v2";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_ROOT: usize = 10_000;
@@ -95,6 +97,9 @@ pub struct RootObservation {
     pub path: PathBuf,
     pub status: RootStatus,
     pub explicit: bool,
+    /// Shared discovery does not authorize an exclusive Agent write destination.
+    #[serde(default)]
+    pub shared: bool,
     pub detail: Option<String>,
     /// Whether discovery inspected the complete configured Skill-root depth.
     /// Session roots do not use this dimension and remain complete by default.
@@ -157,6 +162,10 @@ pub struct SkillPlacement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_directory: Option<PathBuf>,
     pub content_digest: String,
+    /// Routing payload identity observed for this placement before logical
+    /// identity deduplication. Never use this for mutation or drift checks.
+    #[serde(default)]
+    pub content_identity_digest: Option<String>,
     /// SHA-256 of the exact SKILL.md bytes observed during Scan. Missing on
     /// legacy Snapshots cannot authorize a verified load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +206,7 @@ pub struct SkillPlacement {
 pub enum MutationScope {
     Mutable,
     ProviderReadOnly,
+    SharedReadOnly,
     DurableReadOnly,
     UntrustedExternal,
 }
@@ -206,6 +216,7 @@ impl MutationScope {
         match self {
             Self::Mutable => "mutable",
             Self::ProviderReadOnly => "provider_read_only",
+            Self::SharedReadOnly => "shared_read_only",
             Self::DurableReadOnly => "durable_read_only",
             Self::UntrustedExternal => "untrusted_external",
         }
@@ -344,6 +355,7 @@ pub enum SessionCoverageLimitationCode {
     FileByteLimit,
     FileMetadataFailure,
     FileReadFailure,
+    FileParseFailure,
     FileZeroRead,
     FilePathNotUnicode,
     JsonExtractionLimit,
@@ -449,6 +461,10 @@ pub struct SessionCoverage {
     pub files_partially_observed: usize,
     pub files_skipped: usize,
     pub denominator_reliable: bool,
+    /// Version of the syntax and UTF-8 checks applied to session records.
+    /// Missing or unknown versions cannot authorize a complete denominator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_contract_version: Option<u32>,
     pub bytes_observed: u64,
     pub lines_observed: usize,
     pub truncated: bool,
@@ -463,18 +479,43 @@ pub struct SessionCoverage {
 }
 
 impl SessionCoverage {
+    pub fn has_current_parse_contract(&self) -> bool {
+        self.parse_contract_version == Some(SESSION_PARSE_CONTRACT_VERSION)
+    }
+
     pub fn denominator_is_reliable(&self) -> bool {
-        self.limitations.is_some() && self.denominator_reliable
+        self.has_current_parse_contract()
+            && self.limitations.as_ref().is_some_and(Vec::is_empty)
+            && self.denominator_reliable
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
+    /// Versioned bounded Hermes directory-discovery contract; absent on legacy scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hermes_discovery_contract_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_visibility: Option<crate::codex_visibility::VisibilitySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hermes_visibility: Option<crate::hermes_visibility::VisibilitySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
     pub skills: Vec<ScannedSkill>,
+    /// Additional content observations sharing a logical declared identity.
+    /// Some (including empty) marks placement-bound routing observations.
+    #[serde(default)]
+    pub skill_content_variants: Option<Vec<ScannedSkill>>,
     pub placements: Vec<SkillPlacement>,
+    /// Placement-bound native manifest names captured from verified bytes before
+    /// declared-source identity deduplication. None means unsupported or absent.
+    #[serde(default)]
+    pub verified_entrypoint_names: BTreeMap<String, Option<String>>,
+    /// Transient per-placement attributes parsed only from verified bytes.
+    #[serde(skip)]
+    pub(crate) verified_hermes_attributes:
+        BTreeMap<String, (PathBuf, crate::hermes_visibility::EntrypointAttributes)>,
     /// Physical mutation identities frozen while this Snapshot was scanned.
     /// Recommendation consumes only these immutable facts; Plan independently
     /// revalidates current filesystem identities before deriving operations.
@@ -511,6 +552,52 @@ pub struct ScanResult {
 }
 
 impl ScanResult {
+    pub(crate) fn routing_skills(&self) -> impl Iterator<Item = &ScannedSkill> {
+        self.skills
+            .iter()
+            .chain(self.skill_content_variants.iter().flatten())
+    }
+
+    pub(crate) fn observed_skill_for_placement(
+        &self,
+        placement: &SkillPlacement,
+    ) -> Option<&ScannedSkill> {
+        if self.skill_content_variants.is_none() {
+            return self
+                .skills
+                .iter()
+                .find(|skill| skill.id == placement.skill_id);
+        }
+        self.routing_skills().find(|skill| {
+            skill.id == placement.skill_id
+                && skill.content_identity_digest == placement.content_identity_digest
+        })
+    }
+
+    pub(crate) fn placement_native_visibility(
+        &self,
+        placement: &SkillPlacement,
+    ) -> Option<&crate::claude_visibility::CatalogVisibility> {
+        match placement.agent {
+            Some(AgentKind::Codex) => self
+                .codex_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            Some(AgentKind::ClaudeCode) => self
+                .native_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            Some(AgentKind::Hermes) => self
+                .hermes_visibility
+                .as_ref()?
+                .placements
+                .get(&placement.id),
+            _ => None,
+        }
+    }
+
     pub(crate) fn observed_physical_mutation_path(
         &self,
         placement: &SkillPlacement,
@@ -550,6 +637,7 @@ struct EntryCandidate {
     agent: Option<AgentKind>,
     root: PathBuf,
     governable: bool,
+    shared: bool,
     provider: Option<String>,
     /// Canonical physical SKILL.md resolved during discovery. Safe reuse is
     /// bound to this exact file for the lifetime of one Scan.
@@ -575,6 +663,7 @@ struct PhysicalPackageObservation {
 
 #[derive(Clone, Debug)]
 struct SkillRootPolicy {
+    shared: bool,
     agent: Option<AgentKind>,
     explicit: bool,
     governable: bool,
@@ -582,39 +671,47 @@ struct SkillRootPolicy {
     provider: Option<String>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct DiscoveryState {
     hidden_ancestor: bool,
     inside_skill_package: bool,
     harness_excluded: bool,
+    directory_link_ancestor: bool,
+    physical_ancestors: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Default)]
 struct SkillDiscoveryOutcome {
     depth_bounded: bool,
     non_unicode_skipped: u64,
+    directories_skipped: u64,
 }
 
 impl SkillDiscoveryOutcome {
     fn merge(&mut self, other: Self) {
         self.depth_bounded |= other.depth_bounded;
+        self.directories_skipped = self
+            .directories_skipped
+            .saturating_add(other.directories_skipped);
         self.non_unicode_skipped = self
             .non_unicode_skipped
             .saturating_add(other.non_unicode_skipped);
     }
 
     fn is_complete(self) -> bool {
-        !self.depth_bounded && self.non_unicode_skipped == 0
+        !self.depth_bounded && self.non_unicode_skipped == 0 && self.directories_skipped == 0
     }
 }
 
 impl DiscoveryState {
-    fn descend(self, agent: Option<AgentKind>, child_name: &str, containing_skill: bool) -> Self {
+    fn descend(&self, agent: Option<AgentKind>, child_name: &str, containing_skill: bool) -> Self {
         Self {
             hidden_ancestor: self.hidden_ancestor || child_name.starts_with('.'),
             inside_skill_package: self.inside_skill_package || containing_skill,
             harness_excluded: self.harness_excluded
                 || hermes_excludes_directory(agent, child_name, containing_skill),
+            directory_link_ancestor: self.directory_link_ancestor,
+            physical_ancestors: self.physical_ancestors.clone(),
         }
     }
 }
@@ -984,6 +1081,8 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     require_unicode_scan_options(options)?;
     let mut result = ScanResult {
+        hermes_discovery_contract_version: Some(HERMES_DISCOVERY_CONTRACT_VERSION),
+        skill_content_variants: Some(Vec::new()),
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
         identity_path_coverage: IdentityPathCoverage::Complete,
         durable_read_used_permission_ids: Some(BTreeSet::new()),
@@ -1035,6 +1134,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
             observe_skill_root(
                 root,
                 SkillRootPolicy {
+                    shared: is_shared_skill_root(root, &options.home),
                     agent: Some(roots.agent),
                     explicit: false,
                     governable: true,
@@ -1052,6 +1152,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(root, &options.home),
                 agent: None,
                 explicit: false,
                 governable: true,
@@ -1068,6 +1169,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(root, &options.home),
                 agent: None,
                 explicit: true,
                 governable: true,
@@ -1084,6 +1186,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_durable_skill_root(
             root,
             SkillRootPolicy {
+                shared: is_shared_skill_root(&root.path, &options.home),
                 agent: None,
                 explicit: true,
                 governable: false,
@@ -1100,6 +1203,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             &root.path,
             SkillRootPolicy {
+                shared: is_shared_skill_root(&root.path, &options.home),
                 agent: Some(root.agent),
                 explicit: true,
                 governable: true,
@@ -1116,6 +1220,7 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         observe_skill_root(
             &root.path,
             SkillRootPolicy {
+                shared: false,
                 agent: None,
                 explicit: false,
                 governable: false,
@@ -1135,9 +1240,12 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         &confirmed_source_roots,
         &mut result,
     );
+    classify_shared_placements(&options.home, &mut result);
     result.freeze_observed_physical_mutation_paths();
 
     crate::claude_visibility::observe(&options.home, &mut result);
+    crate::codex_visibility::observe(&options.home, &mut result);
+    crate::hermes_visibility::observe(&options.home, &mut result);
 
     if options.include_session_evidence {
         for roots in &known {
@@ -1203,6 +1311,57 @@ fn normalized_confirmed_source_roots(roots: &[PathBuf]) -> io::Result<Vec<PathBu
     Ok(normalized)
 }
 
+// Root aliases retain the shared location's read-only destination contract.
+fn is_shared_skill_root(path: &Path, home: &Path) -> bool {
+    let shared = home.join(".agents/skills");
+    path.starts_with(&shared)
+        || fs::canonicalize(&shared).ok().is_some_and(|shared| {
+            fs::canonicalize(path)
+                .ok()
+                .is_some_and(|path| path.starts_with(shared))
+        })
+}
+
+fn classify_shared_placements(home: &Path, result: &mut ScanResult) {
+    let shared = fs::canonicalize(home.join(".agents/skills")).ok();
+    // A shared placement may link to an approved canonical source. Explicit
+    // source/root aliases must not regain mutation authority over that package.
+    let shared_packages = result
+        .placements
+        .iter()
+        .filter(|placement| {
+            is_shared_skill_root(&placement.root, home)
+                || placement.mutation_scope == Some(MutationScope::SharedReadOnly)
+        })
+        .filter_map(|placement| placement.physical_directory.clone())
+        .collect::<BTreeSet<_>>();
+    for placement in &mut result.placements {
+        if matches!(
+            placement.mutation_scope,
+            Some(MutationScope::Mutable | MutationScope::DurableReadOnly)
+        ) && (is_shared_skill_root(&placement.root, home)
+            || placement.physical_directory.as_ref().is_some_and(|path| {
+                shared.as_ref().is_some_and(|root| path.starts_with(root))
+                    || shared_packages.contains(path)
+            }))
+        {
+            placement.mutation_scope = Some(
+                if placement.physical_directory.is_some()
+                    && !matches!(
+                        placement.link_status,
+                        LinkStatus::Broken | LinkStatus::EscapesRoot
+                    )
+                {
+                    MutationScope::SharedReadOnly
+                } else {
+                    MutationScope::UntrustedExternal
+                },
+            );
+            placement.governable = false;
+        }
+    }
+}
+
 fn observe_excluded_session_roots(
     agent: AgentKind,
     roots: &[PathBuf],
@@ -1216,6 +1375,7 @@ fn observe_excluded_session_roots(
             path: root.clone(),
             status: RootStatus::Excluded,
             explicit: false,
+            shared: false,
             detail: Some(detail.into()),
             discovery_complete: true,
         });
@@ -1224,7 +1384,7 @@ fn observe_excluded_session_roots(
 
 fn observe_skill_root(
     root: &Path,
-    policy: SkillRootPolicy,
+    mut policy: SkillRootPolicy,
     approved_roots: &[PathBuf],
     max_depth: usize,
     result: &mut ScanResult,
@@ -1235,12 +1395,18 @@ fn observe_skill_root(
         Err(error) if error.kind() == io::ErrorKind::NotFound => RootStatus::Missing,
         Err(_) => RootStatus::Inaccessible,
     };
+    // Only the Skill root itself grants shared-directory semantics. System
+    // ancestor aliases such as /var -> /private/var do not imply shared Skills.
+    policy.shared |= policy.agent == Some(AgentKind::Hermes)
+        && fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        && fs::metadata(root).is_ok_and(|metadata| metadata.is_dir());
     result.roots.push(RootObservation {
         agent: policy.agent,
         kind: RootKind::Skills,
         path: root.to_path_buf(),
         status,
         explicit: policy.explicit,
+        shared: policy.shared,
         detail: policy.detail.clone(),
         discovery_complete: true,
     });
@@ -1271,6 +1437,12 @@ fn observe_skill_root(
                 details.push(format!(
                     "Skill discovery skipped {} non-Unicode path(s) that cannot have stable identity",
                     outcome.non_unicode_skipped
+                ));
+            }
+            if outcome.directories_skipped > 0 {
+                details.push(format!(
+                    "Skill discovery skipped {} unapproved, unreadable, cyclic, or drifted directory branch(es)",
+                    outcome.directories_skipped
                 ));
             }
             let detail = details.join("; ");
@@ -1338,6 +1510,7 @@ fn observe_durable_skill_root_with_hook(
             path: root.path.clone(),
             status: RootStatus::Inaccessible,
             explicit: policy.explicit,
+            shared: policy.shared,
             detail: Some(detail.into()),
             discovery_complete: false,
         });
@@ -1392,106 +1565,228 @@ fn discover_entrypoints(
     state: DiscoveryState,
     output: &mut Vec<EntryCandidate>,
 ) -> io::Result<SkillDiscoveryOutcome> {
-    let depth = directory
-        .strip_prefix(placement_root)
-        .map(|path| path.components().count())
-        .unwrap_or(max_depth.saturating_add(1));
-    if depth > max_depth {
-        return Ok(SkillDiscoveryOutcome {
-            depth_bounded: true,
-            non_unicode_skipped: 0,
-        });
+    EntrypointDiscovery {
+        policy,
+        placement_root,
+        approved_roots,
+        max_depth,
+        output,
     }
-    let mut outcome = SkillDiscoveryOutcome::default();
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let directory_has_skill = directory_declares_skill(directory)?;
-    for entry in entries {
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        let file_name = entry.file_name();
-        if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
-            .iter()
-            .any(|excluded| file_name == *excluded)
-        {
-            continue;
-        }
-        if file_name == "SKILL.md" {
-            let (target, link_status) = inspect_link(approved_roots, &path, &metadata);
-            let expected_physical_entrypoint = fs::canonicalize(&path)
-                .ok()
-                .filter(|path| path.to_str().is_some());
-            let default_exposed =
-                default_exposure_for_candidate(policy, placement_root, &path, depth, state);
-            output.push(EntryCandidate {
-                agent: policy.agent,
-                root: placement_root.to_path_buf(),
-                governable: policy.governable,
-                provider: policy.provider.clone(),
-                expected_physical_entrypoint,
-                entrypoint: path,
-                link_target: target,
-                link_status,
-                default_exposed,
+    .discover(directory, state, &mut |_| {})
+}
+
+struct EntrypointDiscovery<'a> {
+    policy: &'a SkillRootPolicy,
+    placement_root: &'a Path,
+    approved_roots: &'a [PathBuf],
+    max_depth: usize,
+    output: &'a mut Vec<EntryCandidate>,
+}
+
+impl EntrypointDiscovery<'_> {
+    fn discover(
+        &mut self,
+        directory: &Path,
+        mut state: DiscoveryState,
+        after_enumerate: &mut impl FnMut(&Path),
+    ) -> io::Result<SkillDiscoveryOutcome> {
+        let depth = directory
+            .strip_prefix(self.placement_root)
+            .map(|path| path.components().count())
+            .unwrap_or(self.max_depth.saturating_add(1));
+        if depth > self.max_depth {
+            return Ok(SkillDiscoveryOutcome {
+                depth_bounded: true,
+                ..Default::default()
             });
-        } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-            if directory_has_skill && !directory_declares_skill(&path)? {
-                continue;
+        }
+        let hermes = self.policy.agent == Some(AgentKind::Hermes);
+        // Hermes follows category links. Resolve and approve each directory before
+        // enumerating its physical path, then reject a changed logical binding.
+        let binding = if hermes {
+            let physical = fs::canonicalize(directory)?;
+            if !is_within_resolved_root(&physical, self.approved_roots)
+                || state.physical_ancestors.contains(&physical)
+            {
+                return Ok(SkillDiscoveryOutcome {
+                    directories_skipped: 1,
+                    ..Default::default()
+                });
             }
-            let Some(child_name) = file_name.to_str() else {
-                outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
-                continue;
-            };
-            let child_state = state.descend(policy.agent, child_name, directory_has_skill);
-            outcome.merge(discover_entrypoints(
-                policy,
-                placement_root,
-                approved_roots,
-                &path,
-                max_depth,
-                child_state,
-                output,
-            )?);
-        } else if metadata.file_type().is_symlink() {
-            // A linked Skill directory is a placement too, but it is never
-            // traversed recursively before the boundary has been evaluated.
-            let linked_entrypoint = path.join("SKILL.md");
-            let (target, status) = inspect_link(approved_roots, &path, &metadata);
-            let declares_skill = directory_declares_skill(&path)?;
-            if directory_has_skill && !declares_skill {
-                continue;
+            let identity = crate::source_policy::capture_identity(&physical)?;
+            state.physical_ancestors.push(physical.clone());
+            Some((physical, identity))
+        } else {
+            None
+        };
+        let enumeration_path = binding
+            .as_ref()
+            .map_or(directory, |(path, _)| path.as_path());
+        let directory_is_link = hermes && fs::symlink_metadata(directory)?.file_type().is_symlink();
+        let candidate_start = self.output.len();
+        let enumeration_result = (|| {
+            let mut outcome = SkillDiscoveryOutcome::default();
+            let mut entries = fs::read_dir(enumeration_path)?.collect::<Result<Vec<_>, _>>()?;
+            entries.sort_by_key(|entry| entry.file_name());
+            let directory_has_skill = directory_declares_skill(enumeration_path)?;
+            for entry in entries {
+                let file_name = entry.file_name();
+                let path = directory.join(&file_name);
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
+                    .iter()
+                    .any(|excluded| file_name == *excluded && !(hermes && *excluded == "target"))
+                {
+                    continue;
+                }
+                if file_name == "SKILL.md" {
+                    let (mut target, mut link_status) =
+                        if directory_is_link && !metadata.file_type().is_symlink() {
+                            inspect_link(
+                                self.approved_roots,
+                                directory,
+                                &fs::symlink_metadata(directory)?,
+                            )
+                        } else {
+                            inspect_link(self.approved_roots, &path, &metadata)
+                        };
+                    // The physical entry came from the approved, bound directory;
+                    // later content reads independently revalidate its logical alias.
+                    let expected_physical_entrypoint = fs::canonicalize(entry.path())
+                        .ok()
+                        .filter(|path| path.to_str().is_some());
+                    if hermes {
+                        if let Some(expected) =
+                            expected_physical_entrypoint.as_ref().filter(|expected| {
+                                !is_within_resolved_root(expected, self.approved_roots)
+                            })
+                        {
+                            target = expected.parent().map(Path::to_path_buf);
+                            link_status = LinkStatus::EscapesRoot;
+                        }
+                    }
+                    let default_exposed = default_exposure_for_candidate(
+                        self.policy,
+                        self.placement_root,
+                        &path,
+                        depth,
+                        &state,
+                    );
+                    self.output.push(EntryCandidate {
+                        agent: self.policy.agent,
+                        root: self.placement_root.to_path_buf(),
+                        governable: self.policy.governable,
+                        shared: self.policy.shared || state.directory_link_ancestor,
+                        provider: self.policy.provider.clone(),
+                        expected_physical_entrypoint,
+                        entrypoint: path,
+                        link_target: target,
+                        link_status,
+                        default_exposed,
+                    });
+                } else if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+                    if !hermes && directory_has_skill && !directory_declares_skill(&path)? {
+                        continue;
+                    }
+                    let Some(child_name) = file_name.to_str() else {
+                        outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
+                        continue;
+                    };
+                    let mut child_state =
+                        state.descend(self.policy.agent, child_name, directory_has_skill);
+                    child_state.directory_link_ancestor |= directory_is_link;
+                    match self.discover(&path, child_state, after_enumerate) {
+                        Ok(child_outcome) => outcome.merge(child_outcome),
+                        Err(_) if hermes => outcome.directories_skipped += 1,
+                        Err(error) => return Err(error),
+                    }
+                } else if metadata.file_type().is_symlink() {
+                    // Native Hermes ignores file links during directory discovery.
+                    // Resolve and approve the target before inspecting its kind;
+                    // unapproved or unknown links retain the fail-closed branch.
+                    if hermes
+                        && fs::canonicalize(entry.path()).is_ok_and(|target| {
+                            is_within_resolved_root(&target, self.approved_roots)
+                                && fs::metadata(target).is_ok_and(|metadata| metadata.is_file())
+                        })
+                    {
+                        continue;
+                    }
+                    let linked_entrypoint = path.join("SKILL.md");
+                    let (target, status) = inspect_link(self.approved_roots, &path, &metadata);
+                    let Some(child_name) = file_name.to_str() else {
+                        outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
+                        continue;
+                    };
+                    let mut child_state =
+                        state.descend(self.policy.agent, child_name, directory_has_skill);
+                    child_state.directory_link_ancestor |= directory_is_link;
+                    if hermes && status == LinkStatus::Valid {
+                        match self.discover(&path, child_state, after_enumerate) {
+                            Ok(child_outcome) => outcome.merge(child_outcome),
+                            Err(_) => outcome.directories_skipped += 1,
+                        }
+                        continue;
+                    }
+                    // Never probe SKILL.md beneath an unapproved Hermes target.
+                    // Keep its unreadable placement for the existing source-confirmation flow.
+                    let declares_skill = if hermes {
+                        false
+                    } else {
+                        directory_declares_skill(&path)?
+                    };
+                    if !hermes && directory_has_skill && !declares_skill {
+                        continue;
+                    }
+                    if hermes {
+                        outcome.directories_skipped += 1;
+                    }
+                    if declares_skill || status != LinkStatus::Valid {
+                        let expected_physical_entrypoint = if hermes {
+                            None
+                        } else {
+                            fs::canonicalize(&linked_entrypoint)
+                                .ok()
+                                .filter(|path| path.to_str().is_some())
+                        };
+                        let default_exposed = default_exposure_for_candidate(
+                            self.policy,
+                            self.placement_root,
+                            &linked_entrypoint,
+                            depth + 1,
+                            &child_state,
+                        );
+                        self.output.push(EntryCandidate {
+                            agent: self.policy.agent,
+                            root: self.placement_root.to_path_buf(),
+                            governable: self.policy.governable,
+                            shared: self.policy.shared || child_state.directory_link_ancestor,
+                            provider: self.policy.provider.clone(),
+                            expected_physical_entrypoint,
+                            entrypoint: linked_entrypoint,
+                            link_target: target,
+                            link_status: status,
+                            default_exposed,
+                        });
+                    }
+                }
             }
-            let Some(child_name) = file_name.to_str() else {
-                outcome.non_unicode_skipped = outcome.non_unicode_skipped.saturating_add(1);
-                continue;
-            };
-            if declares_skill || status != LinkStatus::Valid {
-                let expected_physical_entrypoint = fs::canonicalize(&linked_entrypoint)
-                    .ok()
-                    .filter(|path| path.to_str().is_some());
-                let child_state = state.descend(policy.agent, child_name, directory_has_skill);
-                let default_exposed = default_exposure_for_candidate(
-                    policy,
-                    placement_root,
-                    &linked_entrypoint,
-                    depth + 1,
-                    child_state,
-                );
-                output.push(EntryCandidate {
-                    agent: policy.agent,
-                    root: placement_root.to_path_buf(),
-                    governable: policy.governable,
-                    provider: policy.provider.clone(),
-                    expected_physical_entrypoint,
-                    entrypoint: linked_entrypoint,
-                    link_target: target,
-                    link_status: status,
-                    default_exposed,
+            Ok(outcome)
+        })();
+        after_enumerate(directory);
+        if let Some((physical, identity)) = binding {
+            if fs::canonicalize(directory).ok().as_ref() != Some(&physical)
+                || !crate::source_policy::identity_matches_exact(&physical, &identity)
+            {
+                self.output.truncate(candidate_start);
+                return Ok(SkillDiscoveryOutcome {
+                    directories_skipped: 1,
+                    ..Default::default()
                 });
             }
         }
+        enumeration_result
     }
-    Ok(outcome)
 }
 
 fn directory_declares_skill(directory: &Path) -> io::Result<bool> {
@@ -1539,7 +1834,7 @@ fn default_exposure_for_candidate(
     placement_root: &Path,
     entrypoint: &Path,
     depth: usize,
-    state: DiscoveryState,
+    state: &DiscoveryState,
 ) -> bool {
     let Some(agent) = policy.agent else {
         return false;
@@ -1825,6 +2120,7 @@ fn materialize_candidates_with_hook(
     mut before_read: impl FnMut(&Path),
 ) -> usize {
     let mut skills = BTreeMap::<String, ScannedSkill>::new();
+    let mut content_variants = BTreeMap::new();
     let mut physical_packages = BTreeMap::<PathBuf, PhysicalPackageObservation>::new();
     let mut drifted_physical_packages = BTreeMap::<PathBuf, String>::new();
     let mut physical_package_observations = 0;
@@ -2043,19 +2339,26 @@ fn materialize_candidates_with_hook(
                     .is_some_and(|name| declared.eq_ignore_ascii_case(name))
             })
         });
-        skills
-            .entry(skill_id.clone())
-            .or_insert_with(|| ScannedSkill {
-                id: skill_id.clone(),
-                name,
-                metadata,
-                content_digest: digest.clone(),
-                content_identity_digest: content_identity_digest.clone(),
-                digest_algorithm: "sha256-v1".into(),
-                summary: summarize_markdown(&content, 320),
-                normalized_text,
-                modified_at_unix: modified_at,
-            });
+        let observed_skill = || ScannedSkill {
+            id: skill_id.clone(),
+            name,
+            metadata,
+            content_digest: digest.clone(),
+            content_identity_digest: content_identity_digest.clone(),
+            digest_algorithm: "sha256-v1".into(),
+            summary: summarize_markdown(&content, 320),
+            normalized_text,
+            modified_at_unix: modified_at,
+        };
+        if let Some(primary) = skills.get(&skill_id) {
+            if primary.content_identity_digest != content_identity_digest {
+                content_variants
+                    .entry((skill_id.clone(), content_identity_digest.clone()))
+                    .or_insert_with(observed_skill);
+            }
+        } else {
+            skills.insert(skill_id.clone(), observed_skill());
+        }
         let root = candidate
             .root
             .to_str()
@@ -2072,6 +2375,8 @@ fn materialize_candidates_with_hook(
         );
         let mutation_scope = if candidate.provider.is_some() {
             MutationScope::ProviderReadOnly
+        } else if candidate.shared && safe_to_read {
+            MutationScope::SharedReadOnly
         } else if durable_anchor.is_some() {
             MutationScope::DurableReadOnly
         } else if !candidate.governable
@@ -2082,7 +2387,12 @@ fn materialize_candidates_with_hook(
         } else {
             MutationScope::Mutable
         };
-        if safe_to_read && mutation_scope == MutationScope::DurableReadOnly {
+        if safe_to_read
+            && matches!(
+                mutation_scope,
+                MutationScope::DurableReadOnly | MutationScope::SharedReadOnly
+            )
+        {
             if let Some(root) = durable_anchor {
                 result
                     .durable_read_used_permission_ids
@@ -2090,8 +2400,28 @@ fn materialize_candidates_with_hook(
                     .insert(root.permission_id.clone());
             }
         }
+        let placement_id = format!("placement_{}", stable_digest(placement_basis.as_bytes()));
+        result.verified_entrypoint_names.insert(
+            placement_id.clone(),
+            safe_to_read
+                .then(|| crate::codex_visibility::parse_native_name(&content))
+                .flatten(),
+        );
+        if let Some(identity) = candidate
+            .expected_physical_entrypoint
+            .as_ref()
+            .filter(|_| safe_to_read)
+        {
+            result.verified_hermes_attributes.insert(
+                placement_id.clone(),
+                (
+                    identity.clone(),
+                    crate::hermes_visibility::parse_entrypoint_attributes(&content),
+                ),
+            );
+        }
         result.placements.push(SkillPlacement {
-            id: format!("placement_{}", stable_digest(placement_basis.as_bytes())),
+            id: placement_id,
             skill_id,
             agent: candidate.agent,
             root: candidate.root,
@@ -2099,6 +2429,7 @@ fn materialize_candidates_with_hook(
             entrypoint: candidate.entrypoint,
             physical_directory,
             content_digest: digest,
+            content_identity_digest,
             entrypoint_digest: safe_to_read.then(|| stable_digest(content.as_bytes())),
             fingerprint_completeness,
             fingerprint_detail,
@@ -2114,6 +2445,7 @@ fn materialize_candidates_with_hook(
         });
     }
     result.skills = skills.into_values().collect();
+    result.skill_content_variants = Some(content_variants.into_values().collect());
     physical_package_observations
 }
 
@@ -2659,6 +2991,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
         files_partially_observed: 0,
         files_skipped: 0,
         denominator_reliable: false,
+        parse_contract_version: Some(SESSION_PARSE_CONTRACT_VERSION),
         bytes_observed: 0,
         lines_observed: 0,
         truncated: false,
@@ -2733,6 +3066,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     let mut bytes_observed = 0_u64;
     let mut lines_observed = 0_usize;
     let mut non_unicode_files_skipped = 0_u64;
+    let mut files_with_parse_failures = 0_u64;
 
     for root in roots {
         let status = match fs::read_dir(root) {
@@ -2776,6 +3110,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             path: root.clone(),
             status,
             explicit: false,
+            shared: false,
             detail: None,
             discovery_complete: true,
         });
@@ -2999,13 +3334,10 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 timestamp,
             );
             let source_path_digest = stable_digest(file_identity.as_bytes());
-            let sample = String::from_utf8_lossy(&sample);
-            let complete_json = is_json
-                && sample_bytes == metadata.len()
-                && serde_json::from_str::<serde_json::Value>(&sample).is_ok();
-            let records = if complete_json {
-                let physical_lines = sample.lines().count().max(1);
-                vec![(sample.into_owned(), physical_lines)]
+            let mut file_parse_failed = false;
+            let records = if is_json && sample_bytes == metadata.len() {
+                let physical_lines = sample.split_inclusive(|byte| *byte == b'\n').count();
+                vec![(sample, physical_lines)]
             } else if is_json {
                 let extracted = extract_complete_json_objects_with_facts(&sample);
                 if extracted.extraction_limited {
@@ -3030,11 +3362,15 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                         SessionCoverageLimitationSource::SessionJson,
                     );
                 }
-                extracted.records
+                extracted
+                    .records
+                    .into_iter()
+                    .map(|(record, lines)| (record.into_bytes(), lines))
+                    .collect()
             } else {
                 sample
-                    .lines()
-                    .map(|line| (line.to_owned(), 1))
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .map(|line| (line.to_vec(), 1))
                     .collect::<Vec<_>>()
             };
             for (line, physical_lines) in records {
@@ -3053,9 +3389,23 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     break;
                 }
                 lines_observed += physical_lines;
-                let record_timestamp = session_record_timestamp(agent, &line);
+                if !is_json
+                    && line
+                        .iter()
+                        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    continue;
+                }
+                let line = match std::str::from_utf8(&line) {
+                    Ok(line) if serde_json::from_str::<serde_json::Value>(line).is_ok() => line,
+                    _ => {
+                        file_parse_failed = true;
+                        continue;
+                    }
+                };
+                let record_timestamp = session_record_timestamp(agent, line);
                 let record_month = record_timestamp.and_then(month_start_unix);
-                let observations = session_record_observations(agent, &line);
+                let observations = session_record_observations(agent, line);
                 if !observations.is_empty() {
                     let mut seen_event_skill_stages = BTreeSet::new();
                     for observation in observations {
@@ -3148,6 +3498,19 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     );
                 }
             }
+            if file_parse_failed {
+                files_with_parse_failures += 1;
+                file_partially_observed = true;
+                record_session_limitation(
+                    &mut limitations,
+                    SessionCoverageLimitationCode::FileParseFailure,
+                    SessionCoverageScope::File,
+                    SessionCoverageCountKind::Exact,
+                    Some(files_with_parse_failures),
+                    None,
+                    SessionCoverageLimitationSource::SessionSampling,
+                );
+            }
             if file_partially_observed {
                 coverage.files_partially_observed += 1;
             }
@@ -3213,6 +3576,7 @@ const fn limitation_unit(code: SessionCoverageLimitationCode) -> SessionCoverage
         | SessionCoverageLimitationCode::SampledFileLimit
         | SessionCoverageLimitationCode::FileMetadataFailure
         | SessionCoverageLimitationCode::FileReadFailure
+        | SessionCoverageLimitationCode::FileParseFailure
         | SessionCoverageLimitationCode::FileZeroRead
         | SessionCoverageLimitationCode::FilePathNotUnicode => SessionCoverageUnit::Files,
         SessionCoverageLimitationCode::DiscoveryDepthLimit => SessionCoverageUnit::Depth,
@@ -3258,8 +3622,7 @@ struct JsonExtractionFacts {
     parse_boundary: bool,
 }
 
-fn extract_complete_json_objects_with_facts(sample: &str) -> JsonExtractionFacts {
-    let bytes = sample.as_bytes();
+fn extract_complete_json_objects_with_facts(bytes: &[u8]) -> JsonExtractionFacts {
     let mut candidates = Vec::<(usize, usize)>::new();
     // A tail can begin either inside or outside a JSON string. Try both bounded
     // parser states, then retain only the largest non-overlapping valid values.
@@ -3322,7 +3685,9 @@ fn extract_complete_json_objects_with_facts(sample: &str) -> JsonExtractionFacts
         records: selected
             .into_iter()
             .map(|(start, end)| {
-                let value = sample[start..end].to_owned();
+                let value = std::str::from_utf8(&bytes[start..end])
+                    .expect("validated JSON is UTF-8")
+                    .to_owned();
                 let lines = value.lines().count().max(1);
                 (value, lines)
             })
@@ -3334,7 +3699,7 @@ fn extract_complete_json_objects_with_facts(sample: &str) -> JsonExtractionFacts
 
 #[cfg(test)]
 fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
-    extract_complete_json_objects_with_facts(sample).records
+    extract_complete_json_objects_with_facts(sample.as_bytes()).records
 }
 
 #[derive(Default)]
@@ -3618,6 +3983,121 @@ mod tests {
         let path = std::env::temp_dir().join(format!("skillroster-{name}-{nonce}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn codex_discovers_both_user_roots_with_shared_read_only_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        for (root, name) in [(".codex/skills", "legacy"), (".agents/skills", "shared")] {
+            let directory = home.join(root).join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!("---\nname: {name}\n---\n"),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        let roots = result
+            .roots
+            .iter()
+            .filter(|root| root.agent == Some(AgentKind::Codex) && root.kind == RootKind::Skills)
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].path, home.join(".codex/skills"));
+        assert!(!roots[0].shared);
+        assert_eq!(roots[1].path, home.join(".agents/skills"));
+        assert!(roots[1].shared);
+        for placement in &result.placements {
+            assert!(placement.default_exposed);
+            assert_eq!(placement.owned_by_agent, Some(true));
+            let shared = placement.root == home.join(".agents/skills");
+            assert_eq!(
+                placement.mutation_scope,
+                Some(if shared {
+                    MutationScope::SharedReadOnly
+                } else {
+                    MutationScope::Mutable
+                })
+            );
+            assert_eq!(placement.is_mutable(), !shared);
+        }
+        assert_eq!(result.placements.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_shared_root_preserves_untrusted_links_and_read_only_physical_aliases() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let shared = home.join(".agents/skills");
+        let package = shared.join("shared");
+        let outside = temp.path().join("outside");
+        for directory in [&package, &outside] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(directory.join("SKILL.md"), "---\nname: sample\n---\n").unwrap();
+        }
+        symlink(&outside, shared.join("escaping")).unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&shared, &alias).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let untrusted = scan(&options).unwrap();
+        let escaped = untrusted
+            .placements
+            .iter()
+            .find(|placement| placement.directory == shared.join("escaping"))
+            .unwrap();
+        assert_eq!(
+            escaped.mutation_scope,
+            Some(MutationScope::UntrustedExternal)
+        );
+        assert_eq!(escaped.link_status, LinkStatus::EscapesRoot);
+        // Explicit Agent roots and source aliases cannot make shared packages mutable.
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::ClaudeCode,
+            path: alias.clone(),
+        });
+        options
+            .explicit_source_roots
+            .extend([alias.clone(), outside.clone()]);
+        let trusted = scan(&options).unwrap();
+        assert!(!trusted.placements.is_empty());
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .all(
+                    |placement| placement.mutation_scope == Some(MutationScope::SharedReadOnly)
+                        && !placement.is_mutable()
+                )
+        );
+        assert!(
+            trusted
+                .roots
+                .iter()
+                .filter(|root| root.path == alias && root.agent.is_some())
+                .all(|root| root.shared)
+        );
+        let outside_physical = fs::canonicalize(&outside).unwrap();
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .any(|placement| placement.agent.is_none()
+                    && placement.physical_directory.as_ref() == Some(&outside_physical))
+        );
+        assert!(
+            trusted
+                .placements
+                .iter()
+                .filter(|placement| placement.directory == shared.join("escaping"))
+                .all(|placement| placement.link_status == LinkStatus::Valid)
+        );
     }
 
     #[test]
@@ -4339,6 +4819,361 @@ enabled = true
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hermes_linked_root_is_shared_but_an_ancestor_alias_is_not() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source = temp.path().join("source");
+        fs::create_dir_all(home.join(".hermes")).unwrap();
+        fs::create_dir_all(source.join("child")).unwrap();
+        for directory in [&source, &source.join("child")] {
+            fs::write(directory.join("SKILL.md"), "# shared package\n").unwrap();
+        }
+        let root = home.join(".hermes/skills");
+        symlink(&source, &root).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options.explicit_source_roots.push(source.clone());
+        let result = scan(&options).unwrap();
+        let observed = result.roots.iter().find(|r| r.path == root).unwrap();
+        assert!(observed.shared);
+        assert!(observed.discovery_complete);
+        assert!(result.placements.iter().all(|placement| {
+            placement.mutation_scope == Some(MutationScope::SharedReadOnly) && !placement.governable
+        }));
+
+        let ordinary_home = temp.path().join("ordinary-home");
+        fs::create_dir_all(ordinary_home.join(".hermes/skills/ordinary")).unwrap();
+        fs::write(
+            ordinary_home.join(".hermes/skills/ordinary/SKILL.md"),
+            "# ordinary package\n",
+        )
+        .unwrap();
+        let home_alias = temp.path().join("home-alias");
+        symlink(&ordinary_home, &home_alias).unwrap();
+        let mut options = ScanOptions::for_home(&home_alias);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        let observed = result
+            .roots
+            .iter()
+            .find(|r| r.path == home_alias.join(".hermes/skills"))
+            .unwrap();
+        assert!(!observed.shared);
+        assert!(result.placements.iter().all(SkillPlacement::is_mutable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_ignores_approved_regular_file_links_during_directory_discovery() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".hermes/skills");
+        fs::create_dir_all(root.join("ordinary")).unwrap();
+        fs::write(root.join("ordinary/SKILL.md"), "# ordinary package\n").unwrap();
+        fs::write(root.join("README.md"), "ordinary documentation\n").unwrap();
+        let guide = root.join("ordinary/guide.md");
+        symlink("../README.md", &guide).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        assert_eq!(result.placements.len(), 1);
+        assert_eq!(result.placements[0].directory, root.join("ordinary"));
+        assert!(result.placements[0].default_exposed);
+        assert!(
+            result
+                .roots
+                .iter()
+                .find(|r| r.path == root)
+                .unwrap()
+                .discovery_complete
+        );
+
+        let unapproved = temp.path().join("unapproved.md");
+        fs::write(
+            &unapproved,
+            "---\nname: SECRET-FILE-NAME\n---\nSECRET-CONTENT\n",
+        )
+        .unwrap();
+        fs::remove_file(&guide).unwrap();
+        symlink(&unapproved, &guide).unwrap();
+        let result = scan(&options).unwrap();
+        assert!(
+            !result
+                .roots
+                .iter()
+                .find(|r| r.path == root)
+                .unwrap()
+                .discovery_complete
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("SECRET-FILE-NAME"));
+        assert!(!encoded.contains("SECRET-CONTENT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_discovers_categories_below_packages_links_and_target() {
+        use std::os::unix::fs::symlink;
+        let home = temp_directory("hermes-recursive-categories");
+        let root = home.join(".hermes/skills");
+        for relative in [
+            "parent",
+            "parent/group/deep",
+            "target/legit",
+            "category/child",
+            "parent/scripts/support",
+            "parent/references/support",
+            "parent/assets/support",
+            "parent/templates/support",
+        ] {
+            fs::create_dir_all(root.join(relative)).unwrap();
+            fs::write(
+                root.join(relative).join("SKILL.md"),
+                format!("# {relative}\n"),
+            )
+            .unwrap();
+        }
+        symlink(root.join("category"), root.join("category-link")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        for relative in ["parent/group/deep", "target/legit", "category-link/child"] {
+            let placement = result
+                .placements
+                .iter()
+                .find(|p| p.directory == root.join(relative))
+                .unwrap();
+            assert!(placement.default_exposed, "{relative}");
+        }
+        for support in HERMES_SKILL_SUPPORT_DIRS {
+            let placement = result
+                .placements
+                .iter()
+                .find(|p| p.directory == root.join("parent").join(support).join("support"))
+                .unwrap();
+            assert!(!placement.default_exposed, "{support}");
+        }
+        for placement in result
+            .placements
+            .iter()
+            .filter(|p| p.directory.ends_with("child"))
+        {
+            assert_eq!(
+                placement.mutation_scope,
+                Some(MutationScope::SharedReadOnly)
+            );
+            assert!(!placement.governable);
+        }
+        assert!(
+            result
+                .roots
+                .iter()
+                .find(|r| r.path == root)
+                .unwrap()
+                .discovery_complete
+        );
+        assert_eq!(
+            result.hermes_discovery_contract_version,
+            Some(HERMES_DISCOVERY_CONTRACT_VERSION)
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_branch_cycles_do_not_hide_distinct_aliases_and_mark_incomplete_discovery() {
+        use std::os::unix::fs::symlink;
+        let home = temp_directory("hermes-cycle");
+        let root = home.join(".hermes/skills");
+        fs::create_dir_all(root.join("category/child")).unwrap();
+        fs::write(root.join("category/child/SKILL.md"), "# child\n").unwrap();
+        symlink(&root, root.join("category/back")).unwrap();
+        symlink(root.join("category"), root.join("first")).unwrap();
+        symlink(root.join("category"), root.join("second")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        for alias in ["category", "first", "second"] {
+            assert!(
+                result
+                    .placements
+                    .iter()
+                    .any(|p| p.directory == root.join(alias).join("child"))
+            );
+        }
+        assert_eq!(result.placements.len(), 3);
+        let observed = result.roots.iter().find(|r| r.path == root).unwrap();
+        assert!(!observed.discovery_complete);
+        assert!(observed.detail.as_ref().unwrap().contains("cyclic"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn hermes_depth_limit_below_a_package_is_disclosed() {
+        let home = temp_directory("hermes-package-depth");
+        let root = home.join(".hermes/skills");
+        fs::create_dir_all(root.join("parent/group/deep")).unwrap();
+        fs::write(root.join("parent/SKILL.md"), "# parent\n").unwrap();
+        fs::write(root.join("parent/group/deep/SKILL.md"), "# deep\n").unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        options.max_depth = 1;
+        let result = scan(&options).unwrap();
+        assert_eq!(result.placements.len(), 1);
+        let observed = result.roots.iter().find(|r| r.path == root).unwrap();
+        assert!(!observed.discovery_complete);
+        assert!(
+            observed
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("bounded at depth 1")
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_category_trust_recovery_retains_durable_read_dependencies() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let root = home.join(".hermes/skills");
+        let source = temp.path().join("source");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(source.join("child")).unwrap();
+        fs::write(
+            source.join("child/SKILL.md"),
+            "---\nname: permitted-child\n---\n",
+        )
+        .unwrap();
+        symlink(&source, root.join("category")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let blocked = scan(&options).unwrap();
+        assert!(
+            !blocked
+                .roots
+                .iter()
+                .find(|r| r.path == root)
+                .unwrap()
+                .discovery_complete
+        );
+        assert_eq!(blocked.placements.len(), 1);
+        assert_eq!(blocked.placements[0].link_status, LinkStatus::EscapesRoot);
+        assert!(
+            !serde_json::to_string(&blocked)
+                .unwrap()
+                .contains("permitted-child")
+        );
+        let source = fs::canonicalize(&source).unwrap();
+        options.durable_read_roots.push(DurableReadRoot {
+            permission_id: "sroot_hermes_category".into(),
+            path: source.clone(),
+            identity: crate::source_policy::capture_identity(&source).unwrap(),
+        });
+        let recovered = scan(&options).unwrap();
+        assert!(
+            recovered
+                .roots
+                .iter()
+                .find(|r| r.path == root)
+                .unwrap()
+                .discovery_complete
+        );
+        assert_eq!(recovered.placements.len(), 2);
+        assert!(
+            recovered
+                .placements
+                .iter()
+                .all(|p| p.mutation_scope == Some(MutationScope::SharedReadOnly) && !p.governable)
+        );
+        assert!(
+            recovered
+                .durable_read_used_permission_ids
+                .as_ref()
+                .unwrap()
+                .contains("sroot_hermes_category")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_retarget_during_enumeration_discards_the_bound_branch() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("agent");
+        let source = temp.path().join("source");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        for (directory, name) in [(&source, "permitted"), (&outside, "SECRET-CHILD")] {
+            fs::create_dir_all(directory.join(name)).unwrap();
+            fs::write(directory.join(name).join("SKILL.md"), format!("# {name}\n")).unwrap();
+        }
+        let alias = root.join("category");
+        symlink(&source, &alias).unwrap();
+        let policy = SkillRootPolicy {
+            shared: false,
+            agent: Some(AgentKind::Hermes),
+            explicit: true,
+            governable: true,
+            detail: None,
+            provider: None,
+        };
+        let approved = vec![
+            fs::canonicalize(&root).unwrap(),
+            fs::canonicalize(&source).unwrap(),
+        ];
+        let mut candidates = Vec::new();
+        let outcome = EntrypointDiscovery {
+            policy: &policy,
+            placement_root: &root,
+            approved_roots: &approved,
+            max_depth: 5,
+            output: &mut candidates,
+        }
+        .discover(&alias, DiscoveryState::default(), &mut |directory| {
+            if directory == alias {
+                fs::remove_file(&alias).unwrap();
+                symlink(&outside, &alias).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(candidates.is_empty());
+        assert!(!outcome.is_complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hermes_directory_link_does_not_authorize_an_escaping_entrypoint_link() {
+        use std::os::unix::fs::symlink;
+        let home = temp_directory("hermes-entrypoint-trust");
+        let root = home.join(".hermes/skills");
+        fs::create_dir_all(root.join("package")).unwrap();
+        let outside = home.join("outside.md");
+        fs::write(&outside, "---\nname: SECRET-NAME\n---\nSECRET-BODY\n").unwrap();
+        symlink(&outside, root.join("package/SKILL.md")).unwrap();
+        symlink(root.join("package"), root.join("package-link")).unwrap();
+        let mut options = ScanOptions::for_home(&home);
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        assert_eq!(result.placements.len(), 2);
+        assert!(
+            result
+                .placements
+                .iter()
+                .all(|p| p.link_status == LinkStatus::EscapesRoot && !p.governable)
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("SECRET-NAME"));
+        assert!(!encoded.contains("SECRET-BODY"));
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn legacy_scan_payloads_default_to_untrusted_coverage() {
         let root = temp_directory("legacy-scan-payload");
@@ -4468,6 +5303,7 @@ enabled = true
             agent: Some(AgentKind::Codex),
             root: agent_root,
             governable: true,
+            shared: false,
             provider: None,
             expected_physical_entrypoint: Some(source.join("SKILL.md")),
             entrypoint: linked.join("SKILL.md"),
@@ -4546,6 +5382,7 @@ enabled = true
             agent: Some(AgentKind::Codex),
             root: agent_root,
             governable: true,
+            shared: false,
             provider: None,
             entrypoint: linked.join("SKILL.md"),
             expected_physical_entrypoint: Some(source.join("SKILL.md")),
@@ -4600,6 +5437,7 @@ enabled = true
                 agent: Some(agent),
                 root: agent_root,
                 governable: true,
+                shared: false,
                 provider: None,
                 expected_physical_entrypoint: Some(physical_entrypoint.clone()),
                 entrypoint: linked.join("SKILL.md"),
@@ -4651,6 +5489,7 @@ enabled = true
                 agent: Some(agent),
                 root: agent_root,
                 governable: true,
+                shared: false,
                 provider: None,
                 expected_physical_entrypoint: Some(physical_entrypoint.clone()),
                 entrypoint: linked.join("SKILL.md"),
@@ -4724,6 +5563,7 @@ enabled = true
             agent: Some(AgentKind::Codex),
             root: agent_root,
             governable: true,
+            shared: false,
             provider: None,
             expected_physical_entrypoint: Some(source.join("SKILL.md")),
             entrypoint: linked.join("SKILL.md"),
@@ -4773,6 +5613,7 @@ enabled = true
         observe_durable_skill_root_with_hook(
             &anchor,
             SkillRootPolicy {
+                shared: false,
                 agent: None,
                 explicit: true,
                 governable: false,
@@ -4834,6 +5675,76 @@ enabled = true
     }
 
     #[test]
+    fn declared_identity_retains_placement_bound_content_observations() {
+        let root = temp_directory("declared-content-observations");
+        for (name, instructions) in [
+            ("research", "Research papers and summarize findings."),
+            ("deploy", "Deploy services to production."),
+        ] {
+            let directory = root.join(name);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: {name} capability\nsource: shared-source\nversion: 1\n---\n{instructions}"
+                ),
+            )
+            .unwrap();
+        }
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skill_content_variants.as_ref().unwrap().len(), 1);
+        assert_eq!(result.routing_skills().count(), 2);
+        assert_eq!(result.placements.len(), 2);
+        assert_ne!(
+            result.placements[0].content_identity_digest,
+            result.placements[1].content_identity_digest
+        );
+        for placement in &result.placements {
+            assert_eq!(placement.skill_id, result.skills[0].id);
+            let expected_digest = digest_skill_directory(&placement.directory)
+                .unwrap()
+                .content_identity_digest;
+            assert_eq!(
+                placement.content_identity_digest.as_deref(),
+                Some(expected_digest.as_str())
+            );
+            let observed = result.observed_skill_for_placement(placement).unwrap();
+            let expected_name = placement.directory.file_name().unwrap().to_str().unwrap();
+            assert_eq!(observed.name, expected_name);
+            assert_eq!(observed.metadata.name.as_deref(), Some(expected_name));
+            assert_eq!(
+                observed.metadata.description.as_deref(),
+                Some(format!("{expected_name} capability").as_str())
+            );
+            let instructions = if expected_name == "research" {
+                "Research papers and summarize findings."
+            } else {
+                "Deploy services to production."
+            };
+            assert!(observed.normalized_text.contains(instructions));
+            assert!(observed.summary.contains(instructions));
+        }
+        let restored: ScanResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(restored.routing_skills().count(), 2);
+        for placement in &restored.placements {
+            assert!(restored.observed_skill_for_placement(placement).is_some());
+        }
+        let mut unmatched = restored.placements[0].clone();
+        unmatched.content_identity_digest = Some("unobserved-content".into());
+        assert!(restored.observed_skill_for_placement(&unmatched).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn content_identity_ignores_gitignore_but_keeps_supporting_files() {
         let root = temp_directory("content-identity");
         let first = root.join("one");
@@ -4868,6 +5779,8 @@ enabled = true
             Some(CONTENT_IDENTITY_ALGORITHM)
         );
         assert_eq!(result.skills.len(), 1);
+        assert!(result.skill_content_variants.as_ref().unwrap().is_empty());
+        assert_eq!(result.routing_skills().count(), 1);
         assert_eq!(result.placements.len(), 2);
         let first_content_identity = digest_skill_directory(&first)
             .unwrap()
@@ -4876,6 +5789,13 @@ enabled = true
             result.skills[0].content_identity_digest.as_deref(),
             Some(first_content_identity.as_str())
         );
+        for placement in &result.placements {
+            assert_eq!(
+                placement.content_identity_digest.as_deref(),
+                Some(first_content_identity.as_str())
+            );
+            assert!(result.observed_skill_for_placement(placement).is_some());
+        }
 
         fs::write(second.join("run.sh"), "different behavior").unwrap();
         let (changed_id, _) = inspect_skill_identity(&second.join("SKILL.md")).unwrap();
@@ -5289,6 +6209,136 @@ enabled = true
         assert_eq!(result.coverage[0].files_partially_observed, 2);
         assert!(result.coverage[0].bytes_observed <= MAX_SESSION_BYTES_PER_AGENT);
 
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn session_parse_failures_block_coverage_without_creating_usage() {
+        for (extension, content, expected_loaded, expected_failed_files) in [
+            ("jsonl", b"{invalid research\n".to_vec(), 0, 1),
+            ("log", b"plain research text\n".to_vec(), 0, 1),
+            ("jsonl", b"{\"loaded_skill\":\"research\",\"text\":\"\xff\"}\n".to_vec(), 0, 1),
+            ("json", b"{\"loaded_skill\":\"research\",\"text\":\"\xff\"}".to_vec(), 0, 1),
+            ("json", b"{invalid: {\"loaded_skill\":\"research\"}}".to_vec(), 0, 1),
+            ("json", b"{\"loaded_skill\":\"research\"}".to_vec(), 1, 0),
+            ("jsonl", b"{\"loaded_skill\":\"research\"}\n{\"research\":".to_vec(), 1, 1),
+            ("jsonl", b"{invalid research\n{\"loaded_skill\":\"research\"}".to_vec(), 1, 1),
+            ("jsonl", b"{\"loaded_skill\":\"research\",\"text\":\"\xff\"}\n{\"loaded_skill\":\"research\"}".to_vec(), 1, 1),
+            ("jsonl", b"{\"loaded_skill\":\"research\"}".to_vec(), 1, 0),
+            ("jsonl", b"\n  \r\n{\"unknown_future_event\":true}\n{}\nnull\n".to_vec(), 0, 0),
+            ("jsonl", Vec::new(), 0, 0),
+            ("jsonl", b"\x0c\n".to_vec(), 0, 1),
+            ("jsonl", b"\x0b\n".to_vec(), 0, 1),
+            ("jsonl", b" \t\r\n".to_vec(), 0, 0),
+            ("json", Vec::new(), 0, 1),
+            ("json", b" \t\r\n \n".to_vec(), 0, 1),
+            ("jsonl", b" \t\r\n \n".to_vec(), 0, 0),
+        ] {
+            let home = temp_directory("session-parse-failure");
+            let skill = home.join(".codex/skills/research");
+            let sessions = home.join(".codex/sessions");
+            fs::create_dir_all(&skill).unwrap();
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+            let expected_lines = content.split_inclusive(|byte| *byte == b'\n').count();
+            fs::write(sessions.join(format!("session.{extension}")), content).unwrap();
+
+            let result = scan(&ScanOptions::for_home(&home)).unwrap();
+            let coverage = result.coverage.iter().find(|item| item.agent == AgentKind::Codex).unwrap();
+            assert!(coverage.has_current_parse_contract());
+            assert_eq!(coverage.lines_observed, expected_lines);
+            assert_eq!(coverage.denominator_is_reliable(), expected_failed_files == 0);
+            assert_eq!(coverage.files_partially_observed, expected_failed_files);
+            let failures = coverage.limitations.as_ref().unwrap().iter().filter(|fact| fact.code == SessionCoverageLimitationCode::FileParseFailure).collect::<Vec<_>>();
+            if expected_failed_files > 0 {
+                assert_eq!(failures.len(), 1);
+                let failure = failures[0];
+                assert_eq!(failure.scope, SessionCoverageScope::File);
+                assert_eq!(failure.count_kind, SessionCoverageCountKind::Exact);
+                assert_eq!(failure.observed, Some(expected_failed_files as u64));
+                assert_eq!(failure.limit, None);
+                assert_eq!(failure.unit, SessionCoverageUnit::Files);
+                assert_eq!(failure.source, SessionCoverageLimitationSource::SessionSampling);
+            } else {
+                assert!(failures.is_empty());
+            }
+            assert!(result.usage.iter().all(|usage| usage.quality == EvidenceQuality::Observed && usage.stage == UsageStage::Loaded));
+            assert_eq!(result.usage.iter().map(|usage| usage.event_count).sum::<u64>(), expected_loaded);
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn session_parse_failure_counts_files_once_and_preserves_valid_inference() {
+        let home = temp_directory("session-parse-file-count");
+        let skill = home.join(".codex/skills/research");
+        let sessions = home.join(".codex/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+        fs::write(sessions.join("one.jsonl"), "{bad research\n{bad research\n").unwrap();
+        fs::write(
+            sessions.join("two.jsonl"),
+            "{bad research\n{\"unknown\":\"research\"}\n",
+        )
+        .unwrap();
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|item| item.agent == AgentKind::Codex)
+            .unwrap();
+        let failure = coverage
+            .limitations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|fact| fact.code == SessionCoverageLimitationCode::FileParseFailure)
+            .unwrap();
+        assert_eq!(failure.observed, Some(2));
+        assert_eq!(coverage.files_partially_observed, 2);
+        assert_eq!(result.usage.len(), 1);
+        assert_eq!(result.usage[0].quality, EvidenceQuality::Inferred);
+        assert_eq!(result.usage[0].event_count, 1);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn bounded_json_tail_rejects_invalid_utf8_candidates_and_keeps_valid_siblings() {
+        let home = temp_directory("session-json-tail-utf8");
+        let skill = home.join(".hermes/skills/research");
+        let sessions = home.join(".hermes/sessions");
+        fs::create_dir_all(&skill).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+        let mut document = format!(
+            r#"{{"padding":"{}","events":["#,
+            "x".repeat(MAX_SESSION_BYTES_PER_FILE as usize)
+        )
+        .into_bytes();
+        document.extend_from_slice(
+            b"{\"loaded_skill\":\"research\",\"text\":\"\xff\"},{\"loaded_skill\":\"research\"}]}",
+        );
+        fs::write(sessions.join("session.json"), document).unwrap();
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|item| item.agent == AgentKind::Hermes)
+            .unwrap();
+        assert!(!coverage.denominator_is_reliable());
+        assert_eq!(coverage.files_partially_observed, 1);
+        assert!(
+            coverage
+                .limitations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|fact| fact.code == SessionCoverageLimitationCode::FileByteLimit)
+        );
+        assert_eq!(result.usage.len(), 1);
+        assert_eq!(result.usage[0].stage, UsageStage::Loaded);
+        assert_eq!(result.usage[0].event_count, 1);
         fs::remove_dir_all(home).unwrap();
     }
 

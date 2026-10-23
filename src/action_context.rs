@@ -118,6 +118,19 @@ impl ActionContext {
             "find" => {
                 if let Some(matches) = result.get_mut("matches").and_then(Value::as_array_mut) {
                     for found in matches {
+                        if let Some(choice) = found.get_mut("content_choice") {
+                            self.apply_content_choice(choice);
+                        }
+                        for variant in found
+                            .get_mut("variants")
+                            .and_then(Value::as_array_mut)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(choice) = variant.get_mut("content_choice") {
+                                self.apply_content_choice(choice);
+                            }
+                        }
                         if let Some(argv) = found.pointer_mut("/variant_finding/argv") {
                             self.apply_json_argv(argv);
                         }
@@ -125,6 +138,19 @@ impl ActionContext {
                 }
             }
             "report" => {
+                if let Some(choice) = result.pointer_mut("/resolution/content_choice") {
+                    self.apply_content_choice(choice);
+                }
+                for finding in result
+                    .get_mut("findings")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(choice) = finding.pointer_mut("/resolution/content_choice") {
+                        self.apply_content_choice(choice);
+                    }
+                }
                 if let Some(action) = result.pointer_mut("/planning/action") {
                     self.apply_json_action(action);
                 }
@@ -147,6 +173,29 @@ impl ActionContext {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn apply_content_choice(&self, choice: &mut Value) {
+        if let Some(argv) = choice.pointer_mut("/inspection/argv") {
+            self.apply_json_argv(argv);
+        }
+        for group in choice
+            .get_mut("groups")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            for placement in group
+                .get_mut("placements")
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(argv) = placement.get_mut("load_argv") {
+                    self.apply_json_argv(argv);
+                }
+            }
         }
     }
 
@@ -382,6 +431,47 @@ mod tests {
         assert_eq!(
             result.pointer("/planning/action/requires_confirmation"),
             Some(&Value::Bool(true))
+        );
+    }
+    #[test]
+    fn content_choice_continuations_preserve_executable_and_discovery_context() {
+        let context = ActionContext {
+            executable: "/verified/skillroster".into(),
+            argv: vec![
+                "--home".into(),
+                "/home".into(),
+                "--state-dir".into(),
+                "/state".into(),
+                "--source-root".into(),
+                "/source".into(),
+            ],
+            argv_without_source_roots: vec![],
+        };
+        let choice = json!({"inspection": {"argv": ["skillroster", "report", "--summary", "--json"]},
+            "groups": [{"placements": [{"load_argv": ["skillroster", "find", "--load", "--variant-placement-id", "placement_1", "--require-snapshot", "scan_1", "--json", "--", "research"]}]}]});
+        let mut find = json!({"matches": [{"content_choice": choice.clone(), "variants": [{"content_choice": choice.clone()}]}]});
+        context.apply_result("find", &mut find);
+        for pointer in [
+            "/matches/0/content_choice/inspection/argv",
+            "/matches/0/variants/0/content_choice/inspection/argv",
+        ] {
+            let argv = find.pointer(pointer).unwrap().as_array().unwrap();
+            assert_eq!(argv[0], "/verified/skillroster");
+            assert_eq!(argv[6], "/source");
+            assert_eq!(argv[7], "report");
+        }
+        let mut report = json!({"resolution": {"content_choice": choice}});
+        context.apply_result("report", &mut report);
+        let argv = report
+            .pointer("/resolution/content_choice/groups/0/placements/0/load_argv")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(argv[0], "/verified/skillroster");
+        assert_eq!(argv[7], "find");
+        assert!(
+            argv.windows(2)
+                .any(|a| a == [json!("--require-snapshot"), json!("scan_1")])
         );
     }
 }

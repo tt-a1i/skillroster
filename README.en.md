@@ -45,6 +45,15 @@ With one agent and a small, clear native catalog, keeping your setup is a valid 
 
 Ordinary tasks can use existing capabilities and search for specialized Skills when useful. No optional match need not interrupt the task. Claude's local exposure counts distinguish manual invocation, disabled entries, and name-only listings; they do not measure a running session's complete catalog or tokens. [Scope and validation](docs/practical-governance.md)
 
+## v1.8.47 source candidate improvements
+
+- **Respect local Agent rules:** discover Codex shared Skills and additional Hermes paths; preserve observed disable rules, platform restrictions, and shared read-only directories during governance. Uncertain configuration stays unknown; local observations are not a complete session catalog.
+- **Choose the content before loading:** when packages declare the same source and version but differ in content, compare and explicitly select a placement. Read-only review constraints no longer exclude a normal review Skill merely for mentioning files.
+- **Keep usage evidence trustworthy:** malformed session records do not contribute usage evidence. Missing reliable records cannot justify archival or Roster reduction. Rescan after upgrading.
+- **Avoid repeated reads:** ordinary Find reuses advisory checks within one invocation; actual loading independently verifies the package. See the [large-support-file benchmark](docs/acceptance/find-read-cost-2026-10-22.md); it does not establish universal latency or token savings.
+
+These changes are in the source candidate; public installation versions appear below. Pending Plans based on older Snapshots or changed configuration may require a new Scan and review before Apply.
+
 ## Start in 30 seconds
 
 Install with Homebrew on macOS or Linux:
