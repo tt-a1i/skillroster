@@ -147,7 +147,7 @@ skillroster setup --json
 ```
 
 Published CLI v1.8.46 bundles Bootstrap content version 1.8.50.
-The source tree is **v1.8.46**.
+The source tree is **v1.8.47**.
 Its bundled Bootstrap content version is 1.8.51. CLI and Bootstrap versions can
 differ intentionally when CLI behavior changes without changing the Bootstrap
 instructions.
