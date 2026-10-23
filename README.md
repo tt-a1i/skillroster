@@ -45,14 +45,14 @@
 
 普通任务可以直接使用已有能力；需要专门的 Skill 时再查找。查不到合适的可选 Skill，不必因此中断任务。Claude 的本地暴露统计会区分手动调用、关闭和仅显示名称等状态；它不等于运行中会话的完整目录或 token 消耗。[统计范围与验证](docs/practical-governance.md)
 
-## v1.8.47 源码候选改进
+## v1.8.47 更新
 
 - **尊重 Agent 的本地规则**：补齐 Codex 共享技能目录和 Hermes 目录发现；整理时保护已观察到的禁用、平台限制与共享只读目录。配置无法确认时保留未知，不把本地统计当作完整会话目录。
 - **加载前确认内容**：同一来源和版本出现不同内容时，先比较并明确选择具体副本；“只审查、不修改文件”不再误排除正常审查技能。
 - **使用证据更可靠**：损坏的会话记录不参与使用判断；没有可靠记录不能作为归档或精简的依据。升级后先重新扫描。
 - **减少重复读取**：普通查找复用本次查询的辅助检查；实际加载仍重新校验内容。大支持文件场景的实测见[性能验收](docs/acceptance/find-read-cost-2026-10-22.md)，不代表普遍性能或 token 收益。
 
-这些改进目前属于源码候选，公开安装版本见下文。已有待确认 Plan 在旧快照或配置变化时可能要求重新扫描；请重新检查方案后再应用。
+这些改进已随 v1.8.47 发布，安装方式见下文。已有待确认 Plan 在旧快照或配置变化时可能要求重新扫描；请重新检查方案后再应用。
 
 ## 30 秒开始
 
@@ -74,7 +74,7 @@ skillroster report
 
 > 使用 SkillRoster 检查我电脑上的 Skills，解释有证据支持、值得处理的问题。没有明确整理项就告诉我可以保持现状。先做分析，我选择整理目标后再预览方案，确认完整 Plan 后才修改 Agent 文件。
 
-当前公开安装得到 CLI **v1.8.46 / Bootstrap 1.8.50**，包含摘要终点、接入状态检查、普通任务回退和 Claude 原生可见性说明。可用 `skillroster setup --check --json` 只查接入状态，不创建 Plan。已有用户需要分别更新 CLI 和可选的 Bootstrap；具体步骤见[安装指南](docs/installation.md)。
+当前公开安装得到 CLI **v1.8.47 / Bootstrap 1.8.51**，包含 Codex/Hermes 本地可见性保护、冲突内容选择和会话证据修复。可用 `skillroster setup --check --json` 只查接入状态，不创建 Plan。已有用户需要分别更新 CLI 和可选的 Bootstrap；具体步骤见[安装指南](docs/installation.md)。
 
 [Windows、Cargo 和 Release 安装方式](docs/installation.md) · [升级并确认 Agent 使用的可执行文件](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)
 
@@ -181,10 +181,10 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
-当前公开版本为 **v1.8.46**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
+当前公开版本为 **v1.8.47**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)
-- [v1.8.46 发布与平台证据](docs/acceptance/release-v1.8.46.md)
+- [v1.8.47 发布与平台证据](docs/acceptance/release-v1.8.47.md)
 - [验收记录](docs/acceptance.md)
 - [产品简介](docs/product-brief.md)
 - [统一术语](CONTEXT.md)
