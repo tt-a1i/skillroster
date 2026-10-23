@@ -199,8 +199,9 @@ pub(super) fn select_top_match_variant(
     } else {
         None
     };
-    if let (Some(skill_id), Some(placement)) = (requested_skill_id, placement)
-        && skill_id != placement.skill_id
+    if requested_skill_id
+        .zip(placement)
+        .is_some_and(|(skill_id, placement)| skill_id != placement.skill_id)
     {
         return Err(blocked("variant_selectors_disagree").into());
     }

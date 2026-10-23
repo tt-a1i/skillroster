@@ -367,9 +367,15 @@ pub(crate) fn observe(home: &Path, scan: &mut ScanResult) {
         )])),
     };
     for placement in &scan.placements {
-        if placement.entrypoint_digest.is_some()
-            && let Some((identity, attributes)) = scan.verified_hermes_attributes.get(&placement.id)
-            && fs::canonicalize(&placement.entrypoint).ok().as_ref() == Some(identity)
+        if placement.entrypoint_digest.is_none() {
+            continue;
+        }
+        if let Some((identity, attributes)) = scan
+            .verified_hermes_attributes
+            .get(&placement.id)
+            .filter(|(identity, _)| {
+                fs::canonicalize(&placement.entrypoint).ok().as_ref() == Some(identity)
+            })
         {
             snapshot
                 .verified_attributes

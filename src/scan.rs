@@ -1655,12 +1655,15 @@ impl EntrypointDiscovery<'_> {
                     let expected_physical_entrypoint = fs::canonicalize(entry.path())
                         .ok()
                         .filter(|path| path.to_str().is_some());
-                    if hermes
-                        && let Some(expected) = &expected_physical_entrypoint
-                        && !is_within_resolved_root(expected, self.approved_roots)
-                    {
-                        target = expected.parent().map(Path::to_path_buf);
-                        link_status = LinkStatus::EscapesRoot;
+                    if hermes {
+                        if let Some(expected) =
+                            expected_physical_entrypoint.as_ref().filter(|expected| {
+                                !is_within_resolved_root(expected, self.approved_roots)
+                            })
+                        {
+                            target = expected.parent().map(Path::to_path_buf);
+                            link_status = LinkStatus::EscapesRoot;
+                        }
                     }
                     let default_exposed = default_exposure_for_candidate(
                         self.policy,
@@ -1702,9 +1705,10 @@ impl EntrypointDiscovery<'_> {
                     // Resolve and approve the target before inspecting its kind;
                     // unapproved or unknown links retain the fail-closed branch.
                     if hermes
-                        && let Ok(target) = fs::canonicalize(entry.path())
-                        && is_within_resolved_root(&target, self.approved_roots)
-                        && fs::metadata(target).is_ok_and(|metadata| metadata.is_file())
+                        && fs::canonicalize(entry.path()).is_ok_and(|target| {
+                            is_within_resolved_root(&target, self.approved_roots)
+                                && fs::metadata(target).is_ok_and(|metadata| metadata.is_file())
+                        })
                     {
                         continue;
                     }
@@ -2403,7 +2407,11 @@ fn materialize_candidates_with_hook(
                 .then(|| crate::codex_visibility::parse_native_name(&content))
                 .flatten(),
         );
-        if safe_to_read && let Some(identity) = &candidate.expected_physical_entrypoint {
+        if let Some(identity) = candidate
+            .expected_physical_entrypoint
+            .as_ref()
+            .filter(|_| safe_to_read)
+        {
             result.verified_hermes_attributes.insert(
                 placement_id.clone(),
                 (
