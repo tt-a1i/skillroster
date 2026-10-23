@@ -1276,7 +1276,12 @@ mod tests {
             .unwrap()
             .values_mut()
         {
-            if let Some(posix) = binding["Resolved"]["identity"]["Posix"].as_object_mut() {
+            if let Some(posix) = binding
+                .get_mut("Resolved")
+                .and_then(|resolved| resolved.get_mut("identity"))
+                .and_then(|identity| identity.get_mut("Posix"))
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 posix.remove("birth_time");
                 posix.insert("ctime".into(), json!(0));
                 posix.insert("ctime_nsec".into(), json!(0));
