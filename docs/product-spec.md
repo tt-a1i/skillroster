@@ -630,19 +630,34 @@ candidate but cannot authorize
 complete instruction loading. Ordinary Find still returns the bounded lexical
 candidates and its actionable hint warning; the blocked load returns no partial
 instructions. Known incomplete package fingerprints are not automatically classified as
-Snapshot drift. Find exposes bounded `path_availability` facts including the
+Snapshot drift. Scan records a typed `entrypoint_read_error` when an authorized
+bounded entrypoint read fails and does not fabricate an empty-file digest.
+A repeated permission, encoding, or entrypoint-size failure on the same physical
+entrypoint remains an unavailable observation: repair that cause before rescanning.
+A missing/retargeted entrypoint or a newly readable entrypoint still requires
+fresh evidence; unknown legacy read state is not assumed unchanged. Find exposes
+bounded `path_availability` facts including the
 fingerprint detail, package byte/depth budgets, and a recovery decision that
 requires resolving the limit or read-access cause before rescanning. Missing,
 changed, or retargeted entrypoints still require a rescan; no incomplete package
-is authorized for exact loading. A successful rescan after package repair must
+is authorized for exact loading. Same-name groups with incomplete fingerprints
+expose an `incomplete_package` inspection state and per-variant availability,
+with inventory inspection rather than a misleading missing-layout-Finding path.
+A healthy explicitly selected variant remains loadable. A successful rescan after package repair must
 search the current Snapshot rather than let historical identities exhaust the
 candidate budget. Discovery additionally exposes per-candidate `load_readiness`:
-`blocked` identifies missing selection evidence, ambiguous variants, or an
-unavailable current path; `verification_required` is advisory eligibility, not
-successful loading or semantic correctness. This advisory covers selection
-evidence, same-name variants, and current-path availability; callers must still
-honor any separately returned `content_choice` decision. Exact verification is
-not performed by this diagnostic. Weak-evidence load refusals offer a Snapshot-bound read-only
+`blocked` identifies missing selection evidence, ambiguous variants or declared
+content, unavailable current paths, and known placement read blockers such as
+the entrypoint transport-size limit. `verification_required` is advisory
+eligibility, not successful loading or semantic correctness. Placement facts
+follow the verifier's eligible-placement preference, but cached read observations
+never authorize content loading. Callers must still honor the separately
+returned `content_choice` decision. Exact verification is not performed by this
+diagnostic. Find comparison-load actions are offered only when the original
+task and hints pass the same direct-selection evidence gate as loading; weak
+candidates retain inspection and Agent-authored refinement instead of an
+executable action that is already known to fail. Weak-evidence load refusals offer
+a Snapshot-bound read-only
 Find inspection command preserving the original task and hints. The Agent must
 independently select the intended capability before authoring a faithful refined
 hint; a ranked name is never automatically converted into an exact-name bypass.

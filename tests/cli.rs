@@ -904,12 +904,12 @@ fn run(args: &[&str], stdin: Option<&str>) -> std::process::Output {
         .spawn()
         .unwrap();
     if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        if let Err(error) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            // A command may reject stale/invalid context before consuming stdin.
+            // Still collect and assert its actual error response, rather than
+            // making that legitimate early exit a scheduling-dependent panic.
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
     }
     child.wait_with_output().unwrap()
 }
@@ -13028,6 +13028,24 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
             .iter()
             .any(|action| action["action"] == "inspect_variant_finding")
     );
+    // The inspection hint is weak: do not advertise loads that would fail its
+    // direct-selection gate. Independently choose this capability explicitly
+    // before exercising the archive/variant boundary below.
+    assert!(
+        variants["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "load_exact_variant_for_comparison")
+    );
+    let variants = json_output(&run(
+        &[
+            &common[..],
+            &["find", "active search marker", "--hint", "shared-route"],
+        ]
+        .concat(),
+        None,
+    ));
     assert_eq!(
         variants["suggested_actions"]
             .as_array()
@@ -13169,6 +13187,21 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
         fresh_variants["result"]["matches"][0]["variant_finding"]["snapshot_id"],
         fresh_snapshot
     );
+    assert!(
+        fresh_variants["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| action["action"] != "load_exact_variant_for_comparison")
+    );
+    let fresh_variants = json_output(&run(
+        &[
+            &common[..],
+            &["find", "active search marker", "--hint", "shared-route"],
+        ]
+        .concat(),
+        None,
+    ));
     let fresh_load_actions = fresh_variants["suggested_actions"]
         .as_array()
         .unwrap()

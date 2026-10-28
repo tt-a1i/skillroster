@@ -1200,6 +1200,9 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                             Some("source_confirmation_required") => {
                                 Some("confirm exact source root first".into())
                             }
+                            Some("incomplete_package") => {
+                                Some("inspect incomplete package inventory".into())
+                            }
                             Some("report_required") => Some("current Report required".into()),
                             _ => None,
                         }
@@ -1308,6 +1311,9 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
                 "Inspect the linked Finding before confirming exact source roots"
             }
             Some("rescan_required") => "Refresh the Snapshot before loading a variant",
+            Some("incomplete_package") => {
+                "Inspect incomplete package inventory; rescan alone is not sufficient"
+            }
             Some("report_required") => "Materialize the current Report before choosing a variant",
             Some("available") => "Inspect the linked Finding before loading an exact variant",
             Some("finding_unavailable") => {

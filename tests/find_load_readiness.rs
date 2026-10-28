@@ -111,3 +111,234 @@ fn find_exposes_missing_selection_evidence_and_executable_read_only_recovery() {
         contents
     );
 }
+
+fn deployment_copies(declared: bool) -> TempDir {
+    let temp = TempDir::new().unwrap();
+    for (agent, body) in [
+        ("codex", "Inspect status without changes."),
+        ("hermes", "Report rollout without mutations."),
+    ] {
+        let package = temp
+            .path()
+            .join(format!("home/.{agent}/skills/deployment-helper"));
+        fs::create_dir_all(&package).unwrap();
+        let declaration = if declared {
+            "source: github:example/deployment-helper\nversion: v1\n"
+        } else {
+            ""
+        };
+        fs::write(package.join("SKILL.md"), format!("---\nname: deployment-helper\n{declaration}description: Inspect deployment progress and workloads in staging; diagnose service rollout and list pod states.\n---\n{body}\n")).unwrap();
+    }
+    assert!(run(&temp, &["scan"]).0);
+    temp
+}
+
+#[test]
+fn discovery_blocks_known_declared_content_selection_before_load() {
+    let temp = deployment_copies(true);
+    let (ok, found) = run(&temp, &["find", "--limit", "1", "--", "deployment-helper"]);
+    assert!(ok, "{found}");
+    let candidate = &found["result"]["matches"][0];
+    assert_eq!(candidate["variant_count"], 1);
+    assert_eq!(
+        candidate["content_choice"]["content_selection_required"],
+        true
+    );
+    assert_eq!(candidate["load_readiness"]["state"], "blocked");
+    assert!(
+        candidate["load_readiness"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "declared_identity_content_ambiguous")
+    );
+    let (ok, blocked) = run(
+        &temp,
+        &["find", "--load", "--limit", "1", "--", "deployment-helper"],
+    );
+    assert!(!ok);
+    assert_eq!(
+        blocked["error"]["code"],
+        "declared_identity_content_ambiguous"
+    );
+    assert!(blocked["result"].is_null());
+}
+
+#[test]
+fn discovery_exposes_known_entrypoint_transport_limit_without_loading_content() {
+    let temp = TempDir::new().unwrap();
+    let package = temp.path().join("home/.codex/skills/diagram");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("SKILL.md"),
+        format!(
+            "---\nname: diagram\ndescription: Render diagrams\n---\n{}",
+            "x".repeat(140_000)
+        ),
+    )
+    .unwrap();
+    assert!(run(&temp, &["scan"]).0);
+    let (ok, found) = run(&temp, &["find", "--limit", "1", "--", "diagram"]);
+    assert!(ok, "{found}");
+    let candidate = &found["result"]["matches"][0];
+    assert!(!candidate["paths"].as_array().unwrap().is_empty());
+    assert_eq!(candidate["load_readiness"]["state"], "blocked");
+    assert!(
+        candidate["load_readiness"]["reason_codes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "entrypoint_exceeds_content_limit")
+    );
+    assert_eq!(candidate["load_readiness"]["verification_performed"], false);
+    assert!(found["result"]["loaded_skill"].is_null());
+    let (ok, blocked) = run(&temp, &["find", "--load", "--limit", "1", "--", "diagram"]);
+    assert!(!ok);
+    assert_eq!(
+        blocked["error"]["details"]["reason"],
+        "entrypoint_exceeds_content_limit"
+    );
+}
+
+#[test]
+fn weak_selection_never_advertises_comparison_loads_that_its_evidence_gate_refuses() {
+    let task = "查看 staging 服务发布进度和 Pod 状态";
+    for declared in [false, true] {
+        let temp = deployment_copies(declared);
+        for hint in [None, Some("deployment status pod")] {
+            let mut args = vec!["find", "--limit", "1"];
+            if let Some(hint) = hint {
+                args.extend(["--hint", hint]);
+            }
+            let (ok, found) = run(&temp, &[args, vec!["--", task]].concat());
+            assert!(ok, "{found}");
+            let actions = found["suggested_actions"].as_array().unwrap();
+            assert!(
+                !actions.is_empty(),
+                "inspection must remain available: {found}"
+            );
+            assert!(
+                !actions.iter().any(|a| a["argv"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "--load")),
+                "{found}"
+            );
+            assert_eq!(
+                found["result"]["matches"][0]["load_readiness"]["state"],
+                "blocked"
+            );
+        }
+        let (ok, exact) = run(
+            &temp,
+            &[
+                "find",
+                "--hint",
+                "deployment-helper",
+                "--limit",
+                "1",
+                "--",
+                task,
+            ],
+        );
+        assert!(ok, "{exact}");
+        let loads = exact["suggested_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a["action"].as_str().unwrap().starts_with("load_exact"))
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 2, "{exact}");
+        for action in loads {
+            let argv = action["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>();
+            let output = Command::new(env!("CARGO_BIN_EXE_skillroster"))
+                .args(&argv[1..])
+                .output()
+                .unwrap();
+            let loaded: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{loaded}");
+            assert_eq!(loaded["result"]["files_changed"], false);
+            assert_eq!(loaded["result"]["task"], task);
+            assert_eq!(
+                loaded["result"]["loaded_skill"]["selection"]["name"],
+                "deployment-helper"
+            );
+        }
+    }
+}
+
+#[test]
+fn same_name_comparison_actions_only_offer_loadable_selected_content() {
+    for declared in [false, true] {
+        let temp = deployment_copies(declared);
+        if declared {
+            // Two contents under one declared identity require placement selection,
+            // while an unrelated same-name identity remains selectable by Skill ID.
+            let package = temp.path().join("home/.claude/skills/deployment-helper");
+            fs::create_dir_all(&package).unwrap();
+            fs::write(package.join("SKILL.md"), "---\nname: deployment-helper\ndescription: Inspect deployments\n---\nOther implementation\n").unwrap();
+        } else {
+            // This variant has a complete inventory fingerprint and a current path,
+            // but exceeds the stricter verified-load transport bound.
+            let package = temp.path().join("home/.hermes/skills/deployment-helper");
+            fs::write(
+                package.join("SKILL.md"),
+                format!(
+                    "---\nname: deployment-helper\ndescription: Inspect deployments\n---\n{}",
+                    "x".repeat(140_000)
+                ),
+            )
+            .unwrap();
+        }
+        assert!(run(&temp, &["scan"]).0);
+        let (ok, found) = run(&temp, &["find", "--limit", "1", "--", "deployment-helper"]);
+        assert!(ok, "{found}");
+        let actions = found["suggested_actions"].as_array().unwrap();
+        let loads = actions
+            .iter()
+            .filter(|a| a["action"].as_str().unwrap().starts_with("load_exact"))
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), if declared { 3 } else { 1 }, "{found}");
+        assert_eq!(
+            loads
+                .iter()
+                .filter(|a| a["action"] == "load_exact_variant_for_comparison")
+                .count(),
+            1,
+            "{found}"
+        );
+        assert_eq!(
+            loads
+                .iter()
+                .filter(|a| a["action"] == "load_exact_content_for_comparison")
+                .count(),
+            if declared { 2 } else { 0 },
+            "{found}"
+        );
+        for action in loads {
+            let argv = action["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>();
+            let output = Command::new(env!("CARGO_BIN_EXE_skillroster"))
+                .args(&argv[1..])
+                .output()
+                .unwrap();
+            let loaded: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(output.status.success(), "{loaded}");
+            assert_eq!(loaded["result"]["files_changed"], false);
+            assert_eq!(
+                loaded["result"]["loaded_skill"]["selection"]["name"],
+                "deployment-helper"
+            );
+        }
+    }
+}
