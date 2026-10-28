@@ -1115,6 +1115,26 @@ impl StateStore {
     /// Returns local Skill IDs selected by SQLite FTS5. User input is reduced
     /// to quoted unicode word terms so FTS operators cannot alter the query.
     pub fn search_skill_ids(&self, task: &str, limit: usize) -> StorageResult<Vec<SkillId>> {
+        self.search_skill_ids_with_snapshot(task, limit, None)
+    }
+
+    /// Scope candidate selection before applying the bound: historical FTS rows
+    /// must not displace a current identity after a package changes and rescans.
+    pub fn search_skill_ids_in_snapshot(
+        &self,
+        task: &str,
+        limit: usize,
+        snapshot_id: &ScanId,
+    ) -> StorageResult<Vec<SkillId>> {
+        self.search_skill_ids_with_snapshot(task, limit, Some(snapshot_id))
+    }
+
+    fn search_skill_ids_with_snapshot(
+        &self,
+        task: &str,
+        limit: usize,
+        snapshot_id: Option<&ScanId>,
+    ) -> StorageResult<Vec<SkillId>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -1130,27 +1150,39 @@ impl StateStore {
         let mut statement = self.connection.prepare(
             "SELECT skill_id FROM skills_fts
              WHERE skills_fts MATCH ?1
+               AND (?3 IS NULL OR skill_id IN (
+                   SELECT json_extract(skill.value, '$.id')
+                   FROM scan_payloads p, json_each(p.payload_json, '$.skills') skill
+                   WHERE p.scan_id = ?3
+               ))
              ORDER BY bm25(skills_fts, 0.0, 8.0, 5.0, 6.0, 1.0), skill_id
              LIMIT ?2",
         )?;
         let mut ids = statement
-            .query_map(params![expression, limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![expression, limit as i64, snapshot_id.map(ScanId::as_str)],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         if ids.is_empty() {
             let mut fallback = self.connection.prepare(
                 "SELECT skill_id FROM skills_fts
-                 WHERE instr(lower(name), lower(?1)) > 0
+                 WHERE (instr(lower(name), lower(?1)) > 0
                     OR instr(lower(description), lower(?1)) > 0
                     OR instr(lower(triggers), lower(?1)) > 0
-                    OR instr(lower(body), lower(?1)) > 0
+                    OR instr(lower(body), lower(?1)) > 0)
+                   AND (?3 IS NULL OR skill_id IN (
+                       SELECT json_extract(skill.value, '$.id')
+                       FROM scan_payloads p, json_each(p.payload_json, '$.skills') skill
+                       WHERE p.scan_id = ?3
+                   ))
                  ORDER BY skill_id LIMIT ?2",
             )?;
             ids = fallback
-                .query_map(params![task.trim(), limit as i64], |row| {
-                    row.get::<_, String>(0)
-                })?
+                .query_map(
+                    params![task.trim(), limit as i64, snapshot_id.map(ScanId::as_str)],
+                    |row| row.get::<_, String>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
         }
         ids.into_iter()
@@ -2642,6 +2674,62 @@ mod tests {
             2
         );
         assert!(store.search_skill_ids("\" OR *", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_search_scopes_fts_and_unicode_fallback_before_limit() {
+        let store = StateStore::open_in_memory().unwrap();
+        let historical = SkillId::parse("skill_a_historical").unwrap();
+        let current = SkillId::parse("skill_z_current").unwrap();
+        for id in [&historical, &current] {
+            store
+                .index_skill(id, "diagram", "MySQL 数据库管理和表结构查询", "", "")
+                .unwrap();
+        }
+        let snapshot = ScanId::parse("scan_current").unwrap();
+        store
+            .save_scan(&ScanRun {
+                id: snapshot.clone(),
+                started_at: 1,
+                completed_at: Some(2),
+                status: ScanStatus::Completed,
+                coverage_notes: vec![],
+            })
+            .unwrap();
+        store
+            .save_scan_payload(
+                &snapshot,
+                &serde_json::json!({ "skills": [{ "id": current.as_str() }] }),
+            )
+            .unwrap();
+
+        for task in ["diagram", "数据库管理"] {
+            assert_eq!(
+                store.search_skill_ids(task, 1).unwrap(),
+                vec![historical.clone()]
+            );
+            assert_eq!(
+                store
+                    .search_skill_ids_in_snapshot(task, 1, &snapshot)
+                    .unwrap(),
+                vec![current.clone()]
+            );
+            assert!(
+                store
+                    .search_skill_ids_in_snapshot(task, 0, &snapshot)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        store
+            .save_scan_payload(&snapshot, &serde_json::json!({ "skills": [] }))
+            .unwrap();
+        assert!(
+            store
+                .search_skill_ids_in_snapshot("diagram", 1, &snapshot)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

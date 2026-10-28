@@ -463,6 +463,12 @@ pub fn error_json_with_context(
             },
         );
         let safe_retry = match blocked.reason {
+            "cjk_hint_required_for_weak_match" | "hint_direct_selection_evidence_required" => {
+                blocked
+                    .retry_argv
+                    .clone()
+                    .map(|argv| ("inspect_ranked_skill_evidence", argv, blocked.reason))
+            }
             "same_name_variants_ambiguous" => blocked.retry_argv.clone().map(|argv| {
                 (
                     "inspect_same_name_variants",
@@ -475,8 +481,18 @@ pub fn error_json_with_context(
                 vec!["report".into(), "--summary".into(), "--json".into()],
                 "verified_skill_load_blocked",
             )),
+            "package_fingerprint_incomplete" => Some((
+                "inspect_incomplete_package_findings",
+                vec![
+                    "report".into(),
+                    "--findings".into(),
+                    "--category".into(),
+                    "inventory".into(),
+                    "--json".into(),
+                ],
+                "package_fingerprint_incomplete",
+            )),
             "placement_missing_from_snapshot"
-            | "package_fingerprint_incomplete"
             | "legacy_snapshot_requires_rescan"
             | "eligible_placement_missing"
             | "entrypoint_content_drift"

@@ -5589,7 +5589,7 @@ fn find_command(
     );
     let candidate_search_text = crate::query::candidate_search_text(retrieval_query.text());
     let mut candidate_ids = store
-        .search_skill_ids(&candidate_search_text, scan.skills.len())?
+        .search_skill_ids_in_snapshot(&candidate_search_text, scan.skills.len(), &scan_id)?
         .into_iter()
         .map(|id| id.to_string())
         .collect::<std::collections::BTreeSet<_>>();
@@ -5770,13 +5770,8 @@ fn find_command(
                     || variant_placement_id.is_some()
             })
             .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
-        let weak_match_reason = if cjk_hint_required {
-            Some("cjk_hint_required_for_weak_match")
-        } else if !retrieval_hints.is_empty() {
-            Some("hint_direct_selection_evidence_required")
-        } else {
-            None
-        };
+        let weak_match_reason = weak_top_match
+            .and_then(|ranked| find_selection_evidence_blocker(ranked, task, &retrieval_hints));
         if let (Some(ranked), Some(reason)) = (weak_top_match, weak_match_reason) {
             return Err(SkillLoadBlocked {
                 reason,
@@ -5791,7 +5786,14 @@ fn find_command(
                     .collect(),
                 expected_digest: None,
                 actual_digest: None,
-                retry_argv: None,
+                retry_argv: Some(find_action_argv(
+                    task,
+                    &retrieval_hints,
+                    FindActionKind::InspectVariants {
+                        limit: limit.max(5),
+                    },
+                    Some(&scan_id),
+                )),
             }
             .into());
         }
@@ -5937,6 +5939,32 @@ fn find_command(
         "warnings": warnings,
         "files_changed": false
     });
+    if !load {
+        for (found, value) in matches
+            .iter()
+            .zip(result["matches"].as_array_mut().unwrap())
+        {
+            let evidence_reason = find_selection_evidence_blocker(found, task, &retrieval_hints);
+            let mut reasons = Vec::new();
+            if found.variant_count > 1 {
+                reasons.push("same_name_variants_ambiguous");
+            }
+            if let Some(reason) = evidence_reason {
+                reasons.push(reason);
+            }
+            if found.paths.is_empty() {
+                reasons.push("current_path_unavailable");
+            }
+            value["load_readiness"] = json!({
+                "state": if reasons.is_empty() { "verification_required" } else { "blocked" },
+                "reason_codes": reasons,
+                "direct_selection_evidence": crate::query::has_strong_verified_load_evidence(found),
+                "verification_performed": false,
+                "selection_guidance": "Ranking is not a capability decision. Inspect the candidate evidence, independently choose the intended capability, and author a faithful hint if direct selection evidence is missing; never derive an exact-name hint solely from Top-1. Exact content verification still runs only on --load."
+            });
+        }
+    }
+    bind_find_path_availability(&scan, state_dir, &mut result, &mut observations);
     bind_content_choices(
         store,
         state_dir,
@@ -5959,6 +5987,22 @@ fn find_command(
     // discards those derived facts instead of returning them as authorized.
     require_loaded_snapshot_current(store, &scan_id, &scan)?;
     Ok((result, actions))
+}
+
+fn find_selection_evidence_blocker(
+    ranked: &crate::query::FindMatch,
+    task: &str,
+    hints: &[String],
+) -> Option<&'static str> {
+    if crate::query::has_strong_verified_load_evidence(ranked) {
+        None
+    } else if hints.is_empty() && crate::query::contains_cjk(task) {
+        Some("cjk_hint_required_for_weak_match")
+    } else if !hints.is_empty() {
+        Some("hint_direct_selection_evidence_required")
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6492,7 +6536,14 @@ fn current_readable_skill_paths_with_observations(
                 .is_some_and(|directory| directory == expected_directory)
         });
     Ok(CurrentSkillPaths {
-        drifted: (paths.is_empty() && !source_confirmation_required)
+        // A known incomplete package is unavailable, not evidence of post-Scan drift.
+        // Retain fail-closed verification while avoiding a futile rescan loop.
+        drifted: (paths.is_empty()
+            && !source_confirmation_required
+            && !placements.iter().all(|placement| {
+                placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
+                    && incomplete_placement_entrypoint_unchanged(placement)
+            }))
             || placements.iter().any(|placement| {
                 matches!(
                     content_choice::placement_read_state_with_observations(
@@ -6511,6 +6562,120 @@ fn current_readable_skill_paths_with_observations(
         source_confirmation_required,
         paths,
     })
+}
+
+// Incompleteness does not prove that the frozen path and entrypoint are still
+// current. Only suppress the generic rescan diagnosis when those observable
+// facts match; never claim integrity for the unobserved package remainder.
+fn incomplete_placement_entrypoint_unchanged(placement: &scan::SkillPlacement) -> bool {
+    if placement
+        .mutation_scope
+        .is_none_or(|scope| scope == scan::MutationScope::UntrustedExternal)
+    {
+        return false;
+    }
+    if placement.validated_physical_directory().is_err() {
+        return false;
+    }
+    let Some(expected) = placement.entrypoint_digest.as_deref() else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(&placement.entrypoint) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > crate::package_fingerprint::MAX_SKILL_FILE_BYTES {
+        return false;
+    }
+    // Bound the read even if the entrypoint grows after metadata inspection.
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(&placement.entrypoint) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(crate::package_fingerprint::MAX_SKILL_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > crate::package_fingerprint::MAX_SKILL_FILE_BYTES
+    {
+        return false;
+    }
+    content_digest(&bytes) == expected
+}
+
+/// Preserve known unavailable-package evidence instead of describing every empty
+/// path set as Snapshot drift. This is advisory; verified loading rechecks bytes.
+fn bind_find_path_availability(
+    scan: &ScanResult,
+    state_dir: &Path,
+    result: &mut Value,
+    observations: &mut content_choice::FindReadObservations,
+) {
+    let mut unavailable_warnings = Vec::new();
+    let Some(matches) = result["matches"].as_array_mut() else {
+        return;
+    };
+    for found in matches {
+        let mut ids = BTreeSet::new();
+        if let Some(id) = found["skill_id"].as_str() {
+            ids.insert(id.to_owned());
+        }
+        if let Some(variants) = found["variants"].as_array() {
+            for variant in variants {
+                if let Some(id) = variant["skill_id"].as_str() {
+                    ids.insert(id.to_owned());
+                }
+            }
+        }
+        let mut reasons = BTreeSet::new();
+        let mut incomplete = Vec::new();
+        for placement in scan.placements.iter().filter(|p| ids.contains(&p.skill_id)) {
+            let reason = content_choice::placement_read_state_with_observations(
+                scan,
+                state_dir,
+                placement,
+                observations,
+            );
+            if reason == "package_fingerprint_incomplete" {
+                if !incomplete_placement_entrypoint_unchanged(placement) {
+                    reasons.insert("incomplete_package_entrypoint_drift");
+                }
+                incomplete.push(json!({
+                    "placement_id": placement.id,
+                    "fingerprint_completeness": placement.fingerprint_completeness,
+                    "detail": placement.fingerprint_detail,
+                }));
+            }
+            if reason != "available" {
+                reasons.insert(reason);
+            }
+        }
+        if incomplete.is_empty() {
+            continue;
+        }
+        unavailable_warnings.push(Value::String(format!(
+            "{} has an incomplete package fingerprint (package budget {} bytes, depth limit {}); inspect the reported package limit or read-access cause before rescanning; rescan alone is not sufficient",
+            found["name"].as_str().unwrap_or("Skill"),
+            crate::package_fingerprint::MAX_SKILL_PACKAGE_BYTES,
+            crate::package_fingerprint::MAX_SKILL_PACKAGE_DEPTH,
+        )));
+        let incomplete_count = incomplete.len();
+        incomplete.truncate(20);
+        found["path_availability"] = json!({
+            "state": "incomplete_package",
+            "reason_codes": reasons,
+            "package_budget_bytes": crate::package_fingerprint::MAX_SKILL_PACKAGE_BYTES,
+            "package_depth_limit": crate::package_fingerprint::MAX_SKILL_PACKAGE_DEPTH,
+            "incomplete_placement_count": incomplete_count,
+            "placements": incomplete,
+            "placements_truncated": incomplete_count > 20,
+            "next_action": "inspect_package_limits_or_read_access_then_rescan",
+            "rescan_alone_sufficient": false,
+        });
+    }
+    if let Some(warnings) = result["warnings"].as_array_mut() {
+        warnings.extend(unavailable_warnings);
+    }
 }
 
 struct CurrentSkillPaths {
