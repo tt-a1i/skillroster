@@ -170,6 +170,10 @@ pub struct SkillPlacement {
     /// legacy Snapshots cannot authorize a verified load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint_digest: Option<String>,
+    /// Typed failure of the bounded entrypoint read. A failed read must never
+    /// masquerade as the digest of an empty file. Missing on older Snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint_read_error: Option<String>,
     /// Whether `content_digest` covers the complete Skill package. Bounded or
     /// unreadable fingerprints are inventory facts only and cannot authorize
     /// exact-duplicate governance.
@@ -651,6 +655,7 @@ struct EntryCandidate {
 #[derive(Clone, Debug)]
 struct PhysicalPackageObservation {
     content: String,
+    entrypoint_read_error: Option<String>,
     modified_at: Option<u64>,
     metadata: SkillMetadata,
     digest: String,
@@ -2019,23 +2024,30 @@ fn observe_physical_skill_package(
     display_directory: &Path,
     result: &mut ScanResult,
 ) -> PhysicalPackageObservation {
-    let (content, modified_at) = match read_bounded(physical_entrypoint, MAX_SKILL_FILE_BYTES) {
-        Ok(value) => value,
-        Err(error) => {
-            result.warnings.push(format!(
-                "could not read Skill entrypoint {}: {error}",
-                display_entrypoint.display()
-            ));
-            (String::new(), None)
-        }
-    };
+    let (content, modified_at, entrypoint_read_error) =
+        match read_bounded(physical_entrypoint, MAX_SKILL_FILE_BYTES) {
+            Ok((content, modified_at)) => (content, modified_at, None),
+            Err(error) => {
+                result.warnings.push(format!(
+                    "could not read Skill entrypoint {}: {error}",
+                    display_entrypoint.display()
+                ));
+                let reason = match error.kind() {
+                    io::ErrorKind::PermissionDenied => "permission_denied",
+                    io::ErrorKind::NotFound => "not_found",
+                    io::ErrorKind::InvalidData => "invalid_data",
+                    _ => "io_error",
+                };
+                (String::new(), None, Some(reason.to_owned()))
+            }
+        };
     let metadata = parse_skill_markdown(&content);
     let (
         digest,
-        content_identity_digest,
-        fingerprint_completeness,
-        fingerprint_detail,
-        checkpoint,
+        mut content_identity_digest,
+        mut fingerprint_completeness,
+        mut fingerprint_detail,
+        mut checkpoint,
         executable_relative_files,
     ) = match digest_skill_directory(physical_directory) {
         Ok(fingerprint) => (
@@ -2081,8 +2093,19 @@ fn observe_physical_skill_package(
             )
         }
     };
+    // If a second package read succeeds after an entrypoint read failure, its
+    // digest still cannot validate metadata parsed from missing entrypoint bytes.
+    if let Some(reason) = entrypoint_read_error.as_deref() {
+        content_identity_digest = None;
+        checkpoint = None;
+        if fingerprint_completeness == FingerprintCompleteness::Complete {
+            fingerprint_completeness = FingerprintCompleteness::Unreadable;
+            fingerprint_detail = Some(format!("Skill entrypoint read failed: {reason}"));
+        }
+    }
     PhysicalPackageObservation {
         content,
+        entrypoint_read_error,
         modified_at,
         metadata,
         digest,
@@ -2101,6 +2124,7 @@ fn unreadable_package_observation(candidate: &EntryCandidate) -> PhysicalPackage
         .expect("discovery excludes non-Unicode entrypoints");
     PhysicalPackageObservation {
         content: String::new(),
+        entrypoint_read_error: Some("unsafe_source".into()),
         modified_at: None,
         metadata: SkillMetadata::default(),
         digest: stable_digest(entrypoint.as_bytes()),
@@ -2234,6 +2258,7 @@ fn materialize_candidates_with_hook(
         };
         let PhysicalPackageObservation {
             mut content,
+            mut entrypoint_read_error,
             mut modified_at,
             mut metadata,
             mut digest,
@@ -2280,6 +2305,7 @@ fn materialize_candidates_with_hook(
                 candidate.entrypoint.display()
             ));
             content.clear();
+            entrypoint_read_error = Some("source_binding_drift".into());
             modified_at = None;
             metadata = SkillMetadata::default();
             let entrypoint = candidate
@@ -2430,7 +2456,9 @@ fn materialize_candidates_with_hook(
             physical_directory,
             content_digest: digest,
             content_identity_digest,
-            entrypoint_digest: safe_to_read.then(|| stable_digest(content.as_bytes())),
+            entrypoint_digest: (safe_to_read && entrypoint_read_error.is_none())
+                .then(|| stable_digest(content.as_bytes())),
+            entrypoint_read_error,
             fingerprint_completeness,
             fingerprint_detail,
             link_target: candidate.link_target,

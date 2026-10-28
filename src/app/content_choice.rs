@@ -480,7 +480,10 @@ pub(super) fn bind_content_choices(
         }
         // Only the Top-1 group authorizes exact selection. Lower-ranked choices
         // remain useful facts without an action that would falsely promise load.
-        if index == 0 && offer_load_actions {
+        if index == 0
+            && offer_load_actions
+            && find_selection_evidence_blocker(matched, task, hints).is_none()
+        {
             let mut top_ids = BTreeSet::from([matched.skill_id.as_str()]);
             top_ids.extend(matched.variants.iter().map(|v| v.skill_id.as_str()));
             for skill_id in top_ids {

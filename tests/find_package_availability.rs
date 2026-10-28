@@ -149,3 +149,122 @@ fn fresh_oversized_package_is_unavailable_not_stale_and_loading_stays_closed() {
             .contains("run skillroster scan")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn fresh_permission_failure_is_not_empty_content_or_snapshot_drift_and_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let package = temp.path().join("home/.codex/skills/unreadable-skill");
+    fs::create_dir_all(&package).unwrap();
+    let entrypoint = package.join("SKILL.md");
+    let contents = "---\nname: unreadable-skill\ndescription: Inspect a synthetic permission failure.\n---\nRead only.\n";
+    fs::write(&entrypoint, contents).unwrap();
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o000)).unwrap();
+    // Privileged test runners cannot model denied access with mode bits.
+    if fs::read(&entrypoint).is_ok() {
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    for _ in 0..2 {
+        let scanned = run(&temp, &["scan", "--summary"]);
+        assert_eq!(scanned["ok"], true);
+        let database =
+            rusqlite::Connection::open(temp.path().join("state/skillroster.db")).unwrap();
+        let payload: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id=?1",
+                [scanned["result"]["snapshot_id"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            snapshot["placements"][0]["entrypoint_read_error"],
+            "permission_denied"
+        );
+        assert!(snapshot["placements"][0]["entrypoint_digest"].is_null());
+        let found = run(&temp, &["find", "--limit", "1", "--", "unreadable-skill"]);
+        assert_eq!(found["result"]["rescan_required"], false, "{found:#}");
+        assert!(
+            !found["result"]["warnings"]
+                .to_string()
+                .contains("run skillroster scan")
+        );
+        assert_eq!(
+            found["result"]["matches"][0]["path_availability"]["placements"][0]["entrypoint_read_error"],
+            "permission_denied"
+        );
+        assert_eq!(
+            run(
+                &temp,
+                &["find", "--load", "--limit", "1", "--", "unreadable-skill"]
+            )["ok"],
+            false
+        );
+    }
+    // A disappearance is different from the frozen permission failure.
+    fs::remove_file(&entrypoint).unwrap();
+    assert_eq!(
+        run(&temp, &["find", "--limit", "1", "--", "unreadable-skill"])["result"]["rescan_required"],
+        true
+    );
+    fs::write(&entrypoint, contents).unwrap();
+    let changed = run(&temp, &["find", "--limit", "1", "--", "unreadable-skill"]);
+    assert_eq!(changed["result"]["rescan_required"], true, "{changed:#}");
+    // Repair access then rescan, without replacing state or forgetting history.
+    assert_eq!(run(&temp, &["scan", "--summary"])["ok"], true);
+    let loaded = run(
+        &temp,
+        &["find", "--load", "--limit", "1", "--", "unreadable-skill"],
+    );
+    assert_eq!(loaded["ok"], true, "{loaded:#}");
+}
+
+#[test]
+fn fresh_invalid_or_over_budget_entrypoints_explain_read_failure_without_rescan_loop() {
+    for bytes in [vec![0xff, 0xfe], vec![b'x'; 2 * 1024 * 1024 + 1]] {
+        let temp = TempDir::new().unwrap();
+        let package = temp.path().join("home/.codex/skills/unreadable-entrypoint");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("SKILL.md"), bytes).unwrap();
+        assert_eq!(run(&temp, &["scan", "--summary"])["ok"], true);
+        let found = run(
+            &temp,
+            &["find", "--limit", "1", "--", "unreadable-entrypoint"],
+        );
+        assert_eq!(found["result"]["rescan_required"], false, "{found:#}");
+        assert_eq!(
+            found["result"]["matches"][0]["path_availability"]["placements"][0]["entrypoint_read_error"],
+            "invalid_data"
+        );
+        assert_eq!(
+            run(
+                &temp,
+                &[
+                    "find",
+                    "--load",
+                    "--limit",
+                    "1",
+                    "--",
+                    "unreadable-entrypoint"
+                ]
+            )["ok"],
+            false
+        );
+        fs::write(package.join("SKILL.md"), "---\nname: unreadable-entrypoint\ndescription: Repaired entrypoint.\n---\nRead only.\n").unwrap();
+        assert_eq!(run(&temp, &["scan", "--summary"])["ok"], true);
+        let loaded = run(
+            &temp,
+            &[
+                "find",
+                "--load",
+                "--limit",
+                "1",
+                "--",
+                "unreadable-entrypoint",
+            ],
+        );
+        assert_eq!(loaded["ok"], true, "{loaded:#}");
+    }
+}

@@ -1276,6 +1276,7 @@ mod tests {
                 content_digest: skill.content_digest.clone(),
                 content_identity_digest: skill.content_identity_digest.clone(),
                 entrypoint_digest: None,
+                entrypoint_read_error: None,
                 fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
                 fingerprint_detail: None,
                 link_target: None,

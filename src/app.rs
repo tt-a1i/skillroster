@@ -5875,6 +5875,13 @@ fn find_command(
             ),
             None if matches!(
                 next.map(|reference| reference.state),
+                Some(crate::query::VariantFindingState::IncompletePackage)
+            ) => format!(
+                "{} has same-name variants with incomplete package fingerprints; inspect inventory findings and per-variant availability before choosing content; rescan alone is not sufficient",
+                found.name
+            ),
+            None if matches!(
+                next.map(|reference| reference.state),
                 Some(crate::query::VariantFindingState::ReportRequired)
             ) => format!(
                 "{} represents {} same-name Skill variants; materialize the current Report before choosing content",
@@ -5910,6 +5917,9 @@ fn find_command(
                 &retrieval_hints,
                 found,
                 Some(&scan_id),
+                &scan,
+                state_dir,
+                &mut observations,
             ));
         }
     }
@@ -5939,32 +5949,8 @@ fn find_command(
         "warnings": warnings,
         "files_changed": false
     });
-    if !load {
-        for (found, value) in matches
-            .iter()
-            .zip(result["matches"].as_array_mut().unwrap())
-        {
-            let evidence_reason = find_selection_evidence_blocker(found, task, &retrieval_hints);
-            let mut reasons = Vec::new();
-            if found.variant_count > 1 {
-                reasons.push("same_name_variants_ambiguous");
-            }
-            if let Some(reason) = evidence_reason {
-                reasons.push(reason);
-            }
-            if found.paths.is_empty() {
-                reasons.push("current_path_unavailable");
-            }
-            value["load_readiness"] = json!({
-                "state": if reasons.is_empty() { "verification_required" } else { "blocked" },
-                "reason_codes": reasons,
-                "direct_selection_evidence": crate::query::has_strong_verified_load_evidence(found),
-                "verification_performed": false,
-                "selection_guidance": "Ranking is not a capability decision. Inspect the candidate evidence, independently choose the intended capability, and author a faithful hint if direct selection evidence is missing; never derive an exact-name hint solely from Top-1. Exact content verification still runs only on --load."
-            });
-        }
-    }
     bind_find_path_availability(&scan, state_dir, &mut result, &mut observations);
+    bind_find_variant_path_availability(&scan, state_dir, &mut result, &mut observations);
     bind_content_choices(
         store,
         state_dir,
@@ -5978,6 +5964,42 @@ fn find_command(
         &mut actions,
         &mut observations,
     )?;
+    if !load {
+        for (found, value) in matches
+            .iter()
+            .zip(result["matches"].as_array_mut().unwrap())
+        {
+            let evidence_reason = find_selection_evidence_blocker(found, task, &retrieval_hints);
+            let mut reasons = Vec::new();
+            if found.variant_count > 1 {
+                reasons.push("same_name_variants_ambiguous");
+            }
+            if let Some(reason) = evidence_reason {
+                reasons.push(reason);
+            }
+            if value["content_choice"]["content_selection_required"] == true {
+                reasons.push("declared_identity_content_ambiguous");
+            }
+            if found.variant_count == 1 {
+                reasons.extend(find_placement_readiness_blockers(
+                    &scan,
+                    state_dir,
+                    &found.skill_id,
+                    &mut observations,
+                ));
+            }
+            if found.paths.is_empty() {
+                reasons.push("current_path_unavailable");
+            }
+            value["load_readiness"] = json!({
+                "state": if reasons.is_empty() { "verification_required" } else { "blocked" },
+                "reason_codes": reasons,
+                "direct_selection_evidence": crate::query::has_strong_verified_load_evidence(found),
+                "verification_performed": false,
+                "selection_guidance": "Ranking is not a capability decision. Inspect the candidate evidence, independently choose the intended capability, and author a faithful hint if direct selection evidence is missing; never derive an exact-name hint solely from Top-1. Exact content verification still runs only on --load."
+            });
+        }
+    }
     if let Some(loaded_skill) = loaded_skill {
         result["loaded_skill"] = loaded_skill;
     }
@@ -5987,6 +6009,53 @@ fn find_command(
     // discards those derived facts instead of returning them as authorized.
     require_loaded_snapshot_current(store, &scan_id, &scan)?;
     Ok((result, actions))
+}
+
+// Advisory evidence only: mirror the verifier's placement preference without
+// returning content or treating these cached observations as authorization.
+fn find_placement_readiness_blockers(
+    scan: &ScanResult,
+    state_dir: &Path,
+    skill_id: &str,
+    observations: &mut content_choice::FindReadObservations,
+) -> Vec<&'static str> {
+    let placements = scan
+        .placements
+        .iter()
+        .filter(|p| p.skill_id == skill_id)
+        .collect::<Vec<_>>();
+    let preferred = placements
+        .iter()
+        .copied()
+        .filter(|p| {
+            p.mutation_scope
+                .is_some_and(|s| s != scan::MutationScope::UntrustedExternal)
+                && p.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+                && p.entrypoint_digest.is_some()
+        })
+        .min_by_key(|p| (!p.default_exposed, &p.entrypoint));
+    if let Some(placement) = preferred {
+        let state = content_choice::placement_read_state_with_observations(
+            scan,
+            state_dir,
+            placement,
+            observations,
+        );
+        return if state == "available" {
+            Vec::new()
+        } else {
+            vec![state]
+        };
+    }
+    placements
+        .into_iter()
+        .map(|p| {
+            content_choice::placement_read_state_with_observations(scan, state_dir, p, observations)
+        })
+        .filter(|state| *state != "available")
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn find_selection_evidence_blocker(
@@ -6054,11 +6123,21 @@ fn explicit_variant_load_actions(
     hints: &[String],
     ranked: &crate::query::FindMatch,
     required_snapshot_id: Option<&ScanId>,
+    scan: &ScanResult,
+    state_dir: &Path,
+    observations: &mut content_choice::FindReadObservations,
 ) -> Vec<SuggestedAction> {
+    if find_selection_evidence_blocker(ranked, task, hints).is_some() {
+        return Vec::new();
+    }
     ranked
         .variants
         .iter()
         .filter(|variant| !variant.paths.is_empty())
+        .filter(|variant| {
+            find_placement_readiness_blockers(scan, state_dir, &variant.skill_id, observations)
+                .is_empty()
+        })
         .map(|variant| {
             let mut argv = vec!["skillroster".to_owned()];
             argv.extend(find_action_argv(
@@ -6079,6 +6158,54 @@ fn explicit_variant_load_actions(
             }
         })
         .collect()
+}
+
+fn bind_find_variant_path_availability(
+    scan: &ScanResult,
+    state_dir: &Path,
+    result: &mut Value,
+    observations: &mut content_choice::FindReadObservations,
+) {
+    for found in result["matches"].as_array_mut().into_iter().flatten() {
+        for variant in found["variants"].as_array_mut().into_iter().flatten() {
+            let Some(skill_id) = variant["skill_id"].as_str() else {
+                continue;
+            };
+            let mut reasons = BTreeSet::new();
+            let mut placements = Vec::new();
+            let mut available_count = 0;
+            for placement in scan.placements.iter().filter(|p| p.skill_id == skill_id) {
+                let reason = content_choice::placement_read_state_with_observations(
+                    scan,
+                    state_dir,
+                    placement,
+                    observations,
+                );
+                if reason == "available" {
+                    available_count += 1;
+                } else {
+                    reasons.insert(reason);
+                }
+                placements.push(json!({
+                    "placement_id": placement.id,
+                    "read_state": reason,
+                    "fingerprint_completeness": placement.fingerprint_completeness,
+                    "entrypoint_read_error": placement.entrypoint_read_error,
+                    "detail": placement.fingerprint_detail,
+                }));
+            }
+            let count = placements.len();
+            placements.truncate(20);
+            variant["path_availability"] = json!({
+                "state": if available_count > 0 { "available" } else { "unavailable" },
+                "reason_codes": reasons,
+                "available_placement_count": available_count,
+                "placement_count": count,
+                "placements": placements,
+                "placements_truncated": count > 20,
+            });
+        }
+    }
 }
 
 fn bind_variant_findings(
@@ -6140,6 +6267,30 @@ fn bind_variant_findings(
                     report_id: None,
                     finding_id: None,
                     resolution: None,
+                    argv: suggested.argv.clone(),
+                },
+                suggested,
+            )
+        } else if scan.placements.iter().any(|placement| {
+            variant_ids.contains(&placement.skill_id)
+                && placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
+                && placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
+        }) {
+            let suggested = action(
+                "inspect_incomplete_variant_inventory",
+                &["report", "--findings", "--category", "inventory", "--json"],
+                false,
+                false,
+                "incomplete_variant_fingerprints",
+            );
+            (
+                crate::query::VariantFindingReference {
+                    state: crate::query::VariantFindingState::IncompletePackage,
+                    reason_code: crate::query::VariantFindingReason::IncompleteVariantFingerprints,
+                    snapshot_id: scan_id.to_string(),
+                    report_id: report.as_ref().map(|report| report.id.to_string()),
+                    finding_id: None,
+                    resolution: Some("inspect_incomplete_package_before_content_choice".into()),
                     argv: suggested.argv.clone(),
                 },
                 suggested,
@@ -6542,7 +6693,7 @@ fn current_readable_skill_paths_with_observations(
             && !source_confirmation_required
             && !placements.iter().all(|placement| {
                 placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
-                    && incomplete_placement_entrypoint_unchanged(placement)
+                    && incomplete_placement_observation_still_applies(placement)
             }))
             || placements.iter().any(|placement| {
                 matches!(
@@ -6567,7 +6718,7 @@ fn current_readable_skill_paths_with_observations(
 // Incompleteness does not prove that the frozen path and entrypoint are still
 // current. Only suppress the generic rescan diagnosis when those observable
 // facts match; never claim integrity for the unobserved package remainder.
-fn incomplete_placement_entrypoint_unchanged(placement: &scan::SkillPlacement) -> bool {
+fn incomplete_placement_observation_still_applies(placement: &scan::SkillPlacement) -> bool {
     if placement
         .mutation_scope
         .is_none_or(|scope| scope == scan::MutationScope::UntrustedExternal)
@@ -6577,19 +6728,26 @@ fn incomplete_placement_entrypoint_unchanged(placement: &scan::SkillPlacement) -
     if placement.validated_physical_directory().is_err() {
         return false;
     }
-    let Some(expected) = placement.entrypoint_digest.as_deref() else {
-        return false;
-    };
     let Ok(metadata) = std::fs::metadata(&placement.entrypoint) else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() > crate::package_fingerprint::MAX_SKILL_FILE_BYTES {
+    if !metadata.is_file() {
         return false;
     }
+    if metadata.len() > crate::package_fingerprint::MAX_SKILL_FILE_BYTES {
+        return placement.entrypoint_read_error.as_deref() == Some("invalid_data");
+    }
+    // A repeated permission failure on the same physical entrypoint is a known
+    // unavailable observation, not proof of changed contents. Repair access
+    // first; a rescan alone cannot create readable evidence.
     // Bound the read even if the entrypoint grows after metadata inspection.
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(&placement.entrypoint) else {
-        return false;
+    let file = match std::fs::File::open(&placement.entrypoint) {
+        Ok(file) => file,
+        Err(error) => {
+            return error.kind() == std::io::ErrorKind::PermissionDenied
+                && placement.entrypoint_read_error.as_deref() == Some("permission_denied");
+        }
     };
     let mut bytes = Vec::new();
     if file
@@ -6600,7 +6758,13 @@ fn incomplete_placement_entrypoint_unchanged(placement: &scan::SkillPlacement) -
     {
         return false;
     }
-    content_digest(&bytes) == expected
+    match placement.entrypoint_digest.as_deref() {
+        Some(expected) => content_digest(&bytes) == expected,
+        None => {
+            placement.entrypoint_read_error.as_deref() == Some("invalid_data")
+                && std::str::from_utf8(&bytes).is_err()
+        }
+    }
 }
 
 /// Preserve known unavailable-package evidence instead of describing every empty
@@ -6637,12 +6801,13 @@ fn bind_find_path_availability(
                 observations,
             );
             if reason == "package_fingerprint_incomplete" {
-                if !incomplete_placement_entrypoint_unchanged(placement) {
+                if !incomplete_placement_observation_still_applies(placement) {
                     reasons.insert("incomplete_package_entrypoint_drift");
                 }
                 incomplete.push(json!({
                     "placement_id": placement.id,
                     "fingerprint_completeness": placement.fingerprint_completeness,
+                    "entrypoint_read_error": placement.entrypoint_read_error,
                     "detail": placement.fingerprint_detail,
                 }));
             }
@@ -12324,6 +12489,7 @@ mod recovery_tests {
             content_digest: "legacy-digest".into(),
             content_identity_digest: None,
             entrypoint_digest: None,
+            entrypoint_read_error: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
             link_target: None,
@@ -13492,6 +13658,7 @@ mod recovery_tests {
             content_digest: "digest_shared".into(),
             content_identity_digest: None,
             entrypoint_digest: None,
+            entrypoint_read_error: None,
             fingerprint_completeness: scan::FingerprintCompleteness::Complete,
             fingerprint_detail: None,
             link_target: None,
@@ -13605,6 +13772,7 @@ mod recovery_tests {
             content_digest: "same-fallback-digest".into(),
             content_identity_digest: None,
             entrypoint_digest: None,
+            entrypoint_read_error: None,
             fingerprint_completeness: completeness,
             fingerprint_detail: Some("package exceeded fingerprint limit".into()),
             link_target: None,
@@ -13713,6 +13881,7 @@ mod recovery_tests {
                 content_digest: "legacy-digest".into(),
                 content_identity_digest: None,
                 entrypoint_digest: None,
+                entrypoint_read_error: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Unknown,
                 fingerprint_detail: None,
                 link_target: None,
@@ -13843,6 +14012,7 @@ mod recovery_tests {
                 content_digest: "legacy-digest".into(),
                 content_identity_digest: None,
                 entrypoint_digest: None,
+                entrypoint_read_error: None,
                 fingerprint_completeness: scan::FingerprintCompleteness::Complete,
                 fingerprint_detail: None,
                 link_target: None,

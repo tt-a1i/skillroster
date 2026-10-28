@@ -416,6 +416,7 @@ pub struct VariantFindingReference {
 #[serde(rename_all = "snake_case")]
 pub enum VariantFindingState {
     Available,
+    IncompletePackage,
     SourceConfirmationRequired,
     RescanRequired,
     ReportRequired,
@@ -426,6 +427,7 @@ pub enum VariantFindingState {
 #[serde(rename_all = "snake_case")]
 pub enum VariantFindingReason {
     SameSnapshotVariantSetMatched,
+    IncompleteVariantFingerprints,
     UntrustedVariantsRequireSourceConfirmation,
     RoutableVariantDriftDetected,
     CurrentSnapshotReportMissing,
@@ -4768,6 +4770,7 @@ mod tests {
                     content_digest: format!("digest_{index}"),
                     content_identity_digest: None,
                     entrypoint_digest: None,
+                    entrypoint_read_error: None,
                     fingerprint_completeness: crate::scan::FingerprintCompleteness::Complete,
                     fingerprint_detail: None,
                     link_target: None,
