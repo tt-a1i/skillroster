@@ -629,7 +629,24 @@ description-token or CJK bigram overlap may preserve an ordinary lexical
 candidate but cannot authorize
 complete instruction loading. Ordinary Find still returns the bounded lexical
 candidates and its actionable hint warning; the blocked load returns no partial
-instructions. An explicit complete Skill name remains direct evidence, so this
+instructions. Known incomplete package fingerprints are not automatically classified as
+Snapshot drift. Find exposes bounded `path_availability` facts including the
+fingerprint detail, package byte/depth budgets, and a recovery decision that
+requires resolving the limit or read-access cause before rescanning. Missing,
+changed, or retargeted entrypoints still require a rescan; no incomplete package
+is authorized for exact loading. A successful rescan after package repair must
+search the current Snapshot rather than let historical identities exhaust the
+candidate budget. Discovery additionally exposes per-candidate `load_readiness`:
+`blocked` identifies missing selection evidence, ambiguous variants, or an
+unavailable current path; `verification_required` is advisory eligibility, not
+successful loading or semantic correctness. This advisory covers selection
+evidence, same-name variants, and current-path availability; callers must still
+honor any separately returned `content_choice` decision. Exact verification is
+not performed by this diagnostic. Weak-evidence load refusals offer a Snapshot-bound read-only
+Find inspection command preserving the original task and hints. The Agent must
+independently select the intended capability before authoring a faithful refined
+hint; a ranked name is never automatically converted into an exact-name bypass.
+An explicit complete Skill name remains direct evidence, so this
 boundary does not prevent deliberate mixed-language selection. The
 loaded placement is selected only after identity ranking: an eligible
 `default_exposed` placement outranks inventory-only exact copies, with path as

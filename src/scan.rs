@@ -5806,6 +5806,50 @@ enabled = true
     }
 
     #[test]
+    fn unverified_installation_marker_remains_identity_and_integrity_bearing() {
+        let root = temp_directory("unverified-installation-marker");
+        let first = root.join("one");
+        let second = root.join("two");
+        for directory in [&first, &second] {
+            fs::create_dir_all(directory).unwrap();
+            fs::write(
+                directory.join("SKILL.md"),
+                "---\nname: example\ndescription: Example skill\n---\nSame instructions.",
+            )
+            .unwrap();
+        }
+        let baseline = inspect_skill_identity(&first.join("SKILL.md")).unwrap();
+        assert_eq!(
+            baseline,
+            inspect_skill_identity(&second.join("SKILL.md")).unwrap()
+        );
+
+        // A filename that looks like installation metadata is not sufficient
+        // evidence to exclude it. Until the installer contract is verified,
+        // retain both routing ambiguity and byte-sensitive integrity (#389).
+        fs::write(second.join(".coral-skill-version"), "1\n").unwrap();
+        let with_marker = inspect_skill_identity(&second.join("SKILL.md")).unwrap();
+        assert_ne!(baseline.0, with_marker.0);
+        assert_ne!(baseline.1, with_marker.1);
+
+        fs::write(second.join(".coral-skill-version"), "2\n").unwrap();
+        let changed_marker = inspect_skill_identity(&second.join("SKILL.md")).unwrap();
+        assert_ne!(with_marker.0, changed_marker.0);
+        assert_ne!(with_marker.1, changed_marker.1);
+
+        let mut options = ScanOptions::for_home(root.join("empty-home"));
+        options.explicit_skill_roots.push(ExplicitSkillRoot {
+            agent: AgentKind::Codex,
+            path: root.clone(),
+        });
+        options.include_session_evidence = false;
+        let result = scan(&options).unwrap();
+        assert_eq!(result.skills.len(), 2);
+        assert_eq!(result.placements.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn projected_package_identity_matches_post_overlay_scan_with_crlf_and_extras() {
         let root = temp_directory("projected-package-identity");
         let skill = root.join("skillroster");

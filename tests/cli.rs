@@ -2821,7 +2821,10 @@ fn public_find_load_rejects_a_weak_hinted_top_match_before_returning_instruction
     );
     assert_eq!(blocked["error"]["details"]["files_changed"], false);
     assert!(blocked["result"].is_null());
-    assert!(blocked["suggested_actions"].as_array().unwrap().is_empty());
+    assert_eq!(
+        blocked["suggested_actions"][0]["action"],
+        "inspect_ranked_skill_evidence"
+    );
 
     let refined = json_output(&run(
         &[
