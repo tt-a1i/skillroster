@@ -534,6 +534,17 @@ discards a strong native-task result. Each task or hint also remains a separate 
 exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars.
 
+Ordinary Find and its read-only recovery inspection expose `routing_metadata`
+for the exact ranked content observation, bound by the enclosing Snapshot,
+Skill ID, and `ranking_content_identity_digest`. The preview includes its
+description (at most 512 Unicode characters) and up to five declared triggers
+(at most 128 characters each), with explicit description/list truncation and
+the full trigger count. Descriptions retain exclusions; metadata from distinct
+observations is never combined. Missing metadata remains missing. This is
+frozen routing evidence for caller-owned interpretation, not the Skill body,
+current filesystem verification, or permission to load. Existing weak-evidence,
+ambiguity, trust, and content-verification gates remain unchanged.
+
 Find's `evidence_quality` describes the current lexical relevance inference and
 remains `inferred`, with `evidence_quality_scope: routing_relevance`. Observed
 history for the exact Skill identity is returned separately in optional

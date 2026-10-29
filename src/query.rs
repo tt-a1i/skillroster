@@ -336,6 +336,9 @@ pub struct FindMatch {
     /// Routing observation whose metadata produced this ranking evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ranking_content_identity_digest: Option<String>,
+    /// Bounded declared metadata from the same observation as the ranking.
+    #[serde(default)]
+    pub routing_metadata: FindRoutingMetadata,
     pub score: f64,
     pub paths: Vec<String>,
     pub agents: Vec<String>,
@@ -381,6 +384,48 @@ pub struct FindMatch {
     /// Same-Snapshot analysis needed to resolve same-name content ambiguity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_finding: Option<VariantFindingReference>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FindRoutingMetadata {
+    pub description: Option<String>,
+    pub description_truncated: bool,
+    pub declared_triggers: Vec<String>,
+    pub trigger_count: usize,
+    pub triggers_truncated: bool,
+}
+
+fn bounded_routing_text(value: &str, limit: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(limit).collect();
+    (bounded, chars.next().is_some())
+}
+
+fn routing_metadata(description: Option<&str>, triggers: &[String]) -> FindRoutingMetadata {
+    let (description, description_truncated) = match description {
+        Some(value) => {
+            let (value, truncated) = bounded_routing_text(value, 512);
+            (Some(value), truncated)
+        }
+        None => (None, false),
+    };
+    let mut triggers_truncated = triggers.len() > 5;
+    let declared_triggers = triggers
+        .iter()
+        .take(5)
+        .map(|trigger| {
+            let (value, truncated) = bounded_routing_text(trigger, 128);
+            triggers_truncated |= truncated;
+            value
+        })
+        .collect();
+    FindRoutingMetadata {
+        description,
+        description_truncated,
+        declared_triggers,
+        trigger_count: triggers.len(),
+        triggers_truncated,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -2320,6 +2365,10 @@ pub(crate) fn find_matching_with_evidence(
                 skill_id: skill.id.clone(),
                 name: skill.name.clone(),
                 ranking_content_identity_digest: skill.content_identity_digest.clone(),
+                routing_metadata: routing_metadata(
+                    skill.metadata.description.as_deref(),
+                    &skill.metadata.triggers,
+                ),
                 score,
                 paths,
                 agents,
@@ -3002,6 +3051,7 @@ mod tests {
             skill_id: format!("skill_{name}"),
             name: name.into(),
             ranking_content_identity_digest: None,
+            routing_metadata: FindRoutingMetadata::default(),
             score: 1.0,
             paths: Vec::new(),
             agents: Vec::new(),
@@ -3024,6 +3074,19 @@ mod tests {
             variants_truncated: false,
             variant_finding: None,
         }
+    }
+
+    #[test]
+    fn routing_metadata_independently_marks_trigger_text_and_count_truncation() {
+        let text_only = routing_metadata(None, &["界".repeat(129)]);
+        assert!(text_only.triggers_truncated);
+        assert_eq!(text_only.trigger_count, 1);
+        let count_only = routing_metadata(None, &vec!["x".into(); 6]);
+        assert!(count_only.triggers_truncated);
+        assert_eq!(count_only.declared_triggers.len(), 5);
+        let exact = routing_metadata(Some(&"界".repeat(512)), &["界".repeat(128)]);
+        assert!(!exact.description_truncated);
+        assert!(!exact.triggers_truncated);
     }
 
     fn scan_declared_content_observations(entries: &[(&str, &str, &str)]) -> ScanResult {
