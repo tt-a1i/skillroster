@@ -6167,7 +6167,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
     for (version, changed_count, legacy_files) in [
         (
             "1.8.51",
-            2,
+            3,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.51.md")),
                 (
@@ -6186,7 +6186,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         ),
         (
             "1.8.50",
-            2,
+            3,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.50.md")),
                 (

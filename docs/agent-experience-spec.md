@@ -119,7 +119,11 @@ semantic conclusion and may read a returned `SKILL.md` path when those facts
 are insufficient; candidate evidence never authorizes a Plan.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
-For `mutation_scope_blocks_roster_change`, open full detail before offering
+For `mutation_scope_blocks_roster_change` or
+`package_fingerprint_variants_block_roster_change`, read all `blocked_reasons`,
+including those outside a truncated preview. Package differences require
+preservation and cannot be resolved by read permission. Open full detail before
+offering
 Core protection whenever the compact protected-Skill set is incomplete. Only
 present a `protect_blocked_skills_as_core` Plan template when
 `plan_request_template_available` is true, and require user confirmation

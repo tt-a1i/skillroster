@@ -4753,6 +4753,14 @@ fn finding_roster_planning_impl(
         .collect::<Vec<_>>();
     if blocked_change_count > 0 {
         let blocked_skills = blocked_skill_planning(&supported.exclusions, full);
+        let blocked_reasons = supported
+            .exclusions
+            .iter()
+            .map(|exclusion| exclusion.reason)
+            .collect::<BTreeSet<_>>();
+        let package_variants_only = blocked_reasons.len() == 1
+            && blocked_reasons
+                .contains("multiple_package_fingerprints_require_explicit_preservation");
         let source_dependency = supported
             .exclusions
             .iter()
@@ -4804,6 +4812,7 @@ fn finding_roster_planning_impl(
                 "agent_count": agents.len(),
                 "agents": agents,
                 "blocked_change_count": blocked_change_count,
+                "blocked_reasons": blocked_reasons,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
                 "blocked_skill_count": blocked_skills.count,
@@ -4848,11 +4857,23 @@ fn finding_roster_planning_impl(
                 state_dir,
                 full,
             )?;
-            return Ok(Some(json!({
+            let mut planning = json!({
                 "supported": false,
-                "reason": "mutation_scope_blocks_roster_change",
-                "decision": "choose_mutable_placements_or_keep_unchanged",
-                "decision_code": "protect_read_only_skills_or_keep_unchanged",
+                "reason": if package_variants_only {
+                    "package_fingerprint_variants_block_roster_change"
+                } else {
+                    "mutation_scope_blocks_roster_change"
+                },
+                "decision": if package_variants_only {
+                    "review_package_fingerprint_variants"
+                } else {
+                    "choose_mutable_placements_or_keep_unchanged"
+                },
+                "decision_code": if package_variants_only {
+                    "protect_package_variants_or_keep_unchanged"
+                } else {
+                    "protect_read_only_skills_or_keep_unchanged"
+                },
                 "automatic_change_supported": false,
                 "snapshot_id": scan_id,
                 "request_field": "finding_roster_changes",
@@ -4861,16 +4882,24 @@ fn finding_roster_planning_impl(
                 "explicit_only_or_archive_decision_implied": false,
                 "agent_count": agents.len(),
                 "agents": agents,
-                "mutation_scopes": mutation_scopes,
                 "blocked_change_count": blocked_change_count,
+                "blocked_reasons": blocked_reasons,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
                 "blocked_skill_count": blocked_skills.count,
                 "blocked_skills": blocked_skills.items,
                 "blocked_skills_truncated": blocked_skills.truncated,
                 "resolution_choices": [protect_choice],
-                "next": "Provider and durable read permissions authorize inspection only; keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
-            })));
+                "next": if package_variants_only {
+                    "These Skill identities have different package fingerprints. Keep every package unchanged through the typed Core-protection choice, or review the packages before proposing another change; read permission does not resolve the content differences."
+                } else {
+                    "Read permissions do not make read-only placements mutable. Review all blocked reasons and keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
+                }
+            });
+            if !package_variants_only {
+                planning["mutation_scopes"] = json!(mutation_scopes);
+            }
+            return Ok(Some(planning));
         }
         let untrusted_external_skill_ids = supported
             .exclusions
@@ -4903,6 +4932,7 @@ fn finding_roster_planning_impl(
             "agent_count": agents.len(),
             "agents": agents,
             "blocked_change_count": blocked_change_count,
+            "blocked_reasons": blocked_reasons,
             "blocked_changes": blocked_changes,
             "blocked_changes_truncated": blocked_change_count > 5,
             "blocked_skill_count": blocked_skills.count,
@@ -4913,7 +4943,11 @@ fn finding_roster_planning_impl(
             "after_confirmation": {
                 "repeatable_option": "--source-root",
                 "value": "absolute canonical source directory",
-                "next": "rescan and reopen the new large-Roster Finding"
+                "next": if blocked_reasons.contains("multiple_package_fingerprints_require_explicit_preservation") {
+                    "rescan and reopen the new large-Roster Finding; read confirmation does not resolve the independent package-preservation blockers"
+                } else {
+                    "rescan and reopen the new large-Roster Finding"
+                }
             }
         })));
     }
