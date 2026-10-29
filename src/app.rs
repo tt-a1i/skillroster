@@ -9533,7 +9533,7 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     if let Some(reverse) = store.reverse_receipt_for(&id)? {
         bail!("Receipt {id} was already undone by {reverse}");
     }
-    let plan = store
+    store
         .get_plan(&record.plan_id)?
         .ok_or_else(|| anyhow!("Plan {} does not exist", record.plan_id))?;
     let latest_snapshot_id = store
@@ -9575,10 +9575,9 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
             "after": record.verification["library_state"]["before"]
         }),
     )?;
-    let invalidates_snapshot_id = latest_snapshot_id.filter(|scan_id| scan_id != &plan.scan_id);
     if outcome.verification_passed {
         store
-            .save_undo_receipt(&id, &receipt, invalidates_snapshot_id.as_ref())
+            .save_undo_receipt(&id, &receipt, latest_snapshot_id.as_ref())
             .with_context(|| {
                 format!(
                     "Undo journal {} is durable but SQLite finalization failed; run lifecycle recovery --json",
@@ -9589,8 +9588,7 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
         store.save_receipt(&receipt)?;
     }
     let mut result = mutation_result(&outcome, &receipt, Some(id));
-    result["rescan_required"] =
-        json!(outcome.verification_passed && invalidates_snapshot_id.is_some());
+    result["rescan_required"] = json!(outcome.verification_passed);
     Ok(result)
 }
 

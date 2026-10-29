@@ -5520,6 +5520,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(find["result"]["matches"][0]["name"], "example");
     let skill_id = find["result"]["matches"][0]["skill_id"].as_str().unwrap();
     let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
+    assert!(!evidence_id.is_empty());
 
     let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     let setup_plan = setup["result"]["plan_id"].as_str().unwrap();
@@ -5535,6 +5536,16 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     ));
     assert_eq!(setup_undone["result"]["verification"], "passed");
     assert!(!skill_root.join("skillroster").exists());
+    let refreshed = json_output(&run_suggested_action(&setup_undone["suggested_actions"][0]));
+    let snapshot = refreshed["result"]["snapshot_id"].as_str().unwrap();
+    let refreshed_find = json_output(&run(
+        &[&common[..], &["find", "example task"]].concat(),
+        None,
+    ));
+    let skill_id = refreshed_find["result"]["matches"][0]["skill_id"]
+        .as_str()
+        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
 
     let plan_input = json!({
         "schema_version": 1,
@@ -6167,7 +6178,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
     for (version, changed_count, legacy_files) in [
         (
             "1.8.51",
-            3,
+            4,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.51.md")),
                 (
@@ -6186,7 +6197,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         ),
         (
             "1.8.50",
-            3,
+            4,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.50.md")),
                 (
@@ -7016,6 +7027,7 @@ fn setup_reuse_and_status_actionability_follow_snapshot_lifecycle() {
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
+    json_output(&run_suggested_action(&undone["suggested_actions"][0]));
 
     let after_terminal_state = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(after_terminal_state["result"]["state"], "preview_ready");
@@ -7384,7 +7396,7 @@ fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
 }
 
 #[test]
-fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
+fn verified_apply_and_immediate_undo_both_require_fresh_scan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -7543,13 +7555,63 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
         applied["result"]["receipt_id"]
     );
     assert!(!bootstrap.exists());
+    assert_eq!(undone["result"]["rescan_required"], true);
+    assert_eq!(undone["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(undone["suggested_actions"][0]["action"], "scan");
+    assert_eq!(undone["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        undone["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+    assert_eq!(
+        undone["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+    );
+    let status_after = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status_after["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status_after["result"]["snapshot_invalidated_by_receipt_id"],
+        undone["result"]["receipt_id"]
+    );
+    let home_after = json_output(&run(&common, None));
+    assert_eq!(home_after["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        home_after["suggested_actions"][0],
+        undone["suggested_actions"][0]
+    );
+    for command in [
+        vec!["report", "--summary"],
+        vec!["find", "help", "--load"],
+        vec!["setup"],
+        vec!["plan", "--stdin"],
+    ] {
+        let output = run(&[&common[..], &command].concat(), Some("{}"));
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "snapshot_rescan_required");
+        assert_eq!(
+            value["suggested_actions"][0]["argv"],
+            context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+        );
+    }
+    let historical = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(historical["result"]["plan_id"], plan_id);
+    let refreshed = json_output(&run_suggested_action(&undone["suggested_actions"][0]));
+    assert_ne!(
+        refreshed["result"]["snapshot_id"],
+        original_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(refreshed["result"]["placement_count"], 0);
     let restored = json_output(&run(
         &[&common[..], &["report", "--summary"]].concat(),
         None,
     ));
     assert_eq!(
         restored["result"]["snapshot_id"],
-        original_scan["result"]["snapshot_id"]
+        refreshed["result"]["snapshot_id"]
     );
     assert_eq!(restored["result"]["placement_count"], 0);
 }
@@ -9017,7 +9079,29 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     assert_eq!(preserve_undo["result"]["verification"], "passed");
     assert!(!sibling.exists());
 
+    let refresh_request = |request: &mut Value, scan: &Value| {
+        let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+        let payload: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+                [snapshot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let skill_id = payload["skills"][0]["id"].as_str().unwrap();
+        request["scan_id"] = json!(snapshot);
+        request["evidence_ids"] = json!([skill_evidence_id(&database, snapshot, skill_id)]);
+        request["source_updates"][0]["skill_id"] = payload["skills"][0]["id"].clone();
+        request["source_updates"][0]["placement_id"] = payload["placements"][0]["id"].clone();
+        request["source_updates"][0]["current_fingerprint"] =
+            payload["placements"][0]["content_digest"].clone();
+    };
+    let post_preserve_scan = json_output(&run_suggested_action(
+        &preserve_undo["suggested_actions"][0],
+    ));
     let mut retain_request = modified_request;
+    refresh_request(&mut retain_request, &post_preserve_scan);
     retain_request["source_updates"][0]["choice"] = json!("retain_local");
     let retain_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
@@ -9043,6 +9127,10 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     ));
     assert_eq!(retained_undo["result"]["verification"], "passed");
 
+    let post_retain_scan = json_output(&run_suggested_action(
+        &retained_undo["suggested_actions"][0],
+    ));
+    refresh_request(&mut retain_request, &post_retain_scan);
     database
         .execute("DELETE FROM source_baselines", [])
         .unwrap();
@@ -9482,9 +9570,44 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         .unwrap();
     assert_eq!(governance_state, "observed");
 
+    let after_managed_scan =
+        json_output(&run_suggested_action(&managed_undo["suggested_actions"][0]));
+    let after_managed_snapshot = after_managed_scan["result"]["snapshot_id"]
+        .as_str()
+        .unwrap();
+    let after_managed_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [after_managed_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let after_managed_payload: Value = serde_json::from_str(&after_managed_payload).unwrap();
+    let after_managed_placements = after_managed_payload["placements"].as_array().unwrap();
+    let after_managed_skill = after_managed_payload["skills"][0]["id"].as_str().unwrap();
+    let after_managed_canonical = after_managed_placements
+        .iter()
+        .find(|p| p["agent"] == "codex")
+        .unwrap();
+    let mut hosted_request = request("hosted");
+    hosted_request["scan_id"] = json!(after_managed_snapshot);
+    hosted_request["evidence_ids"] = json!([skill_evidence_id(
+        &database,
+        after_managed_snapshot,
+        after_managed_skill
+    )]);
+    hosted_request["library_changes"][0]["skill_id"] = json!(after_managed_skill);
+    hosted_request["library_changes"][0]["canonical_placement_id"] =
+        after_managed_canonical["id"].clone();
+    hosted_request["library_changes"][0]["placement_ids"] = json!(
+        after_managed_placements
+            .iter()
+            .map(|p| p["id"].clone())
+            .collect::<Vec<_>>()
+    );
     let hosted_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
-        Some(&request("hosted").to_string()),
+        Some(&hosted_request.to_string()),
     ));
     let hosted_impact = &hosted_plan["result"]["impact"]["items"][0];
     assert_eq!(hosted_impact["before"]["physical_source_count"], 2);

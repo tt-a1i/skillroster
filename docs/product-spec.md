@@ -355,12 +355,16 @@ Until a newer Scan completes, commands that require current inventory facts
 fail with typed `snapshot_rescan_required` details and one read-only Scan
 continuation. Apply returns `rescan_required: true` and keeps both the required
 Scan and exact Receipt Undo actions visible. Status, lifecycle recovery, and
-Undo remain available while facts are stale. If no newer Scan completed after
-Apply, verified exact Undo consumes the Applied Receipt and restores the
-pre-Apply state, so that original Snapshot is current again without a redundant
-Scan. If a newer Scan observed the applied state, Undo invalidates that newer
-Snapshot and returns its own required Scan continuation. Failed-and-compensated
-Apply never invalidates a Snapshot; recovery-required state keeps its existing
+Undo remain available while facts are stale. Verified exact Undo consumes the
+Applied Receipt and invalidates the latest Snapshot, when available, through
+its own Undo Receipt. Every verified Undo returns
+`rescan_required: true` and a read-only Scan continuation, including when no
+Snapshot is available. Receipt verification establishes bounded restoration of
+SkillRoster-owned changes; it does not establish that preserved user contents
+or other inventory still match an earlier observation. One explicit fresh Scan
+is therefore required before current-inventory decisions resume, even after
+unchanged immediate Undo. This adds an observation, not continuous monitoring.
+Failed-and-compensated Apply never invalidates a Snapshot; recovery-required state keeps its existing
 recovery boundary.
 
 When Home or Status resumes an ordinary invalidated-Snapshot state, the

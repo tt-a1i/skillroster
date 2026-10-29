@@ -211,10 +211,11 @@ If Apply failed but compensation succeeded, say that no planned state remains an
 After a verified Apply, the Agent follows the returned read-only Scan action
 before using Report, Find, Plan, Setup, or another current-inventory decision.
 It does not hide this required continuation or infer it from prose. Status and
-the exact Receipt Undo remain usable. If exact Undo verifies before a new Scan,
-the original Snapshot becomes current again. If a newer Scan already observed
-the applied state, Undo returns another required Scan before current-inventory
-decisions resume.
+the exact Receipt Undo remain usable. Every verified Undo returns another
+required read-only Scan before current-inventory decisions resume, including
+unchanged immediate Undo. Receipt verification establishes bounded restoration;
+it does not make an earlier Snapshot current. The Agent follows the returned
+Scan explicitly and preserves user edits.
 
 While facts are invalid, Home and Status name `snapshot_state:
 rescan_required`, bind the invalidating Receipt ID, and return the same

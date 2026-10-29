@@ -34,10 +34,11 @@ A verified Apply returns `rescan_required: true`. Follow its read-only Scan
 action before Report, Find, Plan, Setup, source confirmation, or another Apply;
 the Plan's Snapshot predates the verified mutation and is no longer current.
 Keep the exact Receipt Undo action available. Status, recovery inspection, and
-Undo remain valid before that Scan. If exact Undo verifies first, the original
-Snapshot is current again and no redundant Scan is required. If a newer Scan
-already observed the applied state, verified Undo returns its own required Scan
-action; follow it before using current inventory facts.
+Undo remain valid before that Scan. Every verified Undo returns its own required
+read-only Scan action; follow it before using current inventory facts, including
+after unchanged immediate Undo. Undo verification covers the Receipt's bounded
+restoration and preserves user edits; a fresh Scan establishes the next inventory
+observation. Never infer that Undo made an earlier Snapshot current.
 
 “Complete” means every affected Agent, Skill, placement, operation group,
 exclusion, risk, and before/after delta is accounted for by count. It does not

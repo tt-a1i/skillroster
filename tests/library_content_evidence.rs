@@ -248,33 +248,77 @@ fn apply_refuses_content_change_before_mutation_or_receipt() {
 
 #[test]
 fn preserved_edit_after_undo_cannot_authorize_old_duplicate_finding() {
-    let f = Fixture::new();
-    let req = f.request("managed", false);
-    let p = f.ok(&["plan", "--stdin"], Some(&req));
-    let applied = f.ok(&["apply", p["result"]["plan_id"].as_str().unwrap()], None);
-    f.edit(&f.codex.join("SKILL.md"));
-    let undo = f.ok(
-        &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
-        None,
-    );
-    assert_eq!(undo["result"]["verification"], "passed");
-    let before = f.tree();
-    let pending = f.pending();
-    let (ok, v) = f.call(&["plan", "--stdin"], Some(&req));
-    assert!(!ok, "{v}");
-    f.assert_rescan(&v, &f.codex.join("SKILL.md"), true);
-    assert_eq!(f.pending(), pending);
-    assert_eq!(f.tree(), before);
-    assert!(
-        fs::read_to_string(f.codex.join("SKILL.md"))
-            .unwrap()
-            .contains("user edit")
-    );
-    assert!(
-        !fs::read_to_string(f.claude.join("SKILL.md"))
-            .unwrap()
-            .contains("user edit")
-    );
+    for support in [false, true] {
+        let f = Fixture::new();
+        let req = f.request("managed", false);
+        let p = f.ok(&["plan", "--stdin"], Some(&req));
+        let applied = f.ok(&["apply", p["result"]["plan_id"].as_str().unwrap()], None);
+        let relative = if support {
+            "references/guide.txt"
+        } else {
+            "SKILL.md"
+        };
+        f.edit(&f.codex.join(relative));
+        let undo = f.ok(
+            &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+            None,
+        );
+        assert_eq!(undo["result"]["verification"], "passed");
+        assert_eq!(undo["result"]["rescan_required"], true);
+        assert_eq!(undo["suggested_actions"][0]["action"], "scan");
+        let before = f.tree();
+        let status = f.ok(&["status"], None);
+        assert_eq!(status["result"]["snapshot_state"], "rescan_required");
+        assert_eq!(
+            status["result"]["snapshot_invalidated_by_receipt_id"],
+            undo["result"]["receipt_id"]
+        );
+        for (args, input) in [
+            (&["report", "--summary"][..], None),
+            (&["plan", "--stdin"][..], Some(&req)),
+        ] {
+            let (ok, value) = f.call(args, input);
+            assert!(!ok, "{value}");
+            assert_eq!(value["error"]["code"], "snapshot_rescan_required");
+            assert_eq!(
+                value["suggested_actions"][0]["argv"],
+                undo["suggested_actions"][0]["argv"]
+            );
+        }
+        assert_eq!(f.tree(), before);
+        assert!(
+            fs::read_to_string(f.codex.join(relative))
+                .unwrap()
+                .contains("user edit")
+        );
+        assert!(
+            !fs::read_to_string(f.claude.join(relative))
+                .unwrap()
+                .contains("user edit")
+        );
+        let fresh = f.ok(&["scan", "--summary"], None);
+        let report = f.ok(&["report", "--findings", "--category", "overlap"], None);
+        assert_eq!(
+            report["result"]["snapshot_id"],
+            fresh["result"]["snapshot_id"]
+        );
+        assert!(
+            report["result"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|v| v["kind"] != "exact_duplicate_placements")
+        );
+        let (ok, stale) = f.call(&["plan", "--stdin"], Some(&req));
+        assert!(!ok, "{stale}");
+        assert!(
+            stale["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("does not belong to the latest Snapshot")
+        );
+        assert_eq!(f.tree(), before);
+    }
 }
 
 #[test]
