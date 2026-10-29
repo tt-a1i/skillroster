@@ -48,11 +48,25 @@ endorse, or establish success for the user's task.
 2. If `TASK` is non-English or mixed-language, create one concise English
    capability paraphrase as `HINT`. It supplements `TASK`; it never replaces it.
 3. Invoke the fixed SkillRoster executable with `TASK` and `HINT` as separate,
-   literal argv values; never interpolate either into shell syntax. Use:
+   literal argv values; never interpolate either into shell syntax. For a user-required
+   named Skill, perform the required-name check below first. Otherwise use:
    - English: `skillroster find --load --limit 1 --json -- "TASK"`
    - Otherwise: `skillroster find --hint "HINT" --load --limit 1 --json -- "TASK"`
    The `--` boundary is required even when `TASK` does not begin with `-`; it
    keeps opaque user text from being parsed as a SkillRoster option.
+   **Required-name check:** first use the corresponding Find above without `--load`
+   and with `--limit 5`. Match the user's required name to returned `name`, keeping
+   `skill_id`, `rank`, `paths`, any `providers`, and `result.snapshot_id` together.
+   Resolve any user-specified provider or path from those same public facts.
+   Once the intended identity is unambiguous and rank 1, repeat the same Find with
+   `--load --limit 1 --require-snapshot SNAPSHOT_ID`, preserving executable, context,
+   `TASK`, and hints. Require `loaded_skill.selection.skill_id` to equal that ID
+   and its `snapshot_id` to equal the inspected Snapshot before using the content.
+   A name missing from these bounded results remains unresolved. For that case,
+   lower rank, or ambiguity, follow the bounded recovery below and
+   `references/routing.md`; keep the required identity unresolved until established.
+   Use variant selectors only within that intended Top-1 same-name group.
+   A semantically similar candidate does not satisfy the user's required name.
 4. When `HINT` was used, first require
    `ranking_strategy: task_hint_reciprocal_rank_fusion`.
 5. Require `loaded_skill.selection.rank: 1`, `content.complete: true`, and all
@@ -72,7 +86,8 @@ first; these flags do not authorize a material change. For any other typed
 blocker, read `references/routing.md` and follow its bounded branch; execute a
 returned action only when one is present.
 
-If the result is empty or clearly from another domain, retry at most once. Keep `TASK`
+If the result is empty, clearly from another domain, or the required-name check
+remains unresolved, retry at most once. Keep `TASK`
 unchanged; refine the existing hint, or add one capability hint when the first
 English call had none. Use the recovery procedure in `references/routing.md`;
 all hint refinements share this one-retry budget. If no usable result remains
