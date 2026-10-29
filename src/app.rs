@@ -42,10 +42,10 @@ use content_choice::{
 };
 
 use error::{
-    ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
-    MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked,
-    SnapshotRescanRequired, SourceRootSnapshotRescanRequired, StoredFindingCoverageInvalid,
-    incomplete_fingerprint_blocker,
+    ContentIdentityRescanRequired, FindSnapshotChanged, InvalidSourceUpdateRequest,
+    LibraryRootConflict, MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch,
+    PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired, SourceRootSnapshotRescanRequired,
+    StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
@@ -8341,7 +8341,8 @@ fn normalize_agent_plan(
         .as_object_mut()
         .and_then(|object| object.remove("source_updates"))
         .unwrap_or_else(|| json!([]));
-    let requests: Vec<SourceUpdateRequest> = serde_json::from_value(raw_updates)?;
+    let requests: Vec<SourceUpdateRequest> =
+        serde_json::from_value(raw_updates).map_err(InvalidSourceUpdateRequest)?;
     let raw_library_changes = input
         .as_object_mut()
         .and_then(|object| object.remove("library_changes"))

@@ -8590,6 +8590,84 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
             "upstream_digest": digest(upstream)
         }]
     });
+    let plans_before: i64 = database
+        .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+        .unwrap();
+    for field in [
+        "current_fingerprint",
+        "skill_id",
+        "placement_id",
+        "choice",
+        "decision",
+    ] {
+        let mut malformed = request.clone();
+        let update = malformed["source_updates"][0].as_object_mut().unwrap();
+        if field == "choice" {
+            update.insert("choice".into(), json!("unknown_choice"));
+        } else if field == "decision" {
+            update.insert("decision".into(), json!("adopt_upstream"));
+        } else {
+            update.remove(field);
+        }
+        let output = run(
+            &[&common[..], &["plan", "--stdin"]].concat(),
+            Some(&malformed.to_string()),
+        );
+        assert!(!output.status.success(), "malformed field {field}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "invalid_source_update_request");
+        assert_eq!(result["error"]["retryable"], false);
+        let message = result["error"]["message"].as_str().unwrap();
+        if field == "decision" {
+            assert!(message.contains("unknown field `decision`"), "{message}");
+            assert!(message.contains("current_fingerprint"), "{message}");
+        } else if field == "choice" {
+            assert!(
+                message.contains("unknown variant `unknown_choice`"),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.contains(&format!("missing field `{field}`")),
+                "{message}"
+            );
+        }
+
+        assert_eq!(
+            result["error"]["details"]["reason"],
+            "source_update_request_decode_failed"
+        );
+        assert_eq!(
+            result["error"]["details"]["request_field"],
+            "source_updates"
+        );
+        assert_eq!(result["error"]["relevant_ids"], json!([]));
+        assert_eq!(result["error"]["paths"], json!([]));
+        assert!(
+            result["suggested_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["action"] != "scan")
+        );
+        assert!(result["result"].is_null());
+        let plans_after: i64 = database
+            .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(plans_after, plans_before);
+        assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
+    }
+    let mut drifted = request.clone();
+    drifted["source_updates"][0]["current_fingerprint"] = json!("0".repeat(64));
+    drifted["source_updates"][0]["choice"] = json!("adopt_upstream");
+    let output = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&drifted.to_string()),
+    );
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "state_drift");
+    assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
     let untrusted_default = run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
