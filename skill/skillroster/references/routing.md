@@ -34,10 +34,13 @@ An English task may add a capability
 hint if it had none. For a non-English or mixed task whose inspected metadata
 supports that capability in the task's language, retain the faithful English
 hint and optionally add one separate `--hint` in the original task's language.
-Both are literal argv values. Use a specific operation supported by the task and
-metadata, expressed as a short capability phrase in the metadata's wording;
-the complete task retains its other constraints. Generic editing or boilerplate
-phrases are insufficient to establish the requested specialized capability. A
+Both are literal argv values. For description-based evidence, a reliable way
+to express the independently chosen capability is to select a short, specific
+operation/object phrase from the inspected description and reuse its words
+unchanged. Normalized lexical matching does not equate synonyms; adding even a
+faithful synonym can leave a complete hint phrase unsupported. The complete
+TASK retains its other constraints. Generic editing or boilerplate phrases are
+insufficient to establish the requested specialized capability. A
 ranked name alone does not justify an exact-name hint. If the candidate does not support
 the task, use the wrong-domain fallback instead of manufacturing direct evidence.
 After this retry, follow remaining typed blockers or the root fallback; no
