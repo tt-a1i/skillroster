@@ -8573,7 +8573,7 @@ fn normalize_agent_plan(
         let mut diff = diff_summary(
             &current_content,
             &request.upstream_content,
-            local_modified,
+            baseline_trusted.then_some(local_modified),
             choice_name,
             &request.placement_id,
         );
@@ -9085,7 +9085,7 @@ fn source_update_sibling(entrypoint: &Path, revision: &str) -> Result<PathBuf> {
 fn diff_summary(
     current: &str,
     upstream: &str,
-    local_modified: bool,
+    local_modified: Option<bool>,
     choice: &str,
     placement_id: &str,
 ) -> Value {

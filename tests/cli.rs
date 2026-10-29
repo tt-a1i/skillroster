@@ -8617,6 +8617,30 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         plan["result"]["diff_summary"]["items"][0]["choice"],
         "adopt_upstream"
     );
+    for view in [&plan["result"]["diff_summary"], &plan["result"]["impact"]] {
+        assert_eq!(
+            view["items"][0].get("local_modification_detected"),
+            Some(&Value::Null)
+        );
+    }
+    let shown = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "plan",
+                "--show",
+                plan["result"]["plan_id"].as_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    for view in [&shown["result"]["diff_summary"], &shown["result"]["impact"]] {
+        assert_eq!(
+            view["items"][0].get("local_modification_detected"),
+            Some(&Value::Null)
+        );
+    }
     let applied = json_output(&run(
         &[
             &common[..],
@@ -8676,6 +8700,61 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         trusted_plan["result"]["diff_summary"]["items"][0]["choice_reason"],
         "trusted_baseline_clean"
     );
+    for view in [
+        &trusted_plan["result"]["diff_summary"],
+        &trusted_plan["result"]["impact"],
+    ] {
+        assert_eq!(view["items"][0]["local_modification_detected"], false);
+    }
+
+    // A trusted v2 baseline distinguishes a real local edit from an unknown baseline.
+    fs::write(&entrypoint, format!("{upstream}local edit\n")).unwrap();
+    let edited_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let edited_snapshot = edited_scan["result"]["snapshot_id"].as_str().unwrap();
+    let edited_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [edited_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let edited_payload: Value = serde_json::from_str(&edited_payload).unwrap();
+    let mut edited_request = trusted_request.clone();
+    edited_request["scan_id"] = json!(edited_snapshot);
+    edited_request["evidence_ids"] = json!([skill_evidence_id(
+        &database,
+        edited_snapshot,
+        edited_payload["skills"][0]["id"].as_str().unwrap()
+    )]);
+    edited_request["source_updates"][0]["skill_id"] = edited_payload["skills"][0]["id"].clone();
+    edited_request["source_updates"][0]["placement_id"] =
+        edited_payload["placements"][0]["id"].clone();
+    edited_request["source_updates"][0]["current_fingerprint"] =
+        edited_payload["placements"][0]["content_digest"].clone();
+    let edited_without_choice = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&edited_request.to_string()),
+    );
+    assert!(!edited_without_choice.status.success());
+    let rejected: Value = serde_json::from_slice(&edited_without_choice.stdout).unwrap();
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("choice is required")
+    );
+    edited_request["source_updates"][0]["choice"] = json!("retain_local");
+    let edited_plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&edited_request.to_string()),
+    ));
+    for view in [
+        &edited_plan["result"]["diff_summary"],
+        &edited_plan["result"]["impact"],
+    ] {
+        assert_eq!(view["items"][0]["local_modification_detected"], true);
+    }
+    fs::write(&entrypoint, upstream).unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);

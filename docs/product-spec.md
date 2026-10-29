@@ -395,6 +395,13 @@ operation fails closed without touching the escaped target.
 
 SkillRoster records source, revision, and content hash when available. A source-update request submitted through `plan --stdin` first produces a diff and Plan; there is no silent update path. Local modifications stop automatic replacement and require an explicit choice to retain local content, adopt upstream content, or preserve both.
 
+In newly prepared source-update Plans, `local_modification_detected` is `null`
+when no trusted source baseline exists; the first observed bytes do not establish
+whether a local modification occurred. With a trusted baseline, it is `true`
+when the current entrypoint differs and `false` when it matches. An unknown
+result still requires an explicit choice. Previously saved Plan summaries remain
+immutable.
+
 ## 5. CLI contract
 
 The first complete command surface is:
