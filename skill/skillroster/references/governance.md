@@ -78,6 +78,16 @@ Make semantic choices in conversation, then submit them to
   one portable Library target.
 - `finding_library_changes`: preferred for exact duplicates. Supply the Finding
   ID, a listed canonical placement, and `managed` or `hosted`.
+
+Choose the state by the user's physical-location intent. `managed` keeps the
+selected canonical package at its current path and links matching placements
+to it. `hosted` explicitly migrates it into SkillRoster's Library root. A request
+to retain an existing source in place calls for `managed`; hosting requires
+migration intent. Select the listed canonical candidate separately from this
+state choice. Before Apply, compare `impact.items[].before.canonical_path` and
+`after.canonical_path` with that intent; unchanged default exposure does not
+mean the canonical package stayed put.
+
 - Raw `roster_changes`, `library_changes`, and `source_updates` are advanced
   forms. Bind them to the latest Snapshot, complete scope, current Evidence,
   placement/source facts, revision, and fingerprint. For local source drift,
