@@ -3213,7 +3213,8 @@ fn add_same_name_resolution(
         let observations = placements.iter().take(limit).map(|p| json!({
             "placement_id": p.id, "name": scan.observed_skill_for_placement(p).map(|s| &s.name),
             "path": p.entrypoint, "content_identity_digest": p.content_identity_digest,
-            "package_fingerprint": p.content_digest, "mutation_scope": p.mutation_scope,
+            "package_fingerprint": p.content_digest, "entrypoint_digest": p.entrypoint_digest,
+            "mutation_scope": p.mutation_scope,
             "read_state": content_choice::placement_read_state(scan, state_dir, p),
         })).collect::<Vec<_>>();
         Some(json!({
@@ -3234,9 +3235,63 @@ fn add_same_name_resolution(
         json!({
             "decision": "choose_same_name_variant", "automatic_change_supported": false,
             "variant_count": variant_count, "variants_truncated": variants.len() < variant_count,
-            "variants": variants, "next_step": "compare_variant_content_and_choose_canonical"
+            "variants": variants,
+            "entrypoint_comparison": entrypoint_comparison(scan.placements.iter().filter(|p|
+                affected_placement_ids.contains(p.id.as_str()))),
+            "next_step": "compare_variant_content_and_choose_canonical"
         }),
     );
+}
+
+/// Snapshot facts only: entrypoint equality never chooses a package or proves
+/// that supporting files are interchangeable. Counts cover all placements;
+/// the returned digest preview stays bounded independently of Finding detail.
+fn entrypoint_comparison<'a>(placements: impl Iterator<Item = &'a scan::SkillPlacement>) -> Value {
+    let mut digests = BTreeSet::new();
+    let mut package_digests = BTreeSet::new();
+    let mut variant_ids = BTreeSet::new();
+    let mut variants_with_digest = BTreeSet::new();
+    let mut unknown_count = 0;
+    let mut complete_packages = true;
+    for placement in placements {
+        variant_ids.insert(&placement.skill_id);
+        if let Some(digest) = placement.entrypoint_digest.as_deref() {
+            digests.insert(digest);
+            variants_with_digest.insert(&placement.skill_id);
+        } else {
+            unknown_count += 1;
+        }
+        complete_packages &=
+            placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete;
+        package_digests.insert(&placement.content_digest);
+    }
+    let known = !variant_ids.is_empty() && unknown_count == 0;
+    let identical = known && digests.len() == 1;
+    let state = if !known {
+        "unknown"
+    } else if identical {
+        "identical_across_variants"
+    } else {
+        "different_across_variants"
+    };
+    let difference_scope = if identical && complete_packages && package_digests.len() > 1 {
+        "supporting_package_files"
+    } else if known && digests.len() > 1 {
+        "entrypoint_content"
+    } else {
+        "unknown"
+    };
+    json!({
+        "basis": "snapshot_entrypoint_digests",
+        "state": state,
+        "distinct_digest_count": digests.len(),
+        "variant_count_with_digest": variants_with_digest.len(),
+        "variant_count": variant_ids.len(),
+        "unknown_placement_count": unknown_count,
+        "digests": digests.iter().take(10).collect::<Vec<_>>(),
+        "digests_truncated": digests.len() > 10,
+        "difference_scope": difference_scope,
+    })
 }
 
 struct PlacementAuthoritySummary {
@@ -5704,7 +5759,7 @@ fn find_command(
             let variant_count = found.variants.len().max(1);
             warnings.push(if drifted_variants == variant_count {
                 format!(
-                    "{} has no current path that matches the latest Snapshot identity and fingerprint; run skillroster scan",
+                    "{} has placement drift relative to the latest Snapshot identity or fingerprint; run skillroster scan",
                     found.name
                 )
             } else {
@@ -5964,6 +6019,34 @@ fn find_command(
         &mut actions,
         &mut observations,
     )?;
+    for (found, value) in matches
+        .iter()
+        .zip(result["matches"].as_array_mut().unwrap())
+    {
+        if found.variant_count > 1 {
+            // Compare the complete routable group, even when the displayed
+            // variant preview is truncated.
+            let ids = scan
+                .routing_skills()
+                .filter(|skill| {
+                    skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
+                })
+                .filter(|skill| routable_ids.contains(&skill.id))
+                .map(|skill| skill.id.as_str())
+                .collect::<BTreeSet<_>>();
+            value["entrypoint_comparison"] = entrypoint_comparison(
+                scan.placements
+                    .iter()
+                    .filter(|placement| ids.contains(placement.skill_id.as_str()))
+                    .filter(|placement| {
+                        scan.observed_skill_for_placement(placement)
+                            .is_some_and(|skill| {
+                                skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
+                            })
+                    }),
+            );
+        }
+    }
     if !load {
         for (found, value) in matches
             .iter()
@@ -6041,7 +6124,19 @@ fn find_placement_readiness_blockers(
             placement,
             observations,
         );
-        return if state == "available" {
+        let exact_copy_available = state == "available"
+            || placements.iter().any(|copy| {
+                copy.content_digest == placement.content_digest
+                    && copy.content_identity_digest == placement.content_identity_digest
+                    && copy.entrypoint_digest == placement.entrypoint_digest
+                    && content_choice::placement_read_state_with_observations(
+                        scan,
+                        state_dir,
+                        copy,
+                        observations,
+                    ) == "available"
+            });
+        return if exact_copy_available {
             Vec::new()
         } else {
             vec![state]
@@ -6919,6 +7014,48 @@ fn verified_skill_placement_load(
         return Err(blocked("legacy_snapshot_requires_rescan", None, None, None).into());
     }
 
+    // Retry only frozen exact package copies. Each attempt runs the full fresh
+    // verifier below; neither a shared declared ID nor routing equivalence can
+    // substitute for matching package bytes. An explicit placement never retries.
+    if selected_placement_id.is_none() {
+        let eligible = placements
+            .iter()
+            .copied()
+            .filter(|placement| {
+                placement
+                    .mutation_scope
+                    .is_some_and(|scope| scope != scan::MutationScope::UntrustedExternal)
+                    && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+                    && placement.entrypoint_digest.is_some()
+            })
+            .collect::<Vec<_>>();
+        if let Some(preferred) = eligible.first() {
+            let mut first_error = None;
+            for placement in eligible.iter().filter(|placement| {
+                placement.content_digest == preferred.content_digest
+                    && placement.content_identity_digest == preferred.content_identity_digest
+                    && placement.entrypoint_digest == preferred.entrypoint_digest
+            }) {
+                match verified_skill_placement_load(
+                    scan_id,
+                    scan,
+                    state_dir,
+                    matched,
+                    ambiguity_retry_argv.clone(),
+                    Some(&placement.id),
+                ) {
+                    Ok(loaded) => return Ok(loaded),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+    }
+
     let placement = placements
         .into_iter()
         .find(|placement| {
@@ -7070,7 +7207,7 @@ fn verified_skill_placement_load(
         Some(scan::MutationScope::DurableReadOnly) => "confirmed_durable_read_only",
         Some(scan::MutationScope::UntrustedExternal) | None => unreachable!("filtered above"),
     };
-    Ok(json!({
+    let mut loaded = json!({
         "selection": {
             "rank": matched.rank,
             "skill_id": matched.skill_id,
@@ -7078,8 +7215,10 @@ fn verified_skill_placement_load(
             "placement_id": placement.id,
             "content_identity_digest": placement.content_identity_digest,
             "snapshot_id": scan_id,
-            "ranking_evidence": matched.match_reasons,
+            "ranking_evidence": crate::query::routing_relevance_evidence(matched),
             "ranking_evidence_scope": "loaded_identity",
+            "evidence_quality": matched.evidence_quality,
+            "evidence_quality_scope": matched.evidence_quality_scope,
         },
         "content": {
             "path": placement.entrypoint,
@@ -7107,7 +7246,11 @@ fn verified_skill_placement_load(
             "content_limit_bytes": MAX_AGENT_LOADED_SKILL_BYTES,
         },
         "task_success": "not_evaluated",
-    }))
+    });
+    if let Some(prior) = &matched.local_usage_prior {
+        loaded["selection"]["local_usage_prior"] = json!(prior);
+    }
+    Ok(loaded)
 }
 
 fn plan_command(

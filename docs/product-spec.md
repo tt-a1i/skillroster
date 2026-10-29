@@ -534,6 +534,18 @@ discards a strong native-task result. Each task or hint also remains a separate 
 exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars.
 
+Find's `evidence_quality` describes the current lexical relevance inference and
+remains `inferred`, with `evidence_quality_scope: routing_relevance`. Observed
+history for the exact Skill identity is returned separately in optional
+`local_usage_prior`: its Skill ID, observed stages, and evidence Agent names.
+Stages and Agents are deduplicated facts, not additive event counts or placement
+exposure. History never adds to the relevance score or creates a candidate with
+no lexical evidence. No stage or recency ranking policy is inferred. The legacy
+outer `match_reasons` may retain `observed_local_usage`; successful load
+`ranking_evidence` excludes that marker and carries the independent prior with
+its original Skill ID, including when explicit variant selection changes which
+package is loaded.
+
 An independent punctuation-delimited task clause that begins with `不要`, the
 parallel continuation `也不要`, or the English marker `do not`, `don't`, or `don’t` remains
 verbatim in `task` but does not contribute positive candidate or ranking
@@ -667,7 +679,13 @@ loaded placement is selected only after identity ranking: an eligible
 `default_exposed` placement outranks inventory-only exact copies, with path as
 the deterministic tie-breaker; when no exposed placement exists, the same
 deterministic eligible fallback keeps source-only Skills loadable. Hidden and
-nested exact copies remain inventory facts. The
+nested exact copies remain inventory facts. If the preferred placement fails
+verification, an implicit load may try another frozen copy only when its
+complete package fingerprint, routing identity digest, and entrypoint digest
+match the preferred copy. Each attempt performs the full current verification;
+routing equivalence or a shared declared identity alone is insufficient. Explicit
+placement selection never falls back. A successful alternate load does not erase
+the stale placement's blocker or rescan requirement. The
 success result separates selection, complete content, governance, and
 verification facts. Digest or path drift, legacy Snapshot data, ambiguity,
 Archived state, untrusted source, unreadable content, escape, or oversize fails
@@ -686,6 +704,15 @@ evidence for the ranked capability group and is explicitly scoped as such; it
 is not attributed to the selected package identity. It supplies content facts
 for the model's comparison; it does not endorse, canonicalize, mutate, or
 establish task success.
+
+Same-name Finding resolution and Find groups also expose bounded
+`entrypoint_comparison` facts from the frozen Snapshot. They distinguish equal
+entrypoint digests, differing entrypoints, and missing digest evidence. Equal
+entrypoints with differing complete package fingerprints identify differences
+in supporting package files; they do not imply that packages are interchangeable.
+Counts cover the complete relevant same-name group even when previews are
+truncated. Existing `content_choice` and explicit content-selection requirements
+remain authoritative; the caller decides what supporting content to inspect.
 
 For divergent content under one declared identity, Find scores each observed
 content separately and keeps the strongest match for that logical ID. FTS may
@@ -734,6 +761,10 @@ All JSON responses use a versioned envelope:
   "suggested_actions": []
 }
 ```
+
+A generic human error whose file-change state is unavailable reports that state
+as unknown. It must not infer that no files changed merely because a command
+failed. Operation-specific verified summaries retain their explicit facts.
 
 IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
 
