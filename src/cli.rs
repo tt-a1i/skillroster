@@ -261,12 +261,22 @@ pub enum ModifiedBootstrapChoice {
 
 #[derive(Debug, Args)]
 pub struct SetupArgs {
+    /// Restrict setup to one detected Agent ID; omission includes every eligible Agent.
+    #[arg(long, value_name = "AGENT_ID", value_parser = parse_setup_agent)]
+    pub agent: Option<crate::harness::AgentKind>,
     /// Inspect detected Bootstrap targets without creating a Plan.
     #[arg(long, conflicts_with = "modified_choice")]
     pub check: bool,
     /// Decide how setup handles locally modified bootstrap Skill files.
     #[arg(long, value_enum)]
     pub modified_choice: Option<ModifiedBootstrapChoice>,
+}
+
+fn parse_setup_agent(value: &str) -> Result<crate::harness::AgentKind, String> {
+    crate::harness::AgentKind::ALL
+        .into_iter()
+        .find(|agent| agent.id() == value)
+        .ok_or_else(|| format!("unsupported Agent: {value}"))
 }
 
 #[derive(Debug, Args)]
@@ -332,4 +342,38 @@ pub struct LifecycleDeleteArgs {
     /// Required exact token: DELETE-LOCAL-STATE.
     #[arg(long)]
     pub confirm: String,
+}
+
+#[cfg(test)]
+mod setup_agent_tests {
+    use super::*;
+
+    #[test]
+    fn setup_agent_accepts_one_supported_id_and_preserves_choice_conflict() {
+        for agent in crate::harness::AgentKind::ALL {
+            let cli =
+                Cli::try_parse_from(["skillroster", "setup", "--agent", agent.id(), "--check"])
+                    .unwrap();
+            let Some(Command::Setup(args)) = cli.command else {
+                panic!("expected Setup");
+            };
+            assert_eq!(args.agent, Some(agent));
+            assert!(args.check);
+        }
+        for args in [
+            vec!["--agent", "unknown"],
+            vec!["--agent", "codex", "--agent", "codex"],
+            vec!["--agent", "codex", "claude-code"],
+            vec!["--agent", "codex,claude-code"],
+            vec![
+                "--agent",
+                "codex",
+                "--check",
+                "--modified-choice",
+                "retain-local",
+            ],
+        ] {
+            assert!(Cli::try_parse_from([vec!["skillroster", "setup"], args].concat()).is_err());
+        }
+    }
 }

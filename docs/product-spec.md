@@ -512,6 +512,26 @@ bounded decision fields is not equivalent: it remains immutable and auditable,
 while Setup creates one decision-complete replacement. Both can temporarily
 appear as pending; the Agent presents only the newly returned Plan ID.
 
+By default Setup includes all detected eligible fixed targets. Optional
+`setup --agent codex` selects one existing Agent ID for both inspection
+(`--check`) and preview; repeated or multiple selections are invalid.
+`detected_agents` still records the complete eligible detection set, while
+`requested_agent` identifies the selected scope and `targets` and status counts
+describe only that scope. No eligible selected target returns
+`no_supported_agent` for this request; no Snapshot still returns `scan_required`.
+Selection never creates detection evidence, changes approved paths, or enables
+a shared/read-only target. Modified-file choices and subsequent Setup actions
+retain the selector. After a required Scan, resume the same selected Setup request.
+
+When prospective selected writes reach the same resolved fixed Bootstrap target
+as an unselected detected Agent, both check and preview return
+`selected_scope_not_isolatable` without a Plan. Bounded conflict bindings identify
+the selected and unselected Agent paths and their physical destination. The caller
+must explicitly resolve the scope; Setup never adds the other Agent silently.
+An already-current selected target needs no write and retains `up_to_date`.
+Default combined-target deduplication and normal Plan confirmation, drift guards,
+Receipts and Undo remain unchanged.
+
 The affected scope applies the normal Skill identity rules to the projected
 package after Apply: declared source plus version/revision takes precedence;
 otherwise identity comes from content, excluding `.gitignore`. The content

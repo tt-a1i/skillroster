@@ -10,6 +10,10 @@ not a blocker for ordinary CLI use. When the user wants Agent integration,
 run `skillroster setup --json` to preview installation or upgrade of this
 complete package. Show every detected Agent and target before Apply; never
 assume all supported Agents are installed or that detection authorizes setup.
+For a request limited to one Agent, use `setup --agent ID --json` (or `--check`)
+and retain that selector on follow-up Setup calls. Omission includes all eligible
+detected targets. Distinguish full `detected_agents` from selected `targets`;
+`selected_scope_not_isolatable` requires a scope decision before any Plan.
 An exact official older package produces a recoverable Plan. When
 `state` is `modified_choice_required`, show affected Agent targets and ask for
 `retain-local` or `adopt-current`; never choose for the user. Unsupported links
