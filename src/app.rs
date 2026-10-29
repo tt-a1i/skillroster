@@ -109,7 +109,16 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                 return cancelled_output("lifecycle");
             }
             let result = lifecycle_delete_command(&database_path, &state_dir)?;
-            let envelope = JsonEnvelope::success("lifecycle", result.clone());
+            let mut actions = vec![action(
+                "scan",
+                &["scan", "--summary", "--json"],
+                false,
+                false,
+                "local_state_deleted_rebuild_inventory",
+            )];
+            action_context.apply(&mut actions);
+            let mut envelope = JsonEnvelope::success("lifecycle", result.clone());
+            envelope.suggested_actions = actions;
             return Ok(Output {
                 json: serde_json::to_string(&envelope)?,
                 human: crate::present::human("lifecycle", &result),

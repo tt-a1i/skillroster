@@ -915,6 +915,15 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
   required Scan continuation described above.
 - Users can inspect, export, purge, or delete retained local state and rebuild inventory by scanning again.
 
+Successful local-state deletion returns a typed `scan` suggested action that
+retains the invoking executable, Home, state directory, explicit Agent roots,
+and temporary source roots. Reusing temporary source roots retains the existing
+confirmation requirement. Deletion does not execute the action. Use its literal
+`argv` for continuation; the legacy `rebuild_command` string is generic syntax,
+not a reconstruction of the caller's context. A new Scan rebuilds inventory;
+it does not restore deleted history, evidence exclusions, or durable source
+permissions.
+
 Reports may identify structural and provenance risks—unknown source, changed content, executable scripts, declaration mismatch, and escaping links—but must not claim malware detection or runtime safety.
 
 ## 8. Scope constraints
