@@ -803,6 +803,11 @@ failed. Operation-specific verified summaries retain their explicit facts.
 
 IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
 
+In JSON mode, valid help and version display requests return a successful `cli`
+envelope with `result.kind` (`help` or `version`) and the display `text`.
+They exit successfully without initializing local state. Actual argument parse
+failures remain `invalid_cli_arguments` errors.
+
 `scan --summary --json` persists the same complete immutable Snapshot as a full
 Scan but returns a bounded Agent continuation view: Snapshot and inventory
 counts, exact root totals, at most ten actionable root issues with exact

@@ -7914,6 +7914,85 @@ fn json_failure_is_one_parseable_document() {
 }
 
 #[test]
+fn json_help_version_and_invalid_arguments_preserve_cli_behavior() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let sentinel = home.join("sentinel.txt");
+    fs::write(&sentinel, b"preserve user data\n").unwrap();
+    let prefix = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ];
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["--json", "--help"], "help", "Usage: skillroster"),
+        (&["--json", "-h"], "help", "Usage: skillroster"),
+        (
+            &["--json", "help", "plan"],
+            "help",
+            "Usage: skillroster plan",
+        ),
+        (
+            &["--json", "plan", "--help"],
+            "help",
+            "Usage: skillroster plan",
+        ),
+        (&["plan", "--json", "-h"], "help", "Usage: skillroster plan"),
+        (&["--json", "--version"], "version", "skillroster"),
+        (&["--json", "-V"], "version", "skillroster"),
+    ];
+    for (args, kind, expected) in cases {
+        let output = run(&[&prefix[..], *args].concat(), None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert!(!output.stdout.contains(&0x1b), "{args:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["command"], "cli");
+        assert_eq!(value["ok"], true);
+        assert!(value["error"].is_null());
+        assert_eq!(value["result"]["kind"], *kind);
+        let text = value["result"]["text"].as_str().unwrap();
+        assert!(text.contains(expected), "{args:?}: {text}");
+        assert!(!text.contains('\u{1b}'), "{args:?}");
+        if *kind == "version" {
+            assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        }
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
+    for args in [
+        &["--json", "not-a-command"][..],
+        &["--json", "--source-root"][..],
+        &["--json", "--unknown-option"][..],
+    ] {
+        let output = run(&[&prefix[..], args].concat(), None);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "invalid_cli_arguments");
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
+    for (args, expected) in [
+        (&["--help"][..], "Usage: skillroster"),
+        (&["--version"][..], "skillroster"),
+    ] {
+        let output = run(&[&prefix[..], args].concat(), None);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(expected));
+        assert!(serde_json::from_str::<Value>(&text).is_err());
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
+}
+
+#[test]
 fn find_load_recovers_from_a_missing_snapshot_without_changing_agent_files() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

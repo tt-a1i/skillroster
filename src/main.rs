@@ -27,6 +27,25 @@ fn main() {
     let wants_json = std::env::args_os().any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
+        Err(error)
+            if wants_json
+                && matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            let kind = match error.kind() {
+                clap::error::ErrorKind::DisplayHelp => "help",
+                clap::error::ErrorKind::DisplayVersion => "version",
+                _ => unreachable!(),
+            };
+            let envelope = skillroster::model::JsonEnvelope::success(
+                "cli",
+                serde_json::json!({"kind": kind, "text": error.to_string()}),
+            );
+            write_stdout_or_exit(&serde_json::to_string(&envelope).expect("serialize CLI display"));
+            return;
+        }
         Err(error) if wants_json => {
             write_stdout_or_exit(&app::error_json("cli", &error));
             std::process::exit(2);
