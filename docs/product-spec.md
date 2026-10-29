@@ -684,6 +684,16 @@ a Snapshot-bound read-only
 Find inspection command preserving the original task and hints. The Agent must
 independently select the intended capability before authoring a faithful refined
 hint; a ranked name is never automatically converted into an exact-name bypass.
+When selection evidence is missing and same-name ambiguity is present, the load
+reports the selection-evidence blocker first, matching the prerequisite for
+comparison-load actions. After faithful refinement, unresolved content ambiguity
+still requires the existing exact comparison flow. Bootstrap recovery shares
+one hint-refinement retry across empty, wrong-domain, and weak-evidence results.
+The caller judges the bounded metadata's capability and exclusions independently;
+for a non-English or mixed task, that retry may retain the English hint and add
+one separate, specific task-language capability hint supported by the original
+task and inspected metadata. The original task and all load gates remain intact;
+generic matching phrases alone do not establish semantic suitability.
 An explicit complete Skill name remains direct evidence, so this
 boundary does not prevent deliberate mixed-language selection. The
 loaded placement is selected only after identity ranking: an eligible

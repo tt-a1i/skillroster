@@ -5819,11 +5819,6 @@ fn find_command(
     if load {
         let weak_top_match = matches
             .first()
-            .filter(|ranked| {
-                ranked.variant_count == 1
-                    || variant_skill_id.is_some()
-                    || variant_placement_id.is_some()
-            })
             .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
         let weak_match_reason = weak_top_match
             .and_then(|ranked| find_selection_evidence_blocker(ranked, task, &retrieval_hints));
@@ -9731,6 +9726,27 @@ struct BootstrapPackageManifest<'a> {
 }
 
 const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
+    BootstrapPackageManifest {
+        version: "1.8.51",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "4555b296030a0680d820ff3b607c6ddb3874c18677c5efafebf333c3086e3d36",
+            ),
+            (
+                "references/routing.md",
+                "83ce87d14166347630ad8951597151092bc0b3be7cc7bd9f0b1d22795689640b",
+            ),
+            (
+                "references/governance.md",
+                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
+            ),
+            (
+                "references/mutation.md",
+                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
+            ),
+        ],
+    },
     BootstrapPackageManifest {
         version: "1.8.50",
         file_digests: &[
@@ -14420,13 +14436,30 @@ mod recovery_tests {
                 .collect::<Vec<_>>()
         };
 
-        for version in ["1.8.23", "1.8.46", "1.8.47", "1.8.48", "1.8.49", "1.8.50"] {
+        for version in [
+            "1.8.23", "1.8.46", "1.8.47", "1.8.48", "1.8.49", "1.8.50", "1.8.51",
+        ] {
             let observed = observed_for(version);
             assert_eq!(
                 legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
                 Some(version)
             );
         }
+
+        let fixture = [
+            include_str!("../tests/fixtures/bootstrap-v1.8.51.md"),
+            include_str!("../tests/fixtures/bootstrap-routing-v1.8.51.md"),
+            include_str!("../tests/fixtures/bootstrap-governance-v1.8.50.md"),
+            include_str!("../tests/fixtures/bootstrap-mutation-v1.8.50.md"),
+        ]
+        .map(|content| Some(bootstrap_content_digest(content.as_bytes())));
+        assert_eq!(observed_for("1.8.51"), fixture);
+        let mut mixed_latest = fixture;
+        mixed_latest[1] = Some(observed_for("1.8.50")[1].clone().unwrap());
+        assert_eq!(
+            legacy_bootstrap_package_version(&mixed_latest, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
+            None
+        );
 
         let observed = observed_for("1.8.23");
         let mut mixed = observed;

@@ -1030,8 +1030,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.51");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.51");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.52");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.52");
 }
 
 #[cfg(unix)]
@@ -6073,7 +6073,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.51"
+        "1.8.52"
     );
 
     let undone = json_output(&run(
@@ -6165,6 +6165,25 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
 #[test]
 fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
     for (version, changed_count, legacy_files) in [
+        (
+            "1.8.51",
+            2,
+            [
+                ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.51.md")),
+                (
+                    "references/routing.md",
+                    include_str!("fixtures/bootstrap-routing-v1.8.51.md"),
+                ),
+                (
+                    "references/governance.md",
+                    include_str!("fixtures/bootstrap-governance-v1.8.50.md"),
+                ),
+                (
+                    "references/mutation.md",
+                    include_str!("fixtures/bootstrap-mutation-v1.8.50.md"),
+                ),
+            ],
+        ),
         (
             "1.8.50",
             2,
@@ -6314,7 +6333,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.51"
+            "1.8.52"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
@@ -12976,17 +12995,17 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     let ambiguous_load: Value = serde_json::from_slice(&ambiguous_load.stdout).unwrap();
     assert_eq!(
         ambiguous_load["error"]["details"]["reason"],
-        "same_name_variants_ambiguous"
+        "hint_direct_selection_evidence_required"
     );
     assert_eq!(
         ambiguous_load["error"]["details"]["next_action"],
-        "inspect_same_name_variants"
+        "refine_agent_authored_hint_with_direct_capability_evidence"
     );
     assert_eq!(
         ambiguous_load["suggested_actions"][0],
         json!({
-            "action": "inspect_same_name_variants",
-            "description": "inspect_same_name_variants",
+            "action": "inspect_ranked_skill_evidence",
+            "description": "inspect_ranked_skill_evidence",
             "argv": [
                 env!("CARGO_BIN_EXE_skillroster"),
                 "--state-dir",
@@ -12997,7 +13016,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
                 "--hint",
                 "inspect active identity",
                 "--limit",
-                "1",
+                "5",
                 "--require-snapshot",
                 snapshot,
                 "--json",
@@ -13006,7 +13025,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
             ],
             "mutates": false,
             "requires_confirmation": false,
-            "reason_code": "same_name_variants_ambiguous"
+            "reason_code": "hint_direct_selection_evidence_required"
         })
     );
     let variants = json_output(&run_suggested_action(

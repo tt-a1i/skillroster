@@ -9,7 +9,7 @@ description: >
   third-party Skills or migrating, distributing, synchronizing, or repairing shared
   Skill-manager directories.
 metadata:
-  bootstrap-version: "1.8.51"
+  bootstrap-version: "1.8.52"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -74,8 +74,9 @@ returned action only when one is present.
 
 If the result is empty or clearly from another domain, retry at most once. Keep `TASK`
 unchanged; refine the existing hint, or add one capability hint when the first
-English call had none. If no usable result remains and no particular Skill is
-required, continue the original task with normal tools. State that no suitable
+English call had none. Use the recovery procedure in `references/routing.md`;
+all hint refinements share this one-retry budget. If no usable result remains
+and no particular Skill is required, continue the original task with normal tools. State that no suitable
 Skill was found only when it affects the result. If the user or applicable
 instructions require a particular Skill, explain its absence and request only
 the missing prerequisite. A permission denial, untrusted source, drift,
