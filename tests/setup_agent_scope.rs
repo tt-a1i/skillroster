@@ -145,6 +145,11 @@ fn selected_setup_previews_applies_and_undoes_only_requested_agent() {
 fn current_selected_agent_ignores_unselected_modified_package() {
     let t = fixture();
     let home = t.path().join("home");
+    let custom = home.join(".claude/skills/skillroster/SKILL.md");
+    fs::create_dir_all(custom.parent().unwrap()).unwrap();
+    let bytes = b"---\nname: skillroster\ndescription: local\n---\ncustom\n";
+    fs::write(&custom, bytes).unwrap();
+    let initial = tree(&home);
     ok(&t, &["scan"]);
     let preview = ok(&t, &["setup", "--agent", "codex"]);
     let applied = ok(
@@ -152,15 +157,19 @@ fn current_selected_agent_ignores_unselected_modified_package() {
         &["apply", preview["result"]["plan_id"].as_str().unwrap()],
     );
     assert_eq!(applied["result"]["verification"], "passed");
-    let custom = home.join(".claude/skills/skillroster/SKILL.md");
-    fs::create_dir_all(custom.parent().unwrap()).unwrap();
-    let bytes = b"---\nname: skillroster\ndescription: local\n---\ncustom\n";
-    fs::write(&custom, bytes).unwrap();
     ok(&t, &["scan"]);
     let current = ok(&t, &["setup", "--agent", "codex"]);
     assert_eq!(current["result"]["state"], "up_to_date");
     assert!(current["result"]["plan_id"].is_null());
-    assert_eq!(fs::read(custom).unwrap(), bytes);
+    assert_eq!(fs::read(&custom).unwrap(), bytes);
+    let undo = ok(
+        &t,
+        &["undo", applied["result"]["receipt_id"].as_str().unwrap()],
+    );
+    assert_eq!(undo["result"]["verification"], "passed");
+    assert_eq!(undo["result"]["rescan_required"], true);
+    assert_eq!(tree(&home), initial);
+    ok(&t, &["scan"]);
 }
 #[test]
 fn selector_refuses_absent_invalid_and_preserves_modified_choice_context() {
