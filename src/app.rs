@@ -43,9 +43,9 @@ use content_choice::{
 
 use error::{
     ContentIdentityRescanRequired, FindSnapshotChanged, InvalidSourceUpdateRequest,
-    LibraryRootConflict, MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch,
-    PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired, SourceRootSnapshotRescanRequired,
-    StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
+    LibraryContentRescanRequired, LibraryRootConflict, MAX_AGENT_LOADED_SKILL_BYTES,
+    PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired,
+    SourceRootSnapshotRescanRequired, StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
@@ -9223,6 +9223,7 @@ fn prepare_plan(
     if finding_provenance.is_none() && !prepared.roster_changes.is_empty() {
         validate_raw_roster_evidence_scope(store, &prepared, &scan)?;
     }
+    validate_library_content_evidence(&prepared, &scan)?;
     if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
         let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
         if let Some(existing) = store.ready_plan_with_reuse_identity(
@@ -9426,6 +9427,7 @@ fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -
     }
 
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
+    validate_library_content_evidence(&prepared, &scan)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     if Value::Array(roster_before.clone()) != record.input["roster_before"] {
         bail!("Plan {id} is stale; Roster state has drifted");
@@ -11255,6 +11257,70 @@ fn validate_governance_operation_mutation_scopes(
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Bind Library decisions to the complete packages actually observed by Scan,
+/// independently of the operation fingerprints captured while preparing a Plan.
+fn validate_library_content_evidence(plan: &PreparedPlan, scan: &ScanResult) -> Result<()> {
+    let mut placements = BTreeMap::new();
+    for change in &plan.library_changes {
+        for id in change
+            .placement_ids
+            .iter()
+            .chain(std::iter::once(&change.canonical_placement_id))
+        {
+            let placement = scan
+                .placements
+                .iter()
+                .find(|placement| placement.id == *id && placement.skill_id == change.skill_id)
+                .ok_or_else(|| {
+                    anyhow!("Library placement {id} is absent from the Plan Snapshot")
+                })?;
+            placements.insert(id, placement);
+        }
+    }
+    let mut identities = BTreeMap::<PathBuf, (String, String)>::new();
+    for placement in placements.into_values() {
+        let blocked = |reason, actual_digest| LibraryContentRescanRequired {
+            snapshot_id: plan.scan_id.clone(),
+            skill_id: placement.skill_id.clone(),
+            placement_id: placement.id.clone(),
+            path: placement.entrypoint.clone(),
+            reason,
+            expected_digest: placement.content_digest.clone(),
+            actual_digest,
+        };
+        // Read only packages already authorized for this Library change. Physical
+        // validation prevents following a retargeted logical placement elsewhere.
+        if matches!(
+            placement.mutation_scope,
+            None | Some(scan::MutationScope::UntrustedExternal)
+        ) {
+            return Err(blocked("snapshot_package_read_not_authorized", None).into());
+        }
+        if placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete {
+            return Err(blocked("snapshot_package_evidence_incomplete", None).into());
+        }
+        let physical = placement
+            .validated_physical_directory()
+            .map_err(|_| blocked("snapshot_package_identity_unavailable", None))?;
+        let (actual_id, actual_digest) = match identities.entry(physical) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let identity = scan::inspect_skill_identity(&entry.key().join("SKILL.md"))
+                    .map_err(|_| blocked("snapshot_package_identity_unavailable", None))?;
+                entry.insert(identity)
+            }
+        };
+        if actual_id != &placement.skill_id || actual_digest != &placement.content_digest {
+            return Err(blocked(
+                "snapshot_package_content_changed",
+                Some(actual_digest.clone()),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_governance_fingerprint_completeness(

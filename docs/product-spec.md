@@ -324,6 +324,15 @@ Before a large-Roster Finding advertises a Ready-Plan template, SkillRoster deri
 
 The CLI validates targets, ownership, conflicts, and current fingerprints, then stores an immutable Plan. Exact-duplicate Library Plans report comparable before/after physical-source, placement, and default-exposure counts plus explicit deltas, so source consolidation cannot be mistaken for Roster reduction. `apply <plan-id>` executes only the approved scope. Cross-filesystem operations use a journal and compensating steps; the CLI never claims atomicity it cannot provide.
 
+Before persisting any Ready Library Plan, and again before Apply enters Applying,
+the CLI verifies each affected placement's current complete package identity and
+digest against its exact Snapshot observation. This includes entrypoint and
+support files and covers explicit and derived Library changes. New operation
+fingerprints cannot substitute for that evidence. Changed, unavailable, or
+incomplete package evidence fails closed with `library_content_rescan_required`
+and a context-preserving read-only Scan continuation; retry requires a fresh
+observation. Existing Plans and Receipts remain immutable.
+
 Logical placements reached through symlinked Agent roots may resolve to one
 physical filesystem object. A Plan operates on that object at most once while
 retaining every logical Agent/placement impact fact. If the linked logical
