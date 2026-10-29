@@ -84,6 +84,41 @@ Make semantic choices in conversation, then submit them to
   require the user's explicit `retain_local`, `adopt_upstream`, or
   `preserve_both` choice.
 
+For a raw source update, use this request shape with observed values:
+`schema_version: 1`, `scan_id`, `evidence_ids`, and `source_updates: [...]`.
+Each `source_updates` item has these exact fields:
+
+- `skill_id`, `placement_id`: the exact target's current public Evidence
+  bindings or an already verified exact Find selection; never infer by name.
+- `source`: the installed target's declared source, from authorized metadata.
+- `current_revision`: its declared `version`, otherwise `revision`.
+- `current_fingerprint`: that placement's complete **package** fingerprint,
+  from current placement-bound digest Evidence or verified Find's
+  `verification.package_fingerprint`; never substitute a SKILL.md file hash
+  or a routing-content identity digest. Require complete coverage and bindings.
+- `upstream_revision`: the supplied candidate's different declared revision.
+- `upstream_content`: exact UTF-8 entrypoint content supplied for this update.
+- `upstream_digest`: SHA-256 of those exact entrypoint bytes, not its package.
+- `choice`: `retain_local`, `adopt_upstream`, or `preserve_both`, matching the
+  user's decision. The key is `choice`, not `decision`. First-observed/untrusted
+  baselines require an explicit choice even without known local modification;
+  modified trusted baselines also require it. Do not invent user intent.
+- Optional `base_digest`: an already established immutable baseline's
+  entrypoint SHA-256. Omit it if that baseline is unknown; a hash of today's
+  file does not establish or replace a baseline and never promotes trust.
+
+Take `scan_id` and relevant skill/placement-bound `evidence_ids` from the same
+latest Snapshot's public Report/Finding facts. Open the exact Finding detail
+when compact Evidence omits a required digest; keep each ID/digest together.
+Only read installed/candidate metadata or hash bytes inside the authorized
+scope; do not bypass a source/read blocker or read private SQLite to fill gaps.
+The candidate's source/revision must match the submitted source/revision;
+source updates consume supplied bytes, not an automatic Git fetch or endorsement.
+Target only the authorized mutable regular placement. Do not choose canonical
+content, send raw filesystem `operations`, or mix Roster/Library changes here.
+Preview the validated Plan and its exact targets; Apply needs authorization.
+Follow the existing mutation reference for Receipt verification and Undo.
+
 Keep Roster, source, and Library changes in separate Plans. A stale Snapshot,
 Evidence ID, fingerprint, incomplete scope, or revision requires rescan or user
 input, never weaker validation.
