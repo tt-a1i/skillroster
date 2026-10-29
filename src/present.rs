@@ -184,7 +184,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
 }
 
 pub fn error_human(error: &dyn Display) -> String {
-    format!("SkillRoster · Error\n\nERR  {error}\n\nNo files changed.")
+    format!("SkillRoster · Error\n\nERR  {error}\n\nFile changes: unknown.")
 }
 
 pub fn blocked_roster_plan(details: &Value) -> String {
@@ -2602,10 +2602,10 @@ mod tests {
     }
 
     #[test]
-    fn errors_have_an_explicit_no_change_summary() {
+    fn unstructured_errors_do_not_guess_whether_files_changed() {
         let rendered = error_human(&"drifted plan");
         assert!(rendered.contains("drifted plan"));
-        assert!(rendered.ends_with("No files changed."));
+        assert!(rendered.ends_with("File changes: unknown."));
     }
 
     #[test]
