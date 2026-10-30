@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::TempDir;
 
 fn run(temp: &TempDir, args: &[&str]) -> Output {
@@ -48,8 +48,12 @@ fn find_load_skips_stale_alternative_when_exact_copy_remains() {
     fs::remove_dir_all(root.join("a-copy")).unwrap();
     let found = success(run(&temp, &["find", "route-helper", "--load"]));
     assert_eq!(
-        found["result"]["loaded_skill"]["content"]["path"],
-        json!(root.join("z-copy/SKILL.md"))
+        Path::new(
+            found["result"]["loaded_skill"]["content"]["path"]
+                .as_str()
+                .unwrap()
+        ),
+        root.join("z-copy/SKILL.md")
     );
     // Loading one verified copy does not erase the stale placement's own facts.
     assert_eq!(found["result"]["rescan_required"], true);
@@ -78,7 +82,7 @@ fn explicit_stale_placement_never_falls_back_to_an_exact_copy() {
         .unwrap();
     let id = placements
         .iter()
-        .find(|p| p["path"] == json!(root.join("a-copy/SKILL.md")))
+        .find(|p| Path::new(p["path"].as_str().unwrap()) == root.join("a-copy/SKILL.md"))
         .unwrap()["placement_id"]
         .as_str()
         .unwrap();

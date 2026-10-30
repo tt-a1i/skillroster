@@ -25,3 +25,7 @@ Controlled fixtures do not establish independent-user acceptance, complete host
 session visibility or general retrieval quality. WSL1 mutation and native Linux
 arm64/Windows arm64 remain outside the release matrix. No real Agent installation
 is changed by acceptance. Bootstrap updates remain optional and require inspection.
+
+Candidate rc.1 exposed two Windows-only test assertions comparing path strings
+with mixed separators. rc.2 compares path components while preserving the exact
+selected-copy and stale-placement refusal assertions. No product logic changed.
