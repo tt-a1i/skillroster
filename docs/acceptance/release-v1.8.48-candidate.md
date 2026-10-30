@@ -33,3 +33,7 @@ selected-copy and stale-placement refusal assertions. No product logic changed.
 Candidate rc.2 reached the JSON help regression on Windows and exposed a
 Unix-only executable-name expectation. rc.3 accounts for the `.exe` suffix
 without changing CLI behavior or relaxing JSON/exit-status/side-effect checks.
+
+Candidate rc.3 exposed one more Unix separator assumption in routing metadata
+placement selection. rc.4 uses path components there and in the adjacent Library
+error-path assertion. All product behavior and refusal conditions remain intact.

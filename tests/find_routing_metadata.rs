@@ -1,4 +1,4 @@
-use std::{fs, process::Command};
+use std::{fs, path::Path, process::Command};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -111,10 +111,18 @@ fn ranked_metadata_comes_from_one_declared_identity_observation() {
                     .unwrap()
                     .iter()
                     .any(|placement| {
-                        placement["path"]
-                            .as_str()
-                            .unwrap()
-                            .contains(&format!("/.{agent}/skills/"))
+                        Path::new(placement["path"].as_str().unwrap())
+                            .components()
+                            .map(|part| part.as_os_str())
+                            .collect::<Vec<_>>()
+                            .windows(2)
+                            .any(|parts| {
+                                parts
+                                    == [
+                                        std::ffi::OsStr::new(&format!(".{agent}")),
+                                        std::ffi::OsStr::new("skills"),
+                                    ]
+                            })
                     })
             })
             .unwrap();

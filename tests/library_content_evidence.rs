@@ -161,7 +161,8 @@ impl Fixture {
             v["error"]["paths"]
                 .as_array()
                 .unwrap()
-                .contains(&json!(entrypoint))
+                .iter()
+                .any(|value| std::path::Path::new(value.as_str().unwrap()) == entrypoint)
         );
         for field in ["snapshot_id", "skill_id", "placement_id"] {
             let id = v["error"]["details"][field].as_str().unwrap();
