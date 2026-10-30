@@ -1,7 +1,7 @@
 # SkillRoster v1.8.48 release candidate
 
-CLI 1.8.48 bundles Bootstrap 1.8.52. Candidate acceptance is pending.
-The current public release remains v1.8.47 until publication.
+CLI 1.8.48 bundles Bootstrap 1.8.52. Candidate rc.4 and formal release acceptance passed; see [release receipt](release-v1.8.48.md).
+The accepted release is v1.8.48.
 
 ## Changes
 
