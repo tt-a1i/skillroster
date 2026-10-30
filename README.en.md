@@ -45,14 +45,14 @@ With one agent and a small, clear native catalog, keeping your setup is a valid 
 
 Ordinary tasks can use existing capabilities and search for specialized Skills when useful. No optional match need not interrupt the task. Claude's local exposure counts distinguish manual invocation, disabled entries, and name-only listings; they do not measure a running session's complete catalog or tokens. [Scope and validation](docs/practical-governance.md)
 
-## What changed in v1.8.47
+## What changed in v1.8.48
 
-- **Respect local Agent rules:** discover Codex shared Skills and additional Hermes paths; preserve observed disable rules, platform restrictions, and shared read-only directories during governance. Uncertain configuration stays unknown; local observations are not a complete session catalog.
-- **Choose the content before loading:** when packages declare the same source and version but differ in content, compare and explicitly select a placement. Read-only review constraints no longer exclude a normal review Skill merely for mentioning files.
-- **Keep usage evidence trustworthy:** malformed session records do not contribute usage evidence. Missing reliable records cannot justify archival or Roster reduction. Rescan after upgrading.
-- **Avoid repeated reads:** ordinary Find reuses advisory checks within one invocation; actual loading independently verifies the package. See the [large-support-file benchmark](docs/acceptance/find-read-cost-2026-10-22.md); it does not establish universal latency or token savings.
+- **Scope integration to one Agent:** `setup --agent codex` previews only the selected Agent; writes are refused when shared targets cannot be isolated.
+- **Keep mutation evidence current:** revalidate Library content before planning and applying; rescan after a verified Undo.
+- **Clarify Find and Load:** inspect bounded descriptions and triggers, verify requested Skill identity, and independently validate exact-copy fallbacks.
+- **Improve diagnostics:** distinguish unknown source modifications, malformed requests, package preservation and permissions; retain discovery context when rebuilding state.
 
-These changes are published in v1.8.47; installation instructions appear below. Pending Plans based on older Snapshots or changed configuration may require a new Scan and review before Apply.
+These changes are published in v1.8.48; installation instructions appear below. Pending Plans based on older Snapshots or changed configuration may require a new Scan and review before Apply.
 
 ## Start in 30 seconds
 
@@ -77,7 +77,7 @@ session so it can discover the Bootstrap Skill, then ask:
 
 > Use SkillRoster to inspect my local Skills and explain evidence-backed problems worth reviewing. If there is no clear cleanup work, say I can keep the current setup. Analyze first; preview a Plan after I choose a goal, and change Agent files only after I approve the complete Plan.
 
-Public installs currently deliver **CLI v1.8.47 / Bootstrap 1.8.51**, including
+GitHub Release and pinned-tag installs deliver **CLI v1.8.48 / Bootstrap 1.8.52**, including
 Codex/Hermes local visibility protections, explicit content selection, and
 validated session evidence. `skillroster setup --check --json` inspects integration
 without creating a Plan. Existing users update the CLI and optional Bootstrap separately;
@@ -197,10 +197,10 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-The current public release is **v1.8.47**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
+The current public release is **v1.8.48**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
-- [v1.8.47 release and platform evidence](docs/acceptance/release-v1.8.47.md)
+- [v1.8.48 release and platform evidence](docs/acceptance/release-v1.8.48.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)
 - [Canonical vocabulary](CONTEXT.md)
