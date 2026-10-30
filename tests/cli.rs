@@ -8017,7 +8017,9 @@ fn json_help_version_and_invalid_arguments_preserve_cli_behavior() {
         assert!(value["error"].is_null());
         assert_eq!(value["result"]["kind"], *kind);
         let text = value["result"]["text"].as_str().unwrap();
-        assert!(text.contains(expected), "{args:?}: {text}");
+        // Clap includes the executable suffix in Windows subcommand help.
+        let portable_text = text.replace("skillroster.exe", "skillroster");
+        assert!(portable_text.contains(expected), "{args:?}: {text}");
         assert!(!text.contains('\u{1b}'), "{args:?}");
         if *kind == "version" {
             assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");

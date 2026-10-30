@@ -29,3 +29,7 @@ is changed by acceptance. Bootstrap updates remain optional and require inspecti
 Candidate rc.1 exposed two Windows-only test assertions comparing path strings
 with mixed separators. rc.2 compares path components while preserving the exact
 selected-copy and stale-placement refusal assertions. No product logic changed.
+
+Candidate rc.2 reached the JSON help regression on Windows and exposed a
+Unix-only executable-name expectation. rc.3 accounts for the `.exe` suffix
+without changing CLI behavior or relaxing JSON/exit-status/side-effect checks.
