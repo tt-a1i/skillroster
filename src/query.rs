@@ -336,6 +336,9 @@ pub struct FindMatch {
     /// Routing observation whose metadata produced this ranking evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ranking_content_identity_digest: Option<String>,
+    /// Bounded declared metadata from the same observation as the ranking.
+    #[serde(default)]
+    pub routing_metadata: FindRoutingMetadata,
     pub score: f64,
     pub paths: Vec<String>,
     pub agents: Vec<String>,
@@ -363,7 +366,13 @@ pub struct FindMatch {
     /// Policy adjustments applied after reciprocal-rank fusion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ranking_adjustments: Vec<RankingAdjustment>,
+    /// Quality of the current lexical relevance inference, not historical use.
     pub evidence_quality: EvidenceQuality,
+    #[serde(default)]
+    pub evidence_quality_scope: FindEvidenceQualityScope,
+    /// Independent observed history for this exact identity, never a score boost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_usage_prior: Option<FindUsagePrior>,
     /// Same declared name with distinct Skill identities is one ambiguous capability result.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variant_skill_ids: Vec<String>,
@@ -375,6 +384,73 @@ pub struct FindMatch {
     /// Same-Snapshot analysis needed to resolve same-name content ambiguity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_finding: Option<VariantFindingReference>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FindRoutingMetadata {
+    pub description: Option<String>,
+    pub description_truncated: bool,
+    pub declared_triggers: Vec<String>,
+    pub trigger_count: usize,
+    pub triggers_truncated: bool,
+}
+
+fn bounded_routing_text(value: &str, limit: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let bounded = chars.by_ref().take(limit).collect();
+    (bounded, chars.next().is_some())
+}
+
+fn routing_metadata(description: Option<&str>, triggers: &[String]) -> FindRoutingMetadata {
+    let (description, description_truncated) = match description {
+        Some(value) => {
+            let (value, truncated) = bounded_routing_text(value, 512);
+            (Some(value), truncated)
+        }
+        None => (None, false),
+    };
+    let mut triggers_truncated = triggers.len() > 5;
+    let declared_triggers = triggers
+        .iter()
+        .take(5)
+        .map(|trigger| {
+            let (value, truncated) = bounded_routing_text(trigger, 128);
+            triggers_truncated |= truncated;
+            value
+        })
+        .collect();
+    FindRoutingMetadata {
+        description,
+        description_truncated,
+        declared_triggers,
+        trigger_count: triggers.len(),
+        triggers_truncated,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindEvidenceQualityScope {
+    #[default]
+    RoutingRelevance,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FindUsagePrior {
+    pub skill_id: String,
+    pub quality: EvidenceQuality,
+    pub observed_stages: Vec<UsageStage>,
+    pub evidence_agents: Vec<String>,
+}
+
+/// Legacy match reasons retain the usage marker; selection evidence must not.
+pub(crate) fn routing_relevance_evidence(matched: &FindMatch) -> Vec<String> {
+    matched
+        .match_reasons
+        .iter()
+        .filter(|reason| reason.as_str() != "observed_local_usage")
+        .cloned()
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -2037,6 +2113,16 @@ pub(crate) fn find_matching_with_evidence(
         variants.sort();
         variants.dedup();
     }
+    let mut local_usage = BTreeMap::<&str, (BTreeSet<UsageStage>, BTreeSet<&str>)>::new();
+    for usage in scan
+        .usage
+        .iter()
+        .filter(|usage| usage.quality == EvidenceQuality::Observed)
+    {
+        let (stages, agents) = local_usage.entry(&usage.skill_id).or_default();
+        stages.insert(usage.stage);
+        agents.insert(usage.agent.id());
+    }
     let mut task_exclusion_effects = Vec::new();
     let mut matches = scan
         .routing_skills()
@@ -2154,11 +2240,16 @@ pub(crate) fn find_matching_with_evidence(
             if cjk_all_text_overlap > 0 {
                 reasons.push(format!("cjk_all_text_bigrams:{cjk_all_text_overlap}"));
             }
-            let observed_usage = scan.usage.iter().any(|usage| {
-                usage.skill_id == skill.id && usage.quality == EvidenceQuality::Observed
-            });
-            if observed_usage {
-                score += 2.0;
+            let local_usage_prior =
+                local_usage
+                    .get(skill.id.as_str())
+                    .map(|(stages, agents)| FindUsagePrior {
+                        skill_id: skill.id.clone(),
+                        quality: EvidenceQuality::Observed,
+                        observed_stages: stages.iter().copied().collect(),
+                        evidence_agents: agents.iter().map(|agent| (*agent).to_owned()).collect(),
+                    });
+            if local_usage_prior.is_some() {
                 reasons.push("observed_local_usage".into());
             }
             if score <= 0.0 {
@@ -2274,6 +2365,10 @@ pub(crate) fn find_matching_with_evidence(
                 skill_id: skill.id.clone(),
                 name: skill.name.clone(),
                 ranking_content_identity_digest: skill.content_identity_digest.clone(),
+                routing_metadata: routing_metadata(
+                    skill.metadata.description.as_deref(),
+                    &skill.metadata.triggers,
+                ),
                 score,
                 paths,
                 agents,
@@ -2287,11 +2382,9 @@ pub(crate) fn find_matching_with_evidence(
                 task_channel_rank: None,
                 augmented_channel_rank: None,
                 ranking_adjustments: Vec::new(),
-                evidence_quality: if observed_usage {
-                    EvidenceQuality::Observed
-                } else {
-                    EvidenceQuality::Inferred
-                },
+                evidence_quality: EvidenceQuality::Inferred,
+                evidence_quality_scope: FindEvidenceQualityScope::RoutingRelevance,
+                local_usage_prior,
                 variant_skill_ids,
                 variants,
                 variant_count,
@@ -2958,6 +3051,7 @@ mod tests {
             skill_id: format!("skill_{name}"),
             name: name.into(),
             ranking_content_identity_digest: None,
+            routing_metadata: FindRoutingMetadata::default(),
             score: 1.0,
             paths: Vec::new(),
             agents: Vec::new(),
@@ -2972,12 +3066,27 @@ mod tests {
             augmented_channel_rank: None,
             ranking_adjustments: Vec::new(),
             evidence_quality: EvidenceQuality::Inferred,
+            evidence_quality_scope: FindEvidenceQualityScope::RoutingRelevance,
+            local_usage_prior: None,
             variant_skill_ids: Vec::new(),
             variants: Vec::new(),
             variant_count: 1,
             variants_truncated: false,
             variant_finding: None,
         }
+    }
+
+    #[test]
+    fn routing_metadata_independently_marks_trigger_text_and_count_truncation() {
+        let text_only = routing_metadata(None, &["界".repeat(129)]);
+        assert!(text_only.triggers_truncated);
+        assert_eq!(text_only.trigger_count, 1);
+        let count_only = routing_metadata(None, &vec!["x".into(); 6]);
+        assert!(count_only.triggers_truncated);
+        assert_eq!(count_only.declared_triggers.len(), 5);
+        let exact = routing_metadata(Some(&"界".repeat(512)), &["界".repeat(128)]);
+        assert!(!exact.description_truncated);
+        assert!(!exact.triggers_truncated);
     }
 
     fn scan_declared_content_observations(entries: &[(&str, &str, &str)]) -> ScanResult {
@@ -3322,6 +3431,59 @@ mod tests {
         options.include_session_evidence = false;
         let scan = scan(&options).unwrap();
         (root, scan)
+    }
+
+    #[test]
+    fn observed_history_never_creates_or_upgrades_task_relevance() {
+        let (root, mut scan) = fixture();
+        let before = find(&scan, "research", 10);
+        let skill_id = before[0].skill_id.clone();
+        let observation = |agent, stage, quality| crate::scan::UsageEvidence {
+            agent,
+            skill_id: skill_id.clone(),
+            stage,
+            quality,
+            event_count: 999,
+            first_seen_unix: Some(10),
+            last_seen_unix: Some(20),
+            month_start_unix: None,
+            source_path_digest: "synthetic".into(),
+        };
+        scan.usage = vec![
+            observation(
+                AgentKind::Codex,
+                UsageStage::Loaded,
+                EvidenceQuality::Observed,
+            ),
+            observation(
+                AgentKind::Codex,
+                UsageStage::Loaded,
+                EvidenceQuality::Observed,
+            ),
+            observation(
+                AgentKind::Pi,
+                UsageStage::Applied,
+                EvidenceQuality::Observed,
+            ),
+            observation(
+                AgentKind::Hermes,
+                UsageStage::Outcome,
+                EvidenceQuality::Inferred,
+            ),
+        ];
+        let after = find(&scan, "research", 10);
+        assert_eq!(before[0].score, after[0].score);
+        assert_eq!(after[0].evidence_quality, EvidenceQuality::Inferred);
+        let prior = after[0].local_usage_prior.as_ref().unwrap();
+        assert_eq!(prior.skill_id, skill_id);
+        assert_eq!(prior.evidence_agents, ["codex", "pi"]);
+        assert_eq!(
+            prior.observed_stages,
+            [UsageStage::Loaded, UsageStage::Applied]
+        );
+        assert!(!routing_relevance_evidence(&after[0]).contains(&"observed_local_usage".into()));
+        assert!(find(&scan, "unrelatedquartz", 10).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4288,7 +4450,7 @@ mod tests {
         let matches = find(&scan, "archive", 100);
 
         assert_eq!(matches.len(), 3);
-        assert_eq!(matches[0].score, 5.0);
+        assert_eq!(matches[0].score, 3.0);
         assert!(
             matches[0]
                 .match_reasons

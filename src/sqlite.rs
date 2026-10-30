@@ -3432,6 +3432,88 @@ mod tests {
     }
 
     #[test]
+    fn immediate_undo_invalidates_the_same_snapshot_with_its_reverse_receipt() {
+        let store = StateStore::open_in_memory().unwrap();
+        let original_scan = scan();
+        store.save_scan(&original_scan).unwrap();
+        let plan = PlanRecord {
+            id: PlanId::new(),
+            scan_id: original_scan.id.clone(),
+            report_id: None,
+            created_at: 30,
+            status: PlanStatus::Ready,
+            input: serde_json::json!({}),
+            fingerprint: "plan-sha256".to_owned(),
+            operations: vec![],
+        };
+        store.save_plan(&plan).unwrap();
+        let applied = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id.clone(),
+            reverses_receipt_id: None,
+            created_at: 31,
+            completed_at: Some(32),
+            status: ReceiptStatus::Applied,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store
+            .update_plan_status(&plan.id, PlanStatus::Applying)
+            .unwrap();
+        store
+            .save_apply_receipt(&plan.id, PlanStatus::Applied, &applied)
+            .unwrap();
+        let before = store
+            .snapshot_invalidating_receipt(&original_scan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.receipt_id, applied.id);
+        assert_eq!(before.kind, SnapshotInvalidationKind::AppliedReceipt);
+
+        let reverse = ReceiptRecord {
+            id: ReceiptId::new(),
+            plan_id: plan.id,
+            reverses_receipt_id: Some(applied.id.clone()),
+            created_at: 33,
+            completed_at: Some(34),
+            status: ReceiptStatus::Undone,
+            verification: serde_json::json!({}),
+            operation_results: vec![],
+        };
+        store
+            .save_undo_receipt(&applied.id, &reverse, Some(&original_scan.id))
+            .unwrap();
+        assert_eq!(
+            store.get_receipt(&applied.id).unwrap().unwrap().status,
+            ReceiptStatus::Undone
+        );
+        let after = store
+            .snapshot_invalidating_receipt(&original_scan.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.receipt_id, reverse.id);
+        assert_eq!(after.kind, SnapshotInvalidationKind::UndoReceipt);
+
+        let fresh_scan = scan();
+        assert_ne!(fresh_scan.id, original_scan.id);
+        store.save_scan(&fresh_scan).unwrap();
+        assert!(
+            store
+                .snapshot_invalidating_receipt(&fresh_scan.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .snapshot_invalidating_receipt(&original_scan.id)
+                .unwrap()
+                .unwrap()
+                .receipt_id,
+            reverse.id
+        );
+    }
+
+    #[test]
     fn failed_apply_finalization_keeps_sqlite_atomic_for_journal_recovery() {
         let store = StateStore::open_in_memory().unwrap();
         let scan = scan();

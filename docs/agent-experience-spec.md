@@ -119,7 +119,11 @@ semantic conclusion and may read a returned `SKILL.md` path when those facts
 are insufficient; candidate evidence never authorizes a Plan.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
-For `mutation_scope_blocks_roster_change`, open full detail before offering
+For `mutation_scope_blocks_roster_change` or
+`package_fingerprint_variants_block_roster_change`, read all `blocked_reasons`,
+including those outside a truncated preview. Package differences require
+preservation and cannot be resolved by read permission. Open full detail before
+offering
 Core protection whenever the compact protected-Skill set is incomplete. Only
 present a `protect_blocked_skills_as_core` Plan template when
 `plan_request_template_available` is true, and require user confirmation
@@ -207,10 +211,11 @@ If Apply failed but compensation succeeded, say that no planned state remains an
 After a verified Apply, the Agent follows the returned read-only Scan action
 before using Report, Find, Plan, Setup, or another current-inventory decision.
 It does not hide this required continuation or infer it from prose. Status and
-the exact Receipt Undo remain usable. If exact Undo verifies before a new Scan,
-the original Snapshot becomes current again. If a newer Scan already observed
-the applied state, Undo returns another required Scan before current-inventory
-decisions resume.
+the exact Receipt Undo remain usable. Every verified Undo returns another
+required read-only Scan before current-inventory decisions resume, including
+unchanged immediate Undo. Receipt verification establishes bounded restoration;
+it does not make an earlier Snapshot current. The Agent follows the returned
+Scan explicitly and preserves user edits.
 
 While facts are invalid, Home and Status name `snapshot_state:
 rescan_required`, bind the invalidating Receipt ID, and return the same

@@ -42,10 +42,10 @@ use content_choice::{
 };
 
 use error::{
-    ContentIdentityRescanRequired, FindSnapshotChanged, LibraryRootConflict,
-    MAX_AGENT_LOADED_SKILL_BYTES, PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked,
-    SnapshotRescanRequired, SourceRootSnapshotRescanRequired, StoredFindingCoverageInvalid,
-    incomplete_fingerprint_blocker,
+    ContentIdentityRescanRequired, FindSnapshotChanged, InvalidSourceUpdateRequest,
+    LibraryContentRescanRequired, LibraryRootConflict, MAX_AGENT_LOADED_SKILL_BYTES,
+    PlanEvidenceScopeMismatch, PlanSnapshotDrift, SkillLoadBlocked, SnapshotRescanRequired,
+    SourceRootSnapshotRescanRequired, StoredFindingCoverageInvalid, incomplete_fingerprint_blocker,
 };
 pub use error::{error_json, error_json_with_context};
 
@@ -109,7 +109,16 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                 return cancelled_output("lifecycle");
             }
             let result = lifecycle_delete_command(&database_path, &state_dir)?;
-            let envelope = JsonEnvelope::success("lifecycle", result.clone());
+            let mut actions = vec![action(
+                "scan",
+                &["scan", "--summary", "--json"],
+                false,
+                false,
+                "local_state_deleted_rebuild_inventory",
+            )];
+            action_context.apply(&mut actions);
+            let mut envelope = JsonEnvelope::success("lifecycle", result.clone());
+            envelope.suggested_actions = actions;
             return Ok(Output {
                 json: serde_json::to_string(&envelope)?,
                 human: crate::present::human("lifecycle", &result),
@@ -470,8 +479,14 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
             LifecycleCommand::Delete(_) => unreachable!("handled before opening SQLite"),
         },
         Some(Command::Setup(args)) => {
-            let result =
-                setup_command(&store, &home, &state_dir, args.modified_choice, args.check)?;
+            let result = setup_command_for_agent(
+                &store,
+                &home,
+                &state_dir,
+                args.modified_choice,
+                args.check,
+                args.agent,
+            )?;
             let mut actions = Vec::new();
             if result["state"].as_str() == Some("scan_required") {
                 actions.push(action(
@@ -513,6 +528,17 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                     false,
                     "optional_agent_integration_available",
                 ));
+            }
+            if let Some(agent) = args.agent {
+                for suggested in &mut actions {
+                    if suggested
+                        .argv
+                        .get(1)
+                        .is_some_and(|command| command == "setup")
+                    {
+                        suggested.argv.extend(["--agent".into(), agent.id().into()]);
+                    }
+                }
             }
             ("setup", result, vec![], actions)
         }
@@ -3213,7 +3239,8 @@ fn add_same_name_resolution(
         let observations = placements.iter().take(limit).map(|p| json!({
             "placement_id": p.id, "name": scan.observed_skill_for_placement(p).map(|s| &s.name),
             "path": p.entrypoint, "content_identity_digest": p.content_identity_digest,
-            "package_fingerprint": p.content_digest, "mutation_scope": p.mutation_scope,
+            "package_fingerprint": p.content_digest, "entrypoint_digest": p.entrypoint_digest,
+            "mutation_scope": p.mutation_scope,
             "read_state": content_choice::placement_read_state(scan, state_dir, p),
         })).collect::<Vec<_>>();
         Some(json!({
@@ -3234,9 +3261,63 @@ fn add_same_name_resolution(
         json!({
             "decision": "choose_same_name_variant", "automatic_change_supported": false,
             "variant_count": variant_count, "variants_truncated": variants.len() < variant_count,
-            "variants": variants, "next_step": "compare_variant_content_and_choose_canonical"
+            "variants": variants,
+            "entrypoint_comparison": entrypoint_comparison(scan.placements.iter().filter(|p|
+                affected_placement_ids.contains(p.id.as_str()))),
+            "next_step": "compare_variant_content_and_choose_canonical"
         }),
     );
+}
+
+/// Snapshot facts only: entrypoint equality never chooses a package or proves
+/// that supporting files are interchangeable. Counts cover all placements;
+/// the returned digest preview stays bounded independently of Finding detail.
+fn entrypoint_comparison<'a>(placements: impl Iterator<Item = &'a scan::SkillPlacement>) -> Value {
+    let mut digests = BTreeSet::new();
+    let mut package_digests = BTreeSet::new();
+    let mut variant_ids = BTreeSet::new();
+    let mut variants_with_digest = BTreeSet::new();
+    let mut unknown_count = 0;
+    let mut complete_packages = true;
+    for placement in placements {
+        variant_ids.insert(&placement.skill_id);
+        if let Some(digest) = placement.entrypoint_digest.as_deref() {
+            digests.insert(digest);
+            variants_with_digest.insert(&placement.skill_id);
+        } else {
+            unknown_count += 1;
+        }
+        complete_packages &=
+            placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete;
+        package_digests.insert(&placement.content_digest);
+    }
+    let known = !variant_ids.is_empty() && unknown_count == 0;
+    let identical = known && digests.len() == 1;
+    let state = if !known {
+        "unknown"
+    } else if identical {
+        "identical_across_variants"
+    } else {
+        "different_across_variants"
+    };
+    let difference_scope = if identical && complete_packages && package_digests.len() > 1 {
+        "supporting_package_files"
+    } else if known && digests.len() > 1 {
+        "entrypoint_content"
+    } else {
+        "unknown"
+    };
+    json!({
+        "basis": "snapshot_entrypoint_digests",
+        "state": state,
+        "distinct_digest_count": digests.len(),
+        "variant_count_with_digest": variants_with_digest.len(),
+        "variant_count": variant_ids.len(),
+        "unknown_placement_count": unknown_count,
+        "digests": digests.iter().take(10).collect::<Vec<_>>(),
+        "digests_truncated": digests.len() > 10,
+        "difference_scope": difference_scope,
+    })
 }
 
 struct PlacementAuthoritySummary {
@@ -4689,6 +4770,14 @@ fn finding_roster_planning_impl(
         .collect::<Vec<_>>();
     if blocked_change_count > 0 {
         let blocked_skills = blocked_skill_planning(&supported.exclusions, full);
+        let blocked_reasons = supported
+            .exclusions
+            .iter()
+            .map(|exclusion| exclusion.reason)
+            .collect::<BTreeSet<_>>();
+        let package_variants_only = blocked_reasons.len() == 1
+            && blocked_reasons
+                .contains("multiple_package_fingerprints_require_explicit_preservation");
         let source_dependency = supported
             .exclusions
             .iter()
@@ -4740,6 +4829,7 @@ fn finding_roster_planning_impl(
                 "agent_count": agents.len(),
                 "agents": agents,
                 "blocked_change_count": blocked_change_count,
+                "blocked_reasons": blocked_reasons,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
                 "blocked_skill_count": blocked_skills.count,
@@ -4784,11 +4874,23 @@ fn finding_roster_planning_impl(
                 state_dir,
                 full,
             )?;
-            return Ok(Some(json!({
+            let mut planning = json!({
                 "supported": false,
-                "reason": "mutation_scope_blocks_roster_change",
-                "decision": "choose_mutable_placements_or_keep_unchanged",
-                "decision_code": "protect_read_only_skills_or_keep_unchanged",
+                "reason": if package_variants_only {
+                    "package_fingerprint_variants_block_roster_change"
+                } else {
+                    "mutation_scope_blocks_roster_change"
+                },
+                "decision": if package_variants_only {
+                    "review_package_fingerprint_variants"
+                } else {
+                    "choose_mutable_placements_or_keep_unchanged"
+                },
+                "decision_code": if package_variants_only {
+                    "protect_package_variants_or_keep_unchanged"
+                } else {
+                    "protect_read_only_skills_or_keep_unchanged"
+                },
                 "automatic_change_supported": false,
                 "snapshot_id": scan_id,
                 "request_field": "finding_roster_changes",
@@ -4797,16 +4899,24 @@ fn finding_roster_planning_impl(
                 "explicit_only_or_archive_decision_implied": false,
                 "agent_count": agents.len(),
                 "agents": agents,
-                "mutation_scopes": mutation_scopes,
                 "blocked_change_count": blocked_change_count,
+                "blocked_reasons": blocked_reasons,
                 "blocked_changes": blocked_changes,
                 "blocked_changes_truncated": blocked_change_count > 5,
                 "blocked_skill_count": blocked_skills.count,
                 "blocked_skills": blocked_skills.items,
                 "blocked_skills_truncated": blocked_skills.truncated,
                 "resolution_choices": [protect_choice],
-                "next": "Provider and durable read permissions authorize inspection only; keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
-            })));
+                "next": if package_variants_only {
+                    "These Skill identities have different package fingerprints. Keep every package unchanged through the typed Core-protection choice, or review the packages before proposing another change; read permission does not resolve the content differences."
+                } else {
+                    "Read permissions do not make read-only placements mutable. Review all blocked reasons and keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
+                }
+            });
+            if !package_variants_only {
+                planning["mutation_scopes"] = json!(mutation_scopes);
+            }
+            return Ok(Some(planning));
         }
         let untrusted_external_skill_ids = supported
             .exclusions
@@ -4839,6 +4949,7 @@ fn finding_roster_planning_impl(
             "agent_count": agents.len(),
             "agents": agents,
             "blocked_change_count": blocked_change_count,
+            "blocked_reasons": blocked_reasons,
             "blocked_changes": blocked_changes,
             "blocked_changes_truncated": blocked_change_count > 5,
             "blocked_skill_count": blocked_skills.count,
@@ -4849,7 +4960,11 @@ fn finding_roster_planning_impl(
             "after_confirmation": {
                 "repeatable_option": "--source-root",
                 "value": "absolute canonical source directory",
-                "next": "rescan and reopen the new large-Roster Finding"
+                "next": if blocked_reasons.contains("multiple_package_fingerprints_require_explicit_preservation") {
+                    "rescan and reopen the new large-Roster Finding; read confirmation does not resolve the independent package-preservation blockers"
+                } else {
+                    "rescan and reopen the new large-Roster Finding"
+                }
             }
         })));
     }
@@ -5704,7 +5819,7 @@ fn find_command(
             let variant_count = found.variants.len().max(1);
             warnings.push(if drifted_variants == variant_count {
                 format!(
-                    "{} has no current path that matches the latest Snapshot identity and fingerprint; run skillroster scan",
+                    "{} has placement drift relative to the latest Snapshot identity or fingerprint; run skillroster scan",
                     found.name
                 )
             } else {
@@ -5764,11 +5879,6 @@ fn find_command(
     if load {
         let weak_top_match = matches
             .first()
-            .filter(|ranked| {
-                ranked.variant_count == 1
-                    || variant_skill_id.is_some()
-                    || variant_placement_id.is_some()
-            })
             .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
         let weak_match_reason = weak_top_match
             .and_then(|ranked| find_selection_evidence_blocker(ranked, task, &retrieval_hints));
@@ -5964,6 +6074,34 @@ fn find_command(
         &mut actions,
         &mut observations,
     )?;
+    for (found, value) in matches
+        .iter()
+        .zip(result["matches"].as_array_mut().unwrap())
+    {
+        if found.variant_count > 1 {
+            // Compare the complete routable group, even when the displayed
+            // variant preview is truncated.
+            let ids = scan
+                .routing_skills()
+                .filter(|skill| {
+                    skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
+                })
+                .filter(|skill| routable_ids.contains(&skill.id))
+                .map(|skill| skill.id.as_str())
+                .collect::<BTreeSet<_>>();
+            value["entrypoint_comparison"] = entrypoint_comparison(
+                scan.placements
+                    .iter()
+                    .filter(|placement| ids.contains(placement.skill_id.as_str()))
+                    .filter(|placement| {
+                        scan.observed_skill_for_placement(placement)
+                            .is_some_and(|skill| {
+                                skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
+                            })
+                    }),
+            );
+        }
+    }
     if !load {
         for (found, value) in matches
             .iter()
@@ -6041,7 +6179,19 @@ fn find_placement_readiness_blockers(
             placement,
             observations,
         );
-        return if state == "available" {
+        let exact_copy_available = state == "available"
+            || placements.iter().any(|copy| {
+                copy.content_digest == placement.content_digest
+                    && copy.content_identity_digest == placement.content_identity_digest
+                    && copy.entrypoint_digest == placement.entrypoint_digest
+                    && content_choice::placement_read_state_with_observations(
+                        scan,
+                        state_dir,
+                        copy,
+                        observations,
+                    ) == "available"
+            });
+        return if exact_copy_available {
             Vec::new()
         } else {
             vec![state]
@@ -6919,6 +7069,48 @@ fn verified_skill_placement_load(
         return Err(blocked("legacy_snapshot_requires_rescan", None, None, None).into());
     }
 
+    // Retry only frozen exact package copies. Each attempt runs the full fresh
+    // verifier below; neither a shared declared ID nor routing equivalence can
+    // substitute for matching package bytes. An explicit placement never retries.
+    if selected_placement_id.is_none() {
+        let eligible = placements
+            .iter()
+            .copied()
+            .filter(|placement| {
+                placement
+                    .mutation_scope
+                    .is_some_and(|scope| scope != scan::MutationScope::UntrustedExternal)
+                    && placement.fingerprint_completeness == scan::FingerprintCompleteness::Complete
+                    && placement.entrypoint_digest.is_some()
+            })
+            .collect::<Vec<_>>();
+        if let Some(preferred) = eligible.first() {
+            let mut first_error = None;
+            for placement in eligible.iter().filter(|placement| {
+                placement.content_digest == preferred.content_digest
+                    && placement.content_identity_digest == preferred.content_identity_digest
+                    && placement.entrypoint_digest == preferred.entrypoint_digest
+            }) {
+                match verified_skill_placement_load(
+                    scan_id,
+                    scan,
+                    state_dir,
+                    matched,
+                    ambiguity_retry_argv.clone(),
+                    Some(&placement.id),
+                ) {
+                    Ok(loaded) => return Ok(loaded),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+    }
+
     let placement = placements
         .into_iter()
         .find(|placement| {
@@ -7070,7 +7262,7 @@ fn verified_skill_placement_load(
         Some(scan::MutationScope::DurableReadOnly) => "confirmed_durable_read_only",
         Some(scan::MutationScope::UntrustedExternal) | None => unreachable!("filtered above"),
     };
-    Ok(json!({
+    let mut loaded = json!({
         "selection": {
             "rank": matched.rank,
             "skill_id": matched.skill_id,
@@ -7078,8 +7270,10 @@ fn verified_skill_placement_load(
             "placement_id": placement.id,
             "content_identity_digest": placement.content_identity_digest,
             "snapshot_id": scan_id,
-            "ranking_evidence": matched.match_reasons,
+            "ranking_evidence": crate::query::routing_relevance_evidence(matched),
             "ranking_evidence_scope": "loaded_identity",
+            "evidence_quality": matched.evidence_quality,
+            "evidence_quality_scope": matched.evidence_quality_scope,
         },
         "content": {
             "path": placement.entrypoint,
@@ -7107,7 +7301,11 @@ fn verified_skill_placement_load(
             "content_limit_bytes": MAX_AGENT_LOADED_SKILL_BYTES,
         },
         "task_success": "not_evaluated",
-    }))
+    });
+    if let Some(prior) = &matched.local_usage_prior {
+        loaded["selection"]["local_usage_prior"] = json!(prior);
+    }
+    Ok(loaded)
 }
 
 fn plan_command(
@@ -8160,7 +8358,8 @@ fn normalize_agent_plan(
         .as_object_mut()
         .and_then(|object| object.remove("source_updates"))
         .unwrap_or_else(|| json!([]));
-    let requests: Vec<SourceUpdateRequest> = serde_json::from_value(raw_updates)?;
+    let requests: Vec<SourceUpdateRequest> =
+        serde_json::from_value(raw_updates).map_err(InvalidSourceUpdateRequest)?;
     let raw_library_changes = input
         .as_object_mut()
         .and_then(|object| object.remove("library_changes"))
@@ -8392,7 +8591,7 @@ fn normalize_agent_plan(
         let mut diff = diff_summary(
             &current_content,
             &request.upstream_content,
-            local_modified,
+            baseline_trusted.then_some(local_modified),
             choice_name,
             &request.placement_id,
         );
@@ -8904,7 +9103,7 @@ fn source_update_sibling(entrypoint: &Path, revision: &str) -> Result<PathBuf> {
 fn diff_summary(
     current: &str,
     upstream: &str,
-    local_modified: bool,
+    local_modified: Option<bool>,
     choice: &str,
     placement_id: &str,
 ) -> Value {
@@ -9041,6 +9240,7 @@ fn prepare_plan(
     if finding_provenance.is_none() && !prepared.roster_changes.is_empty() {
         validate_raw_roster_evidence_scope(store, &prepared, &scan)?;
     }
+    validate_library_content_evidence(&prepared, &scan)?;
     if matches!(effective_origin, PlanOrigin::BootstrapSetup) {
         let prepared_scan_id = ScanId::parse(prepared.scan_id.clone())?;
         if let Some(existing) = store.ready_plan_with_reuse_identity(
@@ -9244,6 +9444,7 @@ fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -
     }
 
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
+    validate_library_content_evidence(&prepared, &scan)?;
     let roster_before = capture_roster_state(store, &prepared)?;
     if Value::Array(roster_before.clone()) != record.input["roster_before"] {
         bail!("Plan {id} is stale; Roster state has drifted");
@@ -9349,7 +9550,7 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     if let Some(reverse) = store.reverse_receipt_for(&id)? {
         bail!("Receipt {id} was already undone by {reverse}");
     }
-    let plan = store
+    store
         .get_plan(&record.plan_id)?
         .ok_or_else(|| anyhow!("Plan {} does not exist", record.plan_id))?;
     let latest_snapshot_id = store
@@ -9391,10 +9592,9 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
             "after": record.verification["library_state"]["before"]
         }),
     )?;
-    let invalidates_snapshot_id = latest_snapshot_id.filter(|scan_id| scan_id != &plan.scan_id);
     if outcome.verification_passed {
         store
-            .save_undo_receipt(&id, &receipt, invalidates_snapshot_id.as_ref())
+            .save_undo_receipt(&id, &receipt, latest_snapshot_id.as_ref())
             .with_context(|| {
                 format!(
                     "Undo journal {} is durable but SQLite finalization failed; run lifecycle recovery --json",
@@ -9405,8 +9605,7 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
         store.save_receipt(&receipt)?;
     }
     let mut result = mutation_result(&outcome, &receipt, Some(id));
-    result["rescan_required"] =
-        json!(outcome.verification_passed && invalidates_snapshot_id.is_some());
+    result["rescan_required"] = json!(outcome.verification_passed);
     Ok(result)
 }
 
@@ -9588,6 +9787,27 @@ struct BootstrapPackageManifest<'a> {
 }
 
 const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
+    BootstrapPackageManifest {
+        version: "1.8.51",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "4555b296030a0680d820ff3b607c6ddb3874c18677c5efafebf333c3086e3d36",
+            ),
+            (
+                "references/routing.md",
+                "83ce87d14166347630ad8951597151092bc0b3be7cc7bd9f0b1d22795689640b",
+            ),
+            (
+                "references/governance.md",
+                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
+            ),
+            (
+                "references/mutation.md",
+                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
+            ),
+        ],
+    },
     BootstrapPackageManifest {
         version: "1.8.50",
         file_digests: &[
@@ -9853,16 +10073,29 @@ fn setup_command(
     modified_choice: Option<ModifiedBootstrapChoice>,
     check: bool,
 ) -> Result<Value> {
-    setup_command_with_manifests(
+    setup_command_for_agent(store, home, state_dir, modified_choice, check, None)
+}
+
+fn setup_command_for_agent(
+    store: &StateStore,
+    home: &Path,
+    state_dir: &Path,
+    modified_choice: Option<ModifiedBootstrapChoice>,
+    check: bool,
+    requested_agent: Option<AgentKind>,
+) -> Result<Value> {
+    setup_command_with_manifests_for_agent(
         store,
         home,
         state_dir,
         modified_choice,
         LEGACY_COMPLETE_BOOTSTRAP_PACKAGES,
         check,
+        requested_agent,
     )
 }
 
+#[cfg(test)]
 fn setup_command_with_manifests<'a>(
     store: &StateStore,
     home: &Path,
@@ -9871,10 +10104,30 @@ fn setup_command_with_manifests<'a>(
     legacy_complete_packages: &'a [BootstrapPackageManifest<'a>],
     check: bool,
 ) -> Result<Value> {
+    setup_command_with_manifests_for_agent(
+        store,
+        home,
+        state_dir,
+        modified_choice,
+        legacy_complete_packages,
+        check,
+        None,
+    )
+}
+
+fn setup_command_with_manifests_for_agent<'a>(
+    store: &StateStore,
+    home: &Path,
+    state_dir: &Path,
+    modified_choice: Option<ModifiedBootstrapChoice>,
+    legacy_complete_packages: &'a [BootstrapPackageManifest<'a>],
+    check: bool,
+    requested_agent: Option<AgentKind>,
+) -> Result<Value> {
     let bootstrap_content_version = content_version()
         .context("bundled Bootstrap Skill is missing metadata.bootstrap-version")?;
     let Some((snapshot_id, snapshot)) = store.latest_scan_payload::<ScanResult>()? else {
-        return Ok(json!({
+        let mut result = json!({
             "detected_agents": [],
             "targets": [],
             "plan_id": Value::Null,
@@ -9893,7 +10146,11 @@ fn setup_command_with_manifests<'a>(
             "canonical_deletion_count": 0,
             "files_changed": false,
             "next": "skillroster scan --summary --json"
-        }));
+        });
+        if let Some(agent) = requested_agent {
+            result["requested_agent"] = json!(agent.id());
+        }
+        return Ok(result);
     };
     require_loaded_snapshot_current(store, &snapshot_id, &snapshot)?;
     require_content_identity(&snapshot)?;
@@ -9922,6 +10179,7 @@ fn setup_command_with_manifests<'a>(
         .filter(|root| root.kind == RootKind::Sessions && root.status == scan::RootStatus::Included)
         .filter_map(|root| root.agent)
         .collect::<BTreeSet<_>>();
+    let mut eligible_targets = Vec::new();
     for roots in harness::known_agent_roots(home) {
         let agent = roots.agent;
         let detected_by_session = session_detected_agents.contains(&agent);
@@ -9955,217 +10213,244 @@ fn setup_command_with_manifests<'a>(
                 let relative = root.strip_prefix(home).with_context(|| {
                     format!("Agent Skill root {} is outside Home", root.display())
                 })?;
-                bootstrap_anchor_roots.insert(home.to_path_buf());
                 physical_home.join(relative)
             } else {
                 std::fs::canonicalize(&root).with_context(|| {
                     format!("failed to resolve Agent Skill root {}", root.display())
                 })?
             };
-            let physical_directory = physical_root.join("skillroster");
-            let physical_entrypoint = physical_directory.join("SKILL.md");
-            physical_targets.insert(physical_directory.clone());
-            if root_missing {
-                bootstrap_missing_skill_roots.insert(physical_root.clone());
-            }
             detected.push(json!({
                 "agent": agent.id(),
                 "detection_basis": detection_basis,
                 "target": entrypoint
             }));
-            let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
-                Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(_) => true,
-            };
-            let references = directory.join("references");
-            let references_are_unsupported = match std::fs::symlink_metadata(&references) {
-                Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                Err(_) => true,
-            };
-            let package_missing = !directory.exists() && !directory_is_unsupported;
-            let observed_files = current_package
-                .iter()
-                .map(|(relative_path, current_digest, _)| {
-                    let (status, digest) = if directory_is_unsupported
-                        || (references_are_unsupported && relative_path.starts_with("references/"))
-                    {
-                        (BootstrapFileStatus::Unsupported, None)
-                    } else {
-                        bootstrap_file_status(
-                            relative_path,
-                            &directory.join(relative_path),
-                            current_digest,
-                        )
-                    };
-                    (*relative_path, status, digest)
-                })
-                .collect::<Vec<_>>();
-            let observed_digests = observed_files
-                .iter()
-                .map(|(_, _, digest)| digest.clone())
-                .collect::<Vec<_>>();
-            let legacy_version =
-                legacy_bootstrap_package_version(&observed_digests, legacy_complete_packages);
-            let all_managed_files_missing = observed_files
-                .iter()
-                .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Missing));
-            let package_status = if directory_is_unsupported
-                || references_are_unsupported
-                || observed_files
-                    .iter()
-                    .any(|(_, status, _)| matches!(status, BootstrapFileStatus::Unsupported))
-            {
-                "unsupported"
-            } else if package_missing || all_managed_files_missing {
-                "missing"
-            } else if observed_files
-                .iter()
-                .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Current))
-            {
-                "current"
-            } else if legacy_version.is_some() {
-                "official_outdated"
-            } else {
-                "modified"
-            };
-            match package_status {
-                "unsupported" => unsupported_count += 1,
-                "missing" => missing_count += 1,
-                "current" => current_count += 1,
-                "official_outdated" => {
-                    outdated_count += 1;
-                    replace_count += 1;
-                }
-                "modified" => {
-                    modified_count += 1;
-                    if matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)) {
-                        replace_count += 1;
-                    }
-                }
-                _ => unreachable!("package status is exhaustive"),
-            }
-            let should_install = package_status == "missing"
-                || package_status == "official_outdated"
-                || (package_status == "modified"
-                    && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
-            if should_install
-                && agent == AgentKind::Hermes
-                && observed_files.iter().any(|(path, status, _)| {
-                    *path == "SKILL.md" && matches!(status, BootstrapFileStatus::Missing)
-                })
-            {
-                let overrides = current_package
-                    .iter()
-                    .map(|(path, _, content)| (PathBuf::from(path), content.clone()))
-                    .collect::<BTreeMap<_, _>>();
-                let skill_id = scan::projected_skill_id(&physical_directory, &overrides)?;
-                require_new_hermes_bootstrap_visibility(
-                    &snapshot,
-                    &entrypoint,
-                    &overrides[Path::new("SKILL.md")],
-                    &skill_id,
-                )?;
-            }
-            if should_install && !check {
-                planned_agents.insert(agent.id().to_owned());
-                if root_missing {
-                    let mut missing_directories = Vec::new();
-                    let mut cursor = Some(root.as_path());
-                    while let Some(path) = cursor {
-                        if path.exists() {
-                            break;
-                        }
-                        if path == home {
-                            break;
-                        }
-                        missing_directories.push(path.to_path_buf());
-                        cursor = path.parent();
-                    }
-                    missing_directories.reverse();
-                    for target in missing_directories {
-                        let relative = target.strip_prefix(home).with_context(|| {
-                            format!("Bootstrap target {} is outside Home", target.display())
-                        })?;
-                        let physical_target = physical_home.join(relative);
-                        if planned_directories.insert(physical_target) {
-                            operations.push(json!({
-                                "kind": "create_directory",
-                                "target": target,
-                                "expected_fingerprint": "missing"
-                            }));
-                        }
-                    }
-                }
-                if package_missing && planned_directories.insert(physical_directory.clone()) {
-                    operations.push(json!({
-                        "kind": "create_directory",
-                        "target": directory,
-                        "expected_fingerprint": "missing"
-                    }));
-                }
-                let physical_references = physical_directory.join("references");
-                if !references.exists() && planned_directories.insert(physical_references) {
-                    operations.push(json!({
-                        "kind": "create_directory",
-                        "target": references,
-                        "expected_fingerprint": "missing"
-                    }));
-                }
-                for ((relative_path, _, content), (_, status, _)) in
-                    current_package.iter().zip(&observed_files)
-                {
-                    if matches!(status, BootstrapFileStatus::Current) {
-                        continue;
-                    }
-                    let target = directory.join(relative_path);
-                    let physical_target = physical_directory.join(relative_path);
-                    if !planned_files.insert(physical_target) {
-                        continue;
-                    }
-                    planned_package_overrides
-                        .entry(physical_directory.clone())
-                        .or_default()
-                        .insert(PathBuf::from(relative_path), content.clone());
-                    let kind = match status {
-                        BootstrapFileStatus::Missing => "write_file",
-                        BootstrapFileStatus::Modified
-                        | BootstrapFileStatus::OfficialOutdated(_) => "replace_file",
-                        BootstrapFileStatus::Current | BootstrapFileStatus::Unsupported => {
-                            unreachable!("install only receives supported non-current files")
-                        }
-                    };
-                    operations.push(json!({
-                        "kind": kind,
-                        "target": target,
-                        "content": content,
-                        "expected_fingerprint": change::fingerprint(&target)?
-                    }));
-                }
-            }
-            targets.push(json!({
-                "agent": agent.id(),
-                "detection_basis": detection_basis,
-                "target": entrypoint,
-                "physical_target": physical_entrypoint,
-                "status": package_status,
-                "installed_version": if package_status == "current" {
-                    Some(bootstrap_content_version)
-                } else if package_status == "official_outdated" {
-                    legacy_version
-                } else {
-                    None
-                },
-                "managed_file_count": current_package.len(),
-                "managed_files": observed_files.iter().map(|(relative_path, status, _)| json!({
-                    "relative_path": relative_path,
-                    "status": status.as_str()
-                })).collect::<Vec<_>>()
-            }));
+            eligible_targets.push((agent, root, detection_basis, physical_root));
         }
     }
-    let base = json!({
+    let mut isolation_conflicts = Vec::new();
+    for (agent, root, detection_basis, physical_root) in &eligible_targets {
+        if requested_agent.is_some_and(|requested| requested != *agent) {
+            continue;
+        }
+        let agent = *agent;
+        let directory = root.join("skillroster");
+        let entrypoint = directory.join("SKILL.md");
+        let root_missing = !root.exists();
+        let physical_directory = physical_root.join("skillroster");
+        let physical_entrypoint = physical_directory.join("SKILL.md");
+        physical_targets.insert(physical_directory.clone());
+        if root_missing {
+            bootstrap_anchor_roots.insert(home.to_path_buf());
+            bootstrap_missing_skill_roots.insert(physical_root.clone());
+        }
+        let directory_is_unsupported = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        };
+        let references = directory.join("references");
+        let references_are_unsupported = match std::fs::symlink_metadata(&references) {
+            Ok(metadata) => metadata.file_type().is_symlink() || !metadata.file_type().is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => true,
+        };
+        let package_missing = !directory.exists() && !directory_is_unsupported;
+        let observed_files = current_package
+            .iter()
+            .map(|(relative_path, current_digest, _)| {
+                let (status, digest) = if directory_is_unsupported
+                    || (references_are_unsupported && relative_path.starts_with("references/"))
+                {
+                    (BootstrapFileStatus::Unsupported, None)
+                } else {
+                    bootstrap_file_status(
+                        relative_path,
+                        &directory.join(relative_path),
+                        current_digest,
+                    )
+                };
+                (*relative_path, status, digest)
+            })
+            .collect::<Vec<_>>();
+        let observed_digests = observed_files
+            .iter()
+            .map(|(_, _, digest)| digest.clone())
+            .collect::<Vec<_>>();
+        let legacy_version =
+            legacy_bootstrap_package_version(&observed_digests, legacy_complete_packages);
+        let all_managed_files_missing = observed_files
+            .iter()
+            .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Missing));
+        let package_status = if directory_is_unsupported
+            || references_are_unsupported
+            || observed_files
+                .iter()
+                .any(|(_, status, _)| matches!(status, BootstrapFileStatus::Unsupported))
+        {
+            "unsupported"
+        } else if package_missing || all_managed_files_missing {
+            "missing"
+        } else if observed_files
+            .iter()
+            .all(|(_, status, _)| matches!(status, BootstrapFileStatus::Current))
+        {
+            "current"
+        } else if legacy_version.is_some() {
+            "official_outdated"
+        } else {
+            "modified"
+        };
+        match package_status {
+            "unsupported" => unsupported_count += 1,
+            "missing" => missing_count += 1,
+            "current" => current_count += 1,
+            "official_outdated" => {
+                outdated_count += 1;
+                replace_count += 1;
+            }
+            "modified" => {
+                modified_count += 1;
+                if matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)) {
+                    replace_count += 1;
+                }
+            }
+            _ => unreachable!("package status is exhaustive"),
+        }
+        let should_install = package_status == "missing"
+            || package_status == "official_outdated"
+            || (package_status == "modified"
+                && matches!(modified_choice, Some(ModifiedBootstrapChoice::AdoptCurrent)));
+        if should_install && requested_agent.is_some() {
+            for (other_agent, other_root, _, other_physical_root) in &eligible_targets {
+                if *other_agent != agent
+                    && other_physical_root.join("skillroster") == physical_directory
+                {
+                    isolation_conflicts.push(json!({
+                        "selected_agent": agent.id(),
+                        "selected_target": entrypoint,
+                        "unselected_agent": other_agent.id(),
+                        "unselected_target": other_root.join("skillroster/SKILL.md"),
+                        "physical_target": physical_entrypoint
+                    }));
+                }
+            }
+        }
+        if should_install
+            && agent == AgentKind::Hermes
+            && observed_files.iter().any(|(path, status, _)| {
+                *path == "SKILL.md" && matches!(status, BootstrapFileStatus::Missing)
+            })
+        {
+            let overrides = current_package
+                .iter()
+                .map(|(path, _, content)| (PathBuf::from(path), content.clone()))
+                .collect::<BTreeMap<_, _>>();
+            let skill_id = scan::projected_skill_id(&physical_directory, &overrides)?;
+            require_new_hermes_bootstrap_visibility(
+                &snapshot,
+                &entrypoint,
+                &overrides[Path::new("SKILL.md")],
+                &skill_id,
+            )?;
+        }
+        if should_install && !check {
+            planned_agents.insert(agent.id().to_owned());
+            if root_missing {
+                let mut missing_directories = Vec::new();
+                let mut cursor = Some(root.as_path());
+                while let Some(path) = cursor {
+                    if path.exists() {
+                        break;
+                    }
+                    if path == home {
+                        break;
+                    }
+                    missing_directories.push(path.to_path_buf());
+                    cursor = path.parent();
+                }
+                missing_directories.reverse();
+                for target in missing_directories {
+                    let relative = target.strip_prefix(home).with_context(|| {
+                        format!("Bootstrap target {} is outside Home", target.display())
+                    })?;
+                    let physical_target = physical_home.join(relative);
+                    if planned_directories.insert(physical_target) {
+                        operations.push(json!({
+                            "kind": "create_directory",
+                            "target": target,
+                            "expected_fingerprint": "missing"
+                        }));
+                    }
+                }
+            }
+            if package_missing && planned_directories.insert(physical_directory.clone()) {
+                operations.push(json!({
+                    "kind": "create_directory",
+                    "target": directory,
+                    "expected_fingerprint": "missing"
+                }));
+            }
+            let physical_references = physical_directory.join("references");
+            if !references.exists() && planned_directories.insert(physical_references) {
+                operations.push(json!({
+                    "kind": "create_directory",
+                    "target": references,
+                    "expected_fingerprint": "missing"
+                }));
+            }
+            for ((relative_path, _, content), (_, status, _)) in
+                current_package.iter().zip(&observed_files)
+            {
+                if matches!(status, BootstrapFileStatus::Current) {
+                    continue;
+                }
+                let target = directory.join(relative_path);
+                let physical_target = physical_directory.join(relative_path);
+                if !planned_files.insert(physical_target) {
+                    continue;
+                }
+                planned_package_overrides
+                    .entry(physical_directory.clone())
+                    .or_default()
+                    .insert(PathBuf::from(relative_path), content.clone());
+                let kind = match status {
+                    BootstrapFileStatus::Missing => "write_file",
+                    BootstrapFileStatus::Modified | BootstrapFileStatus::OfficialOutdated(_) => {
+                        "replace_file"
+                    }
+                    BootstrapFileStatus::Current | BootstrapFileStatus::Unsupported => {
+                        unreachable!("install only receives supported non-current files")
+                    }
+                };
+                operations.push(json!({
+                    "kind": kind,
+                    "target": target,
+                    "content": content,
+                    "expected_fingerprint": change::fingerprint(&target)?
+                }));
+            }
+        }
+        targets.push(json!({
+            "agent": agent.id(),
+            "detection_basis": detection_basis,
+            "target": entrypoint,
+            "physical_target": physical_entrypoint,
+            "status": package_status,
+            "installed_version": if package_status == "current" {
+                Some(bootstrap_content_version)
+            } else if package_status == "official_outdated" {
+                legacy_version
+            } else {
+                None
+            },
+            "managed_file_count": current_package.len(),
+            "managed_files": observed_files.iter().map(|(relative_path, status, _)| json!({
+                "relative_path": relative_path,
+                "status": status.as_str()
+            })).collect::<Vec<_>>()
+        }));
+    }
+    let mut base = json!({
         "detected_agents": detected,
         "targets": targets,
         "bootstrap_skill": "skillroster",
@@ -10182,6 +10467,22 @@ fn setup_command_with_manifests<'a>(
         "canonical_deletion_count": 0,
         "files_changed": false
     });
+    if let Some(agent) = requested_agent {
+        base["requested_agent"] = json!(agent.id());
+    }
+    if unsupported_count == 0
+        && (modified_count == 0 || modified_choice.is_some())
+        && !isolation_conflicts.is_empty()
+    {
+        let count = isolation_conflicts.len();
+        isolation_conflicts.truncate(10);
+        base["state"] = json!("selected_scope_not_isolatable");
+        base["plan_id"] = Value::Null;
+        base["conflict_count"] = json!(count);
+        base["conflicts"] = json!(isolation_conflicts);
+        base["conflicts_truncated"] = json!(count > 10);
+        return Ok(base);
+    }
     if check {
         let mut result = base;
         result["plan_id"] = Value::Null;
@@ -10262,6 +10563,19 @@ fn setup_command_with_manifests<'a>(
         affected_agents,
         affected_skill_ids,
     };
+    let mut reuse_identity = json!({
+            "modified_choice": match modified_choice {
+                None => Value::Null,
+                Some(ModifiedBootstrapChoice::RetainLocal) => json!("retain-local"),
+                Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
+            },
+            "affected_agents": bootstrap_scope.affected_agents.clone(),
+            "affected_skill_ids": bootstrap_scope.affected_skill_ids.clone(),
+            "affected_placement_count": bootstrap_scope.affected_placement_count
+    });
+    if let Some(agent) = requested_agent {
+        reuse_identity["requested_agent"] = json!(agent.id());
+    }
     let plan = prepare_plan(
         store,
         state_dir,
@@ -10272,16 +10586,7 @@ fn setup_command_with_manifests<'a>(
             "path_projections": path_projections
         }),
         PlanOrigin::BootstrapSetup,
-        Some(json!({
-            "modified_choice": match modified_choice {
-                None => Value::Null,
-                Some(ModifiedBootstrapChoice::RetainLocal) => json!("retain-local"),
-                Some(ModifiedBootstrapChoice::AdoptCurrent) => json!("adopt-current"),
-            },
-            "affected_agents": bootstrap_scope.affected_agents.clone(),
-            "affected_skill_ids": bootstrap_scope.affected_skill_ids.clone(),
-            "affected_placement_count": bootstrap_scope.affected_placement_count
-        })),
+        Some(reuse_identity),
         &[],
         Some(&bootstrap_scope),
     )?;
@@ -11052,6 +11357,70 @@ fn validate_governance_operation_mutation_scopes(
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+/// Bind Library decisions to the complete packages actually observed by Scan,
+/// independently of the operation fingerprints captured while preparing a Plan.
+fn validate_library_content_evidence(plan: &PreparedPlan, scan: &ScanResult) -> Result<()> {
+    let mut placements = BTreeMap::new();
+    for change in &plan.library_changes {
+        for id in change
+            .placement_ids
+            .iter()
+            .chain(std::iter::once(&change.canonical_placement_id))
+        {
+            let placement = scan
+                .placements
+                .iter()
+                .find(|placement| placement.id == *id && placement.skill_id == change.skill_id)
+                .ok_or_else(|| {
+                    anyhow!("Library placement {id} is absent from the Plan Snapshot")
+                })?;
+            placements.insert(id, placement);
+        }
+    }
+    let mut identities = BTreeMap::<PathBuf, (String, String)>::new();
+    for placement in placements.into_values() {
+        let blocked = |reason, actual_digest| LibraryContentRescanRequired {
+            snapshot_id: plan.scan_id.clone(),
+            skill_id: placement.skill_id.clone(),
+            placement_id: placement.id.clone(),
+            path: placement.entrypoint.clone(),
+            reason,
+            expected_digest: placement.content_digest.clone(),
+            actual_digest,
+        };
+        // Read only packages already authorized for this Library change. Physical
+        // validation prevents following a retargeted logical placement elsewhere.
+        if matches!(
+            placement.mutation_scope,
+            None | Some(scan::MutationScope::UntrustedExternal)
+        ) {
+            return Err(blocked("snapshot_package_read_not_authorized", None).into());
+        }
+        if placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete {
+            return Err(blocked("snapshot_package_evidence_incomplete", None).into());
+        }
+        let physical = placement
+            .validated_physical_directory()
+            .map_err(|_| blocked("snapshot_package_identity_unavailable", None))?;
+        let (actual_id, actual_digest) = match identities.entry(physical) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let identity = scan::inspect_skill_identity(&entry.key().join("SKILL.md"))
+                    .map_err(|_| blocked("snapshot_package_identity_unavailable", None))?;
+                entry.insert(identity)
+            }
+        };
+        if actual_id != &placement.skill_id || actual_digest != &placement.content_digest {
+            return Err(blocked(
+                "snapshot_package_content_changed",
+                Some(actual_digest.clone()),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_governance_fingerprint_completeness(
@@ -14277,13 +14646,30 @@ mod recovery_tests {
                 .collect::<Vec<_>>()
         };
 
-        for version in ["1.8.23", "1.8.46", "1.8.47", "1.8.48", "1.8.49", "1.8.50"] {
+        for version in [
+            "1.8.23", "1.8.46", "1.8.47", "1.8.48", "1.8.49", "1.8.50", "1.8.51",
+        ] {
             let observed = observed_for(version);
             assert_eq!(
                 legacy_bootstrap_package_version(&observed, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
                 Some(version)
             );
         }
+
+        let fixture = [
+            include_str!("../tests/fixtures/bootstrap-v1.8.51.md"),
+            include_str!("../tests/fixtures/bootstrap-routing-v1.8.51.md"),
+            include_str!("../tests/fixtures/bootstrap-governance-v1.8.50.md"),
+            include_str!("../tests/fixtures/bootstrap-mutation-v1.8.50.md"),
+        ]
+        .map(|content| Some(bootstrap_content_digest(content.as_bytes())));
+        assert_eq!(observed_for("1.8.51"), fixture);
+        let mut mixed_latest = fixture;
+        mixed_latest[1] = Some(observed_for("1.8.50")[1].clone().unwrap());
+        assert_eq!(
+            legacy_bootstrap_package_version(&mixed_latest, LEGACY_COMPLETE_BOOTSTRAP_PACKAGES),
+            None
+        );
 
         let observed = observed_for("1.8.23");
         let mut mixed = observed;

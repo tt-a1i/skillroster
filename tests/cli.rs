@@ -1030,8 +1030,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.51");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.51");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.52");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.52");
 }
 
 #[cfg(unix)]
@@ -5520,6 +5520,7 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     assert_eq!(find["result"]["matches"][0]["name"], "example");
     let skill_id = find["result"]["matches"][0]["skill_id"].as_str().unwrap();
     let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
+    assert!(!evidence_id.is_empty());
 
     let setup = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     let setup_plan = setup["result"]["plan_id"].as_str().unwrap();
@@ -5535,6 +5536,16 @@ fn public_cli_scans_reports_plans_applies_and_undoes() {
     ));
     assert_eq!(setup_undone["result"]["verification"], "passed");
     assert!(!skill_root.join("skillroster").exists());
+    let refreshed = json_output(&run_suggested_action(&setup_undone["suggested_actions"][0]));
+    let snapshot = refreshed["result"]["snapshot_id"].as_str().unwrap();
+    let refreshed_find = json_output(&run(
+        &[&common[..], &["find", "example task"]].concat(),
+        None,
+    ));
+    let skill_id = refreshed_find["result"]["matches"][0]["skill_id"]
+        .as_str()
+        .unwrap();
+    let evidence_id = skill_evidence_id(&database, snapshot, skill_id);
 
     let plan_input = json!({
         "schema_version": 1,
@@ -6073,7 +6084,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.51"
+        "1.8.52"
     );
 
     let undone = json_output(&run(
@@ -6166,8 +6177,27 @@ fn setup_upgrades_an_exact_official_legacy_bootstrap_and_undo_restores_it() {
 fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
     for (version, changed_count, legacy_files) in [
         (
+            "1.8.51",
+            4,
+            [
+                ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.51.md")),
+                (
+                    "references/routing.md",
+                    include_str!("fixtures/bootstrap-routing-v1.8.51.md"),
+                ),
+                (
+                    "references/governance.md",
+                    include_str!("fixtures/bootstrap-governance-v1.8.50.md"),
+                ),
+                (
+                    "references/mutation.md",
+                    include_str!("fixtures/bootstrap-mutation-v1.8.50.md"),
+                ),
+            ],
+        ),
+        (
             "1.8.50",
-            2,
+            4,
             [
                 ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.50.md")),
                 (
@@ -6314,7 +6344,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.51"
+            "1.8.52"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
@@ -6997,6 +7027,7 @@ fn setup_reuse_and_status_actionability_follow_snapshot_lifecycle() {
     let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
+    json_output(&run_suggested_action(&undone["suggested_actions"][0]));
 
     let after_terminal_state = json_output(&run(&[&common[..], &["setup"]].concat(), None));
     assert_eq!(after_terminal_state["result"]["state"], "preview_ready");
@@ -7365,7 +7396,7 @@ fn setup_bootstraps_a_detected_agent_before_its_first_skill_root_exists() {
 }
 
 #[test]
-fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
+fn verified_apply_and_immediate_undo_both_require_fresh_scan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -7524,13 +7555,63 @@ fn verified_apply_invalidates_inventory_until_scan_or_exact_undo() {
         applied["result"]["receipt_id"]
     );
     assert!(!bootstrap.exists());
+    assert_eq!(undone["result"]["rescan_required"], true);
+    assert_eq!(undone["suggested_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(undone["suggested_actions"][0]["action"], "scan");
+    assert_eq!(undone["suggested_actions"][0]["mutates"], false);
+    assert_eq!(
+        undone["suggested_actions"][0]["requires_confirmation"],
+        false
+    );
+    assert_eq!(
+        undone["suggested_actions"][0]["argv"],
+        context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+    );
+    let status_after = json_output(&run(&[&common[..], &["status"]].concat(), None));
+    assert_eq!(status_after["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        status_after["result"]["snapshot_invalidated_by_receipt_id"],
+        undone["result"]["receipt_id"]
+    );
+    let home_after = json_output(&run(&common, None));
+    assert_eq!(home_after["result"]["snapshot_state"], "rescan_required");
+    assert_eq!(
+        home_after["suggested_actions"][0],
+        undone["suggested_actions"][0]
+    );
+    for command in [
+        vec!["report", "--summary"],
+        vec!["find", "help", "--load"],
+        vec!["setup"],
+        vec!["plan", "--stdin"],
+    ] {
+        let output = run(&[&common[..], &command].concat(), Some("{}"));
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "snapshot_rescan_required");
+        assert_eq!(
+            value["suggested_actions"][0]["argv"],
+            context_action_argv(&home, &state, &["scan", "--summary", "--json"])
+        );
+    }
+    let historical = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert_eq!(historical["result"]["plan_id"], plan_id);
+    let refreshed = json_output(&run_suggested_action(&undone["suggested_actions"][0]));
+    assert_ne!(
+        refreshed["result"]["snapshot_id"],
+        original_scan["result"]["snapshot_id"]
+    );
+    assert_eq!(refreshed["result"]["placement_count"], 0);
     let restored = json_output(&run(
         &[&common[..], &["report", "--summary"]].concat(),
         None,
     ));
     assert_eq!(
         restored["result"]["snapshot_id"],
-        original_scan["result"]["snapshot_id"]
+        refreshed["result"]["snapshot_id"]
     );
     assert_eq!(restored["result"]["placement_count"], 0);
 }
@@ -7892,6 +7973,87 @@ fn json_failure_is_one_parseable_document() {
     assert_eq!(invalid_value["command"], "cli");
     assert_eq!(invalid_value["error"]["code"], "invalid_cli_arguments");
     assert!(invalid.stderr.is_empty());
+}
+
+#[test]
+fn json_help_version_and_invalid_arguments_preserve_cli_behavior() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let state = temp.path().join("state");
+    fs::create_dir_all(&home).unwrap();
+    let sentinel = home.join("sentinel.txt");
+    fs::write(&sentinel, b"preserve user data\n").unwrap();
+    let prefix = [
+        "--home",
+        home.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+    ];
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&["--json", "--help"], "help", "Usage: skillroster"),
+        (&["--json", "-h"], "help", "Usage: skillroster"),
+        (
+            &["--json", "help", "plan"],
+            "help",
+            "Usage: skillroster plan",
+        ),
+        (
+            &["--json", "plan", "--help"],
+            "help",
+            "Usage: skillroster plan",
+        ),
+        (&["plan", "--json", "-h"], "help", "Usage: skillroster plan"),
+        (&["--json", "--version"], "version", "skillroster"),
+        (&["--json", "-V"], "version", "skillroster"),
+    ];
+    for (args, kind, expected) in cases {
+        let output = run(&[&prefix[..], *args].concat(), None);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}");
+        assert!(!output.stdout.contains(&0x1b), "{args:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["command"], "cli");
+        assert_eq!(value["ok"], true);
+        assert!(value["error"].is_null());
+        assert_eq!(value["result"]["kind"], *kind);
+        let text = value["result"]["text"].as_str().unwrap();
+        // Clap includes the executable suffix in Windows subcommand help.
+        let portable_text = text.replace("skillroster.exe", "skillroster");
+        assert!(portable_text.contains(expected), "{args:?}: {text}");
+        assert!(!text.contains('\u{1b}'), "{args:?}");
+        if *kind == "version" {
+            assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+        }
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
+    for args in [
+        &["--json", "not-a-command"][..],
+        &["--json", "--source-root"][..],
+        &["--json", "--unknown-option"][..],
+    ] {
+        let output = run(&[&prefix[..], args].concat(), None);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "invalid_cli_arguments");
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
+    for (args, expected) in [
+        (&["--help"][..], "Usage: skillroster"),
+        (&["--version"][..], "skillroster"),
+    ] {
+        let output = run(&[&prefix[..], args].concat(), None);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(expected));
+        assert!(serde_json::from_str::<Value>(&text).is_err());
+        assert!(!state.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve user data\n");
+    }
 }
 
 #[test]
@@ -8571,6 +8733,84 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
             "upstream_digest": digest(upstream)
         }]
     });
+    let plans_before: i64 = database
+        .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+        .unwrap();
+    for field in [
+        "current_fingerprint",
+        "skill_id",
+        "placement_id",
+        "choice",
+        "decision",
+    ] {
+        let mut malformed = request.clone();
+        let update = malformed["source_updates"][0].as_object_mut().unwrap();
+        if field == "choice" {
+            update.insert("choice".into(), json!("unknown_choice"));
+        } else if field == "decision" {
+            update.insert("decision".into(), json!("adopt_upstream"));
+        } else {
+            update.remove(field);
+        }
+        let output = run(
+            &[&common[..], &["plan", "--stdin"]].concat(),
+            Some(&malformed.to_string()),
+        );
+        assert!(!output.status.success(), "malformed field {field}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "invalid_source_update_request");
+        assert_eq!(result["error"]["retryable"], false);
+        let message = result["error"]["message"].as_str().unwrap();
+        if field == "decision" {
+            assert!(message.contains("unknown field `decision`"), "{message}");
+            assert!(message.contains("current_fingerprint"), "{message}");
+        } else if field == "choice" {
+            assert!(
+                message.contains("unknown variant `unknown_choice`"),
+                "{message}"
+            );
+        } else {
+            assert!(
+                message.contains(&format!("missing field `{field}`")),
+                "{message}"
+            );
+        }
+
+        assert_eq!(
+            result["error"]["details"]["reason"],
+            "source_update_request_decode_failed"
+        );
+        assert_eq!(
+            result["error"]["details"]["request_field"],
+            "source_updates"
+        );
+        assert_eq!(result["error"]["relevant_ids"], json!([]));
+        assert_eq!(result["error"]["paths"], json!([]));
+        assert!(
+            result["suggested_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|action| action["action"] != "scan")
+        );
+        assert!(result["result"].is_null());
+        let plans_after: i64 = database
+            .query_row("SELECT COUNT(*) FROM plans", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(plans_after, plans_before);
+        assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
+    }
+    let mut drifted = request.clone();
+    drifted["source_updates"][0]["current_fingerprint"] = json!("0".repeat(64));
+    drifted["source_updates"][0]["choice"] = json!("adopt_upstream");
+    let output = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&drifted.to_string()),
+    );
+    assert!(!output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error"]["code"], "state_drift");
+    assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
     let untrusted_default = run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
@@ -8598,6 +8838,30 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         plan["result"]["diff_summary"]["items"][0]["choice"],
         "adopt_upstream"
     );
+    for view in [&plan["result"]["diff_summary"], &plan["result"]["impact"]] {
+        assert_eq!(
+            view["items"][0].get("local_modification_detected"),
+            Some(&Value::Null)
+        );
+    }
+    let shown = json_output(&run(
+        &[
+            &common[..],
+            &[
+                "plan",
+                "--show",
+                plan["result"]["plan_id"].as_str().unwrap(),
+            ],
+        ]
+        .concat(),
+        None,
+    ));
+    for view in [&shown["result"]["diff_summary"], &shown["result"]["impact"]] {
+        assert_eq!(
+            view["items"][0].get("local_modification_detected"),
+            Some(&Value::Null)
+        );
+    }
     let applied = json_output(&run(
         &[
             &common[..],
@@ -8657,6 +8921,61 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
         trusted_plan["result"]["diff_summary"]["items"][0]["choice_reason"],
         "trusted_baseline_clean"
     );
+    for view in [
+        &trusted_plan["result"]["diff_summary"],
+        &trusted_plan["result"]["impact"],
+    ] {
+        assert_eq!(view["items"][0]["local_modification_detected"], false);
+    }
+
+    // A trusted v2 baseline distinguishes a real local edit from an unknown baseline.
+    fs::write(&entrypoint, format!("{upstream}local edit\n")).unwrap();
+    let edited_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
+    let edited_snapshot = edited_scan["result"]["snapshot_id"].as_str().unwrap();
+    let edited_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [edited_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let edited_payload: Value = serde_json::from_str(&edited_payload).unwrap();
+    let mut edited_request = trusted_request.clone();
+    edited_request["scan_id"] = json!(edited_snapshot);
+    edited_request["evidence_ids"] = json!([skill_evidence_id(
+        &database,
+        edited_snapshot,
+        edited_payload["skills"][0]["id"].as_str().unwrap()
+    )]);
+    edited_request["source_updates"][0]["skill_id"] = edited_payload["skills"][0]["id"].clone();
+    edited_request["source_updates"][0]["placement_id"] =
+        edited_payload["placements"][0]["id"].clone();
+    edited_request["source_updates"][0]["current_fingerprint"] =
+        edited_payload["placements"][0]["content_digest"].clone();
+    let edited_without_choice = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&edited_request.to_string()),
+    );
+    assert!(!edited_without_choice.status.success());
+    let rejected: Value = serde_json::from_slice(&edited_without_choice.stdout).unwrap();
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("choice is required")
+    );
+    edited_request["source_updates"][0]["choice"] = json!("retain_local");
+    let edited_plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&edited_request.to_string()),
+    ));
+    for view in [
+        &edited_plan["result"]["diff_summary"],
+        &edited_plan["result"]["impact"],
+    ] {
+        assert_eq!(view["items"][0]["local_modification_detected"], true);
+    }
+    fs::write(&entrypoint, upstream).unwrap();
     let undone = json_output(&run(&[&common[..], &["undo", receipt]].concat(), None));
     assert_eq!(undone["result"]["verification"], "passed");
     assert_eq!(fs::read_to_string(&entrypoint).unwrap(), original);
@@ -8762,7 +9081,29 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     assert_eq!(preserve_undo["result"]["verification"], "passed");
     assert!(!sibling.exists());
 
+    let refresh_request = |request: &mut Value, scan: &Value| {
+        let snapshot = scan["result"]["snapshot_id"].as_str().unwrap();
+        let payload: String = database
+            .query_row(
+                "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+                [snapshot],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let payload: Value = serde_json::from_str(&payload).unwrap();
+        let skill_id = payload["skills"][0]["id"].as_str().unwrap();
+        request["scan_id"] = json!(snapshot);
+        request["evidence_ids"] = json!([skill_evidence_id(&database, snapshot, skill_id)]);
+        request["source_updates"][0]["skill_id"] = payload["skills"][0]["id"].clone();
+        request["source_updates"][0]["placement_id"] = payload["placements"][0]["id"].clone();
+        request["source_updates"][0]["current_fingerprint"] =
+            payload["placements"][0]["content_digest"].clone();
+    };
+    let post_preserve_scan = json_output(&run_suggested_action(
+        &preserve_undo["suggested_actions"][0],
+    ));
     let mut retain_request = modified_request;
+    refresh_request(&mut retain_request, &post_preserve_scan);
     retain_request["source_updates"][0]["choice"] = json!("retain_local");
     let retain_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
@@ -8788,6 +9129,10 @@ fn source_update_requires_conflict_choice_and_round_trips_adoption() {
     ));
     assert_eq!(retained_undo["result"]["verification"], "passed");
 
+    let post_retain_scan = json_output(&run_suggested_action(
+        &retained_undo["suggested_actions"][0],
+    ));
+    refresh_request(&mut retain_request, &post_retain_scan);
     database
         .execute("DELETE FROM source_baselines", [])
         .unwrap();
@@ -9227,9 +9572,44 @@ fn library_governance_managed_and_hosted_round_trip_and_refuse_drift() {
         .unwrap();
     assert_eq!(governance_state, "observed");
 
+    let after_managed_scan =
+        json_output(&run_suggested_action(&managed_undo["suggested_actions"][0]));
+    let after_managed_snapshot = after_managed_scan["result"]["snapshot_id"]
+        .as_str()
+        .unwrap();
+    let after_managed_payload: String = database
+        .query_row(
+            "SELECT payload_json FROM scan_payloads WHERE scan_id = ?1",
+            [after_managed_snapshot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let after_managed_payload: Value = serde_json::from_str(&after_managed_payload).unwrap();
+    let after_managed_placements = after_managed_payload["placements"].as_array().unwrap();
+    let after_managed_skill = after_managed_payload["skills"][0]["id"].as_str().unwrap();
+    let after_managed_canonical = after_managed_placements
+        .iter()
+        .find(|p| p["agent"] == "codex")
+        .unwrap();
+    let mut hosted_request = request("hosted");
+    hosted_request["scan_id"] = json!(after_managed_snapshot);
+    hosted_request["evidence_ids"] = json!([skill_evidence_id(
+        &database,
+        after_managed_snapshot,
+        after_managed_skill
+    )]);
+    hosted_request["library_changes"][0]["skill_id"] = json!(after_managed_skill);
+    hosted_request["library_changes"][0]["canonical_placement_id"] =
+        after_managed_canonical["id"].clone();
+    hosted_request["library_changes"][0]["placement_ids"] = json!(
+        after_managed_placements
+            .iter()
+            .map(|p| p["id"].clone())
+            .collect::<Vec<_>>()
+    );
     let hosted_plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
-        Some(&request("hosted").to_string()),
+        Some(&hosted_request.to_string()),
     ));
     let hosted_impact = &hosted_plan["result"]["impact"]["items"][0];
     assert_eq!(hosted_impact["before"]["physical_source_count"], 2);
@@ -12976,17 +13356,17 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
     let ambiguous_load: Value = serde_json::from_slice(&ambiguous_load.stdout).unwrap();
     assert_eq!(
         ambiguous_load["error"]["details"]["reason"],
-        "same_name_variants_ambiguous"
+        "hint_direct_selection_evidence_required"
     );
     assert_eq!(
         ambiguous_load["error"]["details"]["next_action"],
-        "inspect_same_name_variants"
+        "refine_agent_authored_hint_with_direct_capability_evidence"
     );
     assert_eq!(
         ambiguous_load["suggested_actions"][0],
         json!({
-            "action": "inspect_same_name_variants",
-            "description": "inspect_same_name_variants",
+            "action": "inspect_ranked_skill_evidence",
+            "description": "inspect_ranked_skill_evidence",
             "argv": [
                 env!("CARGO_BIN_EXE_skillroster"),
                 "--state-dir",
@@ -12997,7 +13377,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
                 "--hint",
                 "inspect active identity",
                 "--limit",
-                "1",
+                "5",
                 "--require-snapshot",
                 snapshot,
                 "--json",
@@ -13006,7 +13386,7 @@ fn archived_same_name_identity_cannot_return_through_active_variant() {
             ],
             "mutates": false,
             "requires_confirmation": false,
-            "reason_code": "same_name_variants_ambiguous"
+            "reason_code": "hint_direct_selection_evidence_required"
         })
     );
     let variants = json_output(&run_suggested_action(

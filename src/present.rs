@@ -184,7 +184,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
 }
 
 pub fn error_human(error: &dyn Display) -> String {
-    format!("SkillRoster · Error\n\nERR  {error}\n\nNo files changed.")
+    format!("SkillRoster · Error\n\nERR  {error}\n\nFile changes: unknown.")
 }
 
 pub fn blocked_roster_plan(details: &Value) -> String {
@@ -1851,6 +1851,10 @@ fn mutation(value: &Value, lines: &mut Vec<String>) {
 
 fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "State", text(value, "state"));
+    if let Some(agent) = value.get("requested_agent").and_then(Value::as_str) {
+        fact(lines, "Requested Agent", agent);
+        fact(lines, "Selected targets", array_len(value, "targets"));
+    }
     fact(lines, "CLI version", text(value, "cli_version"));
     fact(
         lines,
@@ -1906,6 +1910,24 @@ fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
             lines.push(format!("{prefix}{path}"));
         }
     }
+    if let Some(conflicts) = value.get("conflicts").and_then(Value::as_array) {
+        for conflict in conflicts.iter().take(5) {
+            lines.push(format!(
+                "Shared target · {} / {}",
+                text(conflict, "selected_agent"),
+                text(conflict, "unselected_agent")
+            ));
+            for key in ["selected_target", "unselected_target", "physical_target"] {
+                lines.push(format!(
+                    "  {}",
+                    middle_truncate(&text(conflict, key), width.saturating_sub(2))
+                ));
+            }
+        }
+        if conflicts.len() > 5 || value["conflicts_truncated"] == true {
+            lines.push("Additional bindings are available in Setup JSON.".into());
+        }
+    }
     match value
         .get("state")
         .and_then(Value::as_str)
@@ -1934,6 +1956,14 @@ fn setup(value: &Value, lines: &mut Vec<String>, width: usize) {
         "up_to_date" => lines.extend(summary(
             "Healthy · bootstrap Skill is current",
             "No setup action is needed",
+        )),
+        "selected_scope_not_isolatable" => lines.extend(summary(
+            "Blocked · selected writes also reach an unselected Agent target",
+            "Inspect the reported bindings and choose the scope explicitly",
+        )),
+        "no_supported_agent" if value.get("requested_agent").is_some() => lines.extend(summary(
+            "No change · no eligible target for the requested Agent",
+            "The selector does not create an Agent installation or target",
         )),
         "no_supported_agent" => lines.extend(summary(
             "No change · no supported Agent target found",
@@ -2602,10 +2632,10 @@ mod tests {
     }
 
     #[test]
-    fn errors_have_an_explicit_no_change_summary() {
+    fn unstructured_errors_do_not_guess_whether_files_changed() {
         let rendered = error_human(&"drifted plan");
         assert!(rendered.contains("drifted plan"));
-        assert!(rendered.ends_with("No files changed."));
+        assert!(rendered.ends_with("File changes: unknown."));
     }
 
     #[test]

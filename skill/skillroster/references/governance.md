@@ -78,11 +78,56 @@ Make semantic choices in conversation, then submit them to
   one portable Library target.
 - `finding_library_changes`: preferred for exact duplicates. Supply the Finding
   ID, a listed canonical placement, and `managed` or `hosted`.
+
+Choose the state by the user's physical-location intent. `managed` keeps the
+selected canonical package at its current path and links matching placements
+to it. `hosted` explicitly migrates it into SkillRoster's Library root. A request
+to retain an existing source in place calls for `managed`; hosting requires
+migration intent. Select the listed canonical candidate separately from this
+state choice. Before Apply, compare `impact.items[].before.canonical_path` and
+`after.canonical_path` with that intent; unchanged default exposure does not
+mean the canonical package stayed put.
+
 - Raw `roster_changes`, `library_changes`, and `source_updates` are advanced
   forms. Bind them to the latest Snapshot, complete scope, current Evidence,
   placement/source facts, revision, and fingerprint. For local source drift,
   require the user's explicit `retain_local`, `adopt_upstream`, or
   `preserve_both` choice.
+
+For a raw source update, use this request shape with observed values:
+`schema_version: 1`, `scan_id`, `evidence_ids`, and `source_updates: [...]`.
+Each `source_updates` item has these exact fields:
+
+- `skill_id`, `placement_id`: the exact target's current public Evidence
+  bindings or an already verified exact Find selection; never infer by name.
+- `source`: the installed target's declared source, from authorized metadata.
+- `current_revision`: its declared `version`, otherwise `revision`.
+- `current_fingerprint`: that placement's complete **package** fingerprint,
+  from current placement-bound digest Evidence or verified Find's
+  `verification.package_fingerprint`; never substitute a SKILL.md file hash
+  or a routing-content identity digest. Require complete coverage and bindings.
+- `upstream_revision`: the supplied candidate's different declared revision.
+- `upstream_content`: exact UTF-8 entrypoint content supplied for this update.
+- `upstream_digest`: SHA-256 of those exact entrypoint bytes, not its package.
+- `choice`: `retain_local`, `adopt_upstream`, or `preserve_both`, matching the
+  user's decision. The key is `choice`, not `decision`. First-observed/untrusted
+  baselines require an explicit choice even without known local modification;
+  modified trusted baselines also require it. Do not invent user intent.
+- Optional `base_digest`: an already established immutable baseline's
+  entrypoint SHA-256. Omit it if that baseline is unknown; a hash of today's
+  file does not establish or replace a baseline and never promotes trust.
+
+Take `scan_id` and relevant skill/placement-bound `evidence_ids` from the same
+latest Snapshot's public Report/Finding facts. Open the exact Finding detail
+when compact Evidence omits a required digest; keep each ID/digest together.
+Only read installed/candidate metadata or hash bytes inside the authorized
+scope; do not bypass a source/read blocker or read private SQLite to fill gaps.
+The candidate's source/revision must match the submitted source/revision;
+source updates consume supplied bytes, not an automatic Git fetch or endorsement.
+Target only the authorized mutable regular placement. Do not choose canonical
+content, send raw filesystem `operations`, or mix Roster/Library changes here.
+Preview the validated Plan and its exact targets; Apply needs authorization.
+Follow the existing mutation reference for Receipt verification and Undo.
 
 Keep Roster, source, and Library changes in separate Plans. A stale Snapshot,
 Evidence ID, fingerprint, incomplete scope, or revision requires rescan or user
@@ -96,8 +141,11 @@ points to a SkillRoster-owned JSON detail file; validate its schema before
 using the complete identities and argv. Do not inspect or trust targets
 independently, synthesize broader parents, or submit a partial Plan.
 
-If planning reports `mutation_scope_blocks_roster_change`, read its typed
-`resolution_choices`. A compact `protect_blocked_skills_as_core` choice with
+If planning reports `mutation_scope_blocks_roster_change` or
+`package_fingerprint_variants_block_roster_change`, read all `blocked_reasons`
+and its typed `resolution_choices`. Package differences require preservation;
+read permission does not resolve them. A compact
+`protect_blocked_skills_as_core` choice with
 `protected_skill_ids_complete: false` is not executable; open the same Finding
 with `--full`. Only after the user confirms a full choice with
 `plan_request_template_available: true` may you replay its exact Plan request.

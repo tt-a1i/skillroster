@@ -15,6 +15,21 @@ use crate::scan;
 pub(super) const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
 
 #[derive(Debug)]
+pub(super) struct InvalidSourceUpdateRequest(pub(super) serde_json::Error);
+
+impl std::fmt::Display for InvalidSourceUpdateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidSourceUpdateRequest {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct FindSnapshotChanged {
     pub(super) expected_snapshot_id: ScanId,
     pub(super) actual_snapshot_id: ScanId,
@@ -147,6 +162,29 @@ impl std::fmt::Display for SourceRootSnapshotRescanRequired {
 impl std::error::Error for SourceRootSnapshotRescanRequired {}
 
 #[derive(Debug)]
+pub(super) struct LibraryContentRescanRequired {
+    pub(super) snapshot_id: String,
+    pub(super) skill_id: String,
+    pub(super) placement_id: String,
+    pub(super) path: PathBuf,
+    pub(super) reason: &'static str,
+    pub(super) expected_digest: String,
+    pub(super) actual_digest: Option<String>,
+}
+
+impl std::fmt::Display for LibraryContentRescanRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Library placement {} no longer has complete content evidence from Snapshot {}; run skillroster scan before preparing or applying a Library Plan",
+            self.placement_id, self.snapshot_id
+        )
+    }
+}
+
+impl std::error::Error for LibraryContentRescanRequired {}
+
+#[derive(Debug)]
 pub(super) struct PlanEvidenceScopeMismatch {
     pub(super) unsupported_changes: Vec<(String, String)>,
 }
@@ -172,6 +210,61 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(required) = error.downcast_ref::<LibraryContentRescanRequired>() {
+        let mut envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "library_content_rescan_required".into(),
+                message: required.to_string(),
+                retryable: true,
+                relevant_ids: vec![
+                    required.snapshot_id.clone(),
+                    required.skill_id.clone(),
+                    required.placement_id.clone(),
+                ],
+                paths: vec![required.path.display().to_string()],
+                details: Some(json!({
+                    "reason": required.reason,
+                    "snapshot_id": required.snapshot_id,
+                    "skill_id": required.skill_id,
+                    "placement_id": required.placement_id,
+                    "expected_digest": required.expected_digest,
+                    "actual_digest": required.actual_digest,
+                    "next_action": "scan",
+                    "retry_after": "fresh_scan"
+                })),
+            },
+        );
+        envelope.suggested_actions = vec![action(
+            "scan",
+            &["scan", "--summary", "--json"],
+            false,
+            false,
+            "library_content_evidence_requires_rescan",
+        )];
+        action_context.apply(&mut envelope.suggested_actions);
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
+    if let Some(invalid) = error.downcast_ref::<InvalidSourceUpdateRequest>() {
+        let envelope = JsonEnvelope::<Value>::failure(
+            command,
+            ApiError {
+                code: "invalid_source_update_request".into(),
+                message: invalid.to_string(),
+                retryable: false,
+                details: Some(json!({
+                    "reason": "source_update_request_decode_failed",
+                    "request_field": "source_updates",
+                    "next_action": "correct_source_update_request"
+                })),
+                relevant_ids: Vec::new(),
+                paths: Vec::new(),
+            },
+        );
+        return serde_json::to_string(&envelope)
+            .unwrap_or_else(|_| r#"{"schema_version":1,"ok":false}"#.into());
+    }
     if let Some(mismatch) = error.downcast_ref::<PlanEvidenceScopeMismatch>() {
         const PREVIEW_LIMIT: usize = 10;
         let unsupported_changes = mismatch

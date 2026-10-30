@@ -313,9 +313,25 @@ Read-only commands never mutate Agent configuration or Skill contents. Agent rec
 When large-Roster planning is blocked with `trusted_canonical_sources_required`, its detail exposes a typed opaque `source_confirmation_finding` reference only when one unique escaping-link Finding covers all relevant untrusted-external blocker Skill IDs in that same Report/Snapshot. A read-only `view_source_confirmation_finding` continuation may open that Finding; only its existing exact source-root confirmation actions can grant local read permission. Missing, stale, or ambiguous references remain unavailable and emit no prerequisite action.
 When provider, durable-read-only, or multi-fingerprint placements make a Roster demotion unsafe, the Finding groups the blocked changes by stable Skill identity and offers an explicit Core-protection choice. Compact detail never exposes a Plan template from a truncated protected-Skill set. Full detail validates the complete protected set through the production Recommendation path; only a valid set produces an exact `finding_roster_changes` template. Replaying that template keeps the blocked Skills Core and derives changes only for mutable placements. It never promotes read authority into mutation authority or treats a read permission as content endorsement.
 
+When all blocked changes require preserving different package fingerprints,
+the Finding reports `package_fingerprint_variants_block_roster_change` instead
+of a mutation-scope refusal. `blocked_reasons` lists the distinct reasons from
+the complete blocked set even when its per-change or per-Skill preview is
+truncated. Mixed blockers retain the applicable source or scope continuation;
+read confirmation cannot resolve independent package-preservation blockers.
+
 Before a large-Roster Finding advertises a Ready-Plan template, SkillRoster derives the proposed Plan without persisting it. If multiple Skill identities would claim one name-derived Library target, planning fails closed with every claimant's exact Skill ID and original name. Library target identity uses a conservative ASCII case-fold so the same Plan is safe on supported case-sensitive and case-insensitive filesystems. A true same-name group links the matching same-Snapshot divergent-content Finding when available; distinct names that normalize to one safe directory use a separate typed reason and never claim that a same-name Finding exists. It never chooses a canonical variant by rank, path, or recency. Full Finding detail may instead offer one exact request that keeps every conflicting identity Core, but only after that request passes the production Recommendation, placement-safety, and Plan derivation paths without a duplicate physical target. Validation recursively closes over later target-claim groups and discloses each target, original name, and Skill ID before confirmation. Compact claimant and protected-ID lists are bounded and cannot expose a template from an incomplete closure. The generic physical-operation conflict check remains the final guard.
 
 The CLI validates targets, ownership, conflicts, and current fingerprints, then stores an immutable Plan. Exact-duplicate Library Plans report comparable before/after physical-source, placement, and default-exposure counts plus explicit deltas, so source consolidation cannot be mistaken for Roster reduction. `apply <plan-id>` executes only the approved scope. Cross-filesystem operations use a journal and compensating steps; the CLI never claims atomicity it cannot provide.
+
+Before persisting any Ready Library Plan, and again before Apply enters Applying,
+the CLI verifies each affected placement's current complete package identity and
+digest against its exact Snapshot observation. This includes entrypoint and
+support files and covers explicit and derived Library changes. New operation
+fingerprints cannot substitute for that evidence. Changed, unavailable, or
+incomplete package evidence fails closed with `library_content_rescan_required`
+and a context-preserving read-only Scan continuation; retry requires a fresh
+observation. Existing Plans and Receipts remain immutable.
 
 Logical placements reached through symlinked Agent roots may resolve to one
 physical filesystem object. A Plan operates on that object at most once while
@@ -339,12 +355,16 @@ Until a newer Scan completes, commands that require current inventory facts
 fail with typed `snapshot_rescan_required` details and one read-only Scan
 continuation. Apply returns `rescan_required: true` and keeps both the required
 Scan and exact Receipt Undo actions visible. Status, lifecycle recovery, and
-Undo remain available while facts are stale. If no newer Scan completed after
-Apply, verified exact Undo consumes the Applied Receipt and restores the
-pre-Apply state, so that original Snapshot is current again without a redundant
-Scan. If a newer Scan observed the applied state, Undo invalidates that newer
-Snapshot and returns its own required Scan continuation. Failed-and-compensated
-Apply never invalidates a Snapshot; recovery-required state keeps its existing
+Undo remain available while facts are stale. Verified exact Undo consumes the
+Applied Receipt and invalidates the latest Snapshot, when available, through
+its own Undo Receipt. Every verified Undo returns
+`rescan_required: true` and a read-only Scan continuation, including when no
+Snapshot is available. Receipt verification establishes bounded restoration of
+SkillRoster-owned changes; it does not establish that preserved user contents
+or other inventory still match an earlier observation. One explicit fresh Scan
+is therefore required before current-inventory decisions resume, even after
+unchanged immediate Undo. This adds an observation, not continuous monitoring.
+Failed-and-compensated Apply never invalidates a Snapshot; recovery-required state keeps its existing
 recovery boundary.
 
 When Home or Status resumes an ordinary invalidated-Snapshot state, the
@@ -387,6 +407,13 @@ operation fails closed without touching the escaped target.
 ### 4.5 Source updates
 
 SkillRoster records source, revision, and content hash when available. A source-update request submitted through `plan --stdin` first produces a diff and Plan; there is no silent update path. Local modifications stop automatic replacement and require an explicit choice to retain local content, adopt upstream content, or preserve both.
+
+In newly prepared source-update Plans, `local_modification_detected` is `null`
+when no trusted source baseline exists; the first observed bytes do not establish
+whether a local modification occurred. With a trusted baseline, it is `true`
+when the current entrypoint differs and `false` when it matches. An unknown
+result still requires an explicit choice. Previously saved Plan summaries remain
+immutable.
 
 ## 5. CLI contract
 
@@ -485,6 +512,26 @@ bounded decision fields is not equivalent: it remains immutable and auditable,
 while Setup creates one decision-complete replacement. Both can temporarily
 appear as pending; the Agent presents only the newly returned Plan ID.
 
+By default Setup includes all detected eligible fixed targets. Optional
+`setup --agent codex` selects one existing Agent ID for both inspection
+(`--check`) and preview; repeated or multiple selections are invalid.
+`detected_agents` still records the complete eligible detection set, while
+`requested_agent` identifies the selected scope and `targets` and status counts
+describe only that scope. No eligible selected target returns
+`no_supported_agent` for this request; no Snapshot still returns `scan_required`.
+Selection never creates detection evidence, changes approved paths, or enables
+a shared/read-only target. Modified-file choices and subsequent Setup actions
+retain the selector. After a required Scan, resume the same selected Setup request.
+
+When prospective selected writes reach the same resolved fixed Bootstrap target
+as an unselected detected Agent, both check and preview return
+`selected_scope_not_isolatable` without a Plan. Bounded conflict bindings identify
+the selected and unselected Agent paths and their physical destination. The caller
+must explicitly resolve the scope; Setup never adds the other Agent silently.
+An already-current selected target needs no write and retains `up_to_date`.
+Default combined-target deduplication and normal Plan confirmation, drift guards,
+Receipts and Undo remain unchanged.
+
 The affected scope applies the normal Skill identity rules to the projected
 package after Apply: declared source plus version/revision takes precedence;
 otherwise identity comes from content, excluding `.gitignore`. The content
@@ -533,6 +580,29 @@ metadata without letting its raw token count set one global cutoff that
 discards a strong native-task result. Each task or hint also remains a separate phrase for
 exact name, description, and declared-trigger evidence. The scanner reads
 ordinary and folded YAML description scalars.
+
+Ordinary Find and its read-only recovery inspection expose `routing_metadata`
+for the exact ranked content observation, bound by the enclosing Snapshot,
+Skill ID, and `ranking_content_identity_digest`. The preview includes its
+description (at most 512 Unicode characters) and up to five declared triggers
+(at most 128 characters each), with explicit description/list truncation and
+the full trigger count. Descriptions retain exclusions; metadata from distinct
+observations is never combined. Missing metadata remains missing. This is
+frozen routing evidence for caller-owned interpretation, not the Skill body,
+current filesystem verification, or permission to load. Existing weak-evidence,
+ambiguity, trust, and content-verification gates remain unchanged.
+
+Find's `evidence_quality` describes the current lexical relevance inference and
+remains `inferred`, with `evidence_quality_scope: routing_relevance`. Observed
+history for the exact Skill identity is returned separately in optional
+`local_usage_prior`: its Skill ID, observed stages, and evidence Agent names.
+Stages and Agents are deduplicated facts, not additive event counts or placement
+exposure. History never adds to the relevance score or creates a candidate with
+no lexical evidence. No stage or recency ranking policy is inferred. The legacy
+outer `match_reasons` may retain `observed_local_usage`; successful load
+`ranking_evidence` excludes that marker and carries the independent prior with
+its original Skill ID, including when explicit variant selection changes which
+package is loaded.
 
 An independent punctuation-delimited task clause that begins with `不要`, the
 parallel continuation `也不要`, or the English marker `do not`, `don't`, or `don’t` remains
@@ -661,13 +731,29 @@ a Snapshot-bound read-only
 Find inspection command preserving the original task and hints. The Agent must
 independently select the intended capability before authoring a faithful refined
 hint; a ranked name is never automatically converted into an exact-name bypass.
+When selection evidence is missing and same-name ambiguity is present, the load
+reports the selection-evidence blocker first, matching the prerequisite for
+comparison-load actions. After faithful refinement, unresolved content ambiguity
+still requires the existing exact comparison flow. Bootstrap recovery shares
+one hint-refinement retry across empty, wrong-domain, and weak-evidence results.
+The caller judges the bounded metadata's capability and exclusions independently;
+for a non-English or mixed task, that retry may retain the English hint and add
+one separate, specific task-language capability hint supported by the original
+task and inspected metadata. The original task and all load gates remain intact;
+generic matching phrases alone do not establish semantic suitability.
 An explicit complete Skill name remains direct evidence, so this
 boundary does not prevent deliberate mixed-language selection. The
 loaded placement is selected only after identity ranking: an eligible
 `default_exposed` placement outranks inventory-only exact copies, with path as
 the deterministic tie-breaker; when no exposed placement exists, the same
 deterministic eligible fallback keeps source-only Skills loadable. Hidden and
-nested exact copies remain inventory facts. The
+nested exact copies remain inventory facts. If the preferred placement fails
+verification, an implicit load may try another frozen copy only when its
+complete package fingerprint, routing identity digest, and entrypoint digest
+match the preferred copy. Each attempt performs the full current verification;
+routing equivalence or a shared declared identity alone is insufficient. Explicit
+placement selection never falls back. A successful alternate load does not erase
+the stale placement's blocker or rescan requirement. The
 success result separates selection, complete content, governance, and
 verification facts. Digest or path drift, legacy Snapshot data, ambiguity,
 Archived state, untrusted source, unreadable content, escape, or oversize fails
@@ -686,6 +772,15 @@ evidence for the ranked capability group and is explicitly scoped as such; it
 is not attributed to the selected package identity. It supplies content facts
 for the model's comparison; it does not endorse, canonicalize, mutate, or
 establish task success.
+
+Same-name Finding resolution and Find groups also expose bounded
+`entrypoint_comparison` facts from the frozen Snapshot. They distinguish equal
+entrypoint digests, differing entrypoints, and missing digest evidence. Equal
+entrypoints with differing complete package fingerprints identify differences
+in supporting package files; they do not imply that packages are interchangeable.
+Counts cover the complete relevant same-name group even when previews are
+truncated. Existing `content_choice` and explicit content-selection requirements
+remain authoritative; the caller decides what supporting content to inspect.
 
 For divergent content under one declared identity, Find scores each observed
 content separately and keeps the strongest match for that logical ID. FTS may
@@ -735,7 +830,16 @@ All JSON responses use a versioned envelope:
 }
 ```
 
+A generic human error whose file-change state is unavailable reports that state
+as unknown. It must not infer that no files changed merely because a command
+failed. Operation-specific verified summaries retain their explicit facts.
+
 IDs for Agents, Scans, reports, Skills, placements, Evidence, Findings, Plans, operations, and Receipts are opaque and stable within the local state store. Names and paths are never write-operation identities. Errors carry a stable code, human-readable message, retryability, and relevant IDs or paths. In JSON mode stdout contains exactly one JSON document and never an interactive prompt, progress bar, ANSI sequence, or log line. Terminal output is a polished human interface; Agents consume JSON rather than scraping styled text. The normative human-output, accessibility, progress, confirmation, and responsive-layout requirements live in [cli-ux-spec.md](cli-ux-spec.md).
+
+In JSON mode, valid help and version display requests return a successful `cli`
+envelope with `result.kind` (`help` or `version`) and the display `text`.
+They exit successfully without initializing local state. Actual argument parse
+failures remain `invalid_cli_arguments` errors.
 
 `scan --summary --json` persists the same complete immutable Snapshot as a full
 Scan but returns a bounded Agent continuation view: Snapshot and inventory
@@ -862,6 +966,15 @@ SkillRoster uses one SQLite database at `~/.skillroster/skillroster.db`, includi
   judgment to the Agent. Missing or invalidated Snapshots instead expose the
   required Scan continuation described above.
 - Users can inspect, export, purge, or delete retained local state and rebuild inventory by scanning again.
+
+Successful local-state deletion returns a typed `scan` suggested action that
+retains the invoking executable, Home, state directory, explicit Agent roots,
+and temporary source roots. Reusing temporary source roots retains the existing
+confirmation requirement. Deletion does not execute the action. Use its literal
+`argv` for continuation; the legacy `rebuild_command` string is generic syntax,
+not a reconstruction of the caller's context. A new Scan rebuilds inventory;
+it does not restore deleted history, evidence exclusions, or durable source
+permissions.
 
 Reports may identify structural and provenance risks—unknown source, changed content, executable scripts, declaration mismatch, and escaping links—but must not claim malware detection or runtime safety.
 
