@@ -174,6 +174,7 @@ the user whether to retain the local copy or adopt the current bundled copy;
 never infer the choice. `unsupported_targets` means links, non-files, or
 unreadable paths were preserved for manual inspection.
 
-The separate Homebrew tap and its bottles have an independent update process.
-For the verified v1.8.48 delivery, use its GitHub Release assets or pinned tag;
-do not infer the tap version from this repository Formula alone.
+The Homebrew tap now provides v1.8.48 with verified macOS ARM (Tahoe) and Linux
+x86_64 bottles. Both public bottle hashes match the tested artifacts and saved
+Formula. See the [Homebrew acceptance receipt](acceptance/release-v1.8.48.md#homebrew-tap-and-bottles)
+for installation tests, hashes and platform limits.

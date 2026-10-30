@@ -48,9 +48,35 @@ All eight public asset downloads are compared byte for byte with formal workflow
 artifacts. The public macOS ARM executable is additionally checked with the
 repository governance smoke and four isolated first-use scenarios.
 
-The repository Formula pins the release source. The separate Homebrew tap and
-its bottles have an independent delivery process; this receipt does not certify
-new bottles. Controlled tests do not establish independent-user acceptance,
+The repository Formula pins the release source. Homebrew bottle delivery is
+verified separately below. Controlled tests do not establish independent-user acceptance,
 complete live session catalogs or general retrieval quality. WSL1 mutation and
 native Linux arm64/Windows arm64 remain outside the matrix. No real Agent files
 or installed user CLI are changed by these acceptance checks.
+
+## Homebrew tap and bottles
+
+Published 2026-10-30 17:02:03 UTC (2026-10-31 01:02:03 Asia/Shanghai).
+[Tap PR #23](https://github.com/tt-a1i/homebrew-skillroster/pull/23) was integrated
+by the existing SHA-guarded pr-pull workflow; it closes the PR after applying its
+commits, rather than creating a GitHub merge event. Tap main is
+`1a2fe69889f1f319ae801a7ba9812f5d895ae5e5`.
+
+- [macOS/Linux test-bot](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/41093860990): passed.
+- [Bottle publishing](https://github.com/tt-a1i/homebrew-skillroster/actions/runs/41095057955): passed, pinned to PR head `2aeef64369ec95f818d1af7d5c3d8f20bd6ed603`.
+- [Public bottles](https://github.com/tt-a1i/homebrew-skillroster/releases/tag/skillroster-1.8.48): two assets, anonymously downloaded and byte-identical to tested artifacts.
+
+Source archive SHA-256: `fb002a2c885ccf5f58b6d84724f0dc23079372f23f6ff0fb55a46455fe1570e9`.
+
+| Bottle | SHA-256 |
+| --- | --- |
+| arm64_tahoe | `4f3f21da054ca4d6443e60f69c46c6b3fa7796c1a8fe53f66a781a14b86033b5` |
+| x86_64_linux | `152ef4d7e705dbc826a2efad2dc409b80aaed0b9246b20afe5180d0ba024ac92` |
+
+Both test-bot jobs build, bottle, install the bottle, check linkage and run the
+Formula test. Saved Formula hashes match public downloads. The public macOS
+bottle executable additionally passes upstream governance smoke and all four
+isolated first-use scenarios (CLI 1.8.48 / Bootstrap 1.8.52). The Linux binary was
+not run on the local Mac; its installation and test evidence comes from the Linux
+runner. Intel macOS and other bottle tags were not added to the existing tap
+matrix. No user's real CLI or Agent installation was changed.
