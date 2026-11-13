@@ -145,6 +145,27 @@ pub(super) const LEGACY_SINGLE_FILE_BOOTSTRAPS: &[(&str, &str)] = &[
 
 pub(super) const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
     BootstrapPackageManifest {
+        version: "1.8.53",
+        file_digests: &[
+            (
+                "SKILL.md",
+                "18fdc26bb0e711b44416dfd47ddc51fde09fbd4c304ae7d1ade7398b21b65cda",
+            ),
+            (
+                "references/routing.md",
+                "4d1d2bf283c4d9d5ea0471f38eaa9479ac5d84be2b764d3247e20b0068e267e4",
+            ),
+            (
+                "references/governance.md",
+                "78965720f8e776e2486770142a04e204bc88fd21c6af318177c6dbddc1678d51",
+            ),
+            (
+                "references/mutation.md",
+                "40a8529fcdc847eb52b0e10d9fd19a792b5379392199109ab2dab0a6ed12fd13",
+            ),
+        ],
+    },
+    BootstrapPackageManifest {
         version: "1.8.52",
         file_digests: &[
             (

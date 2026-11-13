@@ -1406,6 +1406,26 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
 fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
     if let Some(impact) = value.get("impact") {
         metadata_footprint(impact, lines, width);
+        if impact["kind"] == "shared_adoption" {
+            fact(
+                lines,
+                "Shared adoption",
+                format!(
+                    "{} packages → Library",
+                    text(impact, "hosted_package_count")
+                ),
+            );
+            fact(
+                lines,
+                "Root aliases",
+                format!(
+                    "{} → independent directories",
+                    array_len(impact, "separated_agent_roots")
+                ),
+            );
+            lines.push("Excluded packages stay in place; host settings stay unchanged.".into());
+            lines.push("Unobserved shared-root consumers may lose package paths.".into());
+        }
     }
     fact(lines, "Plan", text(value, "plan_id"));
     native_visibility_basis(value, lines);
@@ -1837,6 +1857,8 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
 fn core_reason_label(reason: &str) -> &str {
     match reason {
         "protected_by_request" => "protected",
+        "immutable_placement_retained" => "retained Core",
+        "native_visibility_unknown_retained" => "unknown; retained",
         "declared_core" => "declared",
         "skillroster_bootstrap" => "bootstrap",
         "observed_outcome" => "outcome",

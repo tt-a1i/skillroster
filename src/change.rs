@@ -135,6 +135,7 @@ pub(crate) enum OperationPolicy {
     },
     SourceUpdate,
     LibraryGovernance,
+    SharedAdoption,
     #[cfg(test)]
     TestOnly,
 }
@@ -466,7 +467,7 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
                 "source updates may only replace the validated placement or create a non-overwriting sibling",
             ));
         }
-        OperationPolicy::LibraryGovernance
+        OperationPolicy::LibraryGovernance | OperationPolicy::SharedAdoption
             if input.operations.iter().any(|operation| {
                 !matches!(
                     operation,
@@ -488,6 +489,7 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
         OperationPolicy::GovernanceOnly
             | OperationPolicy::SourceUpdate
             | OperationPolicy::LibraryGovernance
+            | OperationPolicy::SharedAdoption
     ) && input.evidence_ids.is_empty()
     {
         return Err(ChangeError::new(
@@ -554,8 +556,15 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
     let mut projected_missing = HashSet::new();
     let mut projected_present = HashSet::new();
     let mut projected_fingerprints: HashMap<PathBuf, String> = HashMap::new();
+    let mut projected_directories = HashSet::new();
     for raw in input.operations {
-        let operation = normalize_operation(raw, &roots, &projected_present)?;
+        let operation = normalize_operation(
+            raw,
+            &roots,
+            &projected_present,
+            &projected_directories,
+            &ctx.operation_policy,
+        )?;
         if matches!(
             &ctx.operation_policy,
             OperationPolicy::BootstrapSetup { .. }
@@ -587,7 +596,11 @@ pub fn prepare(input: &str, ctx: &PrepareContext) -> Result<PreparedPlan> {
             &projected_missing,
             &projected_present,
             &projected_fingerprints,
+            &projected_directories,
         )?;
+        if let Operation::CreateDirectory { target, .. } = &operation {
+            projected_directories.insert(target.clone());
+        }
         project_operation(
             &operation,
             &mut projected_missing,
@@ -1234,13 +1247,16 @@ fn normalize_operation(
     raw: OperationInput,
     roots: &[PathBuf],
     projected_present: &HashSet<PathBuf>,
+    projected_directories: &HashSet<PathBuf>,
+    policy: &OperationPolicy,
 ) -> Result<Operation> {
+    let target_path = |path: &Path| normalize_projected_target(path, roots, projected_directories);
     let normalized = match raw {
         OperationInput::CreateDirectory {
             target,
             expected_fingerprint,
         } => Operation::CreateDirectory {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             expected_fingerprint,
         },
         OperationInput::CreateSymlink {
@@ -1249,9 +1265,13 @@ fn normalize_operation(
             expected_fingerprint,
             expected_source_fingerprint,
         } => Operation::CreateSymlink {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             source: if projected_present.contains(&lexical_absolute(&source)?) {
-                normalize_target(&source, roots)?
+                target_path(&source)?
+            } else if matches!(policy, OperationPolicy::SharedAdoption)
+                && expected_source_fingerprint.starts_with("symlink:sha256:")
+            {
+                normalize_movable_source(&source, roots)?
             } else {
                 normalize_source(&source, roots)?
             },
@@ -1263,7 +1283,7 @@ fn normalize_operation(
             content,
             expected_fingerprint,
         } => Operation::WriteFile {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             content,
             expected_fingerprint,
         },
@@ -1272,7 +1292,7 @@ fn normalize_operation(
             content,
             expected_fingerprint,
         } => Operation::ReplaceFile {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             content,
             expected_fingerprint,
         },
@@ -1280,7 +1300,7 @@ fn normalize_operation(
             target,
             expected_fingerprint,
         } => Operation::RemoveSymlink {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             expected_fingerprint,
         },
         OperationInput::Copy {
@@ -1288,7 +1308,7 @@ fn normalize_operation(
             source,
             expected_fingerprint,
         } => Operation::Copy {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             source: normalize_source(&source, roots)?,
             expected_fingerprint,
         },
@@ -1297,7 +1317,7 @@ fn normalize_operation(
             source,
             expected_fingerprint,
         } => Operation::MoveRecoverable {
-            target: normalize_target(&target, roots)?,
+            target: target_path(&target)?,
             source: normalize_movable_source(&source, roots)?,
             expected_fingerprint,
         },
@@ -1369,7 +1389,10 @@ fn bootstrap_skill_directory(target: &Path) -> Option<&Path> {
 fn validate_current_state(operation: &Operation, roots: &[PathBuf]) -> Result<()> {
     normalize_target(operation.target(), roots)?;
     if let Some(source) = operation.source() {
-        if matches!(operation, Operation::MoveRecoverable { .. }) {
+        if matches!(operation, Operation::MoveRecoverable { .. })
+            || matches!(operation, Operation::CreateSymlink { expected_source_fingerprint, .. }
+                if expected_source_fingerprint.starts_with("symlink:sha256:"))
+        {
             normalize_movable_source(source, roots)?;
         } else {
             normalize_source(source, roots)?;
@@ -1472,50 +1495,21 @@ fn validate_operation_sequence_anchored(
 ) -> Result<()> {
     let mut projected_missing = HashSet::new();
     let mut projected_present = HashSet::new();
-    let mut projected_fingerprints: HashMap<PathBuf, String> = HashMap::new();
+    let mut projected_fingerprints = HashMap::new();
+    let mut projected_directories = HashSet::new();
     for operation in operations {
-        if let Operation::CreateSymlink {
-            target,
-            source,
-            expected_fingerprint,
-            expected_source_fingerprint,
-        } = operation
-        {
-            if projected_missing.contains(target) || projected_present.contains(source) {
-                if projected_missing.contains(target) && expected_fingerprint != "missing" {
-                    return Err(ChangeError::new(
-                        "invalid_projected_fingerprint",
-                        format!(
-                            "{} must expect missing after its planned move",
-                            target.display()
-                        ),
-                    ));
-                }
-                let actual_source = if let Some(actual) = projected_fingerprints.get(source) {
-                    actual.clone()
-                } else {
-                    anchored.fingerprint(source).map_err(|error| {
-                        ChangeError::io(
-                            "inspect projected link source through approved root handle",
-                            source,
-                            error,
-                        )
-                    })?
-                };
-                if &actual_source != expected_source_fingerprint {
-                    return Err(ChangeError::new(
-                        "plan_drifted",
-                        format!(
-                            "{} expected {expected_source_fingerprint}, found {actual_source}",
-                            source.display()
-                        ),
-                    ));
-                }
-            } else {
-                validate_anchored_current_state(operation, anchored)?;
-            }
-        } else {
+        if !validate_projected_preconditions(
+            operation,
+            &projected_missing,
+            &projected_present,
+            &projected_fingerprints,
+            &projected_directories,
+            |path| anchored_fingerprint(anchored, path),
+        )? {
             validate_anchored_current_state(operation, anchored)?;
+        }
+        if let Operation::CreateDirectory { target, .. } = operation {
+            projected_directories.insert(target.clone());
         }
         project_operation(
             operation,
@@ -1533,52 +1527,76 @@ fn validate_projected_state(
     projected_missing: &HashSet<PathBuf>,
     projected_present: &HashSet<PathBuf>,
     projected_fingerprints: &HashMap<PathBuf, String>,
+    projected_directories: &HashSet<PathBuf>,
 ) -> Result<()> {
-    if let Operation::CreateSymlink {
-        target,
-        source,
-        expected_fingerprint,
-        expected_source_fingerprint,
-    } = operation
-    {
-        if projected_missing.contains(target) || projected_present.contains(source) {
-            if projected_missing.contains(target) && expected_fingerprint != "missing" {
-                return Err(ChangeError::new(
-                    "invalid_projected_fingerprint",
-                    format!(
-                        "{} must expect missing after its planned move",
-                        target.display()
-                    ),
-                ));
-            }
-            normalize_target(target, roots)?;
-            if let Some(actual_source) = projected_fingerprints.get(source) {
-                if actual_source != expected_source_fingerprint {
-                    return Err(ChangeError::new(
-                        "plan_drifted",
-                        format!(
-                            "{} expected {expected_source_fingerprint}, found {actual_source}",
-                            source.display()
-                        ),
-                    ));
-                }
-            } else {
-                normalize_source(source, roots)?;
-                let actual_source = fingerprint(source)?;
-                if &actual_source != expected_source_fingerprint {
-                    return Err(ChangeError::new(
-                        "plan_drifted",
-                        format!(
-                            "{} expected {expected_source_fingerprint}, found {actual_source}",
-                            source.display()
-                        ),
-                    ));
-                }
-            }
-            return Ok(());
+    if !validate_projected_preconditions(
+        operation,
+        projected_missing,
+        projected_present,
+        projected_fingerprints,
+        projected_directories,
+        fingerprint,
+    )? {
+        validate_current_state(operation, roots)?;
+    }
+    Ok(())
+}
+
+fn validate_projected_preconditions(
+    operation: &Operation,
+    missing: &HashSet<PathBuf>,
+    present: &HashSet<PathBuf>,
+    fingerprints: &HashMap<PathBuf, String>,
+    directories: &HashSet<PathBuf>,
+    inspect: impl Fn(&Path) -> Result<String>,
+) -> Result<bool> {
+    let target = operation.target();
+    let virtual_target = missing.contains(target)
+        || directories
+            .iter()
+            .any(|directory| target != directory && target.starts_with(directory));
+    let (expected, link_source) = match operation {
+        Operation::CreateDirectory {
+            expected_fingerprint,
+            ..
+        } if virtual_target => (expected_fingerprint, None),
+        Operation::CreateSymlink {
+            source,
+            expected_fingerprint,
+            expected_source_fingerprint,
+            ..
+        } if virtual_target || present.contains(source) => (
+            expected_fingerprint,
+            Some((source, expected_source_fingerprint)),
+        ),
+        _ => return Ok(false),
+    };
+    if expected != "missing" || (!virtual_target && inspect(target)? != "missing") {
+        return Err(ChangeError::new(
+            "plan_drifted",
+            format!(
+                "{} must be missing at its planned creation",
+                target.display()
+            ),
+        ));
+    }
+    if let Some((source, expected_source)) = link_source {
+        let actual = fingerprints
+            .get(source)
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| inspect(source))?;
+        if &actual != expected_source {
+            return Err(ChangeError::new(
+                "plan_drifted",
+                format!(
+                    "{} expected {expected_source}, found {actual}",
+                    source.display()
+                ),
+            ));
         }
     }
-    validate_current_state(operation, roots)
+    Ok(true)
 }
 
 fn project_operation(
@@ -1797,10 +1815,18 @@ fn execute(
                 expected_fingerprint: anchored_fingerprint(anchored, target)?,
             }))
         }
-        Operation::CreateSymlink { target, source, .. } => {
-            anchored
-                .create_symlink(source, target)
-                .map_err(|e| anchored_mutation_error("create symlink", target, e))?;
+        Operation::CreateSymlink {
+            target,
+            source,
+            expected_source_fingerprint,
+            ..
+        } => {
+            let created = if expected_source_fingerprint.starts_with("symlink:sha256:") {
+                anchored.create_symlink_to_entry(source, target, expected_source_fingerprint)
+            } else {
+                anchored.create_symlink(source, target)
+            };
+            created.map_err(|e| anchored_mutation_error("create symlink", target, e))?;
             Ok(Some(Compensation::StashCreated {
                 path: target.clone(),
                 expected_fingerprint: anchored_fingerprint(anchored, target)?,
@@ -2480,6 +2506,52 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+fn normalize_projected_target(
+    path: &Path,
+    roots: &[PathBuf],
+    directories: &HashSet<PathBuf>,
+) -> Result<PathBuf> {
+    let mut path = lexical_absolute(path)?;
+    // Resolve only stable prefixes, stopping before a directory this Plan will
+    // create. Resolving the live parent of a deeper child would follow the old
+    // root symlink instead (for example through macOS /var -> /private/var).
+    for ancestor in path
+        .ancestors()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        if let Ok(resolved) = normalize_target(ancestor, roots)
+            && directories.contains(&resolved)
+        {
+            path = resolved.join(path.strip_prefix(ancestor).expect("ancestor"));
+            break;
+        }
+    }
+    if let Some(directory) = directories
+        .iter()
+        .filter(|directory| path != **directory && path.starts_with(directory))
+        .min_by_key(|directory| directory.components().count())
+    {
+        let mut parent = path.parent();
+        while let Some(candidate) = parent {
+            if !directories.contains(candidate) {
+                return Err(ChangeError::new(
+                    "unsafe_projected_parent",
+                    format!("{} is not a planned real directory", candidate.display()),
+                ));
+            }
+            if candidate == directory {
+                break;
+            }
+            parent = candidate.parent();
+        }
+        return Ok(path);
+    }
+    normalize_target(&path, roots)
+}
+
 fn normalize_target(path: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
     let path = lexical_absolute(path)?;
     if roots.contains(&path) {
@@ -2963,6 +3035,196 @@ mod tests {
     #[cfg(windows)]
     use std::rc::Rc;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn adoption_plan(root: &Path, state: &Path, operations: serde_json::Value) -> PreparedPlan {
+        prepare(&serde_json::json!({
+            "schema_version": 1, "scan_id": "scan_adoption", "evidence_ids": ["evidence_shared"],
+            "operations": operations
+        }).to_string(), &PrepareContext {
+            approved_roots: vec![root.to_path_buf(), state.join("library")],
+            state_dir: state.to_path_buf(), operation_policy: OperationPolicy::SharedAdoption,
+        }).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_adoption_replaces_root_alias_and_undo_restores_exact_link_contents() {
+        for relative in [false, true] {
+            let (_temp, root, state) = fixture();
+            let shared = root.join("shared");
+            let package = shared.join("package");
+            fs::create_dir_all(shared.join("group")).unwrap();
+            fs::create_dir(&package).unwrap();
+            fs::write(package.join("SKILL.md"), "retained package").unwrap();
+            std::os::unix::fs::symlink(&package, shared.join("group/core")).unwrap();
+            let alias = root.join("skills");
+            let original = if relative {
+                PathBuf::from("shared")
+            } else {
+                shared.clone()
+            };
+            std::os::unix::fs::symlink(&original, &alias).unwrap();
+            let library = state.join("library");
+            let hosted = library.join("package");
+            let content = fingerprint(&package).unwrap();
+            let old_shared = fingerprint(&shared).unwrap();
+            let plan = adoption_plan(
+                &root,
+                &state,
+                serde_json::json!([
+                    {"kind":"create_directory", "target":library, "expected_fingerprint":"missing"},
+                    {"kind":"move_recoverable", "source":package, "target":hosted, "expected_fingerprint":content},
+                    {"kind":"move_recoverable", "source":alias, "target":root.join("saved-alias"), "expected_fingerprint":fingerprint(&alias).unwrap()},
+                    {"kind":"create_directory", "target":alias, "expected_fingerprint":"missing"},
+                    {"kind":"create_directory", "target":alias.join("group"), "expected_fingerprint":"missing"},
+                    {"kind":"create_symlink", "target":alias.join("group/core"), "source":hosted,
+                        "expected_fingerprint":"missing", "expected_source_fingerprint":content}
+                ]),
+            );
+            assert_eq!(
+                plan.operations.last().unwrap().target(),
+                alias.join("group/core")
+            );
+            let applied = apply(&plan).unwrap();
+            assert!(applied.verification_passed, "{:?}", applied.receipt.error);
+            assert!(
+                !fs::symlink_metadata(&alias)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_link(alias.join("group/core")).unwrap(), hosted);
+            assert!(!package.exists());
+            let undone = undo(&applied.receipt).unwrap();
+            assert!(undone.verification_passed, "{:?}", undone.receipt.error);
+            assert_eq!(fs::read_link(&alias).unwrap(), original);
+            assert_eq!(fingerprint(&shared).unwrap(), old_shared);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_adoption_resolves_stable_ancestor_alias_before_projected_root() {
+        let (_temp, root, state) = fixture();
+        let home = root.join("home");
+        let logical_home = root.join("home-alias");
+        let shared = root.join("shared");
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(shared.join(".system")).unwrap();
+        fs::write(shared.join(".system/retained"), "unchanged").unwrap();
+        std::os::unix::fs::symlink(&home, &logical_home).unwrap();
+        let alias = logical_home.join(".codex/skills");
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let canonical_alias = home.join(".codex/skills");
+        let shared_before = fingerprint(&shared).unwrap();
+        let source = shared.join(".system");
+        let plan = adoption_plan(
+            &root,
+            &state,
+            serde_json::json!([
+                {"kind":"move_recoverable", "source":alias, "target":root.join("saved-alias"),
+                    "expected_fingerprint":fingerprint(&alias).unwrap()},
+                {"kind":"create_directory", "target":alias, "expected_fingerprint":"missing"},
+                {"kind":"create_directory", "target":alias.join("group"), "expected_fingerprint":"missing"},
+                {"kind":"create_symlink", "target":alias.join("group/.system"), "source":source,
+                    "expected_fingerprint":"missing", "expected_source_fingerprint":fingerprint(&source).unwrap()}
+            ]),
+        );
+        assert_eq!(plan.operations[2].target(), canonical_alias.join("group"));
+        assert_eq!(
+            plan.operations[3].target(),
+            canonical_alias.join("group/.system")
+        );
+        let applied = apply(&plan).unwrap();
+        assert!(applied.verification_passed, "{:?}", applied.receipt.error);
+        assert_eq!(fs::read_link(alias.join("group/.system")).unwrap(), source);
+        assert_eq!(fingerprint(&shared).unwrap(), shared_before);
+        assert!(undo(&applied.receipt).unwrap().verification_passed);
+        assert_eq!(fs::read_link(alias).unwrap(), shared);
+        assert_eq!(fingerprint(&shared).unwrap(), shared_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_adoption_preserves_external_symlink_entry_without_reading_its_destination() {
+        let (temp, root, state) = fixture();
+        let source = root.join("external-link");
+        // An unavailable destination cannot be opened or fingerprinted.
+        let external = temp.path().join("unavailable/SKILL.md");
+        std::os::unix::fs::symlink(&external, &source).unwrap();
+        let target = root.join("preserved-link");
+        let plan = adoption_plan(
+            &root,
+            &state,
+            serde_json::json!([
+                {"kind":"create_symlink", "target":target, "source":source,
+                    "expected_fingerprint":"missing", "expected_source_fingerprint":fingerprint(&source).unwrap()}
+            ]),
+        );
+        assert_eq!(plan.operations[0].source(), Some(source.as_path()));
+        let applied = apply(&plan).unwrap();
+        assert!(applied.verification_passed, "{:?}", applied.receipt.error);
+        assert_eq!(fs::read_link(&target).unwrap(), source);
+        assert_eq!(fs::read_link(&source).unwrap(), external);
+        assert!(undo(&applied.receipt).unwrap().verification_passed);
+        assert!(fs::symlink_metadata(&target).is_err());
+        assert_eq!(fs::read_link(&source).unwrap(), external);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_adoption_rejects_a_symlink_source_entry_swapped_during_creation() {
+        let (_temp, root, state) = fixture();
+        let source = root.join("external-link");
+        let target = root.join("preserved-link");
+        std::os::unix::fs::symlink("missing", &source).unwrap();
+        let plan = adoption_plan(
+            &root,
+            &state,
+            serde_json::json!([
+                {"kind":"create_symlink", "target":target, "source":source,
+                    "expected_fingerprint":"missing", "expected_source_fingerprint":fingerprint(&source).unwrap()}
+            ]),
+        );
+        let swapped = source.clone();
+        crate::anchored_fs::set_after_symlink_source_open_hook(move || {
+            fs::rename(&swapped, swapped.with_file_name("held-source")).unwrap();
+            std::os::unix::fs::symlink("different", &swapped).unwrap();
+        });
+        let applied = apply(&plan).unwrap();
+        assert!(!applied.verification_passed);
+        assert!(fs::symlink_metadata(&target).is_err());
+        assert_eq!(fs::read_link(&source).unwrap(), Path::new("different"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_real_directory_refuses_an_unplanned_intermediate_parent() {
+        let (_temp, root, state) = fixture();
+        let shared = root.join("shared");
+        fs::create_dir(&shared).unwrap();
+        let alias = root.join("skills");
+        std::os::unix::fs::symlink(&shared, &alias).unwrap();
+        let input = serde_json::json!({
+            "schema_version":1,"scan_id":"scan_1","evidence_ids":["evidence_1"],
+            "operations":[
+                {"kind":"move_recoverable","source":alias,"target":root.join("saved"),"expected_fingerprint":fingerprint(&alias).unwrap()},
+                {"kind":"create_directory","target":alias,"expected_fingerprint":"missing"},
+                {"kind":"create_directory","target":alias.join("unplanned/child"),"expected_fingerprint":"missing"}
+            ]
+        });
+        let error = prepare(
+            &input.to_string(),
+            &PrepareContext {
+                approved_roots: vec![root],
+                state_dir: state,
+                operation_policy: OperationPolicy::SharedAdoption,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unsafe_projected_parent");
+    }
 
     struct FailOnceDirectorySync {
         path: PathBuf,

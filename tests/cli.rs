@@ -187,14 +187,22 @@ fn codex_visibility_disabled_inventory_remains_loadable_and_unrelated_apply_undo
 }
 
 #[test]
-fn codex_visibility_malformed_config_is_unknown_and_core_plan_is_refused() {
+fn codex_visibility_malformed_config_allows_unchanged_core_but_refuses_mutation() {
     let temp = codex_visibility_fixture();
     let config = temp.path().join("home/.codex/config.toml");
     let bytes = "[[skills.config]]\npath='skills/active/SKILL.md'\nenabled='false'\n";
     fs::write(&config, bytes).unwrap();
     let scan = json_output(&codex_visibility_fixture_run(&temp, &["scan"], None));
     assert_eq!(scan["result"]["codex_visibility"]["unknown_count"], 2);
-    let proposal = codex_visibility_proposal(&temp, &scan, "active", "core");
+    let retained = codex_visibility_proposal(&temp, &scan, "active", "core");
+    let retained = json_output(&codex_visibility_fixture_run(
+        &temp,
+        &["plan", "--stdin"],
+        Some(&retained.to_string()),
+    ));
+    assert_eq!(retained["result"]["state"], "ready");
+    assert_eq!(retained["result"]["change_summary"]["operation_count"], 0);
+    let proposal = codex_visibility_proposal(&temp, &scan, "active", "on_demand");
     let blocked =
         codex_visibility_fixture_run(&temp, &["plan", "--stdin"], Some(&proposal.to_string()));
     assert!(!blocked.status.success());
@@ -1030,8 +1038,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.53");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.53");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.54");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.54");
 }
 
 #[cfg(unix)]
@@ -6084,7 +6092,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.53"
+        "1.8.54"
     );
 
     let undone = json_output(&run(
@@ -6344,7 +6352,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.53"
+            "1.8.54"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
@@ -10712,7 +10720,7 @@ fn messy_report_surfaces_agent_actionability_and_reversibility() {
 
 #[test]
 #[cfg(unix)]
-fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
+fn large_roster_finding_preserves_unconfirmed_sources_in_one_safe_plan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -10759,145 +10767,66 @@ fn large_roster_finding_blocks_partial_plan_until_source_is_confirmed() {
     ));
     assert_eq!(detail["result"]["kind"], "large_default_roster");
     assert_eq!(detail["result"]["files_changed"], false);
-    assert_eq!(detail["result"]["planning"]["supported"], false);
+    let planning = &detail["result"]["planning"];
+    assert_eq!(planning["supported"], true);
+    assert_eq!(planning["blocked_change_count"], 0);
     assert_eq!(
-        detail["result"]["planning"]["reason"],
-        "trusted_canonical_sources_required"
+        planning["plan_request_template"]["finding_roster_changes"][0]["protected_skill_ids"],
+        json!([])
     );
-    assert_eq!(detail["result"]["planning"]["blocked_change_count"], 1);
-    assert_eq!(
-        detail["result"]["planning"]["observed_link_targets"],
-        json!([outside])
-    );
-    let prerequisite = &detail["result"]["planning"]["source_confirmation_finding"];
-    assert_eq!(prerequisite["state"], "available");
-    assert_eq!(prerequisite["kind"], "escaping_link_source_confirmation");
-    assert_eq!(prerequisite["snapshot_id"], report["result"]["snapshot_id"]);
-    let source_finding_id = prerequisite["finding_id"].as_str().unwrap();
-    assert_ne!(source_finding_id, finding_id);
-    let source_action = detail["suggested_actions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|action| action["action"] == "view_source_confirmation_finding")
-        .expect("blocked Roster exposes its source Finding continuation");
-    let source_argv = source_action["argv"].as_array().unwrap();
-    assert_eq!(source_argv[0], env!("CARGO_BIN_EXE_skillroster"));
-    assert_eq!(source_argv[1], "--state-dir");
-    assert_eq!(source_argv[2], state.to_str().unwrap());
-    assert_eq!(source_argv[3], "--home");
-    assert_eq!(source_argv[4], home.to_str().unwrap());
-    assert_eq!(
-        &source_argv[5..],
-        &json!(["report", "--finding", source_finding_id, "--json"])
+    let plan = json_output(&run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&planning["plan_request_template"].to_string()),
+    ));
+    assert_eq!(plan["result"]["state"], "ready");
+    assert_eq!(plan["result"]["confirmation_required"], true);
+    assert_eq!(plan["result"]["files_changed"], false);
+    let plan_id = plan["result"]["plan_id"].as_str().unwrap();
+    let full_plan = json_output(&run(
+        &[&common[..], &["plan", "--show", plan_id]].concat(),
+        None,
+    ));
+    assert!(
+        full_plan["result"]["operations"]
             .as_array()
-            .unwrap()[..]
+            .unwrap()
+            .iter()
+            .all(|operation| !operation.to_string().contains("zzz-external")
+                && !operation.to_string().contains(outside.to_str().unwrap()))
     );
-    assert_eq!(source_action["mutates"], false);
-    assert_eq!(source_action["requires_confirmation"], false);
-    let source_detail = json_output(&run_suggested_action(source_action));
-    assert_eq!(
-        source_detail["result"]["kind"],
-        "escaping_link_source_confirmation"
-    );
-    let confirm_actions = source_detail["suggested_actions"]
+    let full_report = json_output(&run(&[&common[..], &["report", "--full"]].concat(), None));
+    let source_id = full_report["result"]["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|action| action["action"] == "confirm_source_root_read_permission")
-        .collect::<Vec<_>>();
-    assert!(!confirm_actions.is_empty());
+        .find(|finding| finding["kind"] == "escaping_link_source_confirmation")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let source_detail = json_output(&run(
+        &[&common[..], &["report", "--finding", source_id]].concat(),
+        None,
+    ));
     assert!(
-        confirm_actions
-            .iter()
-            .all(|action| { action["mutates"] == true && action["requires_confirmation"] == true })
-    );
-    assert!(
-        detail["suggested_actions"]
+        source_detail["suggested_actions"]
             .as_array()
             .unwrap()
             .iter()
             .all(|action| action["action"] != "plan")
     );
-
-    let request = json!({
-        "schema_version": 1,
-        "finding_roster_changes": [{
-            "finding_id": finding_id,
-            "core_budget": 50,
-            "protected_skill_ids": []
-        }]
-    });
-    let blocked = run(
-        &[&common[..], &["plan", "--stdin"]].concat(),
-        Some(&request.to_string()),
-    );
-    assert!(!blocked.status.success());
-    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert!(
-        blocked["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("confirm the reported source roots")
-    );
-
-    let database = rusqlite::Connection::open(state.join("skillroster.db")).unwrap();
-    let report_id = prerequisite["report_id"].as_str().unwrap();
-    let duplicate_finding_id = "finding_197_cli_duplicate";
-    database
-        .execute(
-            "INSERT INTO findings (id, report_id, category, severity, title, summary, details_json) SELECT ?1, report_id, category, severity, title, summary, details_json FROM findings WHERE id = ?2",
-            rusqlite::params![duplicate_finding_id, source_finding_id],
-        )
-        .unwrap();
-    let raw_summary: String = database
-        .query_row(
-            "SELECT summary_json FROM reports WHERE id = ?1",
-            [report_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let mut summary: Value = serde_json::from_str(&raw_summary).unwrap();
-    let mut duplicate = summary["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|candidate| candidate["id"] == source_finding_id)
-        .unwrap()
-        .clone();
-    duplicate["id"] = json!(duplicate_finding_id);
-    summary["findings"].as_array_mut().unwrap().push(duplicate);
-    database
-        .execute(
-            "UPDATE reports SET summary_json = ?1 WHERE id = ?2",
-            rusqlite::params![summary.to_string(), report_id],
-        )
-        .unwrap();
-
-    let ambiguous = json_output(&run(
-        &[&common[..], &["report", "--finding", finding_id]].concat(),
-        None,
-    ));
-    assert_eq!(
-        ambiguous["result"]["planning"]["source_confirmation_finding"]["reason_code"],
-        "matching_escaping_link_finding_ambiguous"
-    );
-    assert_eq!(
-        ambiguous["result"]["planning"]["source_confirmation_finding"]["candidate_count"],
-        2
-    );
-    assert!(
-        ambiguous["suggested_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|action| action["action"] != "view_source_confirmation_finding")
-    );
+    let before = fs::read(outside.join("SKILL.md")).unwrap();
+    let applied = json_output(&run(&[&common[..], &["apply", plan_id]].concat(), None));
+    assert!(root.join("zzz-external").is_symlink());
+    assert_eq!(fs::read(outside.join("SKILL.md")).unwrap(), before);
+    let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();
+    json_output(&run(&[&common[..], &["undo", receipt_id]].concat(), None));
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 52);
+    assert_eq!(fs::read(outside.join("SKILL.md")).unwrap(), before);
 }
 
 #[test]
 #[cfg(unix)]
-fn custom_budget_plan_reports_actionable_source_blockers() {
+fn custom_budget_plan_preserves_external_items_and_reports_its_minimum() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
     let state = temp.path().join("state");
@@ -10981,201 +10910,41 @@ fn custom_budget_plan_reports_actionable_source_blockers() {
             "protected_skill_ids": []
         }]
     });
-    let blocked = run(
+    let custom = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&custom_request.to_string()),
-    );
-    assert!(!blocked.status.success());
-    let blocked: Value = serde_json::from_slice(&blocked.stdout).unwrap();
-    assert_eq!(blocked["ok"], false);
+    ));
+    assert_eq!(custom["result"]["state"], "ready");
     assert_eq!(
-        blocked["error"]["code"],
-        "trusted_canonical_sources_required"
+        custom["result"]["selection_evidence"]["forced_core_count"],
+        2
     );
-    assert_eq!(blocked["error"]["details"]["requested_core_budget"], 10);
-    assert_eq!(blocked["error"]["details"]["blocked_change_count"], 2);
+    let insufficient = json!({"schema_version": 1, "finding_roster_changes": [{"finding_id": finding_id, "core_budget": 1}]});
+    let rejected = run(
+        &[&common[..], &["plan", "--stdin"]].concat(),
+        Some(&insufficient.to_string()),
+    );
+    assert!(!rejected.status.success());
+    let rejected: Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert_eq!(
-        blocked["error"]["details"]["blocked_changes_truncated"],
-        false
+        rejected["error"]["code"],
+        "roster_minimum_core_budget_required"
     );
-    let exact_sources = [reviewed.join("mid-a"), reviewed.join("mid-b")];
-    assert_eq!(
-        blocked["error"]["details"]["source_roots"],
-        json!(exact_sources)
-    );
-    assert_eq!(blocked["error"]["paths"], json!(exact_sources));
-    let names = blocked["error"]["details"]["blocked_changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|item| item["name"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["mid-a", "mid-b"]);
+    assert_eq!(rejected["error"]["details"]["minimum_core_budget"], 2);
+    assert_eq!(rejected["error"]["details"]["core_budget"], 1);
     assert!(
-        blocked["error"]["details"]["blocked_changes"]
-            .as_array()
+        rejected["error"]["message"]
+            .as_str()
             .unwrap()
-            .iter()
-            .all(|item| {
-                item["agent"] == "codex"
-                    && item["reason"] == "untrusted_external_placement_blocks_mutation"
-                    && item["owned_by_agent"] == true
-                    && item["mutation_scope"] == "untrusted_external"
-                    && item["mutation_scopes"] == json!(["untrusted_external"])
-                    && item["observed_source_target"]
-                        .as_str()
-                        .is_some_and(|path| path.starts_with(reviewed.to_str().unwrap()))
-            })
+            .contains("minimum core_budget of 2")
     );
-    assert_eq!(
-        blocked["error"]["details"]["after_confirmation"]["repeatable_option"],
-        "--source-root"
-    );
-    assert_eq!(blocked["error"]["details"]["files_changed"], false);
-    assert_eq!(blocked["error"]["details"]["state_files_changed"], false);
-    assert_eq!(
-        blocked["error"]["details"]["detail_artifact_created"],
-        false
-    );
-    assert_eq!(
-        blocked["suggested_actions"][0]["action"],
-        "scan_with_confirmed_source_roots"
-    );
-    assert_eq!(
-        blocked["suggested_actions"][0]["requires_confirmation"],
-        true
-    );
-    assert_eq!(blocked["suggested_actions"][0]["mutates"], false);
-    let suggested_argv = blocked["suggested_actions"][0]["argv"].as_array().unwrap();
-    assert_eq!(
-        &suggested_argv[..5],
-        &json!([
-            env!("CARGO_BIN_EXE_skillroster"),
-            "--state-dir",
-            state,
-            "--home",
-            home
-        ])
-        .as_array()
-        .unwrap()[..]
-    );
-    assert_eq!(
-        &blocked["error"]["details"]["after_confirmation"]["argv_template"]
-            .as_array()
-            .unwrap()[..5],
-        &suggested_argv[..5]
-    );
-    for exact_source in &exact_sources {
-        assert!(suggested_argv.windows(2).any(|pair| {
-            pair[0] == "--source-root" && pair[1] == exact_source.to_str().unwrap()
-        }));
-    }
-    assert!(
-        !suggested_argv
-            .windows(2)
-            .any(|pair| { pair[0] == "--source-root" && pair[1] == reviewed.to_str().unwrap() })
-    );
-    let suggested_roots = suggested_argv
-        .windows(2)
-        .filter(|pair| pair[0] == "--source-root")
-        .map(|pair| {
-            pair[1]
-                .as_str()
-                .expect("source-root argument must be a string")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        suggested_roots,
-        exact_sources
-            .iter()
-            .map(|path| path.to_str().unwrap())
-            .collect::<Vec<_>>()
-    );
-    let retry_source_args = suggested_roots
-        .iter()
-        .flat_map(|root| ["--source-root", *root])
-        .collect::<Vec<_>>();
-    assert!(root.join("mid-a").exists());
-    assert!(root.join("aaa-000").exists());
-
-    for width in ["60", "80", "120"] {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_skillroster"));
-        command
-            .args([
-                "--home",
-                home.to_str().unwrap(),
-                "--state-dir",
-                state.to_str().unwrap(),
-                "plan",
-                "--stdin",
-            ])
-            .env("COLUMNS", width)
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = command.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(custom_request.to_string().as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success());
-        let human = String::from_utf8(output.stderr).unwrap();
-        assert!(human.contains("mid-a"), "{human}");
-        assert!(human.contains("--source-root"), "{human}");
-        assert!(
-            human.contains("no automatic change is supported"),
-            "{human}"
-        );
-        let max_width: usize = width.parse().unwrap();
-        assert!(
-            human.lines().all(|line| line.chars().count() <= max_width),
-            "line exceeded {width} columns:\n{human}"
-        );
-    }
-
-    json_output(&run(
-        &[&common[..], &retry_source_args, &["scan"]].concat(),
-        None,
-    ));
-    let report = json_output(&run(
-        &[&common[..], &retry_source_args, &["report"]].concat(),
-        None,
-    ));
-    let finding_id = report["result"]["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|finding| finding["title"] == "Large default Rosters need review")
-        .unwrap()["id"]
-        .as_str()
-        .unwrap();
-    let retry = json!({
-        "schema_version": 1,
-        "finding_roster_changes": [{
-            "finding_id": finding_id,
-            "core_budget": 10,
-            "protected_skill_ids": []
-        }]
-    });
-    let plan = json_output(&run(
-        &[&common[..], &retry_source_args, &["plan", "--stdin"]].concat(),
-        Some(&retry.to_string()),
-    ));
-    assert_eq!(plan["ok"], true);
-    assert_eq!(plan["result"]["files_changed"], false);
-    assert!(plan["result"]["plan_id"].as_str().is_some());
-    assert_eq!(plan["result"]["impact"]["after_default_exposure"], 10);
-    assert!(root.join("mid-a").exists());
-    assert_eq!(fs::read_dir(&root).unwrap().count(), 61);
+    assert!(reviewed.join("mid-a/SKILL.md").is_file());
+    assert!(reviewed.join("mid-b/SKILL.md").is_file());
 }
 
 #[test]
 #[cfg(unix)]
-fn full_roster_finding_can_protect_read_only_skills_and_prepare_a_plan() {
+fn compact_roster_finding_retains_read_only_skills_without_pagination() {
     use std::os::unix::fs::symlink;
 
     let temp = TempDir::new().unwrap();
@@ -11267,44 +11036,14 @@ fn full_roster_finding_can_protect_read_only_skills_and_prepare_a_plan() {
         &[&common[..], &["report", "--finding", &roster_finding_id]].concat(),
         None,
     ));
-    let compact_choice = &compact["result"]["planning"]["resolution_choices"][0];
-    assert_eq!(compact_choice["choice"], "protect_blocked_skills_as_core");
-    assert_eq!(compact_choice["available"], false);
+    let planning = &compact["result"]["planning"];
+    assert_eq!(planning["supported"], true);
+    assert_eq!(planning["allowed_core_budget"]["minimum"], 6);
     assert_eq!(
-        compact_choice["unavailable_reason"],
-        "blocked_skill_set_incomplete"
+        planning["plan_request_template"]["finding_roster_changes"][0]["protected_skill_ids"],
+        json!([])
     );
-    assert_eq!(compact_choice["protected_skill_ids_complete"], false);
-    assert_eq!(compact_choice["plan_request_template_available"], false);
-    assert!(compact_choice.get("plan_request_template").is_none());
-
-    let full = json_output(&run(
-        &[
-            &common[..],
-            &["report", "--finding", &roster_finding_id, "--full"],
-        ]
-        .concat(),
-        None,
-    ));
-    assert_eq!(
-        full["result"]["planning"]["decision"],
-        "choose_mutable_placements_or_keep_unchanged"
-    );
-    assert_eq!(
-        full["result"]["planning"]["decision_code"],
-        "protect_read_only_skills_or_keep_unchanged"
-    );
-    let full_choice = &full["result"]["planning"]["resolution_choices"][0];
-    assert_eq!(full_choice["choice"], "protect_blocked_skills_as_core");
-    assert_eq!(full_choice["available"], true);
-    assert_eq!(full_choice["protected_skill_ids_complete"], true);
-    assert_eq!(
-        full_choice["protected_skill_ids"].as_array().unwrap().len(),
-        6
-    );
-    assert_eq!(full_choice["plan_request_template_available"], true);
-
-    let request = full_choice["plan_request_template"].clone();
+    let request = planning["plan_request_template"].clone();
     let plan = json_output(&run(
         &[&common[..], &["plan", "--stdin"]].concat(),
         Some(&request.to_string()),
@@ -11602,7 +11341,7 @@ fn large_roster_core_protection_choice_uses_production_forced_core_constraints()
         protect["unavailable_detail"]
             .as_str()
             .unwrap()
-            .contains("protected, declared-Core, or bootstrap Skills")
+            .contains("requires a minimum core_budget")
     );
     assert!(protect.get("plan_request_template").is_none());
     assert!(
@@ -12548,9 +12287,17 @@ fn large_roster_same_name_library_target_exposes_a_validated_core_protection_pla
     let home = temp.path().join("home");
     let state = temp.path().join("state");
     for (agent_root, prefix, shared_body) in [
-        (home.join(".codex/skills"), "codex", "codex variant"),
-        (home.join(".hermes/skills"), "hermes", "hermes variant"),
-        (home.join(".pi/agent/skills"), "pi", "pi variant"),
+        (
+            home.join(".codex/skills/codex-category"),
+            "codex",
+            "codex variant",
+        ),
+        (
+            home.join(".codex/skills/hermes-category"),
+            "hermes",
+            "hermes variant",
+        ),
+        (home.join(".codex/skills/pi-category"), "pi", "pi variant"),
     ] {
         for index in 0..50 {
             let name = format!("{prefix}-skill-{index:03}");

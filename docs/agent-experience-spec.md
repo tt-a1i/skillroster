@@ -117,6 +117,19 @@ the two Skill IDs to names, descriptions, triggers, summaries, readable paths,
 and the structured routing-vocabulary Jaccard basis. The Agent owns the
 semantic conclusion and may read a returned `SKILL.md` path when those facts
 are insufficient; candidate evidence never authorizes a Plan.
+Shared Skill adoption is a separate user choice, never the default Roster
+proposal. When the first Report offers `shared_adoption`, use its exact request
+template only for that intent. Show the validated Plan's affected consumers,
+exclusions, before/after impact, and unknown-consumer boundary before asking for
+one Apply confirmation. Explain that eligible packages move to the active Library,
+whole-root aliases become independent Agent directories, and observed direct
+consumers retain exposure; excluded packages stay at their original paths. No
+host configuration is written. Drift blocks Apply; Receipt Undo restores the
+bounded package and alias state. Unapproved Apply remains prohibited.
+
+Large-Roster Findings are per Agent. Preserve immutable Core automatically and
+show the exact minimum budget when the requested budget cannot contain it.
+Use `plan_available` in the first view when supplied.
 For a blocked large Roster, present the named blocked Skill identities,
 affected Agents, dependent source paths, and every typed resolution choice.
 For `mutation_scope_blocks_roster_change` or

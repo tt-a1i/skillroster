@@ -211,6 +211,38 @@ fn check_refreshes_legacy_byte_observations_once() {
 
 #[cfg(unix)]
 #[test]
+fn check_refreshes_previous_hermes_discovery_contract_once() {
+    let temp = TempDir::new().unwrap();
+    skill(
+        &temp.path().join("home"),
+        ".hermes/skills/review",
+        "---\nname: review\n---\nBody\n",
+    );
+    let first = run(&temp, &["check"], None);
+    let store =
+        skillroster::sqlite::StateStore::open(temp.path().join("state/skillroster.db")).unwrap();
+    let (id, mut payload) = store.latest_scan_payload::<Value>().unwrap().unwrap();
+    payload["hermes_discovery_contract_version"] = json!(1);
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("skill_discovery_gaps");
+    store.save_scan_payload(&id, &payload).unwrap();
+    drop(store);
+    let refreshed = run(&temp, &["check"], None);
+    assert_eq!(refreshed["result"]["scan_performed"], true);
+    assert_ne!(
+        refreshed["result"]["snapshot_id"],
+        first["result"]["snapshot_id"]
+    );
+    assert_eq!(
+        run(&temp, &["check"], None)["result"]["scan_performed"],
+        false
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn unapproved_external_links_are_unknown_bytes_until_an_explicit_source_scan() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");
@@ -339,18 +371,18 @@ fn previous_official_bootstrap_upgrades_reversibly_without_becoming_a_local_conf
     let package = temp.path().join("home/.codex/skills/skillroster");
     fs::create_dir_all(package.join("references")).unwrap();
     let old = [
-        ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.52.md")),
+        ("SKILL.md", include_str!("fixtures/bootstrap-v1.8.53.md")),
         (
             "references/routing.md",
-            include_str!("fixtures/bootstrap-routing-v1.8.52.md"),
+            include_str!("fixtures/bootstrap-routing-v1.8.53.md"),
         ),
         (
             "references/governance.md",
-            include_str!("fixtures/bootstrap-governance-v1.8.52.md"),
+            include_str!("fixtures/bootstrap-governance-v1.8.53.md"),
         ),
         (
             "references/mutation.md",
-            include_str!("fixtures/bootstrap-mutation-v1.8.52.md"),
+            include_str!("fixtures/bootstrap-mutation-v1.8.53.md"),
         ),
     ];
     for (path, content) in old {
@@ -360,7 +392,7 @@ fn previous_official_bootstrap_upgrades_reversibly_without_becoming_a_local_conf
     let setup = run(&temp, &["setup", "--agent", "codex"], None);
     assert_eq!(setup["result"]["state"], "preview_ready");
     assert_eq!(setup["result"]["targets"][0]["status"], "official_outdated");
-    assert_eq!(setup["result"]["targets"][0]["installed_version"], "1.8.52");
+    assert_eq!(setup["result"]["targets"][0]["installed_version"], "1.8.53");
     let applied = run(
         &temp,
         &["apply", setup["result"]["plan_id"].as_str().unwrap()],

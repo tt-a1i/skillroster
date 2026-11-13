@@ -5,11 +5,11 @@ description: >
   broken links, Core/On-demand proposals, Plans, Receipts, Apply, and Undo.
   Also find a specialized local Skill when the user requests one or the task
   would benefit from instructions beyond the visible catalog. Ordinary work
-  can proceed with the Agent's existing capabilities. Not for installing
-  third-party Skills or migrating, distributing, synchronizing, or repairing shared
-  Skill-manager directories.
+  can proceed with the Agent's existing capabilities. Explicit shared Skill
+  adoption uses a reviewed SkillRoster Plan. Not for third-party installation
+  or general shared-directory synchronization and repair.
 metadata:
-  bootstrap-version: "1.8.53"
+  bootstrap-version: "1.8.54"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 

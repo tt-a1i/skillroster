@@ -1115,6 +1115,66 @@ impl<'a> AnchoredFs<'a> {
         }
     }
 
+    /// Links to an approved symlink entry without granting authority to read its
+    /// destination. The caller binds the entry's exact link contents separately.
+    pub(crate) fn create_symlink_to_entry(
+        &self,
+        source: &Path,
+        target: &Path,
+        expected_fingerprint: &str,
+    ) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            let (source_anchor, source_relative) = self.resolve(source)?;
+            if !source_anchor
+                .dir
+                .symlink_metadata(&source_relative)?
+                .is_symlink()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "entry-bound link source must be a symlink",
+                ));
+            }
+            let retained = entry_identity_at(source_anchor, &source_relative)?;
+            let contents = source_anchor.dir.read_link_contents(&source_relative)?;
+            let actual = format!(
+                "symlink:sha256:{}",
+                hex::encode(Sha256::digest(contents.as_os_str().as_encoded_bytes()))
+            );
+            if actual != expected_fingerprint {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "entry-bound symlink contents changed before creation",
+                ));
+            }
+            run_after_symlink_source_open_hook();
+            require_entry_identity_at(source_anchor, &source_relative, &retained)?;
+            self.require_symlink_contents_at(source_anchor, &source_relative, &contents)?;
+            let (target_anchor, target_relative) = self.resolve(target)?;
+            target_anchor
+                .dir
+                .symlink_contents(source, &target_relative)?;
+            let created = entry_identity_at(target_anchor, &target_relative)?;
+            run_after_created_symlink_hook();
+            self.require_symlink_contents_at(target_anchor, &target_relative, source)?;
+            self.sync_parent_preserving_identity(target_anchor, &target_relative, || {
+                require_entry_identity_at(target_anchor, &target_relative, &created)?;
+                self.require_symlink_contents_at(target_anchor, &target_relative, source)?;
+                require_entry_identity_at(source_anchor, &source_relative, &retained)?;
+                self.require_symlink_contents_at(source_anchor, &source_relative, &contents)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, target, expected_fingerprint);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "entry-bound symlink creation is unsupported on this platform",
+            ))
+        }
+    }
+
     /// Restores previously recorded link contents without reinterpreting them as
     /// fresh source authority. The target entry is still created and synced
     /// relative to its retained approved-root handle.

@@ -20,7 +20,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-pub const HERMES_DISCOVERY_CONTRACT_VERSION: u32 = 1;
+// v2 records preserved branch boundaries for disjoint mutable-subset planning.
+pub const HERMES_DISCOVERY_CONTRACT_VERSION: u32 = 2;
 pub const SESSION_PARSE_CONTRACT_VERSION: u32 = 1;
 pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-unicode-v2";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
@@ -105,6 +106,25 @@ pub struct RootObservation {
     /// Session roots do not use this dimension and remain complete by default.
     #[serde(default)]
     pub discovery_complete: bool,
+}
+
+/// An exact directory branch omitted from recursive Skill discovery. These
+/// paths describe a boundary, never permission to read its contents.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SkillDiscoveryGap {
+    pub path: PathBuf,
+    pub physical_path: Option<PathBuf>,
+    pub reason: SkillDiscoveryGapReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillDiscoveryGapReason {
+    UnapprovedBranch,
+    UnreadableBranch,
+    CyclicBranch,
+    DriftedBranch,
+    MissingBranch,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -506,6 +526,10 @@ pub struct ScanResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_visibility: Option<crate::claude_visibility::VisibilitySnapshot>,
     pub roots: Vec<RootObservation>,
+    /// Present only when every omitted branch has an exact Unicode path and
+    /// discovery has no depth or unknown-path boundary. Legacy absence fails closed.
+    #[serde(default)]
+    pub skill_discovery_gaps: BTreeMap<PathBuf, Vec<SkillDiscoveryGap>>,
     pub skills: Vec<ScannedSkill>,
     /// Additional content observations sharing a logical declared identity.
     /// Some (including empty) marks placement-bound routing observations.
@@ -690,15 +714,42 @@ struct DiscoveryState {
     physical_ancestors: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct SkillDiscoveryOutcome {
     depth_bounded: bool,
     non_unicode_skipped: u64,
     directories_skipped: u64,
+    gaps: Vec<SkillDiscoveryGap>,
 }
 
 impl SkillDiscoveryOutcome {
+    fn skipped(path: &Path, reason: SkillDiscoveryGapReason) -> Self {
+        Self {
+            directories_skipped: 1,
+            gaps: vec![SkillDiscoveryGap {
+                path: path.to_path_buf(),
+                physical_path: fs::canonicalize(path)
+                    .ok()
+                    .filter(|path| path.to_str().is_some()),
+                reason,
+            }],
+            ..Self::default()
+        }
+    }
+
+    fn unreadable(path: &Path, error: &io::Error) -> Self {
+        Self::skipped(
+            path,
+            if error.kind() == io::ErrorKind::NotFound {
+                SkillDiscoveryGapReason::MissingBranch
+            } else {
+                SkillDiscoveryGapReason::UnreadableBranch
+            },
+        )
+    }
+
     fn merge(&mut self, other: Self) {
+        self.gaps.extend(other.gaps);
         self.depth_bounded |= other.depth_bounded;
         self.directories_skipped = self
             .directories_skipped
@@ -708,7 +759,7 @@ impl SkillDiscoveryOutcome {
             .saturating_add(other.non_unicode_skipped);
     }
 
-    fn is_complete(self) -> bool {
+    fn is_complete(&self) -> bool {
         !self.depth_bounded && self.non_unicode_skipped == 0 && self.directories_skipped == 0
     }
 }
@@ -1401,6 +1452,7 @@ fn observe_skill_root(
     result: &mut ScanResult,
     candidates: &mut Vec<EntryCandidate>,
 ) {
+    result.skill_discovery_gaps.remove(root);
     let status = match fs::read_dir(root) {
         Ok(_) => RootStatus::Included,
         Err(error) if error.kind() == io::ErrorKind::NotFound => RootStatus::Missing,
@@ -1436,6 +1488,15 @@ fn observe_skill_root(
     ) {
         Ok(outcome) if outcome.is_complete() => {}
         Ok(outcome) => {
+            if !outcome.depth_bounded
+                && outcome.non_unicode_skipped == 0
+                && outcome.directories_skipped as usize == outcome.gaps.len()
+                && !outcome.gaps.is_empty()
+            {
+                result
+                    .skill_discovery_gaps
+                    .insert(root.to_path_buf(), outcome.gaps.clone());
+            }
             let mut details = Vec::new();
             if outcome.depth_bounded {
                 details.push(format!("Skill discovery was bounded at depth {max_depth}"));
@@ -1619,10 +1680,14 @@ impl EntrypointDiscovery<'_> {
             if !is_within_resolved_root(&physical, self.approved_roots)
                 || state.physical_ancestors.contains(&physical)
             {
-                return Ok(SkillDiscoveryOutcome {
-                    directories_skipped: 1,
-                    ..Default::default()
-                });
+                return Ok(SkillDiscoveryOutcome::skipped(
+                    directory,
+                    if state.physical_ancestors.contains(&physical) {
+                        SkillDiscoveryGapReason::CyclicBranch
+                    } else {
+                        SkillDiscoveryGapReason::UnapprovedBranch
+                    },
+                ));
             }
             let identity = crate::source_policy::capture_identity(&physical)?;
             state.physical_ancestors.push(physical.clone());
@@ -1708,7 +1773,9 @@ impl EntrypointDiscovery<'_> {
                     child_state.directory_link_ancestor |= directory_is_link;
                     match self.discover(&path, child_state, after_enumerate) {
                         Ok(child_outcome) => outcome.merge(child_outcome),
-                        Err(_) if hermes => outcome.directories_skipped += 1,
+                        Err(error) if hermes => {
+                            outcome.merge(SkillDiscoveryOutcome::unreadable(&path, &error))
+                        }
                         Err(error) => return Err(error),
                     }
                 } else if metadata.file_type().is_symlink() {
@@ -1735,7 +1802,9 @@ impl EntrypointDiscovery<'_> {
                     if hermes && status == LinkStatus::Valid {
                         match self.discover(&path, child_state, after_enumerate) {
                             Ok(child_outcome) => outcome.merge(child_outcome),
-                            Err(_) => outcome.directories_skipped += 1,
+                            Err(error) => {
+                                outcome.merge(SkillDiscoveryOutcome::unreadable(&path, &error))
+                            }
                         }
                         continue;
                     }
@@ -1750,7 +1819,14 @@ impl EntrypointDiscovery<'_> {
                         continue;
                     }
                     if hermes {
-                        outcome.directories_skipped += 1;
+                        let gap = match fs::canonicalize(&path) {
+                            Ok(_) => SkillDiscoveryOutcome::skipped(
+                                &path,
+                                SkillDiscoveryGapReason::UnapprovedBranch,
+                            ),
+                            Err(error) => SkillDiscoveryOutcome::unreadable(&path, &error),
+                        };
+                        outcome.merge(gap);
                     }
                     if declares_skill || status != LinkStatus::Valid {
                         let expected_physical_entrypoint = if hermes {
@@ -1790,10 +1866,10 @@ impl EntrypointDiscovery<'_> {
                 || !crate::source_policy::identity_matches_exact(&physical, &identity)
             {
                 self.output.truncate(candidate_start);
-                return Ok(SkillDiscoveryOutcome {
-                    directories_skipped: 1,
-                    ..Default::default()
-                });
+                return Ok(SkillDiscoveryOutcome::skipped(
+                    directory,
+                    SkillDiscoveryGapReason::DriftedBranch,
+                ));
             }
         }
         enumeration_result
@@ -4842,6 +4918,7 @@ enabled = true
         options.max_depth = 1;
         let result = scan(&options).unwrap();
 
+        assert!(result.skill_discovery_gaps.is_empty());
         assert!(result.skills.is_empty());
         let observed = result
             .roots

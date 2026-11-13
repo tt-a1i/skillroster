@@ -55,6 +55,27 @@ not a recommendation. If the user prefers the current Roster, finish there.
 An explicitly requested name-ordered draft may be previewed, with its fallback
 basis stated plainly and no claim of better usefulness.
 
+Shared adoption is a separate choice from Roster reduction. When the user
+explicitly wants to host eligible shared Skills and separate Agent roots, use
+the Report's `shared_adoption.request_template` with the current Scan. It has
+`schema_version: 1`, `scan_id`, and `adopt_shared_skills` containing
+`core_budget` and `protected_skill_ids`. Present affected consumers,
+exclusions, before/after impact, and the unknown-consumer boundary before Apply.
+Complete verified ordinary packages move into the active Library; hidden
+`.system`, provider, external, and incomplete packages stay in place. Supported
+whole-root aliases become independent directories with Core links and retained
+excluded entry links; observed direct symlink consumers retain exposure. Host
+configuration is unchanged. Drift blocks Apply, and the Receipt's bounded Undo
+restores packages and exact old aliases. Apply follows review and user approval.
+Ordinary raw and shared-root operations remain blocked.
+
+Large-Roster Findings are per Agent. Immutable Core is retained automatically;
+when a budget is too small, use the reported exact minimum. The first Report
+also exposes `plan_available` where applicable.
+If the CLI preserves an exact skipped branch, keep its bounded coverage visible;
+do not read or authorize that branch merely to preview disjoint mutable changes.
+Retained native eligibility remains unknown; a Core label does not prove the host loaded it.
+
 Make semantic choices in conversation, then submit them to
 `skillroster plan --stdin --json`. Every declarative request includes
 `schema_version: 1`:

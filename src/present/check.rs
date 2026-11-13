@@ -76,6 +76,16 @@ pub(super) fn render(value: &Value, lines: &mut Vec<String>, width: usize) {
         ));
         for finding in findings.iter().take(3) {
             let prefix = format!("  {:<7} ", text(finding, "severity"));
+            let title = if finding["kind"] == "large_default_roster" {
+                finding["affected_agents"]
+                    .as_array()
+                    .filter(|agents| agents.len() == 1)
+                    .and_then(|agents| agents[0].as_str())
+                    .map(|agent| format!("Large {} Roster needs review", core_agent_label(agent)))
+                    .unwrap_or_else(|| text(finding, "title"))
+            } else {
+                text(finding, "title")
+            };
             let suffix = match finding["actionability"].as_str() {
                 Some("blocked") => " · blocked",
                 Some("plan_available") => " · plan available",
@@ -84,7 +94,7 @@ pub(super) fn render(value: &Value, lines: &mut Vec<String>, width: usize) {
             lines.push(format!(
                 "{prefix}{}{suffix}",
                 middle_truncate(
-                    &text(finding, "title"),
+                    &title,
                     width.saturating_sub(display_width(&prefix) + display_width(suffix))
                 )
             ));
@@ -95,6 +105,9 @@ pub(super) fn render(value: &Value, lines: &mut Vec<String>, width: usize) {
         {
             lines.push("Review exact external paths before permitting reads.".into());
         }
+    }
+    if value["shared_adoption"].is_object() {
+        lines.push("Shared Skills: explicit adoption preview in report --full.".into());
     }
     lines.push(format!("Report: {}", text(value, "report_id")));
     lines.extend(summary(

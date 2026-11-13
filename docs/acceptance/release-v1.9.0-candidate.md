@@ -1,7 +1,9 @@
-# v1.9.0 source candidate acceptance
+# v1.9.0 source candidate baseline acceptance
 
 Local validation on 2026-11-14 used macOS ARM64, Rust 1.89.0 and Node 22.23.3.
-The source candidate is CLI **1.9.0**, with Bootstrap **1.8.53**. The published
+This records baseline commit `7bb9684`, CLI **1.9.0**, with Bootstrap **1.8.53**.
+The later shared-adoption candidate is recorded in
+[its acceptance report](shared-adoption-v1.9.0.md). The published
 installation surface remains pinned to the existing v1.8.48 Formula. No tag,
 GitHub Release, npm publication, website deployment or promotion was performed.
 

@@ -1075,46 +1075,38 @@ fn exposure_findings(scan: &ScanResult, findings: &mut Vec<Finding>) {
             exposed_by_agent.entry(agent).or_default().push(placement);
         }
     }
-    let oversized = exposed_by_agent
+    // Scope each Finding to one Agent so another Agent's read-only Roster
+    // cannot block a safe proposal for a mutable Roster.
+    for (agent, placements) in exposed_by_agent
         .into_iter()
         .filter(|(_, placements)| placements.len() > 50)
-        .collect::<Vec<_>>();
-    if oversized.is_empty() {
-        return;
+    {
+        push_finding(
+            findings,
+            FindingKind::LargeDefaultRoster,
+            FindingCategory::Exposure,
+            Severity::Medium,
+            "Large default Rosters need review",
+            format!(
+                "{} has {} default-exposed placements, exceeding 50; no archive decision is implied.",
+                agent.display_name(),
+                placements.len()
+            ),
+            placements
+                .iter()
+                .map(|placement| placement.skill_id.clone())
+                .collect(),
+            placements
+                .iter()
+                .map(|placement| placement.id.clone())
+                .collect(),
+            placements
+                .iter()
+                .map(|placement| format!("path:{}", placement.entrypoint.display()))
+                .collect(),
+            EvidenceQuality::Observed,
+        );
     }
-    let breakdown = oversized
-        .iter()
-        .map(|(agent, placements)| format!("{}={}", agent.display_name(), placements.len()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    // This is a review threshold, not a claim that any Skill is useless.
-    push_finding(
-        findings,
-        FindingKind::LargeDefaultRoster,
-        FindingCategory::Exposure,
-        Severity::Medium,
-        "Large default Rosters need review",
-        format!(
-            "{} Agents exceed 50 default-exposed placements: {breakdown}; no archive decision is implied.",
-            oversized.len()
-        ),
-        oversized
-            .iter()
-            .flat_map(|(_, placements)| placements.iter())
-            .map(|placement| placement.skill_id.clone())
-            .collect(),
-        oversized
-            .iter()
-            .flat_map(|(_, placements)| placements.iter())
-            .map(|placement| placement.id.clone())
-            .collect(),
-        oversized
-            .iter()
-            .flat_map(|(_, placements)| placements.iter())
-            .map(|placement| format!("path:{}", placement.entrypoint.display()))
-            .collect(),
-        EvidenceQuality::Observed,
-    );
 }
 
 pub(crate) fn usage_overview(scan: &ScanResult) -> UsageOverview {
@@ -4914,7 +4906,7 @@ mod tests {
     }
 
     #[test]
-    fn exposure_is_one_systemic_finding_with_an_agent_breakdown() {
+    fn exposure_findings_cover_one_complete_agent_roster_each() {
         let mut scan = ScanResult::default();
         for (agent, count) in [
             (crate::harness::AgentKind::Codex, 52_usize),
@@ -4950,10 +4942,26 @@ mod tests {
 
         exposure_findings(&scan, &mut findings);
 
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].affected_placement_ids.len(), 103);
-        assert!(findings[0].summary.contains("Codex=52"));
-        assert!(findings[0].summary.contains("Claude Code=51"));
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].affected_placement_ids.len(), 52);
+        assert_eq!(findings[1].affected_placement_ids.len(), 51);
+        assert!(findings[0].summary.contains("Codex has 52"));
+        assert!(findings[1].summary.contains("Claude Code has 51"));
+        assert_ne!(findings[0].id, findings[1].id);
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>();
+        scan.placements.reverse();
+        let mut repeated = Vec::new();
+        exposure_findings(&scan, &mut repeated);
+        assert_eq!(
+            ids,
+            repeated
+                .iter()
+                .map(|finding| finding.id.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

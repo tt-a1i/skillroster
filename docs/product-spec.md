@@ -325,6 +325,37 @@ including per-Agent counts and unknowns. This projection follows the Plan's
 retained, removed and created exposures; a later Scan measures actual
 post-Apply state. Historical Plans remain immutable.
 
+### Explicit shared Skill adoption
+
+Shared placements remain read-only for ordinary Roster and raw operations. A
+separate, explicit `adopt_shared_skills` Plan request binds the current
+`scan_id`, a `core_budget`, and `protected_skill_ids` to schema version 1.
+It may host complete, verified ordinary real packages from the observed physical
+`~/.agents/skills` root in the active state directory's Library. Hidden
+`.system`, provider, external, and incomplete packages stay at their original
+paths. Supported whole-root Agent symlink aliases become independent directories
+with selected Core links and retained excluded entry links. Other observed direct
+symlink consumers are retargeted to preserve exposure; host configuration is
+never written. Unknown consumers cannot be discovered or guaranteed. Preserving
+external link entries during adoption currently requires Unix; unsupported
+platforms refuse the Plan before producing Ready or changing Agent files.
+
+The read-only Plan must disclose affected consumers, exclusions, before/after
+impact, and the unknown-consumer boundary before the standard single Apply
+confirmation. Apply refuses drift; its Receipt and bounded Undo restore hosted
+packages and exact prior aliases. Large-Roster Findings are per Agent, so a shared read-only
+Agent cannot block a separate mutable Agent. Immutable Core is retained
+automatically; an insufficient budget reports the exact minimum required.
+An explicitly recorded skipped directory branch may remain untouched while
+complete, disjoint packages are governed. Discovery stays bounded; depth,
+unknown-path and legacy gaps still block. Apply rechecks the preserved boundary
+and rejects operations or source paths overlapping it without reading it.
+Existing exposure with unknown native eligibility is retained within the Core
+budget. This permits only unchanged paths; it does not establish runtime
+eligibility or permit demotion, relinking or new exposure under unknown policy.
+The first Report view exposes `plan_available` when applicable and a separate
+`shared_adoption` request template when adoption is available.
+
 ### 4.3 Library and Rosters
 
 The Library is logical and does not require moving every Skill. Each discovered Skill begins as Observed. After approval it may become:
@@ -371,7 +402,7 @@ sources or operation targets. Before deriving operations, planning revalidates
 each captured physical source against the current logical entrypoint and stores
 those logical-entrypoint-to-physical-source bindings in the immutable Plan.
 Apply revalidates the complete binding set before entering Applying. A
-physical object shared with any non-mutable placement remains read-only,
+physical object shared with any non-mutable placement remains read-only in ordinary governance,
 and a non-Agent source link that would be broken blocks the Plan. These
 blockers expose stable reasons, IDs, paths, and next actions in `error.details`;
 Agent callers never need to parse the human message.

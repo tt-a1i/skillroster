@@ -14,6 +14,27 @@ use crate::scan::{EvidenceQuality, ScanResult, UsageStage};
 pub const MAX_CORE_BUDGET: usize = 50;
 
 #[derive(Debug)]
+pub struct MinimumCoreBudgetRequired {
+    pub agent: AgentKind,
+    pub minimum_core_budget: usize,
+    pub core_budget: usize,
+}
+
+impl std::fmt::Display for MinimumCoreBudgetRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Agent {} requires a minimum core_budget of {} to retain immutable or protected Skills, Skills with unknown native visibility, declared Core Skills, or bootstrap Skills; core_budget {} is too small",
+            self.agent.id(),
+            self.minimum_core_budget,
+            self.core_budget
+        )
+    }
+}
+
+impl std::error::Error for MinimumCoreBudgetRequired {}
+
+#[derive(Debug)]
 pub struct SharedPhysicalCoreBudgetExceeded {
     pub agent: AgentKind,
     pub core_count: usize,
@@ -96,6 +117,8 @@ struct Candidate {
     skill_id: String,
     name: String,
     protected: bool,
+    immutable: bool,
+    native_unknown: bool,
     declared_core: bool,
     bootstrap: bool,
     direct_signal: UsageSignal,
@@ -135,7 +158,11 @@ impl UsageSignal {
 
 impl Candidate {
     fn is_forced_core(&self) -> bool {
-        self.protected || self.declared_core || self.bootstrap
+        self.immutable
+            || self.native_unknown
+            || self.protected
+            || self.declared_core
+            || self.bootstrap
     }
 
     fn has_positive_signal(&self) -> bool {
@@ -143,7 +170,11 @@ impl Candidate {
     }
 
     fn reason(&self) -> &'static str {
-        if self.protected {
+        if self.immutable {
+            "immutable_placement_retained"
+        } else if self.native_unknown {
+            "native_visibility_unknown_retained"
+        } else if self.protected {
             "protected_by_request"
         } else if self.declared_core {
             "declared_core"
@@ -219,10 +250,39 @@ pub fn recommend(
     declared_core: &BTreeSet<(AgentKind, String)>,
     request: &RecommendationRequest,
 ) -> Result<RosterRecommendation> {
+    let scope = exposure_finding_scope(finding, scan)?;
+    recommend_scope(scan, declared_core, request, scope, true)
+}
+
+pub fn recommend_independent_rosters(
+    scan: &ScanResult,
+    declared_core: &BTreeSet<(AgentKind, String)>,
+    request: &RecommendationRequest,
+    agents: &BTreeSet<AgentKind>,
+) -> Result<RosterRecommendation> {
+    let mut scope = BTreeMap::<AgentKind, Vec<&crate::scan::SkillPlacement>>::new();
+    for placement in scan
+        .placements
+        .iter()
+        .filter(|placement| placement.default_exposed)
+    {
+        if let Some(agent) = placement.agent.filter(|agent| agents.contains(agent)) {
+            scope.entry(agent).or_default().push(placement);
+        }
+    }
+    recommend_scope(scan, declared_core, request, scope, false)
+}
+
+fn recommend_scope(
+    scan: &ScanResult,
+    declared_core: &BTreeSet<(AgentKind, String)>,
+    request: &RecommendationRequest,
+    scope: BTreeMap<AgentKind, Vec<&crate::scan::SkillPlacement>>,
+    reconcile_physical_states: bool,
+) -> Result<RosterRecommendation> {
     if !(1..=MAX_CORE_BUDGET).contains(&request.core_budget) {
         bail!("core_budget must be between 1 and {MAX_CORE_BUDGET}");
     }
-    let scope = exposure_finding_scope(finding, scan)?;
     let scoped_skills = scope
         .values()
         .flatten()
@@ -230,10 +290,7 @@ pub fn recommend(
         .collect::<BTreeSet<_>>();
     for skill_id in &request.protected_skill_ids {
         if !scoped_skills.contains(skill_id.as_str()) {
-            bail!(
-                "protected Skill {skill_id} is outside Finding {}",
-                finding.id
-            );
+            bail!("protected Skill {skill_id} is outside the selected Roster scope");
         }
     }
 
@@ -245,6 +302,16 @@ pub fn recommend(
     let mut by_agent = BTreeMap::<AgentKind, BTreeMap<String, Candidate>>::new();
     for (agent, placements) in scope {
         for placement in placements {
+            let native_unknown = scan.placement_native_visibility(placement)
+                == Some(&crate::claude_visibility::CatalogVisibility::Unknown);
+            let immutable = !placement.is_mutable()
+                || scan
+                    .skill_discovery_gaps
+                    .get(&placement.root)
+                    .is_some_and(|gaps| {
+                        gaps.iter()
+                            .any(|gap| placement.directory.starts_with(&gap.path))
+                    });
             let name = skill_names
                 .get(placement.skill_id.as_str())
                 .ok_or_else(|| anyhow!("Skill {} is missing from Snapshot", placement.skill_id))?;
@@ -252,11 +319,17 @@ pub fn recommend(
                 .entry(agent)
                 .or_default()
                 .entry(placement.skill_id.clone())
+                .and_modify(|candidate| {
+                    candidate.immutable |= immutable;
+                    candidate.native_unknown |= native_unknown;
+                })
                 .or_insert_with(|| Candidate {
                     agent,
                     skill_id: placement.skill_id.clone(),
                     name: (*name).to_owned(),
                     protected: request.protected_skill_ids.contains(&placement.skill_id),
+                    immutable,
+                    native_unknown,
                     declared_core: declared_core.contains(&(agent, placement.skill_id.clone())),
                     bootstrap: name.eq_ignore_ascii_case("skillroster"),
                     direct_signal: UsageSignal::default(),
@@ -295,11 +368,12 @@ pub fn recommend(
             .filter(|candidate| candidate.is_forced_core())
             .count();
         if forced_count > request.core_budget {
-            bail!(
-                "Agent {} has {forced_count} protected, declared-Core, or bootstrap Skills; core_budget {} is too small",
-                agent.id(),
-                request.core_budget
-            );
+            return Err(MinimumCoreBudgetRequired {
+                agent: *agent,
+                minimum_core_budget: forced_count,
+                core_budget: request.core_budget,
+            }
+            .into());
         }
         let mut ranked = candidates.values().collect::<Vec<_>>();
         ranked.sort_by(|left, right| candidate_order(left, right));
@@ -312,8 +386,11 @@ pub fn recommend(
                 .collect::<BTreeSet<_>>(),
         );
     }
-    let shared_core_agents =
-        reconcile_shared_physical_states(scan, &by_agent, &mut core_by_agent, request.core_budget)?;
+    let shared_core_agents = if reconcile_physical_states {
+        reconcile_shared_physical_states(scan, &by_agent, &mut core_by_agent, request.core_budget)?
+    } else {
+        BTreeMap::new()
+    };
 
     let mut changes = Vec::new();
     let mut agents = Vec::new();
@@ -535,16 +612,23 @@ fn exposure_finding_scope<'a>(
             expected.entry(agent).or_default().push(placement);
         }
     }
-    expected.retain(|_, placements| placements.len() > MAX_CORE_BUDGET);
+    // New Findings cover one complete oversized Agent Roster. Accept legacy
+    // combined Findings only when each named Agent is still covered completely.
+    expected.retain(|_, placements| {
+        placements.len() > MAX_CORE_BUDGET
+            && placements
+                .iter()
+                .any(|placement| ids.contains(&placement.id))
+    });
     let expected_ids = expected
         .values()
         .flatten()
         .map(|placement| placement.id.as_str())
         .collect::<BTreeSet<_>>();
     let actual_ids = ids.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    if actual_ids != expected_ids {
+    if expected_ids.is_empty() || actual_ids != expected_ids {
         bail!(
-            "Finding {} no longer covers every oversized default Roster placement",
+            "Finding {} no longer covers complete oversized default Agent Rosters",
             finding.id
         );
     }
@@ -653,6 +737,128 @@ mod tests {
     use crate::scan::{
         LinkStatus, ScanOptions, ScannedSkill, SkillMetadata, SkillPlacement, UsageEvidence, scan,
     };
+
+    #[test]
+    fn independent_rosters_accept_small_scopes_without_shared_physical_propagation() {
+        let mut scan = shared_oversized_scan(3);
+        scan.usage.push(usage(
+            AgentKind::Codex,
+            "skill_002",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        scan.usage.push(usage(
+            AgentKind::ClaudeCode,
+            "skill_001",
+            UsageStage::Loaded,
+            EvidenceQuality::Observed,
+        ));
+        let recommendation = recommend_independent_rosters(
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 1,
+                protected_skill_ids: BTreeSet::new(),
+            },
+            &BTreeSet::from([AgentKind::Codex, AgentKind::ClaudeCode]),
+        )
+        .unwrap();
+        assert_eq!(recommendation.agents.len(), 2);
+        assert_eq!(
+            recommendation.agents[0].core_selections[0].skill_id,
+            "skill_002"
+        );
+        assert_eq!(
+            recommendation.agents[1].core_selections[0].skill_id,
+            "skill_001"
+        );
+    }
+
+    #[test]
+    fn recommendation_retains_immutable_items_without_reading_their_contents() {
+        let mut scan = oversized_scan(60);
+        for (placement, scope) in scan.placements.iter_mut().rev().take(4).zip([
+            crate::scan::MutationScope::UntrustedExternal,
+            crate::scan::MutationScope::ProviderReadOnly,
+            crate::scan::MutationScope::SharedReadOnly,
+            crate::scan::MutationScope::DurableReadOnly,
+        ]) {
+            placement.mutation_scope = Some(scope);
+            placement.governable = false;
+        }
+        let request = RecommendationRequest {
+            core_budget: 4,
+            protected_skill_ids: BTreeSet::new(),
+        };
+        let recommendation = recommend(&finding(&scan), &scan, &BTreeSet::new(), &request).unwrap();
+        assert_eq!(recommendation.agents[0].core_count, 4);
+        assert!(
+            recommendation.agents[0]
+                .core_selections
+                .iter()
+                .all(|selection| selection.reason == "immutable_placement_retained")
+        );
+        assert!(
+            recommendation
+                .changes
+                .iter()
+                .filter(|change| change.state == "on_demand")
+                .all(|change| scan
+                    .placements
+                    .iter()
+                    .find(|placement| placement.skill_id == change.skill_id)
+                    .unwrap()
+                    .is_mutable())
+        );
+        let error = recommend(
+            &finding(&scan),
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 3,
+                ..request
+            },
+        )
+        .unwrap_err();
+        let minimum = error.downcast_ref::<MinimumCoreBudgetRequired>().unwrap();
+        assert_eq!(minimum.minimum_core_budget, 4);
+    }
+
+    #[test]
+    fn one_agent_finding_does_not_inherit_another_agents_immutable_budget() {
+        let mut scan = oversized_scan(60);
+        let mut hermes = scan.placements.clone();
+        for placement in &mut scan.placements {
+            placement.mutation_scope = Some(crate::scan::MutationScope::SharedReadOnly);
+            placement.governable = false;
+        }
+        for placement in &mut hermes {
+            placement.id = format!("hermes_{}", placement.id);
+            placement.agent = Some(AgentKind::Hermes);
+            placement.directory = PathBuf::from(format!("/hermes/{}", placement.skill_id));
+        }
+        let hermes_ids = hermes
+            .iter()
+            .map(|placement| placement.id.clone())
+            .collect::<Vec<_>>();
+        scan.placements.extend(hermes);
+        scan.freeze_observed_physical_mutation_paths();
+        let mut scoped = finding(&scan);
+        scoped.details["affected_placement_ids"] = json!(hermes_ids);
+        let recommendation = recommend(
+            &scoped,
+            &scan,
+            &BTreeSet::new(),
+            &RecommendationRequest {
+                core_budget: 50,
+                protected_skill_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(recommendation.agents.len(), 1);
+        assert_eq!(recommendation.agents[0].agent, AgentKind::Hermes);
+        assert_eq!(recommendation.agents[0].on_demand_count, 10);
+    }
 
     #[test]
     fn recommendation_keeps_only_forced_and_evidence_ranked_core_skills() {
@@ -893,7 +1099,26 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("no longer covers every oversized")
+                .contains("no longer covers complete oversized")
+        );
+    }
+
+    #[test]
+    fn recommendation_rejects_an_empty_finding_scope() {
+        let scan = oversized_scan(51);
+        let mut finding = finding(&scan);
+        finding.details["affected_placement_ids"] = json!([]);
+        assert!(
+            recommend(
+                &finding,
+                &scan,
+                &BTreeSet::new(),
+                &RecommendationRequest {
+                    core_budget: 50,
+                    protected_skill_ids: BTreeSet::new()
+                }
+            )
+            .is_err()
         );
     }
 
