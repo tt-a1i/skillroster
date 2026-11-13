@@ -516,6 +516,9 @@ impl SessionCoverage {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
+    /// Invocation scope for implicit Snapshot reuse; absent on legacy scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_configuration: Option<SnapshotConfiguration>,
     /// Versioned bounded Hermes directory-discovery contract; absent on legacy scans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hermes_discovery_contract_version: Option<u32>,
@@ -582,6 +585,13 @@ pub struct ScanResult {
     /// conservatively from the retained placement authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durable_read_used_permission_ids: Option<BTreeSet<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotConfiguration {
+    pub home: PathBuf,
+    pub explicit_skill_roots: Vec<ExplicitSkillRoot>,
+    pub explicit_source_roots: Vec<PathBuf>,
 }
 
 impl ScanResult {

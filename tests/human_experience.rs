@@ -105,6 +105,182 @@ fn check_scans_once_reuses_and_refreshes_configuration_and_mutation_invalidation
 }
 
 #[test]
+fn check_refreshes_when_home_changes_with_the_same_state_directory() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let other_home = temp.path().join("other-home");
+    skill(&home, ".codex/skills/first", "First home\n");
+    skill(&other_home, ".codex/skills/second", "Second home\n");
+    skill(&other_home, ".codex/skills/third", "Third skill\n");
+    let first = run(&temp, &["check"], None);
+    // Replace only Home, keeping the exact same state database.
+    let output = Command::new(env!("CARGO_BIN_EXE_skillroster"))
+        .args([
+            "--home",
+            other_home.to_str().unwrap(),
+            "--state-dir",
+            temp.path().join("state").to_str().unwrap(),
+            "--json",
+            "check",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let changed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(changed["result"]["scan_performed"], true);
+    assert_ne!(
+        changed["result"]["snapshot_id"],
+        first["result"]["snapshot_id"]
+    );
+    assert_eq!(changed["result"]["default_exposure"], 2);
+    assert_eq!(
+        run(&temp, &["check"], None)["result"]["scan_performed"],
+        true
+    );
+    assert_eq!(
+        run(&temp, &["check"], None)["result"]["scan_performed"],
+        false
+    );
+}
+
+#[test]
+fn check_binds_root_and_source_scope_but_reuses_equivalent_paths_and_order() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let root_a = temp.path().join("root-a");
+    let root_b = temp.path().join("root-b");
+    let source_a = temp.path().join("source-a");
+    let source_b = temp.path().join("source-b");
+    for root in [&root_a, &root_b, &source_a, &source_b] {
+        skill(root, "example", "Example skill\n");
+    }
+    let root_a_arg = format!("codex={}", root_a.display());
+    let root_b_arg = format!("pi={}", root_b.display());
+    let root_a_equivalent = format!("codex={}/../root-a/.", root_a.display());
+    let source_a_equivalent = source_a.join("../source-a/.");
+    let first = run(&temp, &["scan"], None);
+    let added_root = run(&temp, &["--root", &root_a_arg, "check"], None);
+    assert_eq!(added_root["result"]["scan_performed"], true);
+    assert_ne!(
+        first["result"]["snapshot_id"],
+        added_root["result"]["snapshot_id"]
+    );
+    let scopes = [
+        vec!["--root", root_a_arg.as_str(), "--root", root_b_arg.as_str()],
+        vec!["--root", root_b_arg.as_str()],
+        vec!["--source-root", source_a.to_str().unwrap()],
+        vec![
+            "--source-root",
+            source_a.to_str().unwrap(),
+            "--source-root",
+            source_b.to_str().unwrap(),
+        ],
+        vec!["--source-root", source_b.to_str().unwrap()],
+        vec![],
+    ];
+    for mut args in scopes {
+        args.push("check");
+        let refreshed = run(&temp, &args, None);
+        assert_eq!(refreshed["result"]["scan_performed"], true, "{args:?}");
+        let cached = run(&temp, &args, None);
+        assert_eq!(cached["result"]["scan_performed"], false, "{args:?}");
+        assert_eq!(
+            refreshed["result"]["snapshot_id"],
+            cached["result"]["snapshot_id"]
+        );
+    }
+    let original = run(
+        &temp,
+        &[
+            "--root",
+            &root_a_arg,
+            "--root",
+            &root_b_arg,
+            "--source-root",
+            source_a.to_str().unwrap(),
+            "--source-root",
+            source_b.to_str().unwrap(),
+            "scan",
+        ],
+        None,
+    );
+    let equivalent = run(
+        &temp,
+        &[
+            "--root",
+            &root_b_arg,
+            "--root",
+            &root_a_equivalent,
+            "--root",
+            &root_a_arg,
+            "--source-root",
+            source_b.to_str().unwrap(),
+            "--source-root",
+            source_a_equivalent.to_str().unwrap(),
+            "--source-root",
+            source_a.to_str().unwrap(),
+            "check",
+        ],
+        None,
+    );
+    assert_eq!(equivalent["result"]["scan_performed"], false);
+    assert_eq!(
+        original["result"]["snapshot_id"],
+        equivalent["result"]["snapshot_id"]
+    );
+
+    let missing = temp.path().join("missing");
+    let missing_equivalent = temp.path().join("other-missing/../missing/.");
+    let first_missing = run(
+        &temp,
+        &["--source-root", missing.to_str().unwrap(), "check"],
+        None,
+    );
+    let equivalent_missing = run(
+        &temp,
+        &[
+            "--source-root",
+            missing_equivalent.to_str().unwrap(),
+            "check",
+        ],
+        None,
+    );
+    assert_eq!(equivalent_missing["result"]["scan_performed"], false);
+    assert_eq!(
+        first_missing["result"]["snapshot_id"],
+        equivalent_missing["result"]["snapshot_id"]
+    );
+}
+
+#[test]
+fn check_refreshes_a_snapshot_without_configuration_binding_once() {
+    let temp = TempDir::new().unwrap();
+    let first = run(&temp, &["scan"], None);
+    let store =
+        skillroster::sqlite::StateStore::open(temp.path().join("state/skillroster.db")).unwrap();
+    let (id, mut payload) = store.latest_scan_payload::<Value>().unwrap().unwrap();
+    payload
+        .as_object_mut()
+        .unwrap()
+        .remove("snapshot_configuration");
+    store.save_scan_payload(&id, &payload).unwrap();
+    drop(store);
+    let refreshed = run(&temp, &["check"], None);
+    assert_eq!(refreshed["result"]["scan_performed"], true);
+    assert_ne!(
+        refreshed["result"]["snapshot_id"],
+        first["result"]["snapshot_id"]
+    );
+    let cached = run(&temp, &["check"], None);
+    assert_eq!(cached["result"]["scan_performed"], false);
+    assert_eq!(
+        cached["result"]["snapshot_id"],
+        refreshed["result"]["snapshot_id"]
+    );
+}
+
+#[test]
 fn exposed_bytes_count_utf8_crlf_copies_and_unknowns_without_counting_hidden_or_source_only() {
     let temp = TempDir::new().unwrap();
     let home = temp.path().join("home");

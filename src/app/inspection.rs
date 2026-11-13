@@ -37,13 +37,19 @@ pub(super) fn ensure_snapshot(
     roots: &[String],
     source_roots: &[PathBuf],
 ) -> Result<(bool, Vec<String>)> {
+    let explicit = parse_explicit_roots(roots)?;
+    let source_roots = parse_source_roots(source_roots)?;
+    let configuration = snapshot_configuration(home, &explicit, &source_roots)?;
     let refresh = match store.latest_scan_payload::<ScanResult>()? {
         None => true,
         Some((id, snapshot)) => {
             match require_loaded_snapshot_current(store, &id, &snapshot)
                 .and_then(|()| require_content_identity(&snapshot))
             {
-                Ok(()) => !snapshot.entrypoint_bytes_observed,
+                Ok(()) => {
+                    !snapshot.entrypoint_bytes_observed
+                        || snapshot.snapshot_configuration.as_ref() != Some(&configuration)
+                }
                 Err(error)
                     if error.is::<SnapshotRescanRequired>()
                         || error.is::<SourceRootSnapshotRescanRequired>()
@@ -56,19 +62,55 @@ pub(super) fn ensure_snapshot(
         }
     };
     let warnings = if refresh {
-        scan_command(
-            store,
-            home,
-            state_dir,
-            parse_explicit_roots(roots)?,
-            parse_source_roots(source_roots)?,
-            true,
-        )?
-        .1
+        scan_command(store, home, state_dir, explicit, source_roots, true)?.1
     } else {
         Vec::new()
     };
     Ok((refresh, warnings))
+}
+
+fn snapshot_configuration(
+    home: &Path,
+    explicit: &[ExplicitSkillRoot],
+    source_roots: &[PathBuf],
+) -> Result<crate::scan::SnapshotConfiguration> {
+    let normalize = |path: &Path| -> std::io::Result<PathBuf> {
+        std::fs::canonicalize(path).or_else(|_| {
+            let mut normalized = PathBuf::new();
+            for component in std::path::absolute(path)?.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other.as_os_str()),
+                }
+            }
+            Ok(normalized)
+        })
+    };
+    let mut explicit_skill_roots = explicit
+        .iter()
+        .map(|root| {
+            Ok(ExplicitSkillRoot {
+                agent: root.agent,
+                path: normalize(&root.path)?,
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    explicit_skill_roots.sort_by(|a, b| (a.agent, &a.path).cmp(&(b.agent, &b.path)));
+    explicit_skill_roots.dedup();
+    let mut explicit_source_roots = source_roots
+        .iter()
+        .map(|path| normalize(path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    explicit_source_roots.sort();
+    explicit_source_roots.dedup();
+    Ok(crate::scan::SnapshotConfiguration {
+        home: normalize(home)?,
+        explicit_skill_roots,
+        explicit_source_roots,
+    })
 }
 
 pub(super) fn check_command(
@@ -93,6 +135,7 @@ pub(super) fn scan_command(
     source_roots: Vec<PathBuf>,
     summary: bool,
 ) -> Result<(Value, Vec<String>)> {
+    let configuration = snapshot_configuration(home, &explicit, &source_roots)?;
     let started = Utc::now().timestamp();
     let id = ScanId::new();
     // Freeze durable read permissions once before discovery. Only exact roots
@@ -142,6 +185,7 @@ pub(super) fn scan_command(
             return Err(error.into());
         }
     };
+    result.snapshot_configuration = Some(configuration);
     let post_scan_permissions = match crate::source_policy::freeze_active_roots(store) {
         Ok(permissions) => permissions,
         Err(error) => {

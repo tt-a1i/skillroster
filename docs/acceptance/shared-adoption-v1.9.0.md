@@ -130,3 +130,31 @@ the established cross-platform release workflow. The local full-check result
 and final source/binary digests are recorded in ignored
 `dist/shared-adoption-candidate/verification-summary.json`; detailed diagnostics
 stay local and are not release archive inputs.
+
+## Minimum-toolchain verification follow-up
+
+Publication was deferred on 2026-11-14. PR #398 remains open; no v1.9.0 tag,
+GitHub Release, Homebrew update or npm publication was performed.
+
+Cloud validation exposed a Rust 1.85-incompatible let-chain and two older
+Clippy `format_collect` warnings in MCP test helpers. Equivalent supported
+syntax fixes both without raising the minimum Rust version. Review also found
+that Check could reuse a Snapshot after changing Home or explicit roots with
+the same state directory. Snapshots now bind normalized Home, Agent roots and
+source roots; changed scope refreshes, equivalent paths/order reuse, and old
+Snapshots refresh once. Explicit MCP Snapshot requirements keep their existing
+optimistic read boundary.
+
+The full `scripts/ci-full-check.sh` was then executed with
+`RUSTUP_TOOLCHAIN=1.85.0`: **713 Rust tests passed, 0 failed, 1 existing opt-in
+test ignored; 152 Node tests and 3 npm tests passed**, including strict
+Clippy/formatting and all surface verifiers. The 14 human-experience tests
+include the three new scope-binding regressions and actual temporary-terminal
+confirmation/cancellation. Shared adoption tests execute Apply, Receipt,
+post-Apply Scan, On-demand loading and exact Undo in synthetic temporary homes.
+
+The current debug build also repeated isolated real-home Check, MCP inspection,
+Chinese verified loading and both Ready Plan previews. Real-home Apply and Undo
+remain outside this verification. Detailed logs are local under ignored
+`dist/v1.9.0-validation-20261114/`; the earlier optimized measurements above
+remain a separate run rather than a performance claim about this debug build.
