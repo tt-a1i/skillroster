@@ -31,10 +31,11 @@ fn handshake() -> Vec<Value> {
 fn exchange(temp: &TempDir, requests: Vec<Value>) -> Vec<Value> {
     exchange_raw(
         temp,
-        &requests
-            .iter()
-            .map(|r| format!("{r}\n"))
-            .collect::<String>(),
+        &requests.iter().fold(String::new(), |mut wire, request| {
+            wire.push_str(&request.to_string());
+            wire.push('\n');
+            wire
+        }),
     )
 }
 
@@ -268,10 +269,12 @@ fn sdk_nulls_and_whitespace_lines_are_accepted_without_extra_error_frames() {
         ],
     ]
     .concat();
-    let wire = requests
-        .iter()
-        .map(|r| format!(" \t\r\n{r}\n\n\t \n"))
-        .collect::<String>();
+    let wire = requests.iter().fold(String::new(), |mut wire, request| {
+        wire.push_str(" \t\r\n");
+        wire.push_str(&request.to_string());
+        wire.push_str("\n\n\t \n");
+        wire
+    });
     let result = exchange_raw(&temp, &wire);
     assert_eq!(result.len(), 5);
     assert_eq!(result[1]["result"]["tools"].as_array().unwrap().len(), 2);
