@@ -2522,11 +2522,11 @@ fn normalize_projected_target(
         .into_iter()
         .rev()
     {
-        if let Ok(resolved) = normalize_target(ancestor, roots)
-            && directories.contains(&resolved)
-        {
-            path = resolved.join(path.strip_prefix(ancestor).expect("ancestor"));
-            break;
+        if let Ok(resolved) = normalize_target(ancestor, roots) {
+            if directories.contains(&resolved) {
+                path = resolved.join(path.strip_prefix(ancestor).expect("ancestor"));
+                break;
+            }
         }
     }
     if let Some(directory) = directories
