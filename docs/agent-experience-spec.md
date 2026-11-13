@@ -13,8 +13,8 @@ A person should be able to say:
 
 In the same Agent turn, when evidence is sufficient, the Agent should:
 
-1. run a read-only Scan;
-2. generate the evidence-backed report;
+1. run read-only `check --json` (Scan automatically when required);
+2. interpret the returned evidence-backed Report;
 3. make the semantic governance decisions outside the CLI;
 4. submit those decisions to `plan --stdin`;
 5. present the validated Plan and one primary action: **应用这份方案**.
@@ -81,7 +81,7 @@ Bootstrap status does not establish activation inside a running Agent session.
 The initial response should fit roughly one conversation viewport. It contains:
 
 1. **One-sentence diagnosis** with only evidence-backed numbers.
-2. **Four core metrics:** independent Skills, placements, default exposure, and observed-use coverage. Usage coverage names sampled, complete, limited, missing-root, and inaccessible Agent counts separately.
+2. **Core metrics:** independent Skills, placements, default exposure, measured metadata footprint, and observed-use coverage. Footprint is local UTF-8 disk bytes per exposed Placement with unknown counts, not runtime tokens. Usage coverage names sampled, complete, limited, missing-root, and inaccessible Agent counts separately.
 3. **Up to three review Findings:** fact, impact, and Evidence quality. An empty or informational-only Report can end with keeping the current setup; retain scope and usage limits instead of manufacturing problems.
 4. **Impact:** current affected scale for Finding-only diagnosis; current →
    proposed counts and affected Agents only from a validated Plan. Preserve each
@@ -239,6 +239,18 @@ Follow-up questions resolve against the same report and Snapshot unless the user
 The Agent uses stable IDs internally and displays them where they help follow-up. Full paths and raw Evidence remain on demand.
 
 ## 8. Bootstrap Skill rules
+
+Optional stdio MCP can replace Bootstrap installation for read-only discovery:
+`inspect_skills` returns Check's bounded summary and `find_skill` returns the
+same Find/load facts and refusals. Honor envelope version, `ok`, identity and
+verification in either transport. Capability judgment stays with the Agent.
+Find prepares a Snapshot only when needed and does not generate a Report.
+Supplying `require_snapshot` disables automatic Scan: honor the returned CLI
+drift/missing-Snapshot continuation before retrying that optimistic read.
+MCP exposes no mutations; use CLI Setup/Plan, one user confirmation and Apply
+for changes. Human-TTY-only `init` must never be used by an Agent to combine
+planning and writing. CLI follow-ups continue through the same Report/Snapshot
+IDs and typed recovery actions; MCP is not an authorization bypass.
 
 The single `skillroster` bootstrap Skill must instruct every supported Agent to:
 

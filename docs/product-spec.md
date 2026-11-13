@@ -2,7 +2,10 @@
 
 ## 1. Product promise
 
-SkillRoster lets a person ask an AI Agent to inspect and govern local Agent Skills. The Agent invokes one bootstrap Skill, calls a deterministic Rust CLI, explains evidence-backed problems, and executes only a user-approved, reversible Plan.
+SkillRoster keeps everyday Skills in Core and the rest available On-demand.
+People can inspect with one read-only `check`; Agents use Bootstrap + JSON or
+optional local read-only MCP tools. Governance executes only a user-approved,
+immutable, reversible Plan through the deterministic Rust CLI.
 
 > One library. The right roster for every agent.
 
@@ -296,6 +299,32 @@ the semantic conclusion, and no Plan action is suggested from this evidence.
 
 Reports disclose semantic overlap candidate bounds as `semantic_overlap_candidates`: the total qualifying pair count, the retained count (at most 25), and whether candidates were truncated. These are analysis-wide bounds, independent of Finding filters or pagination, and appear in both JSON views and terminal summaries and Finding lists. Cached reports without these bounds are regenerated from the same Snapshot; a new Scan is not required.
 
+### Exposed Metadata Footprint
+
+Scan, aggregate Report views and Check expose `exposed_metadata_footprint`.
+It sums authorized, verified-entrypoint observations once per `default_exposed`
+Placement, including copies and links exposed by different Agents. Full Scan/Report
+and Plan `by_agent` details use canonical Agent IDs; bounded summaries retain
+the same complete totals and unknown counts. Source-only and disabled placements
+do not contribute.
+
+- `exposed_metadata_bytes`: UTF-8 bytes of each complete `SKILL.md` entrypoint.
+- `exposed_frontmatter_bytes`: raw leading YAML frontmatter including both
+  `---` delimiter lines and the closing newline when present. No frontmatter
+  is known zero; an unclosed leading block is unknown.
+- `metadata_unknown_placement_count` and
+  `frontmatter_unknown_placement_count`: unreadable, unauthorized,
+  drift-discarded, legacy or unknown-frontmatter observations. Byte totals are
+  known subtotals and exclude these unknowns.
+
+Measurements freeze the scanner's already authorized bytes before identity
+deduplication. They grant no new read permission and measure local disk metadata,
+not runtime tokens, a tokenizer estimate or an observed session catalog.
+Roster Plans freeze comparable `impact.exposed_metadata_footprint.before/after`
+including per-Agent counts and unknowns. This projection follows the Plan's
+retained, removed and created exposures; a later Scan measures actual
+post-Apply state. Historical Plans remain immutable.
+
 ### 4.3 Library and Rosters
 
 The Library is logical and does not require moving every Skill. Each discovered Skill begins as Observed. After approval it may become:
@@ -421,6 +450,9 @@ The first complete command surface is:
 
 ```bash
 skillroster [--json]
+skillroster check [--json]
+skillroster init [--agent <id>] [--modified-choice retain-local|adopt-current]
+skillroster mcp
 skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--variant-placement-id <placement-id>] [--require-snapshot <scan-id>] [--json] -- <task>
@@ -446,6 +478,68 @@ generated continuation with the original discovery context preserved. A
 current Snapshot proves inventory freshness, not completed analysis: Home and
 `status` remain resumable through `report --json` until that Snapshot has a
 persisted Report.
+
+### One-call entry paths
+
+`check` returns the existing compact Report: core metrics, up to three review
+Findings and typed next actions. It runs a complete read-only Scan only when no
+completed Snapshot exists, mutation/source-permission invalidation requires one,
+or the existing content/native configuration contract detects drift or legacy
+data. Otherwise it reuses the Snapshot and cached Report. It does not watch
+Skill files or expire Snapshots by age; explicit `scan` remains the requested
+refresh path. JSON keeps the versioned envelope with `command: check`,
+`scan_performed`, `snapshot_id`, `report_id`, `primary_metrics` and
+`exposed_metadata_footprint`. Independent Scan/Report behavior is unchanged.
+Snapshot/Report persistence changes only local observation state.
+
+`init` requires human TTY stdin/stdout and rejects `--json` before state
+initialization. It uses Check's freshness decision and the normal Setup Plan,
+selected-Agent isolation and local-modification protection. Complete Plan
+impact and exact target operations precede `Enter confirm · Esc cancel`.
+Enter runs standard Apply with the existing lock, drift checks, Receipt and
+bounded Undo. Escape/EOF/other keys cancel without Agent-file changes. A short
+Escape-sequence settling interval precedes input flushing and terminal-mode
+restoration, so arrow/pasted key remainders do not reach the shell.
+Local modifications require the explicit retain/adopt option; unsupported or
+non-isolatable targets remain blocked. Current targets return `Up to date`
+without an empty Plan or Receipt. Verified application gives a copyable Agent
+prompt. Agents retain `setup --json`, user confirmation, then `apply ID --json`.
+
+### Optional local stdio MCP
+
+`mcp` is a synchronous JSON-RPC 2.0 stdio adapter using standard library and
+existing dependencies, with no network or async runtime. UTF-8 messages are
+newline-delimited. Stdout contains only protocol frames, never human output,
+progress or ANSI. The server negotiates MCP 2025-11-25 and compatible
+2024-11-05, 2025-03-26 and 2025-06-18 revisions. It supports `initialize`,
+`notifications/initialized`, `ping`, `tools/list` and `tools/call`; EOF exits
+cleanly. Pure whitespace input lines are ignored. Empty tools accept omitted
+or null arguments; `tools/list` accepts an omitted or null cursor. Frames are
+bounded to 1 MiB. Invalid requests/methods/tools/arguments
+produce JSON-RPC errors; engine refusals remain typed CLI envelopes with
+`isError: true` in tool results.
+
+Only two tools are exposed, both annotated read-only:
+
+- `find_skill`: verbatim `task`, optional `hints`, `load`, `limit` (1–100),
+  `variant_skill_id`, `variant_placement_id` and `require_snapshot`. Uses the
+  Snapshot preparation path then normal Find without generating a Report,
+  retaining all source, path, fingerprint, content, size and ambiguity gates.
+  Selectors require `load`. When `require_snapshot` is supplied, Find runs
+  directly against that optimistic boundary: missing/stale facts or a changed
+  Snapshot return the CLI refusal without an automatic Scan. Unbound Find
+  refreshes only when the Snapshot readiness contract requires it.
+- `inspect_skills`: empty arguments; Check's Inventory, measured metadata
+  bytes and Top Findings, without a governance Plan.
+
+Handshake/listing do not initialize inventory state. Arguments validate before
+scanning. Results carry the CLI envelope as text JSON and `structuredContent`.
+MCP exposes no permission confirmation, Plan, Apply, Undo or filesystem mutation
+tools. Suggested CLI actions remain options, never authorization. Local Skill
+content does not grant permission to execute its instructions. Bootstrap is
+optional for read-only integration. The same database and locks are reused.
+
+### Independent command details
 
 Finding lists and full Finding records default to 20 rows per page. Compact
 `report --finding <id>` detail defaults to five rows so an Agent receives the
@@ -988,7 +1082,12 @@ The complete first release deliberately contains:
 - eight direct Agent adapters;
 - core-logic and high-risk mutation tests.
 
-It does not contain HTML reports, a GUI, an interactive or full-screen TUI, MCP, cloud services, accounts, telemetry, a daemon, a plugin SDK, generic Agent adapters, a workflow engine, a second Agent, or built-in model calls. Ponytail is a development experiment only and creates no product dependency or product-specific behavior.
+It does not contain HTML reports, a GUI, a full-screen TUI, remote MCP service,
+cloud services, accounts, telemetry, a daemon, a plugin SDK, generic Agent
+adapters, a workflow engine, a second Agent or built-in model calls. Local
+stdio MCP and bounded human Init confirmation are optional entry paths into the
+same engine. npm packages wrap the same binary; there is no second installer
+engine. Ponytail remains a development experiment with no product dependency.
 
 An abstraction requires at least two real consumers. Otherwise, prefer direct code.
 

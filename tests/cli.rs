@@ -1030,8 +1030,8 @@ fn skill_evidence_id(database: &rusqlite::Connection, snapshot_id: &str, skill_i
 
 fn assert_setup_versions(output: &Value) {
     assert_eq!(output["result"]["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.52");
-    assert_eq!(output["result"]["bootstrap_version"], "1.8.52");
+    assert_eq!(output["result"]["bootstrap_content_version"], "1.8.53");
+    assert_eq!(output["result"]["bootstrap_version"], "1.8.53");
 }
 
 #[cfg(unix)]
@@ -6084,7 +6084,7 @@ fn setup_requires_a_choice_before_replacing_a_modified_bootstrap_skill() {
     assert_setup_versions(&current);
     assert_eq!(
         current["result"]["targets"][0]["installed_version"],
-        "1.8.52"
+        "1.8.53"
     );
 
     let undone = json_output(&run(
@@ -6344,7 +6344,7 @@ fn setup_upgrades_released_bootstrap_packages_and_undo_restores_every_file() {
         assert_eq!(current["result"]["state"], "up_to_date");
         assert_eq!(
             current["result"]["targets"][0]["installed_version"],
-            "1.8.52"
+            "1.8.53"
         );
 
         let receipt_id = applied["result"]["receipt_id"].as_str().unwrap();

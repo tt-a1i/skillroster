@@ -6,12 +6,12 @@
   <strong>中文</strong> · <a href="README.en.md">English</a>
 </p>
 
-<h1 align="center">Skill 都留着，每个 Agent 只带上合适的。</h1>
+<h1 align="center">装了 200 个 Skill，Agent 也只带常用的。</h1>
 
 <p align="center">
-  盘清散落的 Skills，找出重复版本和失效链接，<br>
-  为每个 Agent 配好常用能力，其余按需查找。<br>
-  <strong>先看方案，再确认变更；执行有凭据，整理可撤销。</strong>
+  常用配进 <strong>Core</strong>，低频留作 <strong>On-demand</strong>，用时本地查找。<br>
+  一条命令体检，看清默认暴露的数量和元数据体积。<br>
+  <strong>整理先预览，确认后执行，凭 Receipt 可撤销。</strong>
 </p>
 
 <p align="center">
@@ -45,38 +45,39 @@
 
 普通任务可以直接使用已有能力；需要专门的 Skill 时再查找。查不到合适的可选 Skill，不必因此中断任务。Claude 的本地暴露统计会区分手动调用、关闭和仅显示名称等状态；它不等于运行中会话的完整目录或 token 消耗。[统计范围与验证](docs/practical-governance.md)
 
-## v1.8.48 更新
-
-- **按 Agent 接入**：可用 `setup --agent codex` 只预览指定 Agent 的接入；共享目标无法隔离修改时明确拒绝。
-- **修改依据保持新鲜**：规划和执行前重新核对 Library 内容，Undo 成功后要求重新扫描。
-- **查找与加载更清楚**：提供有界描述与触发信息，点名 Skill 时先核对身份；等价副本回退仍校验完整内容。
-- **诊断更准确**：区分未知来源修改、请求格式错误、包内容保护和权限阻断；重建状态保留原扫描上下文。
-
-这些改进已随 v1.8.48 发布，安装方式见下文。已有待确认 Plan 在旧快照或配置变化时可能要求重新扫描；请重新检查方案后再应用。
-
 ## 30 秒开始
 
-macOS 或 Linux 用户可通过 Homebrew 安装：
+CLI 装好后，一条命令看结果；想通过 Bootstrap 接入 Agent，再运行一步初始化：
 
 ```bash
-brew install tt-a1i/skillroster/skillroster
-skillroster --version
+skillroster check
+skillroster init --agent codex
 ```
 
-CLI 安装完成即可直接检查，Bootstrap 接入是可选步骤：
+`check` 只读：需要时自动扫描，随后显示核心指标、前三项诊断和下一步。
+`init` 在终端展示完整安装或升级影响，按 Enter 确认、Esc 取消；成功后给出
+Receipt、撤销入口和可复制给 Agent 的一句话。只检查时无需初始化。
+
+**以上是 v1.9.0 源码候选体验，尚未包含在公开 v1.8.48 中。** 在本仓库使用
+`cargo install --locked --path .` 安装此实现。稳定版仍可通过
+`brew install tt-a1i/skillroster/skillroster` 或 [Release/Cargo/Windows](docs/installation.md)
+安装，使用独立的 `scan`、`report`、`setup` 与 `apply`。
+
+也可以选用本地只读 MCP，无需向各 Agent 的默认目录安装 Bootstrap：
 
 ```bash
-skillroster scan --summary
-skillroster report
+claude mcp add --transport stdio skillroster -- skillroster mcp
+codex mcp add skillroster -- skillroster mcp
 ```
 
-通过 Agent 使用时，先运行 `skillroster setup --json`，查看它检测到的 Agent、目标文件和 Plan。确认这些目标后，再执行 `skillroster apply <plan-id> --json`；命令中的 ID 使用刚刚返回的值。重新打开 Agent 会话，让它发现引导 Skill，然后可以这样说：
+连接后可以说：
 
-> 使用 SkillRoster 检查我电脑上的 Skills，解释有证据支持、值得处理的问题。没有明确整理项就告诉我可以保持现状。先做分析，我选择整理目标后再预览方案，确认完整 Plan 后才修改 Agent 文件。
+> 使用 SkillRoster 检查我的 Skills。常用的保留在 Core，低频的按需查找；先展示方案，等我确认再修改。
 
-GitHub Release 与固定标签安装提供 CLI **v1.8.48 / Bootstrap 1.8.52**，包含 Codex/Hermes 本地可见性保护、冲突内容选择和会话证据修复。可用 `skillroster setup --check --json` 只查接入状态，不创建 Plan。已有用户需要分别更新 CLI 和可选的 Bootstrap；具体步骤见[安装指南](docs/installation.md)。
-
-[Windows、Cargo 和 Release 安装方式](docs/installation.md) · [升级并确认 Agent 使用的可执行文件](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)
+MCP 提供检索和诊断；修改仍走 CLI 的 Plan、确认、Apply、Receipt。
+[npx 包装方案与 Cursor 配置](docs/installation.md#optional-local-stdio-mcp-source-candidate)
+也已提供，npm 包需发布后才能使用 `npx skillroster check`。
+已有用户可先用 `setup --check --json` 检查 Bootstrap 版本。
 
 ## 一眼看懂治理结果
 
@@ -93,8 +94,8 @@ Apply 和 Undo，而不是加载预先写好的结果：
 Placement，并把变更限制在可验证、可撤销的 Receipt 内。完整的三臂过程（包含谨慎人工
 治理对照）见[可重复验收记录](docs/acceptance.md#executed-three-arm-value-comparison)。
 
-这是受控清单上的产品行为证据，不是对 token、人工成本、生产性能、模型质量，或
-Core / On-demand 划分普遍优越性的证明。
+这些数字来自受控清单；不代表实际 token、人工成本或任务质量收益。
+新增的暴露体积是本地磁盘实测 UTF-8 字节数，未知项单列，不换算为运行态 token。
 
 另有一份[真实环境的历史只读记录](docs/acceptance/release-v1.8.28-candidate.md)：252 个独立 Skills、892 个安装位置。那次会话覆盖不完整；没有观察到使用记录，不代表某个 Skill 没有用。
 

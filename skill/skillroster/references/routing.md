@@ -1,10 +1,8 @@
 # Routing details
 
-The root search workflow is authoritative. Read this file for a wrong-domain result
-or `verified_skill_load_blocked`. Keep `TASK` verbatim. A non-English or mixed
-task receives exactly one faithful English `--hint` on the first call.
-Build the hint from the desired surface, object, operation, and state; never
-guess a Skill name.
+Use the root workflow's verbatim `TASK` and capability hint. This reference
+handles wrong-domain results and `verified_skill_load_blocked`; hints describe
+the requested surface, object, operation and state, never a guessed Skill name.
 
 With a hint, require
 `ranking_strategy: task_hint_reciprocal_rank_fusion`. Use `task_channel_rank`
@@ -95,8 +93,7 @@ result has a different blocker. For drift, legacy Snapshot, unreadable,
 oversized, escaping, or untrusted-source reasons, follow
 `error.details.next_action`; never bypass the check or recover partial
 instructions. A successful load returns complete
-instructions but does not activate, install, authorize, endorse, or establish
-task success.
+instructions under the root workflow's authorization and task-success boundary.
 
 Read `owned_by_agent` as placement-path structure only, never as ownership or
 endorsement of linked source content. Read `mutation_scopes` before governance:

@@ -52,10 +52,17 @@ fn main() {
         }
         Err(error) => error.exit(),
     };
+    if matches!(cli.command, Some(skillroster::cli::Command::Mcp)) {
+        if let Err(error) = skillroster::mcp::serve(cli) {
+            eprintln!("MCP stdio failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let json = cli.json;
     let command = cli.command_name();
     // Apply and Undo start progress inside `app::run`, after human confirmation.
-    let progress = (!matches!(command, "apply" | "undo"))
+    let progress = (!matches!(command, "apply" | "undo" | "init"))
         .then(|| skillroster::present::ProgressGuard::start(command, json));
     let (action_context, output) = match app::run_process(cli) {
         Ok(process) => process,

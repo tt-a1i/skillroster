@@ -15,13 +15,17 @@ Existing install and synchronization tools solve only part of this lifecycle. Sk
 
 ## Primary interaction
 
-The user delegates an intent to an agent. The agent loads the single `skillroster` bootstrap Skill, calls the deterministic CLI, interprets structured results, and asks for confirmation before material changes.
+People start with read-only `skillroster check`; optional `init` installs or
+upgrades Bootstrap after one TTY Plan review and confirmation. An Agent uses
+the Bootstrap CLI workflow or optional local stdio MCP tools for retrieval and
+diagnosis. It interprets deterministic facts and obtains user confirmation
+before material changes through the CLI Plan/Apply boundary.
 
 ```text
 Person
   -> AI agent
-      -> SkillRoster bootstrap Skill
-          -> skillroster CLI
+      -> Bootstrap Skill / optional read-only MCP
+          -> SkillRoster local engine
               -> local inventory, index, plans, and receipts
 ```
 
@@ -67,7 +71,8 @@ A record of an applied plan containing enough information to verify the result a
 
 ## Non-goals for the first release
 
-- No MCP server.
+- No remote MCP service or mutation tools over MCP. Local stdio MCP is an
+  optional integration with two read-only tools.
 - No hosted marketplace or mandatory account.
 - No automatic deletion based only on age or low usage.
 - No silent modification of agent configuration.
@@ -91,6 +96,10 @@ A record of an applied plan containing enough information to verify the result a
 - SQLite with FTS5 for local inventory, evidence, and search.
 - Adapter boundary per agent harness.
 - JSON output for agent callers; concise terminal output for people.
+- One-call Check, human-TTY Init and measured per-placement metadata bytes.
+- Optional synchronous stdio MCP using the same local primitives, plus an npm
+  launcher and four exact-version optional native packages staged from
+  checksum-verified Release archives without installation download hooks.
 - One thin bootstrap Skill that teaches agents when to call the CLI. Its runtime
   boundary is documented in [the Bootstrap boundary decision](research/agent-skill-governance-and-routing.md),
   while product presentation and evaluation rules stay outside the Skill.

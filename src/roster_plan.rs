@@ -731,6 +731,7 @@ pub fn derive(
     let mut needs_backup_root = false;
     let mut before_exposure = 0_usize;
     let mut after_exposure = 0_usize;
+    let mut after_exposed_placements = Vec::new();
     let mut affected_agents = BTreeSet::new();
     let mut affected_skills = BTreeSet::new();
     let mut affected_placements = BTreeSet::new();
@@ -1186,6 +1187,9 @@ pub fn derive(
                 needs_backup_root |= !backup_root.exists();
                 before_exposure += usize::from(placement.default_exposed);
                 after_exposure += usize::from(placement.default_exposed);
+                if placement.default_exposed {
+                    after_exposed_placements.push((*placement).clone());
+                }
                 affected_placements.insert(placement.id.clone());
                 if let Some(agent) = placement.agent {
                     affected_agents.insert(agent.id().to_owned());
@@ -1250,6 +1254,13 @@ pub fn derive(
                 .iter()
                 .any(|placement| retargeted_placements.contains(&placement.id))
             {
+                let retained = existing.iter().copied().filter(|placement| {
+                    placement.default_exposed && !retargeted_placements.contains(&placement.id)
+                });
+                for placement in retained {
+                    after_exposure += 1;
+                    after_exposed_placements.push(placement.clone());
+                }
                 exclusions.push(json!({
                     "agent": request.agent,
                     "skill_id": skill_id,
@@ -1263,7 +1274,15 @@ pub fn derive(
                         removal.iter().any(|removed| target == &removed.directory)
                     })
             }) {
-                after_exposure += 1;
+                // Core is selected by Skill identity, but exposure and bytes count
+                // every retained placement, including copies in the same Agent.
+                for placement in existing
+                    .iter()
+                    .filter(|placement| placement.default_exposed)
+                {
+                    after_exposure += 1;
+                    after_exposed_placements.push((**placement).clone());
+                }
                 exclusions.push(json!({
                     "agent": request.agent,
                     "skill_id": skill_id,
@@ -1380,6 +1399,11 @@ pub fn derive(
             });
             *operation_groups.entry("add_core_exposure").or_default() += 1;
             after_exposure += 1;
+            if let Some(placement) = placements.iter().find(|p| p.content_digest == exact_digest) {
+                let mut projected = (*placement).clone();
+                projected.agent = Some(requested_agent);
+                after_exposed_placements.push(projected);
+            }
         }
 
         for request in requests {
@@ -1433,6 +1457,7 @@ pub fn derive(
         {
             before_exposure += 1;
             after_exposure += 1;
+            after_exposed_placements.push(placement.clone());
         }
     }
 
@@ -1442,6 +1467,10 @@ pub fn derive(
         impact: json!({
             "before_default_exposure": before_exposure,
             "after_default_exposure": after_exposure,
+            "exposed_metadata_footprint": {
+                "before": crate::footprint::exposed(scan),
+                "after": crate::footprint::summarize(scan, &after_exposed_placements),
+            },
             "exposure_reduction": before_exposure.saturating_sub(after_exposure),
             "exposure_reduction_percent": if before_exposure == 0 { 0.0 } else {
                 (before_exposure.saturating_sub(after_exposure) as f64 * 100.0)
@@ -1634,7 +1663,14 @@ fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
                 && root.kind == RootKind::Skills
                 && root.status == RootStatus::Included
         })
-        .ok_or_else(|| anyhow!("Agent {} has no included Skill root", agent.id()))?;
+        .ok_or_else(|| {
+            if scan.roots.iter().any(|root| root.agent == Some(agent)
+                && root.kind == RootKind::Skills && root.status == RootStatus::Included && root.shared) {
+                anyhow!("Agent {} has shared read-only Skill roots, but no exclusive Skill root for Roster changes; keep this Roster or configure an exclusive Agent root and rescan. Source read permission cannot make a shared root mutable", agent.id())
+            } else {
+                anyhow!("Agent {} has no included Skill root; inspect the configured Agent roots before planning Roster changes", agent.id())
+            }
+        })?;
     if !root.discovery_complete {
         return Err(RosterDiscoveryIncomplete {
             agent: agent.id().into(),
@@ -1776,7 +1812,11 @@ mod tests {
         let mut options = ScanOptions::for_home(home);
         options.include_session_evidence = false;
         let snapshot = scan(&options).unwrap();
-        assert!(agent_root(&snapshot, AgentKind::Codex).is_err());
+        let blocked = agent_root(&snapshot, AgentKind::Codex)
+            .unwrap_err()
+            .to_string();
+        assert!(blocked.contains("shared read-only Skill roots"));
+        assert!(blocked.contains("configure an exclusive Agent root and rescan"));
         options
             .explicit_skill_roots
             .push(crate::scan::ExplicitSkillRoot {

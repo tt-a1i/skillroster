@@ -2,9 +2,9 @@
 
 ## Inspect
 
-Run `skillroster scan --summary --json`, then the bounded
-`skillroster report --json`. Use full `scan --json` only for deliberate root or
-coverage diagnostics.
+Start a new inspection with `skillroster check --json`: it scans when required
+and returns the bounded Report. Use explicit `scan --summary --json` for a
+requested refresh and full `scan --json` for deliberate root/coverage diagnostics.
 Use `finding_rollups` for group scale and the selected Findings for the first
 decisions. Read `overview.state`: `inventory_empty` means no Skills were found
 in the checked roots; `no_review_items` means only informational Findings remain.
@@ -17,12 +17,9 @@ while that decision remains open. Reserve `report --full` for deliberate
 exhaustive export; do not make extra calls just to satisfy a fixed presentation
 template.
 
-For each selected Finding, pass through these CLI facts without widening their
-scope: `affected_agents` is the observed Agent set, `actionability` describes
-what the CLI can support now, and `reversibility` describes the recovery path
-of a possible applied change. They constrain the next safe action; they are not
-a value score, and `reversibility` is not permission to Apply. Use the user's
-goal and the available evidence to decide what deserves attention.
+For each Finding, retain `affected_agents`, `actionability` and `reversibility`:
+they identify observed scope, supported next steps and recovery, not usefulness
+or permission to Apply.
 
 Usage evidence is five-stage and conservative. Read `session_coverage` before
 describing it. `sampled_agents` support bounded observed events;
@@ -198,7 +195,10 @@ metrics, selected Findings, rollups, and typed safety facts. Include
 and keep each count's field meaning and unit. Do not derive deletion or
 reduction counts from current Finding scale. State measurable before/after
 impact only from a validated Plan, and actual impact only from its Receipt.
-Include uncertainty, evidence quality, safety risks, and whether confirmation is
+For Roster impact, include `exposed_metadata_footprint.before/after`: measured
+local UTF-8 entrypoint/frontmatter bytes per exposed placement, with unknown
+counts. These are not runtime token counts. Include uncertainty, evidence
+quality, safety risks, and whether confirmation is
 required. Choose a primary next action when the evidence supports one; expand
 the view when the user's question or an unresolved decision requires it. For a
 proposed change, include its measurable before/after impact,

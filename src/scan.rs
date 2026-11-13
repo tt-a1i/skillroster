@@ -512,6 +512,11 @@ pub struct ScanResult {
     #[serde(default)]
     pub skill_content_variants: Option<Vec<ScannedSkill>>,
     pub placements: Vec<SkillPlacement>,
+    /// Exact authorized entrypoint byte measurements keyed by placement, before deduplication.
+    #[serde(default)]
+    pub entrypoint_bytes: BTreeMap<String, crate::footprint::EntrypointBytes>,
+    #[serde(default)]
+    pub entrypoint_bytes_observed: bool,
     /// Placement-bound native manifest names captured from verified bytes before
     /// declared-source identity deduplication. None means unsupported or absent.
     #[serde(default)]
@@ -1086,6 +1091,7 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     require_unicode_scan_options(options)?;
     let mut result = ScanResult {
+        entrypoint_bytes_observed: true,
         hermes_discovery_contract_version: Some(HERMES_DISCOVERY_CONTRACT_VERSION),
         skill_content_variants: Some(Vec::new()),
         content_identity_algorithm: Some(CONTENT_IDENTITY_ALGORITHM.into()),
@@ -2427,6 +2433,12 @@ fn materialize_candidates_with_hook(
             }
         }
         let placement_id = format!("placement_{}", stable_digest(placement_basis.as_bytes()));
+        if safe_to_read && entrypoint_read_error.is_none() {
+            result.entrypoint_bytes.insert(
+                placement_id.clone(),
+                crate::footprint::EntrypointBytes::measure(&content),
+            );
+        }
         result.verified_entrypoint_names.insert(
             placement_id.clone(),
             safe_to_read

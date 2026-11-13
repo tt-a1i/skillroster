@@ -1,6 +1,6 @@
 [package]
 name = "skillroster"
-version = "1.8.48"
+version = "1.9.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Local skill governance for AI agents"
@@ -30,7 +30,7 @@ yaml_serde = "0.10"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3.20"

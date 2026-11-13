@@ -33,8 +33,15 @@ use crate::state_security;
 
 pub use crate::action_context::ActionContext;
 
+mod bootstrap_history;
 mod content_choice;
+use bootstrap_history::{LEGACY_COMPLETE_BOOTSTRAP_PACKAGES, LEGACY_SINGLE_FILE_BOOTSTRAPS};
 mod error;
+mod inspection;
+mod interactive;
+
+pub(crate) use inspection::run_mcp_find_process;
+use inspection::scan_command;
 
 use content_choice::{
     add_declared_content_resolution, bind_content_choices, declared_content_choice,
@@ -74,16 +81,23 @@ pub struct Output {
 
 pub fn run(cli: Cli) -> Result<Output> {
     let action_context = ActionContext::from_cli(&cli)?;
-    run_with_context(cli, &action_context)
+    run_with_context(cli, &action_context, false)
 }
 
 pub fn run_process(cli: Cli) -> Result<(ActionContext, Result<Output>)> {
     let action_context = ActionContext::from_process(&cli)?;
-    let output = run_with_context(cli, &action_context);
+    let output = run_with_context(cli, &action_context, false);
     Ok((action_context, output))
 }
 
-fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> {
+fn run_with_context(
+    cli: Cli,
+    action_context: &ActionContext,
+    refresh_find: bool,
+) -> Result<Output> {
+    if matches!(cli.command, Some(Command::Init(_))) {
+        interactive::require_terminal(cli.json)?;
+    }
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
@@ -127,7 +141,8 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
     }
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
-    let state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
+    let state_lock = if refresh_find || command_requires_exclusive_state_lock(cli.command.as_ref())
+    {
         change::StateLock::acquire_exclusive(&state_dir)?
     } else {
         let shared = change::StateLock::acquire_shared(&state_dir)?;
@@ -288,6 +303,29 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                 )
             }
         },
+        Some(Command::Check) => {
+            let (result, warnings, actions) = inspection::check_command(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+            )?;
+            ("check", result, warnings, actions)
+        }
+        Some(Command::Init(args)) => {
+            let (result, actions) = interactive::init_command(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+                &args,
+                &state_lock,
+            )?;
+            ("init", result, vec![], actions)
+        }
+        Some(Command::Mcp) => bail!("MCP must run through its stdio entrypoint"),
         Some(Command::Scan(args)) => {
             let (result, warnings) = scan_command(
                 &store,
@@ -326,8 +364,16 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
             ("report", result, vec![], actions)
         }
         Some(Command::Find(args)) => {
-            let (result, actions) = find_command(&store, &state_dir, &args)?;
-            ("find", result, vec![], actions)
+            let (result, warnings, actions) = inspection::find_with_snapshot(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+                &args,
+                refresh_find,
+            )?;
+            ("find", result, warnings, actions)
         }
         Some(Command::Plan(args)) => {
             let showing_detail = args.show.is_some();
@@ -610,7 +656,13 @@ fn owned_source_confirmation_temp_name(name: &std::ffi::OsStr) -> bool {
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
     match command {
-        Some(Command::Scan(_) | Command::Apply(_) | Command::Undo(_)) => true,
+        Some(
+            Command::Check
+            | Command::Init(_)
+            | Command::Scan(_)
+            | Command::Apply(_)
+            | Command::Undo(_),
+        ) => true,
         Some(Command::Setup(args)) => !args.check,
         Some(Command::Report(args)) => args.finding.is_none(),
         Some(Command::Plan(args)) => args.show.is_none(),
@@ -625,7 +677,7 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
                 | LifecycleCommand::Recovery
                 | LifecycleCommand::Delete(_)
         ),
-        Some(Command::Find(_) | Command::Status) | None => false,
+        Some(Command::Find(_) | Command::Status | Command::Mcp) | None => false,
     }
 }
 
@@ -1683,170 +1735,6 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
     }))
 }
 
-fn scan_command(
-    store: &StateStore,
-    home: &Path,
-    state_dir: &Path,
-    explicit: Vec<ExplicitSkillRoot>,
-    source_roots: Vec<PathBuf>,
-    summary: bool,
-) -> Result<(Value, Vec<String>)> {
-    let started = Utc::now().timestamp();
-    let id = ScanId::new();
-    // Freeze durable read permissions once before discovery. Only exact roots
-    // whose path and stable filesystem identity still match enter the Scan;
-    // drift is local to that permission and persists as typed Snapshot facts.
-    let frozen_permissions = crate::source_policy::freeze_active_roots(store)?;
-    let durable_read_roots = frozen_permissions
-        .iter()
-        .filter(|root| root.state == crate::source_policy::SourceRootState::Active)
-        .filter_map(|root| {
-            root.resolved_path
-                .clone()
-                .map(|path| crate::scan::DurableReadRoot {
-                    permission_id: root.permission.id.as_str().to_owned(),
-                    path,
-                    identity: root.permission.identity.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
-    store.save_scan(&ScanRun {
-        id: id.clone(),
-        started_at: started,
-        completed_at: None,
-        status: ScanStatus::Running,
-        coverage_notes: vec![],
-    })?;
-    let mut options = ScanOptions::for_home(home);
-    options.explicit_skill_roots = explicit;
-    options.explicit_source_roots = source_roots;
-    options.durable_read_roots = durable_read_roots;
-    options.managed_source_roots = vec![state_dir.join("library")];
-    options.excluded_session_agents = store
-        .evidence_exclusions()?
-        .iter()
-        .map(|agent| parse_agent_kind(agent))
-        .collect::<Result<_>>()?;
-    let mut result = match scan::scan(&options) {
-        Ok(result) => result,
-        Err(error) => {
-            store.save_scan(&ScanRun {
-                id,
-                started_at: started,
-                completed_at: Some(Utc::now().timestamp()),
-                status: ScanStatus::Failed,
-                coverage_notes: vec![error.to_string()],
-            })?;
-            return Err(error.into());
-        }
-    };
-    let post_scan_permissions = match crate::source_policy::freeze_active_roots(store) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            store.save_scan(&ScanRun {
-                id,
-                started_at: started,
-                completed_at: Some(Utc::now().timestamp()),
-                status: ScanStatus::Failed,
-                coverage_notes: vec![error.to_string()],
-            })?;
-            return Err(error.into());
-        }
-    };
-    let policy_facts = conservative_source_policy_facts(
-        &frozen_permissions,
-        &post_scan_permissions,
-        &result.durable_read_drifted_permission_ids,
-    );
-    for fact in policy_facts
-        .iter()
-        .filter(|fact| fact.state != crate::source_policy::SourceRootState::Active)
-    {
-        result.warnings.push(format!(
-            "source-root permission {} is {} and was excluded: {}",
-            fact.permission_id,
-            serde_json::to_value(fact.state)?
-                .as_str()
-                .unwrap_or("drifted"),
-            fact.drift_reason.as_deref().unwrap_or("identity drift")
-        ));
-    }
-    result.source_root_policy = policy_facts;
-    store.begin_scan_snapshot()?;
-    let persistence = (|| -> Result<()> {
-        persist_index(store, &id, &result)?;
-        store.save_scan_payload(&id, &result)?;
-        store.save_scan(&ScanRun {
-            id: id.clone(),
-            started_at: started,
-            completed_at: Some(Utc::now().timestamp()),
-            status: ScanStatus::Completed,
-            coverage_notes: result.warnings.clone(),
-        })?;
-        store.commit_scan_snapshot()?;
-        Ok(())
-    })();
-    if let Err(error) = persistence {
-        let rollback_error = store.rollback_scan_snapshot().err();
-        store.save_scan(&ScanRun {
-            id,
-            started_at: started,
-            completed_at: Some(Utc::now().timestamp()),
-            status: ScanStatus::Failed,
-            coverage_notes: vec![error.to_string()],
-        })?;
-        if let Some(rollback_error) = rollback_error {
-            bail!("Scan persistence failed: {error}; rollback failed: {rollback_error}");
-        }
-        return Err(error);
-    }
-    let agents_checked = result
-        .roots
-        .iter()
-        .filter_map(|root| root.agent)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let warnings = compact_scan_warnings(result.warnings.clone());
-    let public_result = if summary {
-        scan_summary_value(&id, agents_checked, &result)?
-    } else {
-        let roots = result
-            .roots
-            .iter()
-            .map(|root| {
-                let mut value = json!(root);
-                value["agent"] = json!(root.agent.map(AgentKind::id));
-                value
-            })
-            .collect::<Vec<_>>();
-        let coverage = result
-            .coverage
-            .iter()
-            .map(session_coverage_details)
-            .collect::<Result<Vec<_>>>()?;
-        json!({
-            "snapshot_id": &id,
-            "agents_checked": agents_checked,
-            "skill_count": result.skills.len(),
-            "placement_count": result.placements.len(),
-            "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
-            "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
-            "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
-            "roots": roots,
-            "coverage": coverage,
-            "source_root_policy": {
-                "scope": "exact_local_read_only",
-                "content_endorsed": false,
-                "evidence_quality_changed": false,
-                "governance_authorized": false,
-                "permissions": result.source_root_policy,
-            },
-            "files_changed": false
-        })
-    };
-    Ok((public_result, warnings))
-}
-
 const SCAN_SUMMARY_ROOT_ISSUE_LIMIT: usize = 10;
 const SESSION_COVERAGE_PRESENTATION_VERSION: u32 = 1;
 
@@ -2004,6 +1892,8 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         "agents_checked": agents_checked,
         "skill_count": result.skills.len(),
         "placement_count": result.placements.len(),
+        "default_exposure": metrics.default_exposure,
+        "exposed_metadata_footprint": crate::footprint::compact(crate::footprint::exposed(result)),
         "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| {
@@ -2628,6 +2518,7 @@ fn report_command(
                 == Some(u64::from(SESSION_COVERAGE_PRESENTATION_VERSION))
             && report_supports_source_confirmation_kind(&existing)
             && report_supports_finding_decision_fields(&existing)
+            && existing.summary["exposed_metadata_footprint"].is_object()
             && existing.summary["overview"].is_object()
             && existing.summary["semantic_overlap_candidates"].is_object()
             && (scan.native_visibility.is_none()
@@ -2708,6 +2599,7 @@ fn report_command(
         "skill_count": report.metrics.independent_skills,
         "placement_count": report.metrics.placements,
         "default_exposure": report.metrics.default_exposure,
+        "exposed_metadata_footprint": crate::footprint::exposed(&scan),
         "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "hermes_visibility": scan.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
@@ -5292,6 +5184,7 @@ fn paged_finding_report(
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "exposed_metadata_footprint": crate::footprint::compact(report["exposed_metadata_footprint"].clone()),
         "native_visibility": report["native_visibility"],
         "codex_visibility": report["codex_visibility"],
         "hermes_visibility": report["hermes_visibility"],
@@ -5377,6 +5270,7 @@ fn compact_report(report: &Value) -> Value {
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "exposed_metadata_footprint": crate::footprint::compact(report["exposed_metadata_footprint"].clone()),
         "native_visibility": report["native_visibility"],
         "codex_visibility": report["codex_visibility"],
         "hermes_visibility": report["hermes_visibility"],
@@ -9609,149 +9503,6 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     Ok(result)
 }
 
-const LEGACY_SINGLE_FILE_BOOTSTRAPS: &[(&str, &str)] = &[
-    (
-        "1.0.0",
-        "08440a4a3e10489eae2484d0a5bf8f4b0451d22c43edaa90c75fcd0b66fd4a74",
-    ),
-    (
-        "1.0.1",
-        "2e18b702cbe61660aafff0b4c01538b51561cd0ce979cc4cce914f539b8c755e",
-    ),
-    (
-        "1.0.2",
-        "4a6c9de673948dbccfe719973395b7712fe09706ae22b2119e4a8ed8c5446a73",
-    ),
-    (
-        "1.0.3",
-        "1c0ffe7e1ef65d88e5c42a8978d92de81353c69072d8e610dce0c33d3938290c",
-    ),
-    (
-        "1.0.4",
-        "629d2d959c5b4277398e48f7b10c29c6c2adb0c0415723938ad7bbe4f8fec1c8",
-    ),
-    (
-        "1.1.0",
-        "d463d28295055fde8012e5c2424a754bf93e8c84c9fd6b48b7194bbaff0b27c2",
-    ),
-    (
-        "1.2.0",
-        "a12e3bbf45e4a3d51b8075dd2b56a410f113fb27cd803676fb614bd88f278f9c",
-    ),
-    (
-        "1.3.0",
-        "0fe2e7b8aed1f6db1c57a3d5b6efc247b795e1af01d5422b9168e707bc8c7b47",
-    ),
-    (
-        "1.4.0",
-        "2161ba4834fb350afee75fd6ab90ecff49741c971bb2d670b8d3c9f6588f9b70",
-    ),
-    (
-        "1.5.0",
-        "0afb58572bf602024f78e0f8c7312cc3485abb184746898945d1f7501a5425b5",
-    ),
-    (
-        "1.5.1",
-        "abb33e147e1b092ff70a2b02c5a8f89fc70d0c73eed2d8ec5ea88bba1ae58221",
-    ),
-    (
-        "1.6.0",
-        "c5f05692527bb2b8c45012ba6a464268b6a91a683a429a11dbe67022bbcc2aa5",
-    ),
-    (
-        "1.7.0",
-        "8b503801efa6a5dd13c8767647654bb9fcd4dcfaf10cdbbb61429dfe29995129",
-    ),
-    (
-        "1.7.1",
-        "f742e5d1af14309e3fa7e95378a207fafed3d09e477b1df9c9e76d65e4eec304",
-    ),
-    (
-        "1.8.0",
-        "820b760c5f6cc8c2ad6695e211044882077af138014579236b8824039fd1f394",
-    ),
-    (
-        "1.8.1",
-        "996891144bca51a654fc51294cd6d63c41df4afb5796af7846480b168f69edc6",
-    ),
-    (
-        "1.8.2",
-        "d79be31fe878267d00f21cf8e198443ebf8b95eb6631fc2395f132f12289e3e5",
-    ),
-    (
-        "1.8.3",
-        "3eba54753cfe8cdf987a8a4fe1ab1337317aef9b72e55b9be49b3158117470b1",
-    ),
-    (
-        "1.8.4",
-        "2758bed89792128c47d01f613a4df277dd32c9641cb036e7ed1f03c0c94e8381",
-    ),
-    (
-        "1.8.5",
-        "9f25609e002ad63e750214c54d7138f6e877849e46626aef441e00eaca8738d1",
-    ),
-    (
-        "1.8.6",
-        "4412ddc1fa4006492c28f8813462504a68cc71f4025398c3d60d5c225b2b904b",
-    ),
-    (
-        "1.8.7",
-        "68007e9c80a942cf4afa581f90639bbd260b69a36cb72aebdbca63e92d787eed",
-    ),
-    (
-        "1.8.8",
-        "15dc6c0bd25dc7a6e97336124960b7d548ecea9a3a58b34d55a4d57dbc4d5aeb",
-    ),
-    (
-        "1.8.9",
-        "1087110d8f8f9bb2c1839b1eda11b4417ca7b57af4449113a6fb5b1394e3309d",
-    ),
-    (
-        "1.8.10",
-        "dbc604dbfc45db5bf766609b28513eacb1ba87a96fc0cba7bb11337561bddd01",
-    ),
-    (
-        "1.8.11",
-        "501c0ce97d677b1a3c68d25dd1ece99590895dd51e23e671ea96312925e98c59",
-    ),
-    (
-        "1.8.12",
-        "69bf20da3494b69b634aee5e8d7dead8d8e30222f9e380461640af02bc83331e",
-    ),
-    (
-        "1.8.13",
-        "3063f8913c22846640389f5a633697aea253ab0805e974bd19fa0f06f2b01682",
-    ),
-    (
-        "1.8.14",
-        "ebf48e298ece30cd850146362b3fa73950b4fa26e35f3ce774a5700ae8b3e3cb",
-    ),
-    (
-        "1.8.15",
-        "dd08e0f4140989cb2a1178f60e152ee7913377d743f4029b9699122589193d47",
-    ),
-    (
-        "1.8.16",
-        "4d46b9699db8490821c1f91be1444dca689cd4b9578a2b732b633de441f8ff59",
-    ),
-    (
-        "1.8.17",
-        "5c7cc974e0d83d82993ba1ca9227c0d542288ca3d7ef4e04165794cb41faec33",
-    ),
-    (
-        "1.8.18",
-        "130cb488305b53dc3123633da50df6d3b843b24663861f7cc6b63964621b8718",
-    ),
-    (
-        "1.8.19",
-        "78aa0dbdf53c3f9f08fb5bf9805e33b2d5b8ffe4c63bac05d88391f608fab16c",
-    ),
-    (
-        "1.8.20",
-        "fc1318f0a8587ce193ab1f54462374508026cf8c50a382b613dc18b48f9d09f2",
-    ),
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapContentStatus {
     Current,
@@ -9785,177 +9536,6 @@ struct BootstrapPackageManifest<'a> {
     version: &'a str,
     file_digests: &'a [(&'a str, &'a str)],
 }
-
-const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
-    BootstrapPackageManifest {
-        version: "1.8.51",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "4555b296030a0680d820ff3b607c6ddb3874c18677c5efafebf333c3086e3d36",
-            ),
-            (
-                "references/routing.md",
-                "83ce87d14166347630ad8951597151092bc0b3be7cc7bd9f0b1d22795689640b",
-            ),
-            (
-                "references/governance.md",
-                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
-            ),
-            (
-                "references/mutation.md",
-                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.50",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "2cb9d6aa446c8cba2a8cd57e36ed256edd6655110006e64df173bfb94bfddcd1",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
-            ),
-            (
-                "references/mutation.md",
-                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.49",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "03dc9acfc37a979d1517640959fdf1572f55e673cd1f4884adc86a5f7223810a",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "ad540ca44ea39e386e1a8e4504dcb574ca6bf1baa4ff35f441ea4eac382952f9",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.23",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "0b5ff8d4ab352ef5b78908a6619352fce668ff5cbdcbc4258c450ceb5a34637f",
-            ),
-            (
-                "references/routing.md",
-                "be2ccff81b8b85c298abaa7f59a71c2f44dc6f1c990804cdf0f901d715c2f782",
-            ),
-            (
-                "references/governance.md",
-                "3285223b046721c6719fa8c6fa3628f2d33488efb4b23bf334a9763f442e95b6",
-            ),
-            (
-                "references/mutation.md",
-                "6490e355033f9fe6de5d027902241a514449a59fbf87831f7971ab1b98687927",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.29",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "c62bc41e54000a6191c781b45d082440cb5930bc26a1511dafc000cb1c1af5e3",
-            ),
-            (
-                "references/routing.md",
-                "9899e88dac1738584b6a8c615077b84f230a73292295a23e5614895628df0f22",
-            ),
-            (
-                "references/governance.md",
-                "3ba164010e51559708cb863abb9dfed450c065680256ddc348ec4677c7a01de8",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.46",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "8e6a7eacea3aea3fa7c11f6f1d73af06f5ca8b98cd287ab82004acd7b0fa938b",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.47",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "01f346450b239524658f1082e701144c396119ac0ef0278739928c5d797253a0",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.48",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "9b95e854f583f646b5aac0d2d839d249cd78651d9fb47a386f9c4d0c513a9e77",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "b121cfdbc3050efedbf2a603b2c7b61632285ea61a686204fcc855aeb115169e",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapFileStatus {

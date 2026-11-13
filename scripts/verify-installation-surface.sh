@@ -71,4 +71,21 @@ require_literal "$website" "IMMUTABLE CURRENT RELEASE · v${published_version}"
 require_literal "$website" "--tag v${published_version} skillroster"
 require_literal "$website" 'data-copy="brew install tt-a1i/skillroster/skillroster"'
 require_literal "$website" "SOURCE TREE v${candidate_version}"
+require_literal "$website" "SOURCE CANDIDATE v${candidate_version} · NOT YET PUBLISHED · BOOTSTRAP ${bootstrap_version}"
+require_literal "$website" "PUBLIC: CLI v${published_version} / BOOTSTRAP ${published_bootstrap_version}"
+for npm_manifest in npm/package.json npm/platforms/*/package.json; do
+  require_literal "$npm_manifest" "\"version\": \"${candidate_version}\""
+done
+require_literal README.md "v${candidate_version} 源码候选体验"
+require_literal README.en.md "v${candidate_version} source-candidate features"
 reject_literal "$website" "brew tap tt-a1i/skillroster https://github.com/tt-a1i/skillroster.git"
+
+# Candidate entry paths and npm templates must stay visible without changing
+# the published Formula revision or hashes.
+require_literal "$installation" 'skillroster check'
+require_literal "$installation" 'skillroster init --agent codex'
+require_literal "$installation" 'claude mcp add --transport stdio skillroster -- skillroster mcp'
+require_literal "$installation" 'codex mcp add skillroster -- skillroster mcp'
+require_literal "$installation" 'scripts/release/build-npm.py'
+require_literal 'README.md' 'skillroster check'
+require_literal 'README.en.md' 'skillroster check'

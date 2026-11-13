@@ -1,0 +1,10 @@
+{
+  "name": "@tt-a1i/skillroster-darwin-arm64",
+  "version": "1.9.0",
+  "description": "SkillRoster native binary for macOS ARM64",
+  "license": "Apache-2.0",
+  "repository": "github:tt-a1i/skillroster",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/", "README.md", "LICENSE", "provenance.json"]
+}
