@@ -566,6 +566,14 @@ pub fn error_json_with_context(
                 ),
             },
         );
+        if let Some(retrieval) = envelope
+            .error
+            .as_mut()
+            .and_then(|error| error.details.as_mut())
+            .and_then(|details| details.get_mut("retrieval"))
+        {
+            action_context.apply_result("find", retrieval);
+        }
         let argv = blocked
             .retry_argv
             .iter()
@@ -595,6 +603,14 @@ pub fn error_json_with_context(
                 paths: extract_paths(&error.to_string()),
             },
         );
+        if let Some(retrieval) = envelope
+            .error
+            .as_mut()
+            .and_then(|error| error.details.as_mut())
+            .and_then(|details| details.get_mut("retrieval"))
+        {
+            action_context.apply_result("find", retrieval);
+        }
         let safe_retry = match blocked.reason {
             "cjk_hint_required_for_weak_match"
             | "hint_direct_selection_evidence_required"

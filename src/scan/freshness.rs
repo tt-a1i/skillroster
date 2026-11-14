@@ -219,7 +219,7 @@ impl MetadataWalk {
         for entry in entries {
             let name = entry.file_name();
             if package_depth.is_some() {
-                if ignored_package_entry_name(&name) {
+                if ignored_package_entry_name(&name) && !(hermes && name == "target") {
                     continue;
                 }
             } else if ENTRYPOINT_DISCOVERY_EXCLUDED_DIRS
@@ -248,5 +248,27 @@ impl MetadataWalk {
             )?;
         }
         Some(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hermes_nested_target_changes_invalidate_fingerprint() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = home.path().join(".hermes/skills/parent");
+        let nested = parent.join("target/research");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(parent.join("SKILL.md"), "parent").unwrap();
+        fs::write(nested.join("SKILL.md"), "research").unwrap();
+        let options = ScanOptions::for_home(home.path());
+        let before = filesystem_fingerprint(&options).unwrap();
+        fs::write(nested.join("SKILL.md"), "updated research").unwrap();
+        let changed = filesystem_fingerprint(&options).unwrap();
+        assert_ne!(before, changed);
+        fs::remove_file(nested.join("SKILL.md")).unwrap();
+        assert_ne!(changed, filesystem_fingerprint(&options).unwrap());
     }
 }

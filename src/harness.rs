@@ -432,7 +432,7 @@ fn tool_read_text(name: &str, arguments: Option<&Value>) -> Option<String> {
         .iter()
         .flat_map(|command| {
             // A here-document body is data, even when it contains shell examples.
-            if command.contains("<<") || command.contains(['$', '`', '#']) {
+            if command.contains("<<") || command.contains(['$', '`', '#', '>']) {
                 return Vec::new();
             }
             command
@@ -853,6 +853,11 @@ mod tests {
             assert!(observations[0].record_text.contains("research/SKILL.md"));
             assert!(!observations[0].record_text.contains("other/SKILL.md"));
         }
+        let write = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call", "name":"exec_command",
+            "arguments":serde_json::json!({"cmd":"cat /tmp/template.md > /skills/research/SKILL.md"}).to_string()
+        }});
+        assert!(session_record_observations(AgentKind::Codex, &write.to_string()).is_empty());
     }
 
     #[test]

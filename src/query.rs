@@ -3166,8 +3166,10 @@ pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
         .match_reasons
         .iter()
         .any(|reason| reason == "description_token_phrase");
-    let has_multiple_specific_features =
-        match_reason_count(matched, "specific_metadata_features:").is_some_and(|count| count >= 3);
+    let has_multiple_specific_features = matched
+        .match_reasons
+        .iter()
+        .any(|reason| reason == "specific_metadata_phrase_coverage");
     has_exact_metadata_phrase
         || has_complete_name_tokens
         || has_specific_description_phrase
@@ -4580,6 +4582,16 @@ mod tests {
 
     #[test]
     fn verified_load_strength_requires_direct_selection_evidence() {
+        assert!(!has_strong_verified_load_evidence(&matched(
+            "mysql-tuning",
+            1,
+            &["specific_metadata_features:3"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "mysql-tuning",
+            1,
+            &["specific_metadata_phrase_coverage"],
+        )));
         assert!(!has_strong_verified_load_evidence(&matched(
             "request-refactor-plan",
             1,

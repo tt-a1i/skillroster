@@ -4883,6 +4883,14 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         "same_name_variants_ambiguous"
     );
     assert!(blocked_load["error"]["details"].get("content").is_none());
+    assert_eq!(
+        blocked_load["error"]["details"]["retrieval"]["matches"][0]["variant_finding"]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--json"]
+        ),
+    );
 
     let repeated_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
