@@ -3496,7 +3496,11 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 / files.len().saturating_sub(index).max(1) as u64;
             let mut extraction_remaining = parse_limit / 2;
             let mut records = Vec::new();
+            let remaining_jsonl_lines = MAX_SESSION_LINES_PER_AGENT.saturating_sub(lines_observed);
             for sample in samples {
+                if !is_json && records.len() > remaining_jsonl_lines {
+                    break;
+                }
                 let mut chunk_records = if is_json
                     && sample_bytes == metadata.len()
                     && sample.len() as u64 <= parse_limit
@@ -3541,10 +3545,10 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                         .map(|(record, lines)| (record.into_bytes(), lines))
                         .collect()
                 } else {
-                    sample
-                        .split_inclusive(|byte| *byte == b'\n')
-                        .map(|line| (line.to_vec(), 1))
-                        .collect::<Vec<_>>()
+                    session_sampling::bounded_jsonl_records(
+                        &sample,
+                        remaining_jsonl_lines.saturating_sub(records.len()),
+                    )
                 };
                 records.append(&mut chunk_records);
             }

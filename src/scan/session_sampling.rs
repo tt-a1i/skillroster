@@ -127,10 +127,58 @@ pub(super) fn has_usage_candidate(line: &[u8], _names: Option<&aho_corasick::Aho
     markers.is_match(line) && events.is_match(line)
 }
 
+/// Copy at most the remaining inspected lines plus one boundary record. The
+/// extra record lets the caller emit its typed line-limit fact before parsing.
+pub(super) fn bounded_jsonl_records(
+    sample: &[u8],
+    remaining_lines: usize,
+) -> Vec<(Vec<u8>, usize)> {
+    sample
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(remaining_lines.saturating_add(1))
+        .map(|line| (line.to_vec(), 1))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn jsonl_record_allocation_stops_at_line_limit_plus_boundary() {
+        let sample = vec![b'\n'; 1_000_000];
+        let records = bounded_jsonl_records(&sample, 7);
+        assert_eq!(records.len(), 8);
+        assert!(
+            records
+                .iter()
+                .all(|(line, count)| line == b"\n" && *count == 1)
+        );
+        assert_eq!(bounded_jsonl_records(&sample, 0).len(), 1);
+        assert!(bounded_jsonl_records(b"", 0).is_empty());
+    }
+
+    #[test]
+    fn jsonl_windows_share_one_record_allocation_limit() {
+        let mut records = Vec::new();
+        let limit = 3;
+        for sample in [b"{}\n{}\n".as_slice(), b"{}\n{}\n", b"{}\n{}\n"] {
+            if records.len() > limit {
+                break;
+            }
+            records.extend(bounded_jsonl_records(
+                sample,
+                limit.saturating_sub(records.len()),
+            ));
+        }
+        assert_eq!(records.len(), limit + 1);
+        assert!(
+            records
+                .iter()
+                .all(|(line, count)| line == b"{}\n" && *count == 1)
+        );
+    }
 
     #[test]
     fn allocation_releases_small_files_and_reaches_many_sessions() {
