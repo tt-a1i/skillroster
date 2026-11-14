@@ -14,6 +14,7 @@ static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_HANDLER: OnceLock<bool> = OnceLock::new();
 
 mod check;
+mod undo;
 
 /// Owns the one-line TTY progress state and restores the terminal on every exit path.
 pub struct ProgressGuard {
@@ -173,6 +174,7 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
         "find" => find(result, &mut lines, options.width),
         "plan" => plan(result, &mut lines, options.width),
         "apply" | "undo" => mutation(result, &mut lines),
+        "undo-preview" => undo::preview(result, &mut lines, options.width),
         "lifecycle" => lifecycle(result, &mut lines),
         "source-root" => source_root(result, &mut lines),
         "setup" => setup(result, &mut lines, options.width),
@@ -211,7 +213,16 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
 }
 
 pub fn error_human(error: &dyn Display) -> String {
-    format!("SkillRoster · Error\n\nERR  {error}\n\nFile changes: unknown.")
+    error_human_with_state(error, None)
+}
+
+pub fn error_human_with_state(error: &dyn Display, files_changed: Option<bool>) -> String {
+    let state = match files_changed {
+        Some(false) => "File changes: none.",
+        Some(true) => "File changes: recorded; inspect the Receipt.",
+        None => "File changes: unknown.",
+    };
+    format!("SkillRoster · Error\n\nERR  {error}\n\n{state}")
 }
 
 pub fn blocked_roster_plan(details: &Value) -> String {
@@ -314,6 +325,9 @@ fn blocked_roster_plan_lines(details: &Value, lines: &mut Vec<String>, width: us
 }
 
 fn title(value: &str) -> String {
+    if value == "undo-preview" {
+        return "Undo Receipt".into();
+    }
     let mut chars = value.chars();
     chars
         .next()

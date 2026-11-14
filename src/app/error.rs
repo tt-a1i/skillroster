@@ -14,6 +14,26 @@ use crate::scan;
 /// inventory parser bound. Larger Skills should disclose references on demand.
 pub(super) const MAX_AGENT_LOADED_SKILL_BYTES: u64 = 128 * 1024;
 
+/// Marks a failure reached before a human mutation was authorized or started.
+#[derive(Debug)]
+struct BeforeMutation(anyhow::Error);
+
+impl std::fmt::Display for BeforeMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl std::error::Error for BeforeMutation {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+pub(super) fn before_mutation(error: anyhow::Error) -> anyhow::Error {
+    BeforeMutation(error).into()
+}
+
 #[derive(Debug)]
 pub(super) struct InvalidSourceUpdateRequest(pub(super) serde_json::Error);
 
@@ -59,6 +79,7 @@ pub(super) struct SkillLoadBlocked {
     pub(super) expected_digest: Option<String>,
     pub(super) actual_digest: Option<String>,
     pub(super) retry_argv: Option<Vec<String>>,
+    pub(super) retrieval: Option<Value>,
 }
 
 impl std::fmt::Display for SkillLoadBlocked {
@@ -77,6 +98,7 @@ impl std::error::Error for SkillLoadBlocked {}
 pub(super) struct DeclaredIdentityContentAmbiguous {
     pub(super) skill_id: String,
     pub(super) content_choice: Value,
+    pub(super) retrieval: Option<Value>,
     pub(super) retry_argv: Vec<String>,
 }
 impl std::fmt::Display for DeclaredIdentityContentAmbiguous {
@@ -98,6 +120,9 @@ pub(super) struct ContentIdentityRescanRequired {
 impl std::fmt::Display for ContentIdentityRescanRequired {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.reason {
+            "filesystem_snapshot_changed" | "filesystem_snapshot_fingerprint_missing" => formatter.write_str(
+                "latest Snapshot's filesystem inventory is missing or changed; run skillroster scan",
+            ),
             "legacy_hermes_visibility_requires_rescan"
             | "hermes_visibility_settings_changed"
             | "hermes_visibility_root_identity_changed"
@@ -210,6 +235,21 @@ pub fn error_json_with_context(
     error: &(dyn std::error::Error + 'static),
     action_context: &ActionContext,
 ) -> String {
+    if let Some(before) = error.downcast_ref::<BeforeMutation>() {
+        let mut envelope: Value = serde_json::from_str(&error_json_with_context(
+            command,
+            before.0.as_ref(),
+            action_context,
+        ))
+        .expect("error envelope is JSON");
+        let details = &mut envelope["error"]["details"];
+        if !details.is_object() {
+            *details = json!({});
+        }
+        details["files_changed"] = json!(false);
+        details["mutation_started"] = json!(false);
+        return envelope.to_string();
+    }
     if let Some(required) = error.downcast_ref::<LibraryContentRescanRequired>() {
         let mut envelope = JsonEnvelope::<Value>::failure(
             command,
@@ -521,7 +561,7 @@ pub fn error_json_with_context(
                 paths: Vec::new(),
                 details: Some(
                     json!({ "reason": "declared_identity_content_ambiguous", "skill_id": blocked.skill_id,
-                "content_choice": blocked.content_choice, "files_changed": false, "state_files_changed": false,
+                "content_choice": blocked.content_choice, "retrieval": blocked.retrieval, "files_changed": false, "state_files_changed": false,
                 "next_action": "inspect_declared_identity_content", "retry_mode": "read_only_command_available" }),
                 ),
             },
@@ -556,12 +596,12 @@ pub fn error_json_with_context(
             },
         );
         let safe_retry = match blocked.reason {
-            "cjk_hint_required_for_weak_match" | "hint_direct_selection_evidence_required" => {
-                blocked
-                    .retry_argv
-                    .clone()
-                    .map(|argv| ("inspect_ranked_skill_evidence", argv, blocked.reason))
-            }
+            "cjk_hint_required_for_weak_match"
+            | "hint_direct_selection_evidence_required"
+            | "direct_selection_evidence_required" => blocked
+                .retry_argv
+                .clone()
+                .map(|argv| ("inspect_ranked_skill_evidence", argv, blocked.reason)),
             "same_name_variants_ambiguous" => blocked.retry_argv.clone().map(|argv| {
                 (
                     "inspect_same_name_variants",
@@ -790,6 +830,10 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
                 "retry_with_agent_authored_english_hint",
                 "agent_correction_required",
             ),
+            "direct_selection_evidence_required" => (
+                "refine_task_or_supply_direct_capability_hint",
+                "agent_correction_required",
+            ),
             "hint_direct_selection_evidence_required" => (
                 "refine_agent_authored_hint_with_direct_capability_evidence",
                 "agent_correction_required",
@@ -833,6 +877,7 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             retryable: false,
             details: Some(json!({
                 "reason": blocker.reason,
+                "retrieval": blocker.retrieval,
                 "skill_id": blocker.skill_id,
                 "skill_name": blocker.skill_name,
                 "path": blocker.path,

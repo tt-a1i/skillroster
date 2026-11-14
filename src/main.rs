@@ -23,6 +23,17 @@ fn write_stdout_or_exit(output: &str) {
     }
 }
 
+fn human_error(command: &str, error: &(dyn std::error::Error + 'static)) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_str(&app::error_json(command, error)).expect("error envelope is JSON");
+    skillroster::present::error_human_with_state(
+        &error,
+        envelope
+            .pointer("/error/details/files_changed")
+            .and_then(serde_json::Value::as_bool),
+    )
+}
+
 fn main() {
     let wants_json = std::env::args_os().any(|argument| argument == "--json");
     let cli = match Cli::try_parse() {
@@ -73,7 +84,7 @@ fn main() {
             if json {
                 write_stdout_or_exit(&app::error_json(command, error.as_ref()));
             } else {
-                eprintln!("{}", skillroster::present::error_human(&error));
+                eprintln!("{}", human_error(command, error.as_ref()));
             }
             std::process::exit(1);
         }
@@ -104,7 +115,7 @@ fn main() {
                     skillroster::present::blocked_roster_plan(&blocked.details)
                 );
             } else {
-                eprintln!("{}", skillroster::present::error_human(&error));
+                eprintln!("{}", human_error(command, error.as_ref()));
             }
             std::process::exit(1);
         }

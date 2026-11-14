@@ -1,6 +1,6 @@
 {
   "name": "@tt-a1i/skillroster-linux-x64",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "SkillRoster native binary for Linux glibc x86_64",
   "license": "Apache-2.0",
   "repository": "github:tt-a1i/skillroster",

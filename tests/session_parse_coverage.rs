@@ -97,7 +97,10 @@ fn malformed_records_preserve_valid_neighbors_without_name_fallback_or_raw_stora
     }
     let scan = cli(&temp, &["scan"]);
     let coverage = codex_coverage(&scan);
-    assert_eq!(coverage["parse_contract_version"], 1);
+    assert_eq!(
+        coverage["parse_contract_version"],
+        skillroster::scan::SESSION_PARSE_CONTRACT_VERSION
+    );
     assert_eq!(coverage["denominator_reliable"], false);
     let failures: Vec<_> = coverage["limitations"]
         .as_array()
@@ -315,7 +318,10 @@ fn legacy_cached_coverage_is_unknown_across_public_views_and_rescan_restores_com
                 && record["details"]["limitation_state"] == "legacy_unknown")
     );
     let rescanned = cli(&temp, &["scan"]);
-    assert_eq!(codex_coverage(&rescanned)["parse_contract_version"], 1);
+    assert_eq!(
+        codex_coverage(&rescanned)["parse_contract_version"],
+        skillroster::scan::SESSION_PARSE_CONTRACT_VERSION
+    );
     assert_eq!(codex_coverage(&rescanned)["denominator_reliable"], true);
     assert_eq!(cli(&temp, &["report"])["coverage_reliable_agent_count"], 1);
 }

@@ -191,6 +191,8 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
+The v1.9.1 source-candidate features refine retrieval, session sampling and local freshness; they are not published. Public installation remains v1.9.0.
+
 The current public release is **v1.9.0**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)

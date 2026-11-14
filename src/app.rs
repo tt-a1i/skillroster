@@ -37,7 +37,11 @@ mod bootstrap_history;
 mod content_choice;
 use bootstrap_history::{LEGACY_COMPLETE_BOOTSTRAP_PACKAGES, LEGACY_SINGLE_FILE_BOOTSTRAPS};
 mod error;
+mod find;
+use find::*;
+mod human_review;
 mod inspection;
+use human_review::{human_plan_preview, human_undo_preview, require_human_confirmation};
 mod interactive;
 mod library_visibility;
 mod roster_guidance;
@@ -100,7 +104,7 @@ fn run_with_context(
     refresh_find: bool,
 ) -> Result<Output> {
     if matches!(cli.command, Some(Command::Init(_))) {
-        interactive::require_terminal(cli.json)?;
+        interactive::require_terminal(cli.json).map_err(error::before_mutation)?;
     }
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
@@ -383,6 +387,17 @@ fn run_with_context(
             let showing_detail = args.show.is_some();
             let result = match args.show.as_deref() {
                 Some(id) => plan_detail_command(&store, id)?,
+                None if args.finding.is_some() || args.adopt_shared => {
+                    roster_guidance::plan_from_finding_or_shared(
+                        &store,
+                        &state_dir,
+                        &args,
+                        &action_context.command_argv_prefix(),
+                    )?
+                }
+                None if args.core_limit.is_some() => {
+                    bail!("--core-limit requires --finding or --adopt-shared")
+                }
                 None => plan_command(&store, &state_dir, &action_context.command_argv_prefix())?,
             };
             let id = result["plan_id"].as_str().unwrap_or_default().to_string();
@@ -449,7 +464,7 @@ fn run_with_context(
                 eprintln!("{}\n", human_undo_preview(&store, &args.id)?);
                 if !require_human_confirmation(
                     &format!("Undo Receipt {}?", args.id),
-                    "Only the exact changed paths shown above will be reversed; unrelated Agent and Library files are outside this Undo.",
+                    "Only paths recorded by this Receipt will be reversed; unrelated Agent and Library files are outside this Undo.",
                 )? {
                     return cancelled_output("undo");
                 }
@@ -695,19 +710,6 @@ fn resolve_home(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(home)
 }
 
-fn require_human_confirmation(question: &str, consequence: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!(
-            "human mutation requires an interactive terminal; Agent callers must use --json only after explicit user confirmation"
-        );
-    }
-    eprintln!("{question}\n{consequence}\n\nType confirm to continue:");
-    std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    Ok(answer.trim() == "confirm")
-}
-
 fn cancelled_output(command: &'static str) -> Result<Output> {
     let result = json!({
         "status": "cancelled",
@@ -721,59 +723,6 @@ fn cancelled_output(command: &'static str) -> Result<Output> {
         json: serde_json::to_string(&envelope)?,
         human: crate::present::human(command, &result),
     })
-}
-
-fn human_plan_preview(store: &StateStore, id: &str) -> Result<String> {
-    let id = PlanId::parse(id.to_string())?;
-    let record = store
-        .get_plan(&id)?
-        .ok_or_else(|| anyhow!("Plan {id} does not exist"))?;
-    let prepared: PreparedPlan = serde_json::from_value(record.input["prepared"].clone())?;
-    if let Some(mut summary) = record.input.get("summary").cloned() {
-        summary["state"] = json!(record.status);
-        return Ok(crate::present::human("plan", &summary));
-    }
-    let risk = plan_risk(&prepared);
-    Ok(crate::present::human(
-        "plan",
-        &json!({
-            "plan_id": prepared.id,
-            "operations": prepared.operations,
-            "roster_changes": prepared.roster_changes,
-            "risk": risk,
-            "reversible": true,
-            "canonical_deletion_count": 0,
-            "blocked_preconditions": [],
-            "state": record.status,
-            "files_changed": false
-        }),
-    ))
-}
-
-fn human_undo_preview(store: &StateStore, id: &str) -> Result<String> {
-    let id = ReceiptId::parse(id.to_string())?;
-    let record = store
-        .get_receipt(&id)?
-        .ok_or_else(|| anyhow!("Receipt {id} does not exist"))?;
-    let paths = record.verification["change_receipt"]["changed_paths"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    let mut preview = format!(
-        "SkillRoster · Undo Receipt\n\n  Receipt                {}\n  Plan                   {}\n  Recorded operations    {}\n  Changed paths          {}",
-        record.id,
-        record.plan_id,
-        record.operation_results.len(),
-        paths.len()
-    );
-    for path in paths {
-        preview.push_str("\n    ");
-        preview.push_str(path);
-    }
-    preview.push_str("\n\nPreview only · no files changed");
-    Ok(preview)
 }
 
 fn parse_explicit_roots(values: &[String]) -> Result<Vec<ExplicitSkillRoot>> {
@@ -2064,6 +2013,8 @@ const fn coverage_retry_disposition(
         | scan::SessionCoverageLimitationCode::FilePathNotUnicode
         | scan::SessionCoverageLimitationCode::JsonExtractionLimit
         | scan::SessionCoverageLimitationCode::JsonRecordLimit
+        | scan::SessionCoverageLimitationCode::JsonParseByteLimit
+        | scan::SessionCoverageLimitationCode::RecordPrefilter
         | scan::SessionCoverageLimitationCode::LineAlignmentLoss
         | scan::SessionCoverageLimitationCode::FileParseFailure => {
             CoverageRetryDisposition::SameBoundaryExpected
@@ -2573,6 +2524,10 @@ fn report_command(
                     .iter()
                     .map(|id| json!(id))
                     .collect::<Vec<_>>();
+                if let Some(planning) = planning.as_ref().filter(|value| value["supported"] == true)
+                {
+                    object.insert("planning".into(), planning.clone());
+                }
                 refresh_finding_decision_facts(
                     object,
                     &scan,
@@ -2602,7 +2557,7 @@ fn report_command(
     let value = json!({
         "report_id": report_id,
         "session_coverage_presentation_version": SESSION_COVERAGE_PRESENTATION_VERSION,
-        "roster_guidance_version": 1,
+        "roster_guidance_version": 2,
         "shared_adoption": shared_adoption::guidance(&scan, &scan_id),
         "snapshot_id": scan_id,
         "skill_count": report.metrics.independent_skills,
@@ -2706,7 +2661,7 @@ fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
 }
 
 fn report_supports_finding_decision_fields(report: &ReportRecord) -> bool {
-    if report.summary["roster_guidance_version"] != 1 {
+    if report.summary["roster_guidance_version"] != 2 {
         return false;
     }
     let Some(findings) = report.summary["findings"].as_array() else {
@@ -4542,7 +4497,12 @@ fn compact_finding_summary(finding: &Value) -> Value {
         "coverage": finding["coverage"]
     });
     if let Some(object) = compact.as_object_mut() {
-        for key in ["affected_agents", "actionability", "reversibility"] {
+        for key in [
+            "affected_agents",
+            "actionability",
+            "reversibility",
+            "planning",
+        ] {
             if let Some(value) = finding.get(key) {
                 object.insert(key.to_owned(), value.clone());
             }
@@ -5090,1030 +5050,6 @@ fn session_finding_coverage(
     })
 }
 
-fn find_command(
-    store: &StateStore,
-    state_dir: &Path,
-    args: &crate::cli::FindArgs,
-) -> Result<(Value, Vec<SuggestedAction>)> {
-    let task = args.task.as_str();
-    let hints = args.hints.as_slice();
-    let limit = usize::from(args.limit);
-    let load = args.load;
-    let variant_skill_id = args.variant_skill_id.as_deref();
-    let variant_placement_id = args.variant_placement_id.as_deref();
-    let required_snapshot_id = args.require_snapshot.as_deref();
-    if (variant_skill_id.is_some() || variant_placement_id.is_some()) && !load {
-        return Err(SkillLoadBlocked {
-            reason: "variant_selector_requires_load",
-            skill_id: variant_skill_id.unwrap_or_default().to_owned(),
-            skill_name: "Top-1".into(),
-            path: None,
-            roster_state: "unknown".into(),
-            mutation_scopes: Vec::new(),
-            expected_digest: None,
-            actual_digest: None,
-            retry_argv: None,
-        }
-        .into());
-    }
-    let retrieval_hints = normalize_retrieval_hints(hints);
-    let (scan_id, scan) = latest_scan(store)?;
-    if let Some(expected) = required_snapshot_id {
-        let expected = ScanId::parse(expected.to_owned())?;
-        if expected != scan_id {
-            return Err(FindSnapshotChanged {
-                expected_snapshot_id: expected,
-                actual_snapshot_id: scan_id.clone(),
-                retry_argv: find_action_argv(
-                    task,
-                    &retrieval_hints,
-                    FindActionKind::InspectVariants { limit },
-                    Some(&scan_id),
-                ),
-            }
-            .into());
-        }
-    }
-    require_content_identity(&scan)?;
-    let retrieval_query = crate::query::RetrievalQuery::from_task_and_hints(
-        task,
-        retrieval_hints.iter().map(String::as_str),
-    );
-    let candidate_search_text = crate::query::candidate_search_text(retrieval_query.text());
-    let mut candidate_ids = store
-        .search_skill_ids_in_snapshot(&candidate_search_text, scan.skills.len(), &scan_id)?
-        .into_iter()
-        .map(|id| id.to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut routable_ids = scan
-        .skills
-        .iter()
-        .map(|skill| skill.id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut archived_ids = BTreeSet::new();
-    for skill_id in routable_ids.clone() {
-        let id = SkillId::parse(skill_id.clone())?;
-        let states = store.roster_states_for_skill(&id)?;
-        if !states.is_empty() && states.iter().all(|state| *state == RosterState::Archived) {
-            routable_ids.remove(&skill_id);
-            archived_ids.insert(skill_id);
-        }
-    }
-    if crate::query::contains_cjk(retrieval_query.text()) {
-        candidate_ids.extend(routable_ids.iter().cloned());
-    }
-    candidate_ids.retain(|skill_id| routable_ids.contains(skill_id));
-    let pool_limit = if retrieval_hints.is_empty() {
-        limit
-    } else {
-        usize::from(crate::cli::MAX_FIND_RESULTS)
-    };
-    let augmented_result = crate::query::find_matching_with_evidence(
-        &scan,
-        &retrieval_query,
-        pool_limit,
-        Some(&candidate_ids),
-        Some(&routable_ids),
-    );
-    let task_exclusion_effects = augmented_result.task_exclusion_effects;
-    let augmented_matches = augmented_result.matches;
-    let ranking_strategy = if retrieval_hints.is_empty() {
-        "single_lexical_channel"
-    } else {
-        "task_hint_reciprocal_rank_fusion"
-    };
-    let mut matches = if retrieval_hints.is_empty() {
-        augmented_matches
-    } else {
-        let task_query =
-            crate::query::RetrievalQuery::from_task_and_hints(task, std::iter::empty::<&str>());
-        let task_matches = crate::query::find_matching(
-            &scan,
-            &task_query,
-            pool_limit,
-            Some(&candidate_ids),
-            Some(&routable_ids),
-        );
-        crate::query::fuse_retrieval_channels(task_matches, augmented_matches, &task_query, limit)
-    };
-    let mut warnings = Vec::new();
-    let mut observations = content_choice::FindReadObservations::default();
-    let mut rescan_required = false;
-    for found in &mut matches {
-        let mut drifted_variants = 0_usize;
-        if found.variants.is_empty() {
-            let skill_id = SkillId::parse(found.skill_id.clone())?;
-            found.roster_state = current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-            let current = current_readable_skill_paths_with_observations(
-                &scan,
-                state_dir,
-                &found.skill_id,
-                &mut observations,
-            )?;
-            found.paths = current.paths;
-            drifted_variants += usize::from(current.drifted);
-        } else {
-            for variant in &mut found.variants {
-                let skill_id = SkillId::parse(variant.skill_id.clone())?;
-                variant.roster_state =
-                    current_roster_state(&store.roster_states_for_skill(&skill_id)?);
-                let current = current_readable_skill_paths_with_observations(
-                    &scan,
-                    state_dir,
-                    &variant.skill_id,
-                    &mut observations,
-                )?;
-                let group_paths = scan
-                    .placements
-                    .iter()
-                    .filter(|placement| placement.skill_id == variant.skill_id)
-                    .filter(|placement| {
-                        scan.observed_skill_for_placement(placement)
-                            .is_some_and(|skill| {
-                                skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
-                            })
-                    })
-                    .map(|placement| placement.entrypoint.display().to_string())
-                    .collect::<BTreeSet<_>>();
-                variant.paths = current
-                    .paths
-                    .into_iter()
-                    .filter(|path| group_paths.contains(path))
-                    .collect();
-                drifted_variants += usize::from(current.drifted);
-            }
-            if let Some(representative) = found
-                .variants
-                .iter()
-                .find(|variant| variant.skill_id == found.skill_id)
-            {
-                found.paths = representative.paths.clone();
-                found.roster_state = representative.roster_state.clone();
-            }
-        }
-        if drifted_variants > 0 {
-            rescan_required = true;
-            let variant_count = found.variants.len().max(1);
-            warnings.push(if drifted_variants == variant_count {
-                format!(
-                    "{} has placement drift relative to the latest Snapshot identity or fingerprint; run skillroster scan",
-                    found.name
-                )
-            } else {
-                format!(
-                    "{} has {drifted_variants} same-name variant(s) with path drift; run skillroster scan",
-                    found.name
-                )
-            });
-        }
-    }
-    let (mut actions, variant_rescan_required) = bind_variant_findings(
-        store,
-        state_dir,
-        &scan_id,
-        &scan,
-        &routable_ids,
-        &mut matches,
-        &mut observations,
-    )?;
-    rescan_required |= variant_rescan_required;
-    let cjk_hint_required = retrieval_hints.is_empty() && crate::query::contains_cjk(task);
-    if load && matches.is_empty() {
-        let archived_match = crate::query::find_matching(
-            &scan,
-            &retrieval_query,
-            1,
-            Some(&archived_ids),
-            Some(&archived_ids),
-        )
-        .into_iter()
-        .next();
-        return Err(SkillLoadBlocked {
-            reason: if archived_match.is_some() {
-                "archived_skill_not_routable"
-            } else {
-                "no_routable_match"
-            },
-            skill_id: archived_match
-                .as_ref()
-                .map(|matched| matched.skill_id.clone())
-                .unwrap_or_default(),
-            skill_name: archived_match
-                .as_ref()
-                .map(|matched| matched.name.clone())
-                .unwrap_or_else(|| "Top-1".into()),
-            path: None,
-            roster_state: archived_match
-                .map(|_| "archived".to_owned())
-                .unwrap_or_else(|| "unassigned".into()),
-            mutation_scopes: Vec::new(),
-            expected_digest: None,
-            actual_digest: None,
-            retry_argv: None,
-        }
-        .into());
-    }
-    if load {
-        let weak_top_match = matches
-            .first()
-            .filter(|ranked| !crate::query::has_strong_verified_load_evidence(ranked));
-        let weak_match_reason = weak_top_match
-            .and_then(|ranked| find_selection_evidence_blocker(ranked, task, &retrieval_hints));
-        if let (Some(ranked), Some(reason)) = (weak_top_match, weak_match_reason) {
-            return Err(SkillLoadBlocked {
-                reason,
-                skill_id: ranked.skill_id.clone(),
-                skill_name: ranked.name.clone(),
-                path: None,
-                roster_state: ranked.roster_state.clone(),
-                mutation_scopes: ranked
-                    .mutation_scopes
-                    .iter()
-                    .map(|scope| scope.id().to_owned())
-                    .collect(),
-                expected_digest: None,
-                actual_digest: None,
-                retry_argv: Some(find_action_argv(
-                    task,
-                    &retrieval_hints,
-                    FindActionKind::InspectVariants {
-                        limit: limit.max(5),
-                    },
-                    Some(&scan_id),
-                )),
-            }
-            .into());
-        }
-    }
-    let loaded_skill = if load && !matches.is_empty() {
-        let ranked = &matches[0];
-        let ambiguity_retry_argv =
-            (ranked.variant_count != 1 && variant_skill_id.is_none()).then(|| {
-                find_action_argv(
-                    task,
-                    &retrieval_hints,
-                    FindActionKind::InspectVariants { limit },
-                    Some(&scan_id),
-                )
-            });
-        let selected = select_top_match_variant(
-            store,
-            &scan,
-            &routable_ids,
-            ranked,
-            variant_skill_id,
-            variant_placement_id,
-        )?;
-        let retry_argv = find_action_argv(
-            task,
-            &retrieval_hints,
-            FindActionKind::InspectVariants { limit },
-            Some(&scan_id),
-        );
-        let choice = declared_content_choice(&scan, state_dir, &selected.skill_id, 10);
-        if variant_placement_id.is_none() && choice["content_selection_required"] == true {
-            return Err(error::DeclaredIdentityContentAmbiguous {
-                skill_id: selected.skill_id.clone(),
-                content_choice: choice,
-                retry_argv,
-            }
-            .into());
-        }
-        let mut loaded = verified_skill_placement_load(
-            &scan_id,
-            &scan,
-            state_dir,
-            &selected,
-            ambiguity_retry_argv,
-            variant_placement_id,
-        )?;
-        if variant_skill_id.is_some() || variant_placement_id.is_some() {
-            loaded["selection"]["ranking_evidence_scope"] = json!("ranked_capability_group");
-            loaded["selection"]["variant_selection"] = json!({
-                "mode": if variant_placement_id.is_some() { "explicit_placement_id" } else { "explicit_skill_id" },
-                "requested_skill_id": variant_skill_id,
-                "requested_placement_id": variant_placement_id,
-                "ranked_capability_name": ranked.name,
-                "ranked_group_representative_skill_id": ranked.skill_id,
-                "ranked_variant_count": ranked.variant_count,
-            });
-        }
-        Some(loaded)
-    } else {
-        None
-    };
-    for found in matches
-        .iter()
-        .take(3)
-        .filter(|found| found.variant_count > 1)
-    {
-        let next = found.variant_finding.as_ref();
-        warnings.push(match next.and_then(|reference| reference.finding_id.as_deref()) {
-            Some(finding_id) => format!(
-                "{} represents {} same-name Skill variants; inspect Finding {finding_id} before choosing content",
-                found.name, found.variant_count
-            ),
-            None if matches!(
-                next.map(|reference| reference.state),
-                Some(crate::query::VariantFindingState::SourceConfirmationRequired)
-            ) => format!(
-                "{} represents {} same-name Skill variants behind unconfirmed source links; inspect the linked source-root Finding before choosing content",
-                found.name, found.variant_count
-            ),
-            None if matches!(
-                next.map(|reference| reference.state),
-                Some(crate::query::VariantFindingState::IncompletePackage)
-            ) => format!(
-                "{} has same-name variants with incomplete package fingerprints; inspect inventory findings and per-variant availability before choosing content; rescan alone is not sufficient",
-                found.name
-            ),
-            None if matches!(
-                next.map(|reference| reference.state),
-                Some(crate::query::VariantFindingState::ReportRequired)
-            ) => format!(
-                "{} represents {} same-name Skill variants; materialize the current Report before choosing content",
-                found.name, found.variant_count
-            ),
-            None if matches!(
-                next.map(|reference| reference.state),
-                Some(crate::query::VariantFindingState::RescanRequired)
-            ) => format!(
-                "{} represents {} same-name Skill variants; refresh the drifted Snapshot before choosing content",
-                found.name, found.variant_count
-            ),
-            _ => format!(
-                "{} represents {} same-name Skill variants, but no matching current divergent-content Finding is available",
-                found.name, found.variant_count
-            ),
-        });
-    }
-    if !load {
-        if let Some(found) = matches.first().filter(|found| {
-            found.variant_count > 1
-                && !matches!(
-                    found
-                        .variant_finding
-                        .as_ref()
-                        .map(|reference| reference.state),
-                    Some(crate::query::VariantFindingState::RescanRequired)
-                        | Some(crate::query::VariantFindingState::SourceConfirmationRequired)
-                )
-        }) {
-            actions.extend(explicit_variant_load_actions(
-                task,
-                &retrieval_hints,
-                found,
-                Some(&scan_id),
-                &scan,
-                state_dir,
-                &mut observations,
-            ));
-        }
-    }
-    if cjk_hint_required {
-        warnings.push(
-            "Find is lexical and the task contains CJK text; retry with one concise English capability paraphrase via --hint if relevant Skills use English metadata"
-                .into(),
-        );
-    }
-    if matches.is_empty() && !cjk_hint_required {
-        warnings.push(
-            "No lexical Skill match was found; retry once with concrete capability, tool, or operation terms via --hint"
-                .into(),
-        );
-    }
-    warnings.sort();
-    warnings.dedup();
-    let mut result = json!({
-        "snapshot_id": scan_id,
-        "task": task,
-        "task_exclusions": retrieval_query.excluded_task_phrases(),
-        "task_exclusion_effects": task_exclusion_effects,
-        "retrieval_hints": retrieval_hints,
-        "ranking_strategy": ranking_strategy,
-        "matches": matches,
-        "rescan_required": rescan_required,
-        "warnings": warnings,
-        "files_changed": false
-    });
-    bind_find_path_availability(&scan, state_dir, &mut result, &mut observations);
-    bind_find_variant_path_availability(&scan, state_dir, &mut result, &mut observations);
-    bind_content_choices(
-        store,
-        state_dir,
-        &scan_id,
-        &scan,
-        task,
-        &retrieval_hints,
-        &matches,
-        !load,
-        &mut result,
-        &mut actions,
-        &mut observations,
-    )?;
-    for (found, value) in matches
-        .iter()
-        .zip(result["matches"].as_array_mut().unwrap())
-    {
-        if found.variant_count > 1 {
-            // Compare the complete routable group, even when the displayed
-            // variant preview is truncated.
-            let ids = scan
-                .routing_skills()
-                .filter(|skill| {
-                    skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
-                })
-                .filter(|skill| routable_ids.contains(&skill.id))
-                .map(|skill| skill.id.as_str())
-                .collect::<BTreeSet<_>>();
-            value["entrypoint_comparison"] = entrypoint_comparison(
-                scan.placements
-                    .iter()
-                    .filter(|placement| ids.contains(placement.skill_id.as_str()))
-                    .filter(|placement| {
-                        scan.observed_skill_for_placement(placement)
-                            .is_some_and(|skill| {
-                                skill.name.trim().to_lowercase() == found.name.trim().to_lowercase()
-                            })
-                    }),
-            );
-        }
-    }
-    if !load {
-        for (found, value) in matches
-            .iter()
-            .zip(result["matches"].as_array_mut().unwrap())
-        {
-            let evidence_reason = find_selection_evidence_blocker(found, task, &retrieval_hints);
-            let mut reasons = Vec::new();
-            if found.variant_count > 1 {
-                reasons.push("same_name_variants_ambiguous");
-            }
-            if let Some(reason) = evidence_reason {
-                reasons.push(reason);
-            }
-            if value["content_choice"]["content_selection_required"] == true {
-                reasons.push("declared_identity_content_ambiguous");
-            }
-            if found.variant_count == 1 {
-                reasons.extend(find_placement_readiness_blockers(
-                    &scan,
-                    state_dir,
-                    &found.skill_id,
-                    &mut observations,
-                ));
-            }
-            if found.paths.is_empty() {
-                reasons.push("current_path_unavailable");
-            }
-            value["load_readiness"] = json!({
-                "state": if reasons.is_empty() { "verification_required" } else { "blocked" },
-                "reason_codes": reasons,
-                "direct_selection_evidence": crate::query::has_strong_verified_load_evidence(found),
-                "verification_performed": false,
-                "selection_guidance": "Ranking is not a capability decision. Inspect the candidate evidence, independently choose the intended capability, and author a faithful hint if direct selection evidence is missing; never derive an exact-name hint solely from Top-1. Exact content verification still runs only on --load."
-            });
-        }
-    }
-    if let Some(loaded_skill) = loaded_skill {
-        result["loaded_skill"] = loaded_skill;
-    }
-    // Find derives current paths and may load content after its initial
-    // Snapshot check. Re-freeze durable permissions before returning so a
-    // persistent revoke or filesystem-identity drift observed during the read
-    // discards those derived facts instead of returning them as authorized.
-    require_loaded_snapshot_current(store, &scan_id, &scan)?;
-    Ok((result, actions))
-}
-
-// Advisory evidence only: mirror the verifier's placement preference without
-// returning content or treating these cached observations as authorization.
-fn find_placement_readiness_blockers(
-    scan: &ScanResult,
-    state_dir: &Path,
-    skill_id: &str,
-    observations: &mut content_choice::FindReadObservations,
-) -> Vec<&'static str> {
-    let placements = scan
-        .placements
-        .iter()
-        .filter(|p| p.skill_id == skill_id)
-        .collect::<Vec<_>>();
-    let preferred = placements
-        .iter()
-        .copied()
-        .filter(|p| {
-            p.mutation_scope
-                .is_some_and(|s| s != scan::MutationScope::UntrustedExternal)
-                && p.fingerprint_completeness == scan::FingerprintCompleteness::Complete
-                && p.entrypoint_digest.is_some()
-        })
-        .min_by_key(|p| (!p.default_exposed, &p.entrypoint));
-    if let Some(placement) = preferred {
-        let state = content_choice::placement_read_state_with_observations(
-            scan,
-            state_dir,
-            placement,
-            observations,
-        );
-        let exact_copy_available = state == "available"
-            || placements.iter().any(|copy| {
-                copy.content_digest == placement.content_digest
-                    && copy.content_identity_digest == placement.content_identity_digest
-                    && copy.entrypoint_digest == placement.entrypoint_digest
-                    && content_choice::placement_read_state_with_observations(
-                        scan,
-                        state_dir,
-                        copy,
-                        observations,
-                    ) == "available"
-            });
-        return if exact_copy_available {
-            Vec::new()
-        } else {
-            vec![state]
-        };
-    }
-    placements
-        .into_iter()
-        .map(|p| {
-            content_choice::placement_read_state_with_observations(scan, state_dir, p, observations)
-        })
-        .filter(|state| *state != "available")
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
-}
-
-fn find_selection_evidence_blocker(
-    ranked: &crate::query::FindMatch,
-    task: &str,
-    hints: &[String],
-) -> Option<&'static str> {
-    if crate::query::has_strong_verified_load_evidence(ranked) {
-        None
-    } else if hints.is_empty() && crate::query::contains_cjk(task) {
-        Some("cjk_hint_required_for_weak_match")
-    } else if !hints.is_empty() {
-        Some("hint_direct_selection_evidence_required")
-    } else {
-        None
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FindActionKind<'a> {
-    InspectVariants { limit: usize },
-    LoadVariant { skill_id: &'a str },
-    LoadPlacement { placement_id: &'a str },
-}
-
-fn find_action_argv(
-    task: &str,
-    hints: &[String],
-    kind: FindActionKind<'_>,
-    required_snapshot_id: Option<&ScanId>,
-) -> Vec<String> {
-    let mut argv = vec!["find".to_owned()];
-    for hint in hints {
-        argv.extend(["--hint".to_owned(), hint.clone()]);
-    }
-    match kind {
-        FindActionKind::InspectVariants { limit } => {
-            argv.extend(["--limit".to_owned(), limit.to_string()]);
-        }
-        FindActionKind::LoadPlacement { placement_id } => argv.extend([
-            "--load".to_owned(),
-            "--limit".to_owned(),
-            "1".to_owned(),
-            "--variant-placement-id".to_owned(),
-            placement_id.to_owned(),
-        ]),
-        FindActionKind::LoadVariant { skill_id } => argv.extend([
-            "--load".to_owned(),
-            "--limit".to_owned(),
-            "1".to_owned(),
-            "--variant-skill-id".to_owned(),
-            skill_id.to_owned(),
-        ]),
-    }
-    if let Some(snapshot_id) = required_snapshot_id {
-        argv.extend(["--require-snapshot".to_owned(), snapshot_id.to_string()]);
-    }
-    argv.push("--json".to_owned());
-    argv.extend(["--".to_owned(), task.to_owned()]);
-    argv
-}
-
-fn explicit_variant_load_actions(
-    task: &str,
-    hints: &[String],
-    ranked: &crate::query::FindMatch,
-    required_snapshot_id: Option<&ScanId>,
-    scan: &ScanResult,
-    state_dir: &Path,
-    observations: &mut content_choice::FindReadObservations,
-) -> Vec<SuggestedAction> {
-    if find_selection_evidence_blocker(ranked, task, hints).is_some() {
-        return Vec::new();
-    }
-    ranked
-        .variants
-        .iter()
-        .filter(|variant| !variant.paths.is_empty())
-        .filter(|variant| {
-            find_placement_readiness_blockers(scan, state_dir, &variant.skill_id, observations)
-                .is_empty()
-        })
-        .map(|variant| {
-            let mut argv = vec!["skillroster".to_owned()];
-            argv.extend(find_action_argv(
-                task,
-                hints,
-                FindActionKind::LoadVariant {
-                    skill_id: &variant.skill_id,
-                },
-                required_snapshot_id,
-            ));
-            SuggestedAction {
-                action: "load_exact_variant_for_comparison".into(),
-                description: "load_exact_variant_for_comparison".into(),
-                argv,
-                mutates: false,
-                requires_confirmation: false,
-                reason_code: "same_name_variant_explicit_read_available".into(),
-            }
-        })
-        .collect()
-}
-
-fn bind_find_variant_path_availability(
-    scan: &ScanResult,
-    state_dir: &Path,
-    result: &mut Value,
-    observations: &mut content_choice::FindReadObservations,
-) {
-    for found in result["matches"].as_array_mut().into_iter().flatten() {
-        for variant in found["variants"].as_array_mut().into_iter().flatten() {
-            let Some(skill_id) = variant["skill_id"].as_str() else {
-                continue;
-            };
-            let mut reasons = BTreeSet::new();
-            let mut placements = Vec::new();
-            let mut available_count = 0;
-            for placement in scan.placements.iter().filter(|p| p.skill_id == skill_id) {
-                let reason = content_choice::placement_read_state_with_observations(
-                    scan,
-                    state_dir,
-                    placement,
-                    observations,
-                );
-                if reason == "available" {
-                    available_count += 1;
-                } else {
-                    reasons.insert(reason);
-                }
-                placements.push(json!({
-                    "placement_id": placement.id,
-                    "read_state": reason,
-                    "fingerprint_completeness": placement.fingerprint_completeness,
-                    "entrypoint_read_error": placement.entrypoint_read_error,
-                    "detail": placement.fingerprint_detail,
-                }));
-            }
-            let count = placements.len();
-            placements.truncate(20);
-            variant["path_availability"] = json!({
-                "state": if available_count > 0 { "available" } else { "unavailable" },
-                "reason_codes": reasons,
-                "available_placement_count": available_count,
-                "placement_count": count,
-                "placements": placements,
-                "placements_truncated": count > 20,
-            });
-        }
-    }
-}
-
-fn bind_variant_findings(
-    store: &StateStore,
-    state_dir: &Path,
-    scan_id: &ScanId,
-    scan: &ScanResult,
-    routable_ids: &BTreeSet<String>,
-    matches: &mut [crate::query::FindMatch],
-    observations: &mut content_choice::FindReadObservations,
-) -> Result<(Vec<SuggestedAction>, bool)> {
-    let report = store
-        .latest_report()?
-        .filter(|report| report.scan_id == *scan_id);
-    let mut actions = Vec::new();
-    let mut action_argvs = BTreeSet::new();
-    let mut rescan_required = false;
-
-    for (index, found) in matches
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, found)| found.variant_count > 1)
-    {
-        let capability_name = found.name.trim().to_lowercase();
-        let variant_ids = scan
-            .routing_skills()
-            .filter(|skill| skill.name.trim().to_lowercase() == capability_name)
-            .filter(|skill| routable_ids.contains(&skill.id))
-            .map(|skill| skill.id.clone())
-            .collect::<BTreeSet<_>>();
-        let mut variant_drifted = false;
-        let mut source_confirmation_variant_ids = BTreeSet::new();
-        for skill_id in &variant_ids {
-            let current = current_readable_skill_paths_with_observations(
-                scan,
-                state_dir,
-                skill_id,
-                observations,
-            )?;
-            variant_drifted |= current.drifted;
-            if current.source_confirmation_required {
-                source_confirmation_variant_ids.insert(skill_id.clone());
-            }
-        }
-        rescan_required |= variant_drifted;
-        let (reference, suggested) = if variant_drifted {
-            let suggested = action(
-                "refresh_drifted_snapshot",
-                &["scan", "--summary", "--json"],
-                false,
-                false,
-                "routable_variant_drift_detected",
-            );
-            (
-                crate::query::VariantFindingReference {
-                    state: crate::query::VariantFindingState::RescanRequired,
-                    reason_code: crate::query::VariantFindingReason::RoutableVariantDriftDetected,
-                    snapshot_id: scan_id.to_string(),
-                    report_id: None,
-                    finding_id: None,
-                    resolution: None,
-                    argv: suggested.argv.clone(),
-                },
-                suggested,
-            )
-        } else if scan.placements.iter().any(|placement| {
-            variant_ids.contains(&placement.skill_id)
-                && placement.fingerprint_completeness != scan::FingerprintCompleteness::Complete
-                && placement.mutation_scope != Some(scan::MutationScope::UntrustedExternal)
-        }) {
-            let suggested = action(
-                "inspect_incomplete_variant_inventory",
-                &["report", "--findings", "--category", "inventory", "--json"],
-                false,
-                false,
-                "incomplete_variant_fingerprints",
-            );
-            (
-                crate::query::VariantFindingReference {
-                    state: crate::query::VariantFindingState::IncompletePackage,
-                    reason_code: crate::query::VariantFindingReason::IncompleteVariantFingerprints,
-                    snapshot_id: scan_id.to_string(),
-                    report_id: report.as_ref().map(|report| report.id.to_string()),
-                    finding_id: None,
-                    resolution: Some("inspect_incomplete_package_before_content_choice".into()),
-                    argv: suggested.argv.clone(),
-                },
-                suggested,
-            )
-        } else if let Some(report) = report.as_ref() {
-            if !variant_ids.is_empty() && source_confirmation_variant_ids == variant_ids {
-                if let Some(finding_id) = matching_escaping_link_finding_id(
-                    store,
-                    report,
-                    &source_confirmation_variant_ids,
-                )? {
-                    let suggested = action(
-                        "inspect_source_confirmation_finding",
-                        &["report", "--finding", &finding_id, "--json"],
-                        false,
-                        false,
-                        "untrusted_same_name_variants_require_source_confirmation",
-                    );
-                    (
-                        crate::query::VariantFindingReference {
-                            state: crate::query::VariantFindingState::SourceConfirmationRequired,
-                            reason_code: crate::query::VariantFindingReason::UntrustedVariantsRequireSourceConfirmation,
-                            snapshot_id: scan_id.to_string(),
-                            report_id: Some(report.id.to_string()),
-                            finding_id: Some(finding_id),
-                            resolution: Some("confirm_trusted_source_roots".into()),
-                            argv: suggested.argv.clone(),
-                        },
-                        suggested,
-                    )
-                } else {
-                    let suggested = action(
-                        "inspect_layout_findings",
-                        &["report", "--findings", "--category", "layout", "--json"],
-                        false,
-                        false,
-                        "matching_escaping_link_finding_missing",
-                    );
-                    (
-                        crate::query::VariantFindingReference {
-                            state: crate::query::VariantFindingState::FindingUnavailable,
-                            reason_code: crate::query::VariantFindingReason::MatchingEscapingLinkFindingMissing,
-                            snapshot_id: scan_id.to_string(),
-                            report_id: Some(report.id.to_string()),
-                            finding_id: None,
-                            resolution: None,
-                            argv: suggested.argv.clone(),
-                        },
-                        suggested,
-                    )
-                }
-            } else if let Some(finding_id) =
-                matching_variant_finding_id(store, report, &variant_ids)?
-            {
-                let suggested = action(
-                    "inspect_variant_finding",
-                    &["report", "--finding", &finding_id, "--json"],
-                    false,
-                    false,
-                    "same_snapshot_variant_finding_available",
-                );
-                (
-                    crate::query::VariantFindingReference {
-                        state: crate::query::VariantFindingState::Available,
-                        reason_code:
-                            crate::query::VariantFindingReason::SameSnapshotVariantSetMatched,
-                        snapshot_id: scan_id.to_string(),
-                        report_id: Some(report.id.to_string()),
-                        finding_id: Some(finding_id),
-                        resolution: Some("choose_same_name_variant".into()),
-                        argv: suggested.argv.clone(),
-                    },
-                    suggested,
-                )
-            } else {
-                let suggested = action(
-                    "inspect_layout_findings",
-                    &["report", "--findings", "--category", "layout", "--json"],
-                    false,
-                    false,
-                    "matching_divergent_content_finding_missing",
-                );
-                (
-                    crate::query::VariantFindingReference {
-                        state: crate::query::VariantFindingState::FindingUnavailable,
-                        reason_code: crate::query::VariantFindingReason::MatchingDivergentContentFindingMissing,
-                        snapshot_id: scan_id.to_string(),
-                        report_id: Some(report.id.to_string()),
-                        finding_id: None,
-                        resolution: None,
-                        argv: suggested.argv.clone(),
-                    },
-                    suggested,
-                )
-            }
-        } else {
-            let suggested = action(
-                "materialize_report",
-                &["report", "--summary", "--json"],
-                false,
-                false,
-                "current_snapshot_report_missing",
-            );
-            (
-                crate::query::VariantFindingReference {
-                    state: crate::query::VariantFindingState::ReportRequired,
-                    reason_code: crate::query::VariantFindingReason::CurrentSnapshotReportMissing,
-                    snapshot_id: scan_id.to_string(),
-                    report_id: None,
-                    finding_id: None,
-                    resolution: None,
-                    argv: suggested.argv.clone(),
-                },
-                suggested,
-            )
-        };
-        found.variant_finding = Some(reference);
-        if index < 3 && action_argvs.insert(suggested.argv.clone()) {
-            actions.push(suggested);
-        }
-    }
-    Ok((actions, rescan_required))
-}
-
-fn matching_variant_finding_id(
-    store: &StateStore,
-    report: &ReportRecord,
-    variant_ids: &BTreeSet<String>,
-) -> Result<Option<String>> {
-    matching_report_finding_id(
-        store,
-        report,
-        crate::query::SAME_NAME_DIVERGENT_FINDING_KIND,
-        |affected| affected == variant_ids,
-    )
-}
-
-fn matching_escaping_link_finding_id(
-    store: &StateStore,
-    report: &ReportRecord,
-    untrusted_variant_ids: &BTreeSet<String>,
-) -> Result<Option<String>> {
-    matching_report_finding_id(
-        store,
-        report,
-        crate::source_policy::ESCAPING_LINK_FINDING_KIND,
-        |affected| untrusted_variant_ids.is_subset(affected),
-    )
-}
-
-fn matching_escaping_link_finding_ids(
-    store: &StateStore,
-    report: &ReportRecord,
-    untrusted_variant_ids: &BTreeSet<String>,
-) -> Result<Vec<String>> {
-    if untrusted_variant_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    matching_report_finding_ids(
-        store,
-        report,
-        crate::source_policy::ESCAPING_LINK_FINDING_KIND,
-        |affected| untrusted_variant_ids.is_subset(affected),
-    )
-}
-
-fn matching_report_finding_id(
-    store: &StateStore,
-    report: &ReportRecord,
-    kind: &str,
-    affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
-) -> Result<Option<String>> {
-    let matches = matching_report_finding_ids(store, report, kind, affected_ids_match)?;
-    Ok(matches.into_iter().next())
-}
-
-fn matching_report_finding_ids(
-    store: &StateStore,
-    report: &ReportRecord,
-    kind: &str,
-    affected_ids_match: impl Fn(&BTreeSet<String>) -> bool,
-) -> Result<Vec<String>> {
-    let mut matches = BTreeSet::new();
-    for finding in report.summary["findings"].as_array().into_iter().flatten() {
-        if finding["kind"] != kind {
-            continue;
-        }
-        let Some(affected) = finding_skill_ids(finding) else {
-            continue;
-        };
-        if !affected_ids_match(&affected) {
-            continue;
-        }
-        let Some(raw_id) = finding["id"].as_str() else {
-            continue;
-        };
-        let Ok(id) = FindingId::parse(raw_id.to_owned()) else {
-            continue;
-        };
-        let Some(stored) = store.get_finding(&id)? else {
-            continue;
-        };
-        let Some(stored_skill_ids) = finding_skill_ids(&stored.details) else {
-            continue;
-        };
-        if stored.report_id == report.id
-            && stored.category == FindingCategory::Layout
-            && stored.details["kind"] == kind
-            && affected_ids_match(&stored_skill_ids)
-        {
-            matches.insert(id.to_string());
-        }
-    }
-    Ok(matches.into_iter().collect())
-}
-
-fn finding_skill_ids(finding: &Value) -> Option<BTreeSet<String>> {
-    finding["affected_skill_ids"]
-        .as_array()?
-        .iter()
-        .map(|id| id.as_str().map(str::to_owned))
-        .collect()
-}
-
-fn normalize_retrieval_hints(hints: &[String]) -> Vec<String> {
-    let mut normalized = hints
-        .iter()
-        .map(|hint| hint.trim())
-        .filter(|hint| !hint.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized.dedup();
-    normalized
-}
-
 fn current_roster_state(states: &[RosterState]) -> String {
     let mut names = states
         .iter()
@@ -6458,6 +5394,7 @@ fn verified_skill_placement_load(
         expected_digest,
         actual_digest,
         retry_argv: ambiguity_retry_argv.clone(),
+        retrieval: None,
     };
 
     if matched.variant_count != 1 {
@@ -8582,6 +7519,29 @@ fn prepare_plan(
 ) -> Result<Value> {
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
+    }
+    if matches!(origin, PlanOrigin::Agent) {
+        if let Some(object) = input.as_object() {
+            const FIELDS: &[&str] = &[
+                "schema_version",
+                "scan_id",
+                "evidence_ids",
+                "operations",
+                "roster_changes",
+                "source_updates",
+                "library_changes",
+                "path_projections",
+                "finding_roster_changes",
+                "finding_library_changes",
+                "adopt_shared_skills",
+            ];
+            if let Some(key) = object.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+                bail!(
+                    "unknown field `{key}`, expected one of {}",
+                    FIELDS.join(", ")
+                );
+            }
+        }
     }
     if matches!(origin, PlanOrigin::Agent) && input.get("adopt_shared_skills").is_some() {
         return shared_adoption::prepare(store, state_dir, input, action_argv_prefix);
@@ -12490,6 +11450,7 @@ mod recovery_tests {
         };
 
         assert!(!report_supports_finding_decision_fields(&report));
+        report.summary["roster_guidance_version"] = json!(2);
         report.summary["findings"][0]["actionability"] = json!("plan_available");
         report.summary["findings"][0]["reversibility"] = json!("undo_after_apply");
         assert!(report_supports_finding_decision_fields(&report));
