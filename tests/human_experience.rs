@@ -668,7 +668,11 @@ fn tty_init_attempt(
             let sent_at = Instant::now();
             master.write_all(&input[..1]).unwrap();
             if input.len() > 1 {
-                std::thread::sleep(Duration::from_millis(10));
+                // Keep this tiny test-only gap off macOS's coalesced sleep timers.
+                let tail_at = Instant::now() + Duration::from_millis(10);
+                while Instant::now() < tail_at {
+                    std::hint::spin_loop();
+                }
                 master.write_all(&input[1..]).unwrap();
                 // A delayed test thread can resume after the CLI's 30 ms Escape
                 // window. Retry only late delivery, never a timely input leak.
