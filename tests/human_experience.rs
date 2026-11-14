@@ -595,6 +595,25 @@ fn tty_init(temp: &TempDir, key: Option<u8>, extra: &[&str]) -> (bool, String) {
 
 #[cfg(unix)]
 fn tty_init_input(temp: &TempDir, input: Option<&[u8]>, extra: &[&str]) -> (bool, String) {
+    let attempts = if input.is_some_and(|input| input.len() > 1 && input[0] == 27) {
+        5
+    } else {
+        1
+    };
+    for _ in 0..attempts {
+        if let Some(result) = tty_init_attempt(temp, input, extra) {
+            return result;
+        }
+    }
+    panic!("TTY test could not deliver the split Escape sequence within 25 ms");
+}
+
+#[cfg(unix)]
+fn tty_init_attempt(
+    temp: &TempDir,
+    input: Option<&[u8]>,
+    extra: &[&str],
+) -> Option<(bool, String)> {
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::time::{Duration, Instant};
@@ -634,6 +653,7 @@ fn tty_init_input(temp: &TempDir, input: Option<&[u8]>, extra: &[&str]) -> (bool
         .unwrap();
     let mut output = Vec::new();
     let mut answered = false;
+    let mut timely_input = true;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let mut bytes = [0; 8192];
@@ -645,10 +665,16 @@ fn tty_init_input(temp: &TempDir, input: Option<&[u8]>, extra: &[&str]) -> (bool
         }
         if !answered && String::from_utf8_lossy(&output).contains("Enter confirm") {
             let input = input.expect("unexpected confirmation");
+            let sent_at = Instant::now();
             master.write_all(&input[..1]).unwrap();
             if input.len() > 1 {
                 std::thread::sleep(Duration::from_millis(10));
                 master.write_all(&input[1..]).unwrap();
+                // A delayed test thread can resume after the CLI's 30 ms Escape
+                // window. Retry only late delivery, never a timely input leak.
+                if input[0] == 27 {
+                    timely_input = sent_at.elapsed() <= Duration::from_millis(25);
+                }
             }
             answered = true;
         }
@@ -674,12 +700,17 @@ fn tty_init_input(temp: &TempDir, input: Option<&[u8]>, extra: &[&str]) -> (bool
                 0
             );
             let mut remaining = [0; 64];
-            assert_eq!(
-                shell_input.read(&mut remaining).unwrap(),
-                0,
-                "terminal input leaked after confirmation"
-            );
-            return (status.success(), String::from_utf8(output).unwrap());
+            if timely_input {
+                assert_eq!(
+                    shell_input.read(&mut remaining).unwrap(),
+                    0,
+                    "terminal input leaked after confirmation"
+                );
+                return Some((status.success(), String::from_utf8(output).unwrap()));
+            }
+            // Drain this rejected trial's late bytes before closing its PTY.
+            while shell_input.read(&mut remaining).unwrap() > 0 {}
+            return None;
         }
         if Instant::now() > deadline {
             child.kill().unwrap();
