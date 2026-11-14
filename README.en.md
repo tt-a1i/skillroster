@@ -60,11 +60,8 @@ review Findings and next steps. `init` previews installation or upgrade targets;
 Enter confirms and Esc cancels. Success returns a verified Receipt, Undo and a
 copyable Agent prompt. Inspection needs no initialization.
 
-**These are v1.9.0 source-candidate features, absent from the public v1.8.48 release.**
-Install this implementation from the checkout with `cargo install --locked --path .`.
-The stable release remains available through `brew install tt-a1i/skillroster/skillroster`
-and [Release/Cargo/Windows installation](docs/installation.md), using separate
-`scan`, `report`, `setup` and `apply` commands.
+Install v1.9.0 through `brew install tt-a1i/skillroster/skillroster`
+or [Release/Cargo/Windows installation](docs/installation.md).
 
 Or connect the optional local read-only MCP server without installing Bootstrap
 into each Agent's default directory:
@@ -79,9 +76,8 @@ Then ask:
 > Use SkillRoster to inspect my Skills. Keep everyday capabilities in Core and the rest available on demand. Show a Plan and wait for my confirmation before changing files.
 
 MCP offers search and diagnostics; changes still use CLI Plan, confirmation,
-Apply and Receipt. [npx packaging and Cursor configuration](docs/installation.md#optional-local-stdio-mcp-source-candidate)
-are provided; the npm packages must be published before `npx skillroster check`
-works. Existing users can inspect Bootstrap with `setup --check --json`.
+Apply and Receipt. [npx packaging and Cursor configuration](docs/installation.md#optional-local-stdio-mcp)
+are provided; run `npx skillroster check` to inspect. Existing users can inspect Bootstrap with `setup --check --json`.
 
 ## The governance result at a glance
 
@@ -195,9 +191,10 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-The current public release is **v1.8.48**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
+The current public release is **v1.9.0**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
+- [v1.9.0 release and platform evidence](docs/acceptance/release-v1.9.0.md)
 - [v1.8.48 release and platform evidence](docs/acceptance/release-v1.8.48.md)
 - [Acceptance ledger](docs/acceptance.md)
 - [Product brief](docs/product-brief.md)

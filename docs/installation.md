@@ -4,8 +4,8 @@ SkillRoster stores inventory, evidence, plans, receipts, and configuration on
 the local machine. Installation does not connect it to a hosted service or
 upload Skill contents or agent session history.
 
-The current public release is **v1.8.48**. Its Formula, annotated tag, four
-platform archives, and adjacent checksums are public.
+The current public release is **v1.9.0**. Its annotated tag, four platform
+archives, and adjacent checksums are public.
 
 WSL users need WSL2 and should use the Linux archive. WSL1 lacks the atomic
 no-replace rename primitive required for safe Apply and Undo, so mutation fails
@@ -34,7 +34,7 @@ On macOS or Linux, the archive contains a versioned directory. Extract it and
 install the binary from that directory (not from the current directory):
 
 ```sh
-SKILLROSTER_VERSION=1.8.48
+SKILLROSTER_VERSION=1.9.0
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -59,7 +59,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v1.8.48 skillroster
+  --tag v1.9.0 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the
@@ -137,8 +137,7 @@ Published v1.8.46 adds `skillroster setup --check --json` and Home's
 This release also includes new report outcomes, native Claude visibility,
 Finding decision facts, and the revised ordinary-task/governance instructions.
 
-For the v1.9.0 source candidate, install with `cargo install --locked --path .` and
-start with `skillroster check`. Optional one-command Bootstrap setup is:
+Start with `skillroster check`. Optional one-command Bootstrap setup is:
 
 ```sh
 skillroster init --agent codex
@@ -163,7 +162,7 @@ skillroster setup --json
 skillroster apply <plan-id> --json
 ```
 
-Published CLI v1.8.48 bundles Bootstrap content version 1.8.52.
+Published CLI v1.9.0 bundles Bootstrap content version 1.8.54.
 The source tree is **v1.9.0**.
 Its bundled Bootstrap content version is 1.8.54. CLI and Bootstrap versions can
 differ intentionally when CLI behavior changes without changing the Bootstrap
@@ -191,15 +190,14 @@ the user whether to retain the local copy or adopt the current bundled copy;
 never infer the choice. `unsupported_targets` means links, non-files, or
 unreadable paths were preserved for manual inspection.
 
-The Homebrew tap now provides v1.8.48 with verified macOS ARM (Tahoe) and Linux
-x86_64 bottles. Both public bottle hashes match the tested artifacts and saved
-Formula. See the [Homebrew acceptance receipt](acceptance/release-v1.8.48.md#homebrew-tap-and-bottles)
-for installation tests, hashes and platform limits.
+The Homebrew tap provides v1.9.0. Availability of prebuilt bottles depends on
+the tap release; Homebrew may build from source. The
+[v1.9.0 Homebrew acceptance receipt](acceptance/release-v1.9.0.md#homebrew-tap-and-bottles)
+records that release’s installation tests, hashes and platform limits.
 
-## Optional local stdio MCP (source candidate)
+## Optional local stdio MCP
 
-The source implementation adds `skillroster mcp`; the current published
-v1.8.48 archives and Formula predate it. Build/install this checkout to try it.
+Run `skillroster mcp` from the installed release.
 The synchronous server needs no network, daemon or API key. It reads newline-
 delimited UTF-8 JSON-RPC 2.0 and keeps stdout exclusively for protocol frames.
 It negotiates MCP revisions through 2025-11-25, with the earlier compatible
@@ -217,7 +215,7 @@ compact Check/Report path. Loads retain CLI fingerprint,
 path, source, identity, size and ambiguity checks. Inspection updates only
 SkillRoster-owned observations; it changes no Agent or Skill files.
 
-With the candidate executable on PATH:
+With the executable on PATH:
 
 ```sh
 # Claude Code
@@ -250,7 +248,7 @@ Client syntax follows the official [Claude Code](https://code.claude.com/docs/en
 [MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
 and [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 
-## npm / npx distribution (release preparation)
+## npm / npx distribution
 
 `npm/` contains the launcher and four optional OS/architecture package templates.
 `scripts/release/build-npm.py` builds the complete distribution from local
@@ -259,7 +257,7 @@ reading binaries, includes the Apache license and provenance, and writes exact
 version dependencies and binary hashes. There is no postinstall hook or runtime
 download. npm itself retrieves its packages; the native MCP server stays local.
 
-After the upgraded packages are published, users can run:
+Run:
 
 ```sh
 npx -y skillroster check
@@ -271,6 +269,5 @@ Cursor uses `"command": "npx", "args": ["-y", "skillroster", "mcp"]` in
 that same entry (Windows shells may need `npx.cmd`). Supported binary targets
 match the four Release archives above. Do not omit npm optional dependencies;
 unsupported platforms get a clear error with no download fallback.
-See the [packaging and publication procedure](../npm/README.md). Registry
-publication and real execution on all four platforms remain release steps;
-source tests and synthetic packaging fixtures do not establish those outcomes.
+See the [packaging and publication procedure](../npm/README.md). Source tests and synthetic packaging fixtures do not establish real execution
+on all four platforms.

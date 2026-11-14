@@ -1,8 +1,7 @@
 # SkillRoster npm distribution
 
-The v1.9.0 source templates produce one `skillroster` launcher and four exact-version
-optional binary packages. These new commands are source-candidate features;
-the npm distribution must be published before the npx examples work.
+The v1.9.0 distribution contains one `skillroster` launcher and four exact-version
+optional binary packages.
 
 ```sh
 npx -y skillroster check
@@ -31,7 +30,7 @@ For release maintainers (Python 3, Node and npm needed only for packaging):
    bash scripts/verify-npm-package.sh
    ```
 
-   The version must match the source candidate (or its `-rc` prerelease).
+   The version must match the source version (or its `-rc` prerelease).
    The generator verifies every archive hash before reading its exact regular
    binary member. It writes binary hashes, full licenses, exact-version
    dependencies, and archive/target provenance. A checksum mismatch, missing

@@ -58,10 +58,8 @@ skillroster init --agent codex
 `init` 在终端展示完整安装或升级影响，按 Enter 确认、Esc 取消；成功后给出
 Receipt、撤销入口和可复制给 Agent 的一句话。只检查时无需初始化。
 
-**以上是 v1.9.0 源码候选体验，尚未包含在公开 v1.8.48 中。** 在本仓库使用
-`cargo install --locked --path .` 安装此实现。稳定版仍可通过
-`brew install tt-a1i/skillroster/skillroster` 或 [Release/Cargo/Windows](docs/installation.md)
-安装，使用独立的 `scan`、`report`、`setup` 与 `apply`。
+v1.9.0 可通过 `brew install tt-a1i/skillroster/skillroster` 或
+[Release/Cargo/Windows](docs/installation.md) 安装。
 
 也可以选用本地只读 MCP，无需向各 Agent 的默认目录安装 Bootstrap：
 
@@ -75,8 +73,8 @@ codex mcp add skillroster -- skillroster mcp
 > 使用 SkillRoster 检查我的 Skills。常用的保留在 Core，低频的按需查找；先展示方案，等我确认再修改。
 
 MCP 提供检索和诊断；修改仍走 CLI 的 Plan、确认、Apply、Receipt。
-[npx 包装方案与 Cursor 配置](docs/installation.md#optional-local-stdio-mcp-source-candidate)
-也已提供，npm 包需发布后才能使用 `npx skillroster check`。
+[npx 包装方案与 Cursor 配置](docs/installation.md#optional-local-stdio-mcp)
+也已提供，可使用 `npx skillroster check`。
 已有用户可先用 `setup --check --json` 检查 Bootstrap 版本。
 
 ## 一眼看懂治理结果
@@ -182,9 +180,10 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
-当前公开版本为 **v1.8.48**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
+当前公开版本为 **v1.9.0**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)
+- [v1.9.0 发布与平台证据](docs/acceptance/release-v1.9.0.md)
 - [v1.8.48 发布与平台证据](docs/acceptance/release-v1.8.48.md)
 - [验收记录](docs/acceptance.md)
 - [产品简介](docs/product-brief.md)
