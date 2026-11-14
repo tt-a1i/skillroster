@@ -6153,8 +6153,8 @@ enabled = true
                     "type": "custom_tool_call",
                     "name": "exec",
                     "input": format!(
-                        "await tools.exec_command({{cmd: \"sed -n '1,80p' {}\"}})",
-                        entrypoint.display()
+                        "await tools.exec_command({{cmd: {}}})",
+                        serde_json::to_string(&format!("sed -n '1,80p' '{}'", entrypoint.display())).unwrap()
                     )
                 }
             }),
