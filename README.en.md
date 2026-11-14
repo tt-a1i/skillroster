@@ -60,7 +60,7 @@ review Findings and next steps. `init` previews installation or upgrade targets;
 Enter confirms and Esc cancels. Success returns a verified Receipt, Undo and a
 copyable Agent prompt. Inspection needs no initialization.
 
-Install v1.9.0 through `brew install tt-a1i/skillroster/skillroster`
+Install v1.9.1 through `brew install tt-a1i/skillroster/skillroster`
 or [Release/Cargo/Windows installation](docs/installation.md).
 
 Or connect the optional local read-only MCP server without installing Bootstrap
@@ -77,7 +77,7 @@ Then ask:
 
 MCP offers search and diagnostics; changes still use CLI Plan, confirmation,
 Apply and Receipt. [npx packaging and Cursor configuration](docs/installation.md#optional-local-stdio-mcp)
-are provided; run `npx skillroster check` to inspect. Existing users can inspect Bootstrap with `setup --check --json`.
+are provided; run `npx skillroster check` to inspect (the npm release is currently v1.9.0). Existing users can inspect Bootstrap with `setup --check --json`.
 
 ## The governance result at a glance
 
@@ -191,9 +191,9 @@ instead of pretending the adapters are interchangeable.
 
 ## Project status
 
-The v1.9.1 source-candidate features refine retrieval, session sampling and local freshness; they are not published. Public installation remains v1.9.0.
+v1.9.1 improves retrieval, session sampling and local freshness.
 
-The current public release is **v1.9.0**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
+The current public release is **v1.9.1**. The local governance loop covers discovery, reporting, search, planning, Apply/Undo, recovery, and eight direct Agent adapters. Published artifacts and controlled acceptance are documented separately from independent-user evidence.
 
 - [Latest release](https://github.com/tt-a1i/skillroster/releases/latest)
 - [v1.9.0 release and platform evidence](docs/acceptance/release-v1.9.0.md)
