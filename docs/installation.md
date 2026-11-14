@@ -250,7 +250,7 @@ and [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tool
 
 ## npm / npx distribution
 
-The public npm release is currently v1.9.0; v1.9.1 npm publication is pending.
+The public npm release is v1.9.1.
 
 `npm/` contains the launcher and four optional OS/architecture package templates.
 `scripts/release/build-npm.py` builds the complete distribution from local

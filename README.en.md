@@ -77,7 +77,7 @@ Then ask:
 
 MCP offers search and diagnostics; changes still use CLI Plan, confirmation,
 Apply and Receipt. [npx packaging and Cursor configuration](docs/installation.md#optional-local-stdio-mcp)
-are provided; run `npx skillroster check` to inspect (the npm release is currently v1.9.0). Existing users can inspect Bootstrap with `setup --check --json`.
+are provided; run `npx skillroster check` to inspect (the npm release is currently v1.9.1). Existing users can inspect Bootstrap with `setup --check --json`.
 
 ## The governance result at a glance
 
