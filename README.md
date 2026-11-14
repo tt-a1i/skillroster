@@ -74,7 +74,7 @@ codex mcp add skillroster -- skillroster mcp
 
 MCP 提供检索和诊断；修改仍走 CLI 的 Plan、确认、Apply、Receipt。
 [npx 包装方案与 Cursor 配置](docs/installation.md#optional-local-stdio-mcp)
-也已提供，可使用 `npx skillroster check`；npm 当前版本为 v1.9.0。
+也已提供，可使用 `npx skillroster check`；npm 当前版本为 v1.9.1。
 已有用户可先用 `setup --check --json` 检查 Bootstrap 版本。
 
 ## 一眼看懂治理结果
