@@ -191,7 +191,7 @@ never infer the choice. `unsupported_targets` means links, non-files, or
 unreadable paths were preserved for manual inspection.
 
 The Homebrew tap provides v1.9.0. Availability of prebuilt bottles depends on
-the tap release; Homebrew may build from source. The historical
+the tap release; Homebrew may build from source. The
 [v1.9.0 Homebrew acceptance receipt](acceptance/release-v1.9.0.md#homebrew-tap-and-bottles)
 records that release’s installation tests, hashes and platform limits.
 
