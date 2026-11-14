@@ -4,10 +4,11 @@ Validated on macOS with Rust 1.85 on 2026-11-14. This is an **unpublished local
 candidate**, not a release or independent-user evaluation. Public installation
 remains v1.9.0; bundled Bootstrap remains 1.8.54. No bundled Skill files changed.
 
-Implementation commit: `7f56e75f78d4786303954ce956b7d19d613b3146` on
+Implementation commits: `7f56e75` and final resource-bound fix
+`1bd040a7cb8c5fa07e8a5a7ebcb18e9e9b4cab59` on
 `codex/v1.9.1-usability`, based on main `910adaf`.
 Optimized candidate executable SHA-256:
-`e70a2902968d99691ef0d114beadc9c0508bc9f9799b6bd87504df7b309b605f`.
+`e5e39800d65ac2e860572503dddad4b4e3bef5e9283fcba4170d15751fd75638`.
 
 ## Changes and boundaries
 
@@ -71,7 +72,10 @@ no positive evidence in this corpus, not that Claude Skills were never used.
 Limits remain explicit: 250 recent files per root, 512 MiB read per Agent,
 64 MiB per file, 16 MiB fair parsing/extraction budget per Agent and 500,000
 inspected lines. Unread regions, prefilter skips and parse quotas retain typed
-partial-coverage facts. No usage percentage claims a complete denominator.
+partial-coverage facts. JSONL record copies are capped before allocation across
+all windows at the remaining line budget plus one boundary record; a million
+empty-line regression verifies this bound. No usage percentage claims a complete
+denominator.
 
 ## Cross-language retrieval
 
@@ -107,6 +111,7 @@ Optimized builds were compared; timings include process startup and local state.
 | --- | --- |
 | v1.9.0 new-state check on frozen input | 2.397 s |
 | v1.9.1 new-state checks on frozen input | 3.595 / 2.773 / 2.779 s |
+| Final allocation-bounded build, new-state frozen check | 3.953 s |
 | v1.9.1 reused checks on frozen input | 95.81 / 90.93 / 94.95 ms |
 | v1.9.1 final live-home check / reuse | 4.114 s / 169 ms |
 
@@ -132,7 +137,7 @@ remain visible. No real Agent or existing user-state mutations were executed.
 ## Validation and retention
 
 `bash scripts/ci-full-check.sh` passed with Rust 1.85: formatting, strict Clippy,
-**744 Rust tests passed**, one opt-in scale test ignored, **152 Node harness
+**746 Rust tests passed**, one opt-in scale test ignored, **152 Node harness
 tests** and **three npm packaging tests**, plus all three surface checks.
 This records local macOS validation; it does not claim new remote cross-platform
 CI or a v1.9.1 registry publication.
