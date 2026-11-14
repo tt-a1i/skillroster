@@ -51,9 +51,9 @@ with tempfile.TemporaryDirectory(prefix="skillroster-first-use-") as directory:
 
         if scenario != "empty":
             for index in range(55 if scenario == "large" else 3):
-                name, description = [("review", "Review pull requests for correctness"),
-                                     ("translate", "Translate English and Chinese documents"),
-                                     ("diagram", "Draw architecture diagrams")][index] if index < 3 else (f"extra-{index:02}", f"Special fixture capability {index}")
+                name, description = [("review", "Review pull requests for correctness, security, regressions, and test coverage"),
+                                     ("translate", "Translate English and Chinese documents with accurate terminology and natural phrasing"),
+                                     ("diagram", "Draw architecture diagrams showing components, connections, data flows, and boundaries")][index] if index < 3 else (f"extra-{index:02}", f"Special fixture capability {index}")
                 skill = home / ".codex/skills" / name
                 skill.mkdir(parents=True)
                 skill.joinpath("SKILL.md").write_text(
