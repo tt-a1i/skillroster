@@ -4,7 +4,7 @@ SkillRoster stores inventory, evidence, plans, receipts, and configuration on
 the local machine. Installation does not connect it to a hosted service or
 upload Skill contents or agent session history.
 
-The current public release is **v1.9.0**. Its annotated tag, four platform
+The current public release is **v1.9.1**. Its annotated tag, four platform
 archives, and adjacent checksums are public.
 
 WSL users need WSL2 and should use the Linux archive. WSL1 lacks the atomic
@@ -34,7 +34,7 @@ On macOS or Linux, the archive contains a versioned directory. Extract it and
 install the binary from that directory (not from the current directory):
 
 ```sh
-SKILLROSTER_VERSION=1.9.0
+SKILLROSTER_VERSION=1.9.1
 SKILLROSTER_TARGET=aarch64-apple-darwin # choose from the table above
 tar -xzf "skillroster-${SKILLROSTER_VERSION}-${SKILLROSTER_TARGET}.tar.gz"
 mkdir -p "$HOME/.local/bin"
@@ -59,7 +59,7 @@ Rust 1.85 or newer is required. For an immutable release tag:
 
 ```sh
 cargo install --locked --git https://github.com/tt-a1i/skillroster.git \
-  --tag v1.9.0 skillroster
+  --tag v1.9.1 skillroster
 ```
 
 For a local checkout, run `cargo install --locked --path .`. Confirm the
@@ -162,10 +162,8 @@ skillroster setup --json
 skillroster apply <plan-id> --json
 ```
 
-Published CLI v1.9.0 bundles Bootstrap content version 1.8.54.
+Published CLI v1.9.1 bundles Bootstrap content version 1.8.54.
 The source tree is **v1.9.1**.
-This patch is a source candidate and is not published; the installation commands
-above continue to install the public v1.9.0 release.
 Its bundled Bootstrap content version is 1.8.54. CLI and Bootstrap versions can
 differ intentionally when CLI behavior changes without changing the Bootstrap
 instructions.
@@ -192,7 +190,7 @@ the user whether to retain the local copy or adopt the current bundled copy;
 never infer the choice. `unsupported_targets` means links, non-files, or
 unreadable paths were preserved for manual inspection.
 
-The Homebrew tap provides v1.9.0. Availability of prebuilt bottles depends on
+The Homebrew tap provides v1.9.1. Availability of prebuilt bottles depends on
 the tap release; Homebrew may build from source. The
 [v1.9.0 Homebrew acceptance receipt](acceptance/release-v1.9.0.md#homebrew-tap-and-bottles)
 records that release’s installation tests, hashes and platform limits.
@@ -251,6 +249,8 @@ Client syntax follows the official [Claude Code](https://code.claude.com/docs/en
 and [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
 
 ## npm / npx distribution
+
+The public npm release is currently v1.9.0; v1.9.1 npm publication is pending.
 
 `npm/` contains the launcher and four optional OS/architecture package templates.
 `scripts/release/build-npm.py` builds the complete distribution from local
