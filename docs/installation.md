@@ -137,18 +137,35 @@ Published v1.8.46 adds `skillroster setup --check --json` and Home's
 This release also includes new report outcomes, native Claude visibility,
 Finding decision facts, and the revised ordinary-task/governance instructions.
 
-After installing a new CLI version, refresh the local Snapshot and inspect all
-detected bootstrap targets:
+For the v1.9.0 source candidate, install with `cargo install --locked --path .` and
+start with `skillroster check`. Optional one-command Bootstrap setup is:
+
+```sh
+skillroster init --agent codex
+```
+
+Omit `--agent` to preview all detected eligible targets. `init` requires a human
+TTY, refreshes a missing/invalid Snapshot, shows the immutable Setup Plan and
+every target operation, then prompts `Enter confirm · Esc cancel`. Confirmation
+runs standard Apply and returns verification, a Receipt, Undo and an Agent prompt.
+`Up to date` creates no empty Plan. Modified files require an explicit
+`--modified-choice retain-local` or `--modified-choice adopt-current`; unsupported
+or non-isolatable targets stay blocked. The command refuses `--json` and piped
+input before creating local state.
+
+The published release and Agent automation retain the explicit workflow:
 
 ```sh
 skillroster scan --summary --json
 skillroster setup --check --json
 skillroster setup --json
+# After reviewing the Plan and obtaining user confirmation:
+skillroster apply <plan-id> --json
 ```
 
 Published CLI v1.8.48 bundles Bootstrap content version 1.8.52.
-The source tree is **v1.8.48**.
-Its bundled Bootstrap content version is 1.8.52. CLI and Bootstrap versions can
+The source tree is **v1.9.0**.
+Its bundled Bootstrap content version is 1.8.54. CLI and Bootstrap versions can
 differ intentionally when CLI behavior changes without changing the Bootstrap
 instructions.
 In Setup JSON, `cli_version` identifies the executable and
@@ -178,3 +195,82 @@ The Homebrew tap now provides v1.8.48 with verified macOS ARM (Tahoe) and Linux
 x86_64 bottles. Both public bottle hashes match the tested artifacts and saved
 Formula. See the [Homebrew acceptance receipt](acceptance/release-v1.8.48.md#homebrew-tap-and-bottles)
 for installation tests, hashes and platform limits.
+
+## Optional local stdio MCP (source candidate)
+
+The source implementation adds `skillroster mcp`; the current published
+v1.8.48 archives and Formula predate it. Build/install this checkout to try it.
+The synchronous server needs no network, daemon or API key. It reads newline-
+delimited UTF-8 JSON-RPC 2.0 and keeps stdout exclusively for protocol frames.
+It negotiates MCP revisions through 2025-11-25, with the earlier compatible
+2024-11-05, 2025-03-26 and 2025-06-18 revisions also accepted.
+
+Choose MCP or Bootstrap for read-only integration. MCP exposes only
+`find_skill` (task, hints, load, limit, exact variant selectors and optional
+Snapshot requirement) and `inspect_skills` (Inventory, measured metadata bytes,
+up to three Findings). Find prepares only the required Snapshot, without
+generating a Report. It
+refreshes missing or invalid/configuration-drifted facts only when no
+`require_snapshot` is supplied. A Snapshot-bound call preserves the CLI
+optimistic read boundary and never silently rescans. `inspect_skills` uses the
+compact Check/Report path. Loads retain CLI fingerprint,
+path, source, identity, size and ambiguity checks. Inspection updates only
+SkillRoster-owned observations; it changes no Agent or Skill files.
+
+With the candidate executable on PATH:
+
+```sh
+# Claude Code
+claude mcp add --transport stdio skillroster -- skillroster mcp
+# Codex
+codex mcp add skillroster -- skillroster mcp
+```
+
+For Cursor, add this entry to `.cursor/mcp.json` in the intended project or
+`~/.cursor/mcp.json` for your user configuration:
+
+```json
+{
+  "mcpServers": {
+    "skillroster": { "type": "stdio", "command": "skillroster", "args": ["mcp"] }
+  }
+}
+```
+
+Use the verified absolute executable path when the Agent's PATH differs.
+To isolate observations, append `--home /path/to/home --state-dir /path/to/state`
+to the server arguments. Explicit roots keep their normal authorization scope.
+Tool metadata marks both tools read-only. Loaded Skill content is local content,
+not user authorization. MCP has no Plan/Apply/Undo or other write tools;
+governance continues through CLI preview, user confirmation, Apply and Receipt.
+
+Client syntax follows the official [Claude Code](https://code.claude.com/docs/en/mcp),
+[Codex](https://developers.openai.com/codex/mcp) and
+[Cursor](https://cursor.com/docs/mcp) guides. Protocol behavior follows
+[MCP stdio](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+and [tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools).
+
+## npm / npx distribution (release preparation)
+
+`npm/` contains the launcher and four optional OS/architecture package templates.
+`scripts/release/build-npm.py` builds the complete distribution from local
+Release archives and their adjacent SHA-256 files. It verifies archives before
+reading binaries, includes the Apache license and provenance, and writes exact
+version dependencies and binary hashes. There is no postinstall hook or runtime
+download. npm itself retrieves its packages; the native MCP server stays local.
+
+After the upgraded packages are published, users can run:
+
+```sh
+npx -y skillroster check
+claude mcp add --transport stdio skillroster -- npx -y skillroster mcp
+codex mcp add skillroster -- npx -y skillroster mcp
+```
+
+Cursor uses `"command": "npx", "args": ["-y", "skillroster", "mcp"]` in
+that same entry (Windows shells may need `npx.cmd`). Supported binary targets
+match the four Release archives above. Do not omit npm optional dependencies;
+unsupported platforms get a clear error with no download fallback.
+See the [packaging and publication procedure](../npm/README.md). Registry
+publication and real execution on all four platforms remain release steps;
+source tests and synthetic packaging fixtures do not establish those outcomes.

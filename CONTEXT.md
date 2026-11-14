@@ -65,11 +65,14 @@ _Avoid_: Source ownership, Trusted content
 
 **Mutation Scope**:
 A typed Snapshot fact describing whether a placement is Mutable,
-Provider-read-only, Shared-read-only, Durable-read-only, or Untrusted-external. Only Mutable may
-authorize placement mutation; a missing legacy fact remains unknown.
+Provider-read-only, Shared-read-only, Durable-read-only, or Untrusted-external. Ordinary
+governance may mutate only Mutable placements; a missing legacy fact remains unknown.
 Shared-read-only records a readable package used through a shared Agent root
 or beneath a directory-link ancestor. Observing it does not establish exclusive
 ownership or authorize changing its exposure for other consumers.
+Explicit shared Skill adoption is a separate, validated Plan scope: it can host
+verified ordinary shared packages and separate known Agent root aliases after
+review and confirmation. This does not grant ordinary shared mutation authority.
 _Avoid_: Governable reason, Trust level
 
 **Usage Observation**:

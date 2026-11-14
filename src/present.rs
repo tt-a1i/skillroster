@@ -13,6 +13,8 @@ const PROGRESS_END: &str = "\r\x1b[2K\x1b[?25h";
 static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_HANDLER: OnceLock<bool> = OnceLock::new();
 
+mod check;
+
 /// Owns the one-line TTY progress state and restores the terminal on every exit path.
 pub struct ProgressGuard {
     active: bool,
@@ -107,6 +109,10 @@ impl Drop for ProgressGuard {
 
 fn progress_copy(command: &str) -> Option<(&'static str, &'static str)> {
     match command {
+        "check" => Some((
+            "Checking local Skills",
+            "Interrupted · check incomplete · no Agent files changed.",
+        )),
         "scan" => Some((
             "Scanning configured Agent roots",
             "Interrupted · scan incomplete · no Agent files changed.",
@@ -161,14 +167,35 @@ fn render(command: &str, result: &Value, options: RenderOptions) -> String {
     ];
     match command {
         "status" => status(result, &mut lines, options.width),
-        "scan" => scan(result, &mut lines),
+        "scan" => scan(result, &mut lines, options.width),
         "report" => report(result, &mut lines, options.width),
+        "check" => check::render(result, &mut lines, options.width),
         "find" => find(result, &mut lines, options.width),
         "plan" => plan(result, &mut lines, options.width),
         "apply" | "undo" => mutation(result, &mut lines),
         "lifecycle" => lifecycle(result, &mut lines),
         "source-root" => source_root(result, &mut lines),
         "setup" => setup(result, &mut lines, options.width),
+        "init" => {
+            if result["status"] == "cancelled" {
+                lines.push("Cancelled · no Agent files changed".into());
+            } else if result.get("receipt_id").is_some() {
+                mutation(result, &mut lines);
+                if result["verification"] == "passed" && result["status"] == "applied" {
+                    lines.push(format!(
+                        "\nCopy to your Agent: {}",
+                        text(result, "agent_prompt")
+                    ));
+                }
+            } else if result["state"] == "up_to_date" {
+                lines.push("Up to date · no Agent files changed".into());
+            } else {
+                setup(result, &mut lines, options.width);
+                if result["state"] == "modified_choice_required" {
+                    lines.push("Retry init with --modified-choice retain-local or --modified-choice adopt-current (and the same --agent selector).".into());
+                }
+            }
+        }
         _ => home(result, &mut lines, options.width),
     }
     if styled {
@@ -382,11 +409,12 @@ fn status(value: &Value, lines: &mut Vec<String>, width: usize) {
     continuation(value, lines, width);
 }
 
-fn scan(value: &Value, lines: &mut Vec<String>) {
+fn scan(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Agents checked", text(value, "agents_checked"));
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Snapshot", text(value, "snapshot_id"));
+    metadata_footprint(value, lines, width);
     native_visibility_basis(value, lines);
     lines.extend(summary(
         "Read-only · no Agent files changed",
@@ -408,6 +436,7 @@ fn report(value: &Value, lines: &mut Vec<String>, width: usize) {
     fact(lines, "Independent Skills", text(value, "skill_count"));
     fact(lines, "Placements", text(value, "placement_count"));
     fact(lines, "Default exposure", text(value, "default_exposure"));
+    metadata_footprint(value, lines, width);
     native_visibility_basis(value, lines);
     fact(
         lines,
@@ -1127,6 +1156,48 @@ fn readable_bytes(value: u64) -> String {
     }
 }
 
+fn metadata_footprint(value: &Value, lines: &mut Vec<String>, width: usize) {
+    let Some(footprint) = value.get("exposed_metadata_footprint") else {
+        return;
+    };
+    for (label, key, unknown) in [
+        (
+            "Exposed frontmatter",
+            "exposed_frontmatter_bytes",
+            "frontmatter_unknown_placement_count",
+        ),
+        (
+            "Exposed SKILL.md",
+            "exposed_metadata_bytes",
+            "metadata_unknown_placement_count",
+        ),
+    ] {
+        let display = |value: &Value| {
+            let bytes = format!(
+                "{:.1} KiB",
+                value[key].as_u64().unwrap_or(0) as f64 / 1024.0
+            );
+            match value[unknown].as_u64().unwrap_or(0) {
+                0 => bytes,
+                count => format!("{bytes} ({count} unknown)"),
+            }
+        };
+        let items = if footprint.get("before").is_some() {
+            vec![format!(
+                "{} → {}",
+                display(&footprint["before"]),
+                display(&footprint["after"])
+            )]
+        } else {
+            vec![display(footprint)]
+        };
+        fact_items(lines, label, items, width);
+    }
+    lines.push(
+        "Local disk UTF-8 bytes per exposed placement.\nRuntime tokens are not measured.".into(),
+    );
+}
+
 fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
     if let Some(items) = value.get("matches").and_then(Value::as_array) {
         for (index, item) in items.iter().enumerate() {
@@ -1333,6 +1404,29 @@ fn find(value: &Value, lines: &mut Vec<String>, width: usize) {
 }
 
 fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
+    if let Some(impact) = value.get("impact") {
+        metadata_footprint(impact, lines, width);
+        if impact["kind"] == "shared_adoption" {
+            fact(
+                lines,
+                "Shared adoption",
+                format!(
+                    "{} packages → Library",
+                    text(impact, "hosted_package_count")
+                ),
+            );
+            fact(
+                lines,
+                "Root aliases",
+                format!(
+                    "{} → independent directories",
+                    array_len(impact, "separated_agent_roots")
+                ),
+            );
+            lines.push("Excluded packages stay in place; host settings stay unchanged.".into());
+            lines.push("Unobserved shared-root consumers may lose package paths.".into());
+        }
+    }
     fact(lines, "Plan", text(value, "plan_id"));
     native_visibility_basis(value, lines);
     if let Some(items) = value.pointer("/impact/items").and_then(Value::as_array) {
@@ -1763,6 +1857,8 @@ fn plan(value: &Value, lines: &mut Vec<String>, width: usize) {
 fn core_reason_label(reason: &str) -> &str {
     match reason {
         "protected_by_request" => "protected",
+        "immutable_placement_retained" => "retained Core",
+        "native_visibility_unknown_retained" => "unknown; retained",
         "declared_core" => "declared",
         "skillroster_bootstrap" => "bootstrap",
         "observed_outcome" => "outcome",

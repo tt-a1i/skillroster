@@ -1,4 +1,7 @@
 /target
+/dist
+/npm/platforms/*/bin/
+__pycache__/
 /local-research/
 .DS_Store
 *.swp

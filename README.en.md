@@ -6,12 +6,12 @@
   <a href="README.md">中文</a> · <strong>English</strong>
 </p>
 
-<h1 align="center">Keep the Skills. Curate what each agent sees.</h1>
+<h1 align="center">200 Skills installed. Just the essentials in view.</h1>
 
 <p align="center">
-  Inventory Skills across your agents, review duplicates and broken links,<br>
-  and keep the rest searchable beyond each agent’s everyday essentials.<br>
-  <strong>Preview every change. Approve the Plan. Undo with a Receipt.</strong>
+  Keep everyday Skills in <strong>Core</strong>; find the rest <strong>On-demand</strong>.<br>
+  One command shows what is exposed and how much local metadata it carries.<br>
+  <strong>Preview the Plan. Confirm changes. Undo with a Receipt.</strong>
 </p>
 
 <p align="center">
@@ -45,45 +45,43 @@ With one agent and a small, clear native catalog, keeping your setup is a valid 
 
 Ordinary tasks can use existing capabilities and search for specialized Skills when useful. No optional match need not interrupt the task. Claude's local exposure counts distinguish manual invocation, disabled entries, and name-only listings; they do not measure a running session's complete catalog or tokens. [Scope and validation](docs/practical-governance.md)
 
-## What changed in v1.8.48
-
-- **Scope integration to one Agent:** `setup --agent codex` previews only the selected Agent; writes are refused when shared targets cannot be isolated.
-- **Keep mutation evidence current:** revalidate Library content before planning and applying; rescan after a verified Undo.
-- **Clarify Find and Load:** inspect bounded descriptions and triggers, verify requested Skill identity, and independently validate exact-copy fallbacks.
-- **Improve diagnostics:** distinguish unknown source modifications, malformed requests, package preservation and permissions; retain discovery context when rebuilding state.
-
-These changes are published in v1.8.48; installation instructions appear below. Pending Plans based on older Snapshots or changed configuration may require a new Scan and review before Apply.
-
 ## Start in 30 seconds
 
-Install with Homebrew on macOS or Linux:
+Once the CLI is installed, check in one call. Add Bootstrap integration only if
+wanted:
 
 ```bash
-brew install tt-a1i/skillroster/skillroster
-skillroster --version
+skillroster check
+skillroster init --agent codex
 ```
 
-The CLI is ready to use; Agent integration is optional:
+`check` is read-only: it scans when needed, then shows core metrics, up to three
+review Findings and next steps. `init` previews installation or upgrade targets;
+Enter confirms and Esc cancels. Success returns a verified Receipt, Undo and a
+copyable Agent prompt. Inspection needs no initialization.
+
+**These are v1.9.0 source-candidate features, absent from the public v1.8.48 release.**
+Install this implementation from the checkout with `cargo install --locked --path .`.
+The stable release remains available through `brew install tt-a1i/skillroster/skillroster`
+and [Release/Cargo/Windows installation](docs/installation.md), using separate
+`scan`, `report`, `setup` and `apply` commands.
+
+Or connect the optional local read-only MCP server without installing Bootstrap
+into each Agent's default directory:
 
 ```bash
-skillroster scan --summary
-skillroster report
+claude mcp add --transport stdio skillroster -- skillroster mcp
+codex mcp add skillroster -- skillroster mcp
 ```
 
-To use it through an Agent, run `skillroster setup --json` and review the detected
-Agents, target files, and Plan. After approving those targets, run
-`skillroster apply <plan-id> --json` with the returned ID. Open a new Agent
-session so it can discover the Bootstrap Skill, then ask:
+Then ask:
 
-> Use SkillRoster to inspect my local Skills and explain evidence-backed problems worth reviewing. If there is no clear cleanup work, say I can keep the current setup. Analyze first; preview a Plan after I choose a goal, and change Agent files only after I approve the complete Plan.
+> Use SkillRoster to inspect my Skills. Keep everyday capabilities in Core and the rest available on demand. Show a Plan and wait for my confirmation before changing files.
 
-GitHub Release and pinned-tag installs deliver **CLI v1.8.48 / Bootstrap 1.8.52**, including
-Codex/Hermes local visibility protections, explicit content selection, and
-validated session evidence. `skillroster setup --check --json` inspects integration
-without creating a Plan. Existing users update the CLI and optional Bootstrap separately;
-see the [installation guide](docs/installation.md) for the steps.
-
-[Windows, Cargo, and release archives](docs/installation.md) · [Upgrade and verify the executable your agent uses](docs/installation.md#upgrade-and-verify-the-executable-your-agent-uses)
+MCP offers search and diagnostics; changes still use CLI Plan, confirmation,
+Apply and Receipt. [npx packaging and Cursor configuration](docs/installation.md#optional-local-stdio-mcp-source-candidate)
+are provided; the npm packages must be published before `npx skillroster check`
+works. Existing users can inspect Bootstrap with `setup --check --json`.
 
 ## The governance result at a glance
 
@@ -102,9 +100,9 @@ placements in this inventory, keep On-demand retrieval, and bind the change to
 a verified, reversible Receipt. The complete three-arm procedure, including the
 careful-manual control, is in the [repeatable acceptance record](docs/acceptance.md#executed-three-arm-value-comparison).
 
-This is controlled-inventory product evidence. It does not prove token or labor
-savings, production performance, model quality, or universally superior Core
-and On-demand choices.
+These controlled-inventory counts do not measure token, labor or task-quality
+gains. The new footprint reports measured local UTF-8 bytes with unknowns
+listed separately; it does not estimate runtime tokens.
 
 A historical [read-only scan of a real environment](docs/acceptance/release-v1.8.28-candidate.md) also records 252 independent Skills across 892 placements. Its session coverage was incomplete: missing usage evidence is not proof that a Skill is unused.
 

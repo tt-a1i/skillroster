@@ -19,7 +19,10 @@ Presentation quality is part of product acceptance. The first complete release e
 
 ### Agent JSON
 
-`--json` is the only Agent contract. It writes exactly one versioned JSON document to stdout and never emits prompts, cursor control, ANSI sequences, progress, or logs there. Agents must pass the flag explicitly; piping output does not silently change the schema.
+CLI Agent calls use explicit `--json`: one versioned JSON document without
+prompts, cursor control, ANSI, progress or logs. Optional `mcp` instead uses
+newline-delimited JSON-RPC frames whose tool results contain that same envelope.
+Piping human commands does not silently select either schema.
 
 ### Human TTY
 
@@ -101,6 +104,38 @@ Show state-store health, latest Snapshot age, pending Plans, last Receipt, and r
 
 Show Agent coverage as it progresses, then independent Skill count, placement count, inaccessible roots, and Snapshot ID. The summary ends with `Read-only · no Agent files changed`.
 
+### `check` and metadata footprint
+
+`check` is the recommended human first call. Missing, invalidated or
+configuration-drifted Snapshots trigger one read-only Scan and the compact
+Report; current Snapshots are reused. Show `scanned now` or `reused`, core
+metrics, up to three review Findings and the same Report next steps. JSON adds
+`scan_performed` and retains Snapshot/Report IDs.
+Finding rows retain `blocked` or `plan available` even when a narrow terminal
+shortens their titles. A leading external-link Finding asks for exact-path
+review before read permission; it never suggests an automatic fix.
+
+Scan, Report and Check show default-exposed frontmatter and complete SKILL.md
+KiB, measured from local UTF-8 disk bytes per Placement, with unknown counts.
+Roster Plan previews show before → after for both alongside exposure counts.
+Known subtotals never imply complete coverage; the label explicitly states that
+runtime tokens are unmeasured. No conversion to estimated token savings.
+
+### `init`
+
+Only human TTY stdin/stdout may use Init; `--json` and piped input are rejected
+before state creation, with the explicit Agent setup/confirmation/Apply path.
+Refresh facts when required, prepare the ordinary Setup Plan, then show Agent
+scope, exact target operations, complete impact, risk and reversibility before
+`Enter confirm · Esc cancel`. Confirmation runs standard Apply/Receipt.
+Cancellation is a successful no-change result; drift remains blocked. Current
+targets calmly print `Up to date` without a Plan. Modified targets explain
+`--modified-choice retain-local|adopt-current`, preserving any Agent selector.
+After verified Apply show the Receipt, Undo and a copyable Agent prompt.
+Escape/arrow sequences cancel as one decision. Allow a short bounded sequence
+settling interval, flush remaining terminal input and restore the prior mode
+before returning control to the shell.
+
 ### `report`
 
 Lead with four counts: independent Skills, placements, default exposure, and observed-use coverage. Show up to three non-informational Findings, then category totals when review items exist. Evidence detail remains behind `report --finding`.
@@ -173,6 +208,12 @@ command without partial instructions. Find/load never implies activation or
 task success.
 
 ### `plan`
+
+The first Report view exposes `plan_available` when a Plan is available and a
+separate `shared_adoption` request template for the explicit adoption choice.
+Show its affected consumers, excluded packages, before/after impact, and the
+unknown-consumer boundary before confirmation. Large-Roster Findings are per
+Agent; show the exact minimum budget when immutable Core exceeds the request.
 
 Show before/after Roster counts, affected Agents and Skills, operation categories, risk, reversibility, exclusions, and blocked preconditions. Finding-derived Roster Plans also show forced, aggregate positive-signal, target-Agent, cross-Agent, and stable-fallback Core counts plus a compact named Core preview for each Agent. Cross-Agent reasons say `elsewhere` in the ordinary CLI; Agent JSON supplies `evidence_scope` and the source `evidence_agents`. At 60, 80, and 120 columns the preview keeps one name, its reason, and the remaining count visible, shortening the name before the evidence label. A fallback- or cross-Agent-dominated selection is explicitly review-required on the Plan and Apply confirmation surfaces. A ready Plan ends with its immutable ID and digest; it performs no mutation. Agent JSON defaults to the bounded summary even when the stored Plan contains hundreds of operations. `plan --show PLAN_ID --json` explicitly returns the exact immutable Core selections and the complete stored operations, changes, and before-state collections for audits or exact-path questions.
 

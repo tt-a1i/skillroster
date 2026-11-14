@@ -15,9 +15,10 @@ release version in that source.
 ## Candidate build
 
 1. Update `Cargo.toml` and `Cargo.lock` to the intended version.
-2. Run `cargo fmt --all --check`,
-   `cargo clippy --locked --all-targets --all-features -- -D warnings`, and
-   `cargo test --locked --all-targets --all-features` locally.
+2. Run `bash scripts/ci-full-check.sh`, including npm package generation,
+   packing and offline launcher checks. Keep Cargo, npm main/platform package
+   versions, the website's source label and installation docs consistent.
+   Published Formula references remain unchanged until publication.
 3. Push an annotated pre-release tag such as `v1.0.0-rc.1`, or dispatch the
    **Release candidate** workflow after it exists on the default branch. It
    builds Linux x86_64, Windows x86_64, macOS arm64, and macOS x86_64 archives

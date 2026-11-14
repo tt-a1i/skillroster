@@ -975,6 +975,28 @@ fn classify_error(error: &(dyn std::error::Error + 'static)) -> ClassifiedError 
             })),
         };
     }
+    if let Some(required) =
+        error.downcast_ref::<crate::roster_recommendation::MinimumCoreBudgetRequired>()
+    {
+        return ClassifiedError {
+            code: "roster_minimum_core_budget_required",
+            retryable: false,
+            details: Some(json!({
+                "reason": "minimum_core_budget_required",
+                "agent": required.agent.id(),
+                "minimum_core_budget": required.minimum_core_budget,
+                "core_budget": required.core_budget,
+                "maximum_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                "files_changed": false,
+                "state_files_changed": false,
+                "next_action": if required.minimum_core_budget <= crate::roster_recommendation::MAX_CORE_BUDGET {
+                    "raise_core_budget_to_minimum"
+                } else {
+                    "review_retained_core_scope"
+                }
+            })),
+        };
+    }
     if let Some(exceeded) =
         error.downcast_ref::<crate::roster_recommendation::SharedPhysicalCoreBudgetExceeded>()
     {
@@ -1317,6 +1339,36 @@ mod tests {
             envelope["suggested_actions"][0]["action"],
             "refresh_snapshot_content_identity"
         );
+    }
+
+    #[test]
+    fn minimum_core_budget_errors_return_exact_typed_limits() {
+        for minimum in [4, 60] {
+            let error = crate::roster_recommendation::MinimumCoreBudgetRequired {
+                agent: crate::harness::AgentKind::Hermes,
+                minimum_core_budget: minimum,
+                core_budget: 3,
+            };
+            let output: Value = serde_json::from_str(&error_json("plan", &error)).unwrap();
+            assert_eq!(
+                output["error"]["code"],
+                "roster_minimum_core_budget_required"
+            );
+            assert_eq!(output["error"]["details"]["agent"], "hermes");
+            assert_eq!(output["error"]["details"]["minimum_core_budget"], minimum);
+            assert_eq!(output["error"]["details"]["core_budget"], 3);
+            assert_eq!(output["error"]["details"]["maximum_core_budget"], 50);
+            assert_eq!(output["error"]["details"]["files_changed"], false);
+            assert_eq!(output["error"]["details"]["state_files_changed"], false);
+            assert_eq!(
+                output["error"]["details"]["next_action"],
+                if minimum <= 50 {
+                    "raise_core_budget_to_minimum"
+                } else {
+                    "review_retained_core_scope"
+                }
+            );
+        }
     }
 
     #[test]

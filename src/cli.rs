@@ -37,6 +37,9 @@ pub struct Cli {
 impl Cli {
     pub fn command_name(&self) -> &'static str {
         match &self.command {
+            Some(Command::Check) => "check",
+            Some(Command::Init(_)) => "init",
+            Some(Command::Mcp) => "mcp",
             Some(Command::Scan(_)) => "scan",
             Some(Command::Report(_)) => "report",
             Some(Command::Find(_)) => "find",
@@ -54,6 +57,12 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect Skills in one read-only call, scanning when current facts require it.
+    Check,
+    /// Install or upgrade Bootstrap with one interactive, reviewable confirmation.
+    Init(InitArgs),
+    /// Serve local read-only Skill search and diagnostics over stdio MCP.
+    Mcp,
     /// Discover Skills and persist an immutable Snapshot.
     Scan(ScanArgs),
     /// Analyze the latest Snapshot or drill into one Finding. Defaults to the bounded Summary view.
@@ -268,6 +277,16 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "modified_choice")]
     pub check: bool,
     /// Decide how setup handles locally modified bootstrap Skill files.
+    #[arg(long, value_enum)]
+    pub modified_choice: Option<ModifiedBootstrapChoice>,
+}
+
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Restrict installation to one detected Agent ID.
+    #[arg(long, value_name = "AGENT_ID", value_parser = parse_setup_agent)]
+    pub agent: Option<crate::harness::AgentKind>,
+    /// Explicitly retain or adopt locally modified Bootstrap files.
     #[arg(long, value_enum)]
     pub modified_choice: Option<ModifiedBootstrapChoice>,
 }

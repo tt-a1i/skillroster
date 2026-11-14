@@ -216,13 +216,13 @@ fn restricted_core_is_blocked_but_ordinary_cross_agent_core_can_be_planned() {
     fixture
         .config("skills:\n  disabled: [blocked]\n  platform_disabled:\n    telegram: [channel]\n");
     let scan = fixture.ok(&["scan"]);
-    for name in ["blocked", "channel"] {
+    for (name, state) in [("blocked", "core"), ("channel", "on_demand")] {
         let placement = fixture.named_placement(name);
         let proposal = fixture.roster_proposal(
             &scan,
             placement["skill_id"].as_str().unwrap(),
             "hermes",
-            "core",
+            state,
         );
         let blocked = fixture.command(&["plan", "--stdin"], Some(&proposal));
         assert_eq!(blocked["ok"], false, "{blocked}");
@@ -231,6 +231,17 @@ fn restricted_core_is_blocked_but_ordinary_cross_agent_core_can_be_planned() {
             "native_visibility_blocks_roster_change"
         );
     }
+    let channel = fixture.named_placement("channel");
+    let retained = fixture.roster_proposal(
+        &scan,
+        channel["skill_id"].as_str().unwrap(),
+        "hermes",
+        "core",
+    );
+    let retained = fixture.command(&["plan", "--stdin"], Some(&retained));
+    assert_eq!(retained["ok"], true, "{retained}");
+    assert_eq!(retained["result"]["change_summary"]["operation_count"], 0);
+    assert_eq!(retained["result"]["hermes_visibility"]["unknown_count"], 1);
     let found = fixture.ok(&["find", "ordinary", "--limit", "1"]);
     let proposal = fixture.roster_proposal(
         &scan,
@@ -366,6 +377,12 @@ fn malformed_or_symlinked_configuration_is_unknown_and_never_exposes_config_cont
             "hermes",
             "core",
         );
+        let retained = fixture.command(&["plan", "--stdin"], Some(&proposal));
+        assert_eq!(retained["ok"], true, "{retained}");
+        assert_eq!(retained["result"]["change_summary"]["operation_count"], 0);
+        assert!(!retained.to_string().contains(secret));
+        let mut proposal = proposal;
+        proposal["roster_changes"][0]["state"] = json!("on_demand");
         let blocked = fixture.command(&["plan", "--stdin"], Some(&proposal));
         assert_eq!(blocked["ok"], false, "{blocked}");
         assert_eq!(

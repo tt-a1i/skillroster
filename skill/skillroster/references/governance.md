@@ -2,9 +2,9 @@
 
 ## Inspect
 
-Run `skillroster scan --summary --json`, then the bounded
-`skillroster report --json`. Use full `scan --json` only for deliberate root or
-coverage diagnostics.
+Start a new inspection with `skillroster check --json`: it scans when required
+and returns the bounded Report. Use explicit `scan --summary --json` for a
+requested refresh and full `scan --json` for deliberate root/coverage diagnostics.
 Use `finding_rollups` for group scale and the selected Findings for the first
 decisions. Read `overview.state`: `inventory_empty` means no Skills were found
 in the checked roots; `no_review_items` means only informational Findings remain.
@@ -17,12 +17,9 @@ while that decision remains open. Reserve `report --full` for deliberate
 exhaustive export; do not make extra calls just to satisfy a fixed presentation
 template.
 
-For each selected Finding, pass through these CLI facts without widening their
-scope: `affected_agents` is the observed Agent set, `actionability` describes
-what the CLI can support now, and `reversibility` describes the recovery path
-of a possible applied change. They constrain the next safe action; they are not
-a value score, and `reversibility` is not permission to Apply. Use the user's
-goal and the available evidence to decide what deserves attention.
+For each Finding, retain `affected_agents`, `actionability` and `reversibility`:
+they identify observed scope, supported next steps and recovery, not usefulness
+or permission to Apply.
 
 Usage evidence is five-stage and conservative. Read `session_coverage` before
 describing it. `sampled_agents` support bounded observed events;
@@ -57,6 +54,27 @@ using a Core budget or fallback ordering. Fifty is a supported budget ceiling,
 not a recommendation. If the user prefers the current Roster, finish there.
 An explicitly requested name-ordered draft may be previewed, with its fallback
 basis stated plainly and no claim of better usefulness.
+
+Shared adoption is a separate choice from Roster reduction. When the user
+explicitly wants to host eligible shared Skills and separate Agent roots, use
+the Report's `shared_adoption.request_template` with the current Scan. It has
+`schema_version: 1`, `scan_id`, and `adopt_shared_skills` containing
+`core_budget` and `protected_skill_ids`. Present affected consumers,
+exclusions, before/after impact, and the unknown-consumer boundary before Apply.
+Complete verified ordinary packages move into the active Library; hidden
+`.system`, provider, external, and incomplete packages stay in place. Supported
+whole-root aliases become independent directories with Core links and retained
+excluded entry links; observed direct symlink consumers retain exposure. Host
+configuration is unchanged. Drift blocks Apply, and the Receipt's bounded Undo
+restores packages and exact old aliases. Apply follows review and user approval.
+Ordinary raw and shared-root operations remain blocked.
+
+Large-Roster Findings are per Agent. Immutable Core is retained automatically;
+when a budget is too small, use the reported exact minimum. The first Report
+also exposes `plan_available` where applicable.
+If the CLI preserves an exact skipped branch, keep its bounded coverage visible;
+do not read or authorize that branch merely to preview disjoint mutable changes.
+Retained native eligibility remains unknown; a Core label does not prove the host loaded it.
 
 Make semantic choices in conversation, then submit them to
 `skillroster plan --stdin --json`. Every declarative request includes
@@ -198,7 +216,10 @@ metrics, selected Findings, rollups, and typed safety facts. Include
 and keep each count's field meaning and unit. Do not derive deletion or
 reduction counts from current Finding scale. State measurable before/after
 impact only from a validated Plan, and actual impact only from its Receipt.
-Include uncertainty, evidence quality, safety risks, and whether confirmation is
+For Roster impact, include `exposed_metadata_footprint.before/after`: measured
+local UTF-8 entrypoint/frontmatter bytes per exposed placement, with unknown
+counts. These are not runtime token counts. Include uncertainty, evidence
+quality, safety risks, and whether confirmation is
 required. Choose a primary next action when the evidence supports one; expand
 the view when the user's question or an unresolved decision requires it. For a
 proposed change, include its measurable before/after impact,

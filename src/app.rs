@@ -33,8 +33,19 @@ use crate::state_security;
 
 pub use crate::action_context::ActionContext;
 
+mod bootstrap_history;
 mod content_choice;
+use bootstrap_history::{LEGACY_COMPLETE_BOOTSTRAP_PACKAGES, LEGACY_SINGLE_FILE_BOOTSTRAPS};
 mod error;
+mod inspection;
+mod interactive;
+mod library_visibility;
+mod roster_guidance;
+mod shared_adoption;
+use roster_guidance::{finding_roster_planning, finding_roster_planning_decision};
+
+pub(crate) use inspection::run_mcp_find_process;
+use inspection::scan_command;
 
 use content_choice::{
     add_declared_content_resolution, bind_content_choices, declared_content_choice,
@@ -74,16 +85,23 @@ pub struct Output {
 
 pub fn run(cli: Cli) -> Result<Output> {
     let action_context = ActionContext::from_cli(&cli)?;
-    run_with_context(cli, &action_context)
+    run_with_context(cli, &action_context, false)
 }
 
 pub fn run_process(cli: Cli) -> Result<(ActionContext, Result<Output>)> {
     let action_context = ActionContext::from_process(&cli)?;
-    let output = run_with_context(cli, &action_context);
+    let output = run_with_context(cli, &action_context, false);
     Ok((action_context, output))
 }
 
-fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> {
+fn run_with_context(
+    cli: Cli,
+    action_context: &ActionContext,
+    refresh_find: bool,
+) -> Result<Output> {
+    if matches!(cli.command, Some(Command::Init(_))) {
+        interactive::require_terminal(cli.json)?;
+    }
     let home = resolve_home(cli.home)?;
     let state_dir = cli.state_dir.unwrap_or_else(|| home.join(".skillroster"));
     let database_path = state_dir.join("skillroster.db");
@@ -127,7 +145,8 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
     }
     // Shared guards let Agent read/analysis commands run concurrently while
     // still excluding lifecycle deletion and filesystem mutations on Windows.
-    let state_lock = if command_requires_exclusive_state_lock(cli.command.as_ref()) {
+    let state_lock = if refresh_find || command_requires_exclusive_state_lock(cli.command.as_ref())
+    {
         change::StateLock::acquire_exclusive(&state_dir)?
     } else {
         let shared = change::StateLock::acquire_shared(&state_dir)?;
@@ -288,6 +307,29 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
                 )
             }
         },
+        Some(Command::Check) => {
+            let (result, warnings, actions) = inspection::check_command(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+            )?;
+            ("check", result, warnings, actions)
+        }
+        Some(Command::Init(args)) => {
+            let (result, actions) = interactive::init_command(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+                &args,
+                &state_lock,
+            )?;
+            ("init", result, vec![], actions)
+        }
+        Some(Command::Mcp) => bail!("MCP must run through its stdio entrypoint"),
         Some(Command::Scan(args)) => {
             let (result, warnings) = scan_command(
                 &store,
@@ -326,8 +368,16 @@ fn run_with_context(cli: Cli, action_context: &ActionContext) -> Result<Output> 
             ("report", result, vec![], actions)
         }
         Some(Command::Find(args)) => {
-            let (result, actions) = find_command(&store, &state_dir, &args)?;
-            ("find", result, vec![], actions)
+            let (result, warnings, actions) = inspection::find_with_snapshot(
+                &store,
+                &home,
+                &state_dir,
+                &cli.roots,
+                &cli.source_roots,
+                &args,
+                refresh_find,
+            )?;
+            ("find", result, warnings, actions)
         }
         Some(Command::Plan(args)) => {
             let showing_detail = args.show.is_some();
@@ -610,7 +660,13 @@ fn owned_source_confirmation_temp_name(name: &std::ffi::OsStr) -> bool {
 
 fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
     match command {
-        Some(Command::Scan(_) | Command::Apply(_) | Command::Undo(_)) => true,
+        Some(
+            Command::Check
+            | Command::Init(_)
+            | Command::Scan(_)
+            | Command::Apply(_)
+            | Command::Undo(_),
+        ) => true,
         Some(Command::Setup(args)) => !args.check,
         Some(Command::Report(args)) => args.finding.is_none(),
         Some(Command::Plan(args)) => args.show.is_none(),
@@ -625,7 +681,7 @@ fn command_requires_exclusive_state_lock(command: Option<&Command>) -> bool {
                 | LifecycleCommand::Recovery
                 | LifecycleCommand::Delete(_)
         ),
-        Some(Command::Find(_) | Command::Status) | None => false,
+        Some(Command::Find(_) | Command::Status | Command::Mcp) | None => false,
     }
 }
 
@@ -1683,170 +1739,6 @@ fn lifecycle_recovery_command(store: &StateStore, state_dir: &Path) -> Result<Va
     }))
 }
 
-fn scan_command(
-    store: &StateStore,
-    home: &Path,
-    state_dir: &Path,
-    explicit: Vec<ExplicitSkillRoot>,
-    source_roots: Vec<PathBuf>,
-    summary: bool,
-) -> Result<(Value, Vec<String>)> {
-    let started = Utc::now().timestamp();
-    let id = ScanId::new();
-    // Freeze durable read permissions once before discovery. Only exact roots
-    // whose path and stable filesystem identity still match enter the Scan;
-    // drift is local to that permission and persists as typed Snapshot facts.
-    let frozen_permissions = crate::source_policy::freeze_active_roots(store)?;
-    let durable_read_roots = frozen_permissions
-        .iter()
-        .filter(|root| root.state == crate::source_policy::SourceRootState::Active)
-        .filter_map(|root| {
-            root.resolved_path
-                .clone()
-                .map(|path| crate::scan::DurableReadRoot {
-                    permission_id: root.permission.id.as_str().to_owned(),
-                    path,
-                    identity: root.permission.identity.clone(),
-                })
-        })
-        .collect::<Vec<_>>();
-    store.save_scan(&ScanRun {
-        id: id.clone(),
-        started_at: started,
-        completed_at: None,
-        status: ScanStatus::Running,
-        coverage_notes: vec![],
-    })?;
-    let mut options = ScanOptions::for_home(home);
-    options.explicit_skill_roots = explicit;
-    options.explicit_source_roots = source_roots;
-    options.durable_read_roots = durable_read_roots;
-    options.managed_source_roots = vec![state_dir.join("library")];
-    options.excluded_session_agents = store
-        .evidence_exclusions()?
-        .iter()
-        .map(|agent| parse_agent_kind(agent))
-        .collect::<Result<_>>()?;
-    let mut result = match scan::scan(&options) {
-        Ok(result) => result,
-        Err(error) => {
-            store.save_scan(&ScanRun {
-                id,
-                started_at: started,
-                completed_at: Some(Utc::now().timestamp()),
-                status: ScanStatus::Failed,
-                coverage_notes: vec![error.to_string()],
-            })?;
-            return Err(error.into());
-        }
-    };
-    let post_scan_permissions = match crate::source_policy::freeze_active_roots(store) {
-        Ok(permissions) => permissions,
-        Err(error) => {
-            store.save_scan(&ScanRun {
-                id,
-                started_at: started,
-                completed_at: Some(Utc::now().timestamp()),
-                status: ScanStatus::Failed,
-                coverage_notes: vec![error.to_string()],
-            })?;
-            return Err(error.into());
-        }
-    };
-    let policy_facts = conservative_source_policy_facts(
-        &frozen_permissions,
-        &post_scan_permissions,
-        &result.durable_read_drifted_permission_ids,
-    );
-    for fact in policy_facts
-        .iter()
-        .filter(|fact| fact.state != crate::source_policy::SourceRootState::Active)
-    {
-        result.warnings.push(format!(
-            "source-root permission {} is {} and was excluded: {}",
-            fact.permission_id,
-            serde_json::to_value(fact.state)?
-                .as_str()
-                .unwrap_or("drifted"),
-            fact.drift_reason.as_deref().unwrap_or("identity drift")
-        ));
-    }
-    result.source_root_policy = policy_facts;
-    store.begin_scan_snapshot()?;
-    let persistence = (|| -> Result<()> {
-        persist_index(store, &id, &result)?;
-        store.save_scan_payload(&id, &result)?;
-        store.save_scan(&ScanRun {
-            id: id.clone(),
-            started_at: started,
-            completed_at: Some(Utc::now().timestamp()),
-            status: ScanStatus::Completed,
-            coverage_notes: result.warnings.clone(),
-        })?;
-        store.commit_scan_snapshot()?;
-        Ok(())
-    })();
-    if let Err(error) = persistence {
-        let rollback_error = store.rollback_scan_snapshot().err();
-        store.save_scan(&ScanRun {
-            id,
-            started_at: started,
-            completed_at: Some(Utc::now().timestamp()),
-            status: ScanStatus::Failed,
-            coverage_notes: vec![error.to_string()],
-        })?;
-        if let Some(rollback_error) = rollback_error {
-            bail!("Scan persistence failed: {error}; rollback failed: {rollback_error}");
-        }
-        return Err(error);
-    }
-    let agents_checked = result
-        .roots
-        .iter()
-        .filter_map(|root| root.agent)
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-    let warnings = compact_scan_warnings(result.warnings.clone());
-    let public_result = if summary {
-        scan_summary_value(&id, agents_checked, &result)?
-    } else {
-        let roots = result
-            .roots
-            .iter()
-            .map(|root| {
-                let mut value = json!(root);
-                value["agent"] = json!(root.agent.map(AgentKind::id));
-                value
-            })
-            .collect::<Vec<_>>();
-        let coverage = result
-            .coverage
-            .iter()
-            .map(session_coverage_details)
-            .collect::<Result<Vec<_>>>()?;
-        json!({
-            "snapshot_id": &id,
-            "agents_checked": agents_checked,
-            "skill_count": result.skills.len(),
-            "placement_count": result.placements.len(),
-            "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
-            "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
-            "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
-            "roots": roots,
-            "coverage": coverage,
-            "source_root_policy": {
-                "scope": "exact_local_read_only",
-                "content_endorsed": false,
-                "evidence_quality_changed": false,
-                "governance_authorized": false,
-                "permissions": result.source_root_policy,
-            },
-            "files_changed": false
-        })
-    };
-    Ok((public_result, warnings))
-}
-
 const SCAN_SUMMARY_ROOT_ISSUE_LIMIT: usize = 10;
 const SESSION_COVERAGE_PRESENTATION_VERSION: u32 = 1;
 
@@ -2004,6 +1896,8 @@ fn scan_summary_value(id: &ScanId, agents_checked: usize, result: &ScanResult) -
         "agents_checked": agents_checked,
         "skill_count": result.skills.len(),
         "placement_count": result.placements.len(),
+        "default_exposure": metrics.default_exposure,
+        "exposed_metadata_footprint": crate::footprint::compact(crate::footprint::exposed(result)),
         "native_visibility": result.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "codex_visibility": result.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "hermes_visibility": result.hermes_visibility.as_ref().map(|visibility| {
@@ -2628,6 +2522,7 @@ fn report_command(
                 == Some(u64::from(SESSION_COVERAGE_PRESENTATION_VERSION))
             && report_supports_source_confirmation_kind(&existing)
             && report_supports_finding_decision_fields(&existing)
+            && existing.summary["exposed_metadata_footprint"].is_object()
             && existing.summary["overview"].is_object()
             && existing.summary["semantic_overlap_candidates"].is_object()
             && (scan.native_visibility.is_none()
@@ -2636,7 +2531,9 @@ fn report_command(
             && (scan.hermes_visibility.is_none()
                 || existing.summary["hermes_visibility"].is_object())
         {
-            return Ok(select_report_view(&existing.summary, request));
+            let mut report = existing.summary.clone();
+            report["shared_adoption"] = json!(shared_adoption::guidance(&scan, &scan_id));
+            return Ok(select_report_view(&report, request));
         }
     }
     let report = crate::query::build_report(&scan);
@@ -2687,10 +2584,11 @@ fn report_command(
             Ok(record)
         })
         .collect::<Result<Vec<_>>>()?;
-    let full_findings = findings
+    let mut full_findings = findings
         .iter()
         .map(|stored| stored.details.clone())
         .collect::<Vec<_>>();
+    prioritize_available_roster_plan(&mut full_findings);
     let finding_rollups = finding_rollups(&full_findings);
     let session_coverage = json!({
         "supported_agents": AgentKind::ALL.len(),
@@ -2704,10 +2602,13 @@ fn report_command(
     let value = json!({
         "report_id": report_id,
         "session_coverage_presentation_version": SESSION_COVERAGE_PRESENTATION_VERSION,
+        "roster_guidance_version": 1,
+        "shared_adoption": shared_adoption::guidance(&scan, &scan_id),
         "snapshot_id": scan_id,
         "skill_count": report.metrics.independent_skills,
         "placement_count": report.metrics.placements,
         "default_exposure": report.metrics.default_exposure,
+        "exposed_metadata_footprint": crate::footprint::exposed(&scan),
         "native_visibility": scan.native_visibility.as_ref().map(|visibility| visibility.summary()),
         "codex_visibility": scan.codex_visibility.as_ref().map(|visibility| visibility.summary()),
         "hermes_visibility": scan.hermes_visibility.as_ref().map(|visibility| visibility.summary()),
@@ -2805,6 +2706,9 @@ fn report_supports_source_confirmation_kind(report: &ReportRecord) -> bool {
 }
 
 fn report_supports_finding_decision_fields(report: &ReportRecord) -> bool {
+    if report.summary["roster_guidance_version"] != 1 {
+        return false;
+    }
     let Some(findings) = report.summary["findings"].as_array() else {
         return false;
     };
@@ -2822,14 +2726,19 @@ fn report_supports_finding_decision_fields(report: &ReportRecord) -> bool {
                 finding.get("kind"),
                 finding.get("title").and_then(Value::as_str).unwrap_or(""),
             ) {
-                Some(crate::query::FindingKind::LargeDefaultRoster) => matches!(
-                    (
-                        finding.get("actionability").and_then(Value::as_str),
-                        finding.get("reversibility").and_then(Value::as_str),
-                    ),
-                    (Some("plan_available"), Some("undo_after_apply"))
-                        | (Some("blocked"), Some("not_governable"))
-                ),
+                Some(crate::query::FindingKind::LargeDefaultRoster) => {
+                    finding["affected_agents"]
+                        .as_array()
+                        .is_some_and(|agents| agents.len() == 1)
+                        && matches!(
+                            (
+                                finding.get("actionability").and_then(Value::as_str),
+                                finding.get("reversibility").and_then(Value::as_str),
+                            ),
+                            (Some("plan_available"), Some("undo_after_apply"))
+                                | (Some("blocked"), Some("not_governable"))
+                        )
+                }
                 _ => true,
             }
     })
@@ -4604,515 +4513,6 @@ fn source_confirmation_finding_reference(
     Ok(reference)
 }
 
-#[derive(Clone, Copy)]
-struct FindingRosterPlanningOptions {
-    full: bool,
-    decision_facts_only: bool,
-}
-
-fn finding_roster_planning_decision(
-    store: &StateStore,
-    finding: &FindingRecord,
-    scan_id: &ScanId,
-    latest_scan_id: &ScanId,
-    scan: &ScanResult,
-    state_dir: &Path,
-) -> Result<Option<Value>> {
-    // Probe the same planning gates used by detail output without resolving
-    // report-linked continuation data before the new Report is persisted.
-    finding_roster_planning_impl(
-        store,
-        finding,
-        scan_id,
-        latest_scan_id,
-        scan,
-        state_dir,
-        FindingRosterPlanningOptions {
-            full: false,
-            decision_facts_only: true,
-        },
-    )
-}
-
-fn finding_roster_planning(
-    store: &StateStore,
-    finding: &FindingRecord,
-    scan_id: &ScanId,
-    latest_scan_id: &ScanId,
-    scan: &ScanResult,
-    state_dir: &Path,
-    full: bool,
-) -> Result<Option<Value>> {
-    finding_roster_planning_impl(
-        store,
-        finding,
-        scan_id,
-        latest_scan_id,
-        scan,
-        state_dir,
-        FindingRosterPlanningOptions {
-            full,
-            decision_facts_only: false,
-        },
-    )
-}
-
-fn finding_roster_planning_impl(
-    store: &StateStore,
-    finding: &FindingRecord,
-    scan_id: &ScanId,
-    latest_scan_id: &ScanId,
-    scan: &ScanResult,
-    state_dir: &Path,
-    options: FindingRosterPlanningOptions,
-) -> Result<Option<Value>> {
-    let FindingRosterPlanningOptions {
-        full,
-        decision_facts_only,
-    } = options;
-    if !crate::roster_recommendation::is_large_roster_finding(finding) {
-        return Ok(None);
-    }
-    if scan_id != latest_scan_id {
-        return Ok(Some(json!({
-            "supported": false,
-            "reason": "stale_finding",
-            "snapshot_id": scan_id,
-            "latest_snapshot_id": latest_scan_id
-        })));
-    }
-    let declared_core = declared_core_pairs(store, scan)?;
-    let recommendation = match crate::roster_recommendation::recommend(
-        finding,
-        scan,
-        &declared_core,
-        &crate::roster_recommendation::RecommendationRequest {
-            core_budget: crate::roster_recommendation::MAX_CORE_BUDGET,
-            protected_skill_ids: BTreeSet::new(),
-        },
-    ) {
-        Ok(recommendation) => recommendation,
-        Err(error) => {
-            if let Some(required) = error.downcast_ref::<
-                crate::roster_recommendation::PhysicalMutationIdentityRescanRequired,
-            >() {
-                return Ok(Some(json!({
-                    "supported": false,
-                    "reason": "physical_mutation_identity_rescan_required",
-                    "reason_code": "snapshot_missing_physical_mutation_identity",
-                    "snapshot_id": scan_id,
-                    "placement_id": required.placement_id,
-                    "files_changed": false,
-                    "state_files_changed": false,
-                    "next_action": "scan",
-                    "action": physical_identity_rescan_action()
-                })));
-            }
-            return Ok(Some(json!({
-                "supported": false,
-                "reason": "automatic_roster_selection_unavailable",
-                "detail": error.to_string(),
-                "snapshot_id": scan_id
-            })));
-        }
-    };
-    let selection_evidence = roster_selection_evidence(&recommendation);
-    let supported =
-        crate::roster_plan::exclude_unpreservable_demotions(scan, recommendation.changes.clone())?;
-    let agents = recommendation
-        .agents
-        .iter()
-        .map(|agent| {
-            let unchanged_blocked_count = supported
-                .exclusions
-                .iter()
-                .filter(|exclusion| exclusion.agent == agent.agent.id())
-                .count();
-            let preview = agent
-                .core_selections
-                .iter()
-                .take(5)
-                .map(|selection| {
-                    json!({
-                        "skill_id": selection.skill_id,
-                        "name": selection.name,
-                        "reason": selection.reason,
-                        "evidence_scope": selection.evidence_scope,
-                        "evidence_agents": selection.evidence_agents
-                    })
-                })
-                .collect::<Vec<_>>();
-            json!({
-                "agent": agent.agent.id(),
-                "before_default_exposure": agent.before_default_exposure,
-                "unique_skill_count": agent.unique_skill_count,
-                "proposed_core_count": agent.core_count,
-                "proposed_on_demand_count": agent.on_demand_count.saturating_sub(unchanged_blocked_count),
-                "unchanged_blocked_count": unchanged_blocked_count,
-                "positive_signal_count": agent.positive_signal_count,
-                "direct_signal_count": agent.direct_signal_count,
-                "cross_agent_signal_count": agent.cross_agent_signal_count,
-                "fallback_core_count": agent.fallback_core_count,
-                "core_preview": preview,
-                "core_preview_truncated": agent.core_selections.len() > 5
-            })
-        })
-        .collect::<Vec<_>>();
-    let blocked_change_count = supported.exclusions.len();
-    if decision_facts_only && blocked_change_count > 0 {
-        return Ok(Some(json!({"supported": false})));
-    }
-    let blocked_changes = supported
-        .exclusions
-        .iter()
-        .take(5)
-        .map(crate::roster_plan::blocked_change_json)
-        .collect::<Vec<_>>();
-    if blocked_change_count > 0 {
-        let blocked_skills = blocked_skill_planning(&supported.exclusions, full);
-        let blocked_reasons = supported
-            .exclusions
-            .iter()
-            .map(|exclusion| exclusion.reason)
-            .collect::<BTreeSet<_>>();
-        let package_variants_only = blocked_reasons.len() == 1
-            && blocked_reasons
-                .contains("multiple_package_fingerprints_require_explicit_preservation");
-        let source_dependency = supported
-            .exclusions
-            .iter()
-            .any(|exclusion| exclusion.reason == "non_agent_source_link_depends_on_removal");
-        let blocked_skill_ids = supported
-            .exclusions
-            .iter()
-            .map(|exclusion| exclusion.skill_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let observed_link_targets = scan
-            .placements
-            .iter()
-            .filter(|placement| blocked_skill_ids.contains(placement.skill_id.as_str()))
-            .filter_map(|placement| placement.link_target.as_ref())
-            .map(|path| path.display().to_string())
-            .collect::<BTreeSet<_>>();
-        if source_dependency {
-            let protect_choice = blocked_core_protection_choice(
-                store,
-                finding,
-                scan,
-                &declared_core,
-                &blocked_skills,
-                state_dir,
-                full,
-            )?;
-            let protection_available = protect_choice["available"].as_bool() == Some(true);
-            let source_choice = json!({
-                "choice": "preserve_or_retarget_dependent_sources",
-                "requires_confirmation": true,
-                "dependent_source_paths": blocked_skills.displayed_dependent_source_paths,
-                "dependent_source_paths_complete": !blocked_skills.truncated,
-                "next": if blocked_skills.truncated {
-                    "open the full Finding before changing any dependent source link"
-                } else {
-                    "after user-approved manual preservation or retargeting, rescan and reopen the new large-Roster Finding; another independent blocker may still fail closed"
-                }
-            });
-            return Ok(Some(json!({
-                "supported": false,
-                "reason": "source_dependency_blocks_roster_change",
-                "decision": "resolve_source_dependency",
-                "automatic_change_supported": false,
-                "snapshot_id": scan_id,
-                "request_field": "finding_roster_changes",
-                "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                "absence_of_usage_evidence": "not_negative_evidence",
-                "explicit_only_or_archive_decision_implied": false,
-                "agent_count": agents.len(),
-                "agents": agents,
-                "blocked_change_count": blocked_change_count,
-                "blocked_reasons": blocked_reasons,
-                "blocked_changes": blocked_changes,
-                "blocked_changes_truncated": blocked_change_count > 5,
-                "blocked_skill_count": blocked_skills.count,
-                "blocked_skills": blocked_skills.items,
-                "blocked_skills_truncated": blocked_skills.truncated,
-                "dependent_link_targets": observed_link_targets,
-                "resolution_choices": [protect_choice, source_choice],
-                "after_resolution": {
-                    "next": if protection_available {
-                        "choose either explicit Core protection or user-approved source-link preservation, then retry from fresh evidence; another independent blocker may still fail closed"
-                    } else {
-                        "use user-approved source-link preservation, then retry from fresh evidence; another independent blocker may still fail closed"
-                    }
-                }
-            })));
-        }
-        let mutation_scopes = supported
-            .exclusions
-            .iter()
-            .flat_map(|exclusion| match exclusion.safety_blocker.as_ref() {
-                Some(crate::roster_plan::RosterSafetyBlocker::ProviderManaged { .. }) => {
-                    vec!["provider_read_only".to_owned()]
-                }
-                Some(crate::roster_plan::RosterSafetyBlocker::MutationScopeReadOnly {
-                    mutation_scopes,
-                    ..
-                }) => mutation_scopes.clone(),
-                _ => Vec::new(),
-            })
-            .collect::<BTreeSet<_>>();
-        let requires_more_than_read_confirmation = mutation_scopes.is_empty()
-            || mutation_scopes
-                .iter()
-                .any(|scope| scope != "untrusted_external");
-        if requires_more_than_read_confirmation {
-            let protect_choice = blocked_core_protection_choice(
-                store,
-                finding,
-                scan,
-                &declared_core,
-                &blocked_skills,
-                state_dir,
-                full,
-            )?;
-            let mut planning = json!({
-                "supported": false,
-                "reason": if package_variants_only {
-                    "package_fingerprint_variants_block_roster_change"
-                } else {
-                    "mutation_scope_blocks_roster_change"
-                },
-                "decision": if package_variants_only {
-                    "review_package_fingerprint_variants"
-                } else {
-                    "choose_mutable_placements_or_keep_unchanged"
-                },
-                "decision_code": if package_variants_only {
-                    "protect_package_variants_or_keep_unchanged"
-                } else {
-                    "protect_read_only_skills_or_keep_unchanged"
-                },
-                "automatic_change_supported": false,
-                "snapshot_id": scan_id,
-                "request_field": "finding_roster_changes",
-                "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                "absence_of_usage_evidence": "not_negative_evidence",
-                "explicit_only_or_archive_decision_implied": false,
-                "agent_count": agents.len(),
-                "agents": agents,
-                "blocked_change_count": blocked_change_count,
-                "blocked_reasons": blocked_reasons,
-                "blocked_changes": blocked_changes,
-                "blocked_changes_truncated": blocked_change_count > 5,
-                "blocked_skill_count": blocked_skills.count,
-                "blocked_skills": blocked_skills.items,
-                "blocked_skills_truncated": blocked_skills.truncated,
-                "resolution_choices": [protect_choice],
-                "next": if package_variants_only {
-                    "These Skill identities have different package fingerprints. Keep every package unchanged through the typed Core-protection choice, or review the packages before proposing another change; read permission does not resolve the content differences."
-                } else {
-                    "Read permissions do not make read-only placements mutable. Review all blocked reasons and keep these Skills unchanged as Core through the typed protection choice. Rescan only when scope facts are missing."
-                }
-            });
-            if !package_variants_only {
-                planning["mutation_scopes"] = json!(mutation_scopes);
-            }
-            return Ok(Some(planning));
-        }
-        let untrusted_external_skill_ids = supported
-            .exclusions
-            .iter()
-            .filter(|exclusion| is_untrusted_external_blocker(exclusion))
-            .map(|exclusion| exclusion.skill_id.clone())
-            .collect::<BTreeSet<_>>();
-        let source_confirmation_finding = source_confirmation_finding_reference(
-            store,
-            finding,
-            scan_id,
-            &untrusted_external_skill_ids,
-        )?;
-        return Ok(Some(json!({
-            "supported": false,
-            "reason": "trusted_canonical_sources_required",
-            "decision": "confirm_trusted_source_roots",
-            "decision_semantics": "confirm_exact_local_read_permission",
-            "permission_scope": "exact_local_read_only",
-            "content_endorsed": false,
-            "evidence_quality_changed": false,
-            "governance_authorized": false,
-            "plan_apply_authorized": false,
-            "automatic_change_supported": false,
-            "snapshot_id": scan_id,
-            "request_field": "finding_roster_changes",
-            "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-            "absence_of_usage_evidence": "not_negative_evidence",
-            "explicit_only_or_archive_decision_implied": false,
-            "agent_count": agents.len(),
-            "agents": agents,
-            "blocked_change_count": blocked_change_count,
-            "blocked_reasons": blocked_reasons,
-            "blocked_changes": blocked_changes,
-            "blocked_changes_truncated": blocked_change_count > 5,
-            "blocked_skill_count": blocked_skills.count,
-            "blocked_skills": blocked_skills.items,
-            "blocked_skills_truncated": blocked_skills.truncated,
-            "observed_link_targets": observed_link_targets,
-            "source_confirmation_finding": source_confirmation_finding,
-            "after_confirmation": {
-                "repeatable_option": "--source-root",
-                "value": "absolute canonical source directory",
-                "next": if blocked_reasons.contains("multiple_package_fingerprints_require_explicit_preservation") {
-                    "rescan and reopen the new large-Roster Finding; read confirmation does not resolve the independent package-preservation blockers"
-                } else {
-                    "rescan and reopen the new large-Roster Finding"
-                }
-            }
-        })));
-    }
-    if let Err(error) = crate::roster_plan::derive(scan, state_dir, &supported.changes) {
-        if let Some(conflict) =
-            error.downcast_ref::<crate::roster_plan::RosterLibraryTargetClaimConflict>()
-        {
-            if decision_facts_only {
-                return Ok(Some(json!({"supported": false})));
-            }
-            let conflict_skill_ids = conflict
-                .claimants
-                .iter()
-                .map(|claimant| claimant.skill_id.clone())
-                .collect::<BTreeSet<_>>();
-            let protected_validation = validated_core_protection(
-                finding,
-                scan,
-                &declared_core,
-                state_dir,
-                conflict_skill_ids.clone(),
-                vec![conflict.clone()],
-            );
-            let validated = protected_validation.as_ref().ok();
-            let protected_skill_ids = validated
-                .map(|validated| validated.protected_skill_ids.clone())
-                .unwrap_or(conflict_skill_ids)
-                .into_iter()
-                .collect::<Vec<_>>();
-            let conflicts = validated
-                .map(|validated| validated.library_target_conflicts.as_slice())
-                .unwrap_or_else(|| std::slice::from_ref(conflict));
-            let disclosure = library_target_claim_disclosure(store, finding, conflicts, full)?;
-            let protected_ids_complete = (full || protected_skill_ids.len() <= 10)
-                && disclosure["claimants_complete"].as_bool() == Some(true);
-            let protection_available = protected_validation.is_ok() && protected_ids_complete;
-            let conflict_kind = if conflicts.len() == 1 {
-                if conflicts[0].has_one_logical_name() {
-                    "same_name_library_target_conflict"
-                } else {
-                    "library_target_name_normalization_conflict"
-                }
-            } else {
-                "library_target_claim_conflicts"
-            };
-            let conflict_reason_code = if conflicts.len() == 1 {
-                if conflicts[0].has_one_logical_name() {
-                    "same_name_variants_require_explicit_preservation"
-                } else {
-                    "normalized_names_claim_one_library_target"
-                }
-            } else {
-                "multiple_library_targets_require_explicit_preservation"
-            };
-            let unavailable_detail = protected_validation.as_ref().err().map(ToString::to_string);
-            let mut protection_choice = json!({
-                "choice": "protect_library_target_claimants_as_core",
-                "requires_confirmation": true,
-                "available": protection_available,
-                "protected_skill_ids": if protected_ids_complete { json!(protected_skill_ids) } else { Value::Null },
-                "protected_skill_ids_complete": protected_ids_complete,
-                "plan_request_template_available": protection_available,
-                "unavailable_detail": unavailable_detail,
-                "next": if protection_available {
-                    "after user confirmation, submit the exact Plan request to preserve every conflicting variant as Core"
-                } else if !protected_ids_complete {
-                    "open the full Finding before constructing a complete protected-Skill Plan request"
-                } else {
-                    "the production Recommendation or Plan preconditions reject this Core protection set"
-                }
-            });
-            if protection_available {
-                protection_choice["plan_request_template"] = json!({
-                    "schema_version": 1,
-                    "finding_roster_changes": [{
-                        "finding_id": finding.id,
-                        "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                        "protected_skill_ids": protected_skill_ids
-                    }]
-                });
-            }
-            return Ok(Some(json!({
-                "supported": false,
-                "reason": conflict_kind,
-                "reason_code": conflict_reason_code,
-                "automatic_change_supported": false,
-                "snapshot_id": scan_id,
-                "request_field": "finding_roster_changes",
-                "library_target_claims": disclosure,
-                "resolution_choices": [protection_choice],
-                "files_changed": false,
-                "state_files_changed": false
-            })));
-        }
-        // A rejected candidate Plan is a Finding blocker, not a failure to
-        // read the Report. Keep the same decision in summary and detail views.
-        return Ok(Some(json!({
-            "supported": false,
-            "reason": "roster_plan_preconditions_failed",
-            "detail": error.to_string(),
-            "snapshot_id": scan_id,
-            "files_changed": false,
-            "state_files_changed": false
-        })));
-    }
-    if decision_facts_only {
-        return Ok(Some(json!({"supported": true})));
-    }
-    Ok(Some(json!({
-        "supported": true,
-        "decision": "right_size_default_rosters",
-        "snapshot_id": scan_id,
-        "request_field": "finding_roster_changes",
-        "default_core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-        "allowed_core_budget": {
-            "minimum": 1,
-            "maximum": crate::roster_recommendation::MAX_CORE_BUDGET,
-            "unit": "skills_per_affected_agent"
-        },
-        "selection_policy": [
-            "protected_by_request",
-            "declared_core",
-            "skillroster_bootstrap",
-            "target_agent_usage_evidence",
-            "cross_agent_same_skill_usage_evidence",
-            "stable_fallback"
-        ],
-        "absence_of_usage_evidence": "not_negative_evidence",
-        "automatic_target_states": ["core", "on_demand"],
-        "explicit_only_or_archive_decision_implied": false,
-        "selection_evidence": selection_evidence.summary,
-        "uncertainty": selection_evidence.uncertainty,
-        "blocked_change_count": blocked_change_count,
-        "blocked_changes": blocked_changes,
-        "blocked_changes_truncated": blocked_change_count > 5,
-        "agent_count": agents.len(),
-        "agents": agents,
-        "plan_request_template": {
-            "schema_version": 1,
-            "finding_roster_changes": [{
-                "finding_id": finding.id,
-                "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
-                "protected_skill_ids": []
-            }]
-        }
-    })))
-}
-
 fn select_report_view(report: &Value, request: ReportRequest<'_>) -> Value {
     match request {
         ReportRequest::Summary => compact_report(report),
@@ -5292,6 +4692,7 @@ fn paged_finding_report(
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "exposed_metadata_footprint": crate::footprint::compact(report["exposed_metadata_footprint"].clone()),
         "native_visibility": report["native_visibility"],
         "codex_visibility": report["codex_visibility"],
         "hermes_visibility": report["hermes_visibility"],
@@ -5309,6 +4710,7 @@ fn paged_finding_report(
         "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
         "semantic_overlap_candidates": report["semantic_overlap_candidates"],
+        "shared_adoption": report["shared_adoption"],
         "filters": {
             "category": category.map(ReportCategory::id),
             "severity": severity.map(ReportSeverity::id)
@@ -5360,15 +4762,48 @@ fn interleave_finding_families(findings: Vec<&Value>) -> Vec<&Value> {
     interleaved
 }
 
+fn prioritize_available_roster_plan(findings: &mut Vec<Value>) {
+    if findings
+        .iter()
+        .take(3)
+        .any(|finding| finding["actionability"] == "plan_available")
+    {
+        return;
+    }
+    if let Some(index) = findings.iter().position(|finding| {
+        finding["severity"] != "info" && finding["actionability"] == "plan_available"
+    }) {
+        let available = findings.remove(index);
+        findings.insert(index.min(2), available);
+    }
+}
+
 fn compact_report(report: &Value) -> Value {
     let findings = report["findings"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
-    let compact_findings = findings
+    let review_findings = findings
         .iter()
         .filter(|finding| finding["severity"] != "info")
-        .take(3)
+        .collect::<Vec<_>>();
+    let mut selected = review_findings.iter().take(3).copied().collect::<Vec<_>>();
+    if !selected
+        .iter()
+        .any(|finding| finding["actionability"] == "plan_available")
+    {
+        if let Some(available) = review_findings
+            .iter()
+            .find(|finding| finding["actionability"] == "plan_available")
+        {
+            if selected.len() == 3 {
+                selected.pop();
+            }
+            selected.push(available);
+        }
+    }
+    let compact_findings = selected
+        .into_iter()
         .map(compact_finding_summary)
         .collect::<Vec<_>>();
     json!({
@@ -5377,6 +4812,7 @@ fn compact_report(report: &Value) -> Value {
         "skill_count": report["skill_count"],
         "placement_count": report["placement_count"],
         "default_exposure": report["default_exposure"],
+        "exposed_metadata_footprint": crate::footprint::compact(report["exposed_metadata_footprint"].clone()),
         "native_visibility": report["native_visibility"],
         "codex_visibility": report["codex_visibility"],
         "hermes_visibility": report["hermes_visibility"],
@@ -5391,6 +4827,7 @@ fn compact_report(report: &Value) -> Value {
         "primary_metrics": report["primary_metrics"],
         "finding_count": findings.len(),
         "overview": report["overview"],
+        "shared_adoption": report["shared_adoption"],
         "findings": compact_findings,
         "finding_rollups": report_finding_rollups(report),
         "category_counts": report["category_counts"],
@@ -7770,6 +7207,7 @@ enum PlanOrigin {
     BootstrapSetup,
     SourceUpdate,
     LibraryGovernance,
+    SharedAdoption,
 }
 
 struct BootstrapPlanScope {
@@ -7930,6 +7368,8 @@ fn roster_selection_evidence(
         json!({
             "detail_level": detail_level,
             "selection_policy": [
+                "immutable_placement_retained",
+                "native_visibility_unknown_retained",
                 "protected_by_request",
                 "declared_core",
                 "skillroster_bootstrap",
@@ -9143,6 +8583,9 @@ fn prepare_plan(
     if store.recovery_required()? {
         bail!("recovery is required before another Plan can be prepared");
     }
+    if matches!(origin, PlanOrigin::Agent) && input.get("adopt_shared_skills").is_some() {
+        return shared_adoption::prepare(store, state_dir, input, action_argv_prefix);
+    }
     let (scan_id, scan) = latest_scan(store)?;
     require_content_identity(&scan)?;
     let (input, finding_provenance) = if matches!(origin, PlanOrigin::Agent) {
@@ -9198,6 +8641,9 @@ fn prepare_plan(
                         .into_iter()
                         .flat_map(|scope| scope.anchor_roots.iter().cloned()),
                 );
+                if matches!(effective_origin, PlanOrigin::SharedAdoption) {
+                    roots.extend(shared_adoption::anchors(reuse_identity.as_ref()));
+                }
                 roots.push(canonical_state_dir.join("library"));
                 roots.push(canonical_state_dir.join("plan-backups"));
                 roots
@@ -9213,6 +8659,7 @@ fn prepare_plan(
                 },
                 PlanOrigin::SourceUpdate => OperationPolicy::SourceUpdate,
                 PlanOrigin::LibraryGovernance => OperationPolicy::LibraryGovernance,
+                PlanOrigin::SharedAdoption => OperationPolicy::SharedAdoption,
             },
         },
     )?;
@@ -9222,18 +8669,14 @@ fn prepare_plan(
             prepared.scan_id
         );
     }
-    validate_roster_changes(store, &prepared, &scan)?;
+    let shared_adoption =
+        shared_adoption::validate(store, &prepared, &scan, reuse_identity.as_ref())?;
+    if !shared_adoption {
+        validate_roster_changes(store, &prepared, &scan)?;
+    }
     validate_source_update_preconditions(&prepared, &scan)?;
-    for change in &prepared.library_changes {
-        validate_library_native_visibility(
-            &scan,
-            &change.skill_id,
-            change
-                .library_path
-                .as_deref()
-                .unwrap_or(&change.canonical_path),
-            &change.canonical_path,
-        )?;
+    if !shared_adoption {
+        library_visibility::validate(&scan, &prepared)?;
     }
 
     validate_plan_evidence(store, &prepared, &scan_id)?;
@@ -9284,7 +8727,9 @@ fn prepare_plan(
         "library_change_count": effective_library_change_count,
         "source_update_count": prepared.source_updates.len()
     });
-    let mut impact = if matches!(effective_origin, PlanOrigin::RosterGovernance) {
+    let mut impact = if shared_adoption {
+        reuse_identity.as_ref().expect("validated adoption")["impact"].clone()
+    } else if matches!(effective_origin, PlanOrigin::RosterGovernance) {
         source_update_diffs
             .first()
             .cloned()
@@ -9318,13 +8763,29 @@ fn prepare_plan(
         .map(|provenance| provenance.report_id.clone());
     let selection_evidence_summary = finding_provenance
         .as_ref()
-        .and_then(|provenance| provenance.selection_evidence_summary.clone());
+        .and_then(|provenance| provenance.selection_evidence_summary.clone())
+        .or_else(|| {
+            shared_adoption.then(|| {
+                reuse_identity.as_ref().expect("validated adoption")["selection_summary"].clone()
+            })
+        });
     let selection_evidence_full = finding_provenance
         .as_ref()
-        .and_then(|provenance| provenance.selection_evidence_full.clone());
+        .and_then(|provenance| provenance.selection_evidence_full.clone())
+        .or_else(|| {
+            shared_adoption.then(|| {
+                reuse_identity.as_ref().expect("validated adoption")["selection_full"].clone()
+            })
+        });
     let uncertainty = finding_provenance
         .as_ref()
-        .and_then(|provenance| provenance.uncertainty.clone());
+        .and_then(|provenance| provenance.uncertainty.clone())
+        .or_else(|| {
+            shared_adoption.then(|| {
+                reuse_identity.as_ref().expect("validated adoption")["selection_uncertainty"]
+                    .clone()
+            })
+        });
     let risk = plan_risk(&prepared);
     let operations_by_kind = operation_groups(&prepared.operations);
     let impact = bounded_plan_impact(impact);
@@ -9427,20 +8888,22 @@ fn apply_command(store: &StateStore, id: &str, state_lock: &change::StateLock) -
     }
     require_content_identity(&scan)?;
     validate_new_hermes_bootstrap_targets(&prepared, &scan, &record.input["reuse_identity"])?;
-    validate_governance_fingerprint_completeness(&prepared, &scan)?;
+    let shared_adoption = shared_adoption::validate(
+        store,
+        &prepared,
+        &scan,
+        Some(&record.input["reuse_identity"]),
+    )?;
+    if !shared_adoption {
+        validate_governance_fingerprint_completeness(&prepared, &scan)?;
+    }
     validate_physical_placement_bindings(&record, &prepared, &scan)?;
-    validate_roster_changes(store, &prepared, &scan)?;
+    if !shared_adoption {
+        validate_roster_changes(store, &prepared, &scan)?;
+    }
     validate_source_update_preconditions(&prepared, &scan)?;
-    for change in &prepared.library_changes {
-        validate_library_native_visibility(
-            &scan,
-            &change.skill_id,
-            change
-                .library_path
-                .as_deref()
-                .unwrap_or(&change.canonical_path),
-            &change.canonical_path,
-        )?;
+    if !shared_adoption {
+        library_visibility::validate(&scan, &prepared)?;
     }
 
     validate_plan_evidence(store, &prepared, &latest_scan_id)?;
@@ -9609,149 +9072,6 @@ fn undo_command(store: &StateStore, id: &str, state_lock: &change::StateLock) ->
     Ok(result)
 }
 
-const LEGACY_SINGLE_FILE_BOOTSTRAPS: &[(&str, &str)] = &[
-    (
-        "1.0.0",
-        "08440a4a3e10489eae2484d0a5bf8f4b0451d22c43edaa90c75fcd0b66fd4a74",
-    ),
-    (
-        "1.0.1",
-        "2e18b702cbe61660aafff0b4c01538b51561cd0ce979cc4cce914f539b8c755e",
-    ),
-    (
-        "1.0.2",
-        "4a6c9de673948dbccfe719973395b7712fe09706ae22b2119e4a8ed8c5446a73",
-    ),
-    (
-        "1.0.3",
-        "1c0ffe7e1ef65d88e5c42a8978d92de81353c69072d8e610dce0c33d3938290c",
-    ),
-    (
-        "1.0.4",
-        "629d2d959c5b4277398e48f7b10c29c6c2adb0c0415723938ad7bbe4f8fec1c8",
-    ),
-    (
-        "1.1.0",
-        "d463d28295055fde8012e5c2424a754bf93e8c84c9fd6b48b7194bbaff0b27c2",
-    ),
-    (
-        "1.2.0",
-        "a12e3bbf45e4a3d51b8075dd2b56a410f113fb27cd803676fb614bd88f278f9c",
-    ),
-    (
-        "1.3.0",
-        "0fe2e7b8aed1f6db1c57a3d5b6efc247b795e1af01d5422b9168e707bc8c7b47",
-    ),
-    (
-        "1.4.0",
-        "2161ba4834fb350afee75fd6ab90ecff49741c971bb2d670b8d3c9f6588f9b70",
-    ),
-    (
-        "1.5.0",
-        "0afb58572bf602024f78e0f8c7312cc3485abb184746898945d1f7501a5425b5",
-    ),
-    (
-        "1.5.1",
-        "abb33e147e1b092ff70a2b02c5a8f89fc70d0c73eed2d8ec5ea88bba1ae58221",
-    ),
-    (
-        "1.6.0",
-        "c5f05692527bb2b8c45012ba6a464268b6a91a683a429a11dbe67022bbcc2aa5",
-    ),
-    (
-        "1.7.0",
-        "8b503801efa6a5dd13c8767647654bb9fcd4dcfaf10cdbbb61429dfe29995129",
-    ),
-    (
-        "1.7.1",
-        "f742e5d1af14309e3fa7e95378a207fafed3d09e477b1df9c9e76d65e4eec304",
-    ),
-    (
-        "1.8.0",
-        "820b760c5f6cc8c2ad6695e211044882077af138014579236b8824039fd1f394",
-    ),
-    (
-        "1.8.1",
-        "996891144bca51a654fc51294cd6d63c41df4afb5796af7846480b168f69edc6",
-    ),
-    (
-        "1.8.2",
-        "d79be31fe878267d00f21cf8e198443ebf8b95eb6631fc2395f132f12289e3e5",
-    ),
-    (
-        "1.8.3",
-        "3eba54753cfe8cdf987a8a4fe1ab1337317aef9b72e55b9be49b3158117470b1",
-    ),
-    (
-        "1.8.4",
-        "2758bed89792128c47d01f613a4df277dd32c9641cb036e7ed1f03c0c94e8381",
-    ),
-    (
-        "1.8.5",
-        "9f25609e002ad63e750214c54d7138f6e877849e46626aef441e00eaca8738d1",
-    ),
-    (
-        "1.8.6",
-        "4412ddc1fa4006492c28f8813462504a68cc71f4025398c3d60d5c225b2b904b",
-    ),
-    (
-        "1.8.7",
-        "68007e9c80a942cf4afa581f90639bbd260b69a36cb72aebdbca63e92d787eed",
-    ),
-    (
-        "1.8.8",
-        "15dc6c0bd25dc7a6e97336124960b7d548ecea9a3a58b34d55a4d57dbc4d5aeb",
-    ),
-    (
-        "1.8.9",
-        "1087110d8f8f9bb2c1839b1eda11b4417ca7b57af4449113a6fb5b1394e3309d",
-    ),
-    (
-        "1.8.10",
-        "dbc604dbfc45db5bf766609b28513eacb1ba87a96fc0cba7bb11337561bddd01",
-    ),
-    (
-        "1.8.11",
-        "501c0ce97d677b1a3c68d25dd1ece99590895dd51e23e671ea96312925e98c59",
-    ),
-    (
-        "1.8.12",
-        "69bf20da3494b69b634aee5e8d7dead8d8e30222f9e380461640af02bc83331e",
-    ),
-    (
-        "1.8.13",
-        "3063f8913c22846640389f5a633697aea253ab0805e974bd19fa0f06f2b01682",
-    ),
-    (
-        "1.8.14",
-        "ebf48e298ece30cd850146362b3fa73950b4fa26e35f3ce774a5700ae8b3e3cb",
-    ),
-    (
-        "1.8.15",
-        "dd08e0f4140989cb2a1178f60e152ee7913377d743f4029b9699122589193d47",
-    ),
-    (
-        "1.8.16",
-        "4d46b9699db8490821c1f91be1444dca689cd4b9578a2b732b633de441f8ff59",
-    ),
-    (
-        "1.8.17",
-        "5c7cc974e0d83d82993ba1ca9227c0d542288ca3d7ef4e04165794cb41faec33",
-    ),
-    (
-        "1.8.18",
-        "130cb488305b53dc3123633da50df6d3b843b24663861f7cc6b63964621b8718",
-    ),
-    (
-        "1.8.19",
-        "78aa0dbdf53c3f9f08fb5bf9805e33b2d5b8ffe4c63bac05d88391f608fab16c",
-    ),
-    (
-        "1.8.20",
-        "fc1318f0a8587ce193ab1f54462374508026cf8c50a382b613dc18b48f9d09f2",
-    ),
-];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapContentStatus {
     Current,
@@ -9785,177 +9105,6 @@ struct BootstrapPackageManifest<'a> {
     version: &'a str,
     file_digests: &'a [(&'a str, &'a str)],
 }
-
-const LEGACY_COMPLETE_BOOTSTRAP_PACKAGES: &[BootstrapPackageManifest<'static>] = &[
-    BootstrapPackageManifest {
-        version: "1.8.51",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "4555b296030a0680d820ff3b607c6ddb3874c18677c5efafebf333c3086e3d36",
-            ),
-            (
-                "references/routing.md",
-                "83ce87d14166347630ad8951597151092bc0b3be7cc7bd9f0b1d22795689640b",
-            ),
-            (
-                "references/governance.md",
-                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
-            ),
-            (
-                "references/mutation.md",
-                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.50",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "2cb9d6aa446c8cba2a8cd57e36ed256edd6655110006e64df173bfb94bfddcd1",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "9bb2b3366d0bdc7decafd4370123a8d94c04d7aea4b39595d8b52e7e6ac79f52",
-            ),
-            (
-                "references/mutation.md",
-                "0f2b4089903a54b6087b159ddd27f7fca44e6be471d54b98f1bb4217a6223101",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.49",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "03dc9acfc37a979d1517640959fdf1572f55e673cd1f4884adc86a5f7223810a",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "ad540ca44ea39e386e1a8e4504dcb574ca6bf1baa4ff35f441ea4eac382952f9",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.23",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "0b5ff8d4ab352ef5b78908a6619352fce668ff5cbdcbc4258c450ceb5a34637f",
-            ),
-            (
-                "references/routing.md",
-                "be2ccff81b8b85c298abaa7f59a71c2f44dc6f1c990804cdf0f901d715c2f782",
-            ),
-            (
-                "references/governance.md",
-                "3285223b046721c6719fa8c6fa3628f2d33488efb4b23bf334a9763f442e95b6",
-            ),
-            (
-                "references/mutation.md",
-                "6490e355033f9fe6de5d027902241a514449a59fbf87831f7971ab1b98687927",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.29",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "c62bc41e54000a6191c781b45d082440cb5930bc26a1511dafc000cb1c1af5e3",
-            ),
-            (
-                "references/routing.md",
-                "9899e88dac1738584b6a8c615077b84f230a73292295a23e5614895628df0f22",
-            ),
-            (
-                "references/governance.md",
-                "3ba164010e51559708cb863abb9dfed450c065680256ddc348ec4677c7a01de8",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.46",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "8e6a7eacea3aea3fa7c11f6f1d73af06f5ca8b98cd287ab82004acd7b0fa938b",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.47",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "01f346450b239524658f1082e701144c396119ac0ef0278739928c5d797253a0",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "0aff10c04ef8aaa6fc19b119aa5e7b723fe7ae01f1bf72a569d0b02b7cdec5ad",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-    BootstrapPackageManifest {
-        version: "1.8.48",
-        file_digests: &[
-            (
-                "SKILL.md",
-                "9b95e854f583f646b5aac0d2d839d249cd78651d9fb47a386f9c4d0c513a9e77",
-            ),
-            (
-                "references/routing.md",
-                "58bd0140cf31ebf89b7ffbc9d0d6f5013096897e666c436b8bf703ce45abd3cf",
-            ),
-            (
-                "references/governance.md",
-                "b121cfdbc3050efedbf2a603b2c7b61632285ea61a686204fcc855aeb115169e",
-            ),
-            (
-                "references/mutation.md",
-                "b6614b2e0c52f1b84df1562462810b0fdfe03fabac0da75f8bde26693bb43589",
-            ),
-        ],
-    },
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BootstrapFileStatus {
@@ -11009,6 +10158,7 @@ fn validate_roster_changes(
     plan: &PreparedPlan,
     scan: &ScanResult,
 ) -> Result<()> {
+    crate::roster_plan::validate_preserved_discovery_gaps(plan, scan)?;
     validate_governance_operation_mutation_scopes(plan, scan)?;
     validate_hermes_entrypoint_replacements(plan, scan)?;
     validate_hermes_consumers_after_moves(plan, scan)?;
@@ -11446,7 +10596,35 @@ fn validate_governance_fingerprint_completeness(
     if let Some(blocker) = incomplete_fingerprint_blocker(
         scan.placements
             .iter()
-            .filter(|placement| governed_skill_ids.contains(placement.skill_id.as_str())),
+            .filter(|placement| governed_skill_ids.contains(placement.skill_id.as_str()))
+            .filter(|placement| {
+                // Retained Core is an exposure fact, not permission to inspect
+                // an external package. Real operations still require coverage.
+                let retained_core = placement.default_exposed
+                    && plan.roster_changes.iter().any(|change| {
+                        placement
+                            .agent
+                            .is_some_and(|agent| agent.id() == change.agent)
+                            && change.skill_id == placement.skill_id
+                            && change.state == "core"
+                    });
+                !retained_core
+                    || plan
+                        .library_changes
+                        .iter()
+                        .any(|c| c.skill_id == placement.skill_id)
+                    || plan.operations.iter().any(|operation| {
+                        std::iter::once(operation.target())
+                            .chain(operation.source())
+                            .any(|path| {
+                                paths_overlap(path, &placement.directory)
+                                    || placement
+                                        .physical_directory
+                                        .as_ref()
+                                        .is_some_and(|physical| paths_overlap(path, physical))
+                            })
+                    })
+            }),
         "apply",
     ) {
         return Err(blocker.into());
@@ -12718,6 +11896,7 @@ mod recovery_tests {
         for marker in [
             None,
             Some(0),
+            Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION - 1),
             Some(scan::HERMES_DISCOVERY_CONTRACT_VERSION + 1),
         ] {
             let mut outdated = legacy.clone();
@@ -13300,9 +12479,10 @@ mod recovery_tests {
             scan_id: ScanId::new(),
             created_at: 0,
             summary: json!({
+                "roster_guidance_version": 1,
                 "findings": [{
                     "kind": "large_default_roster",
-                    "affected_agents": [],
+                    "affected_agents": ["codex"],
                     "actionability": "review_required",
                     "reversibility": "manual_only"
                 }]
@@ -13316,6 +12496,15 @@ mod recovery_tests {
         report.summary["findings"][0]["actionability"] = json!("blocked");
         report.summary["findings"][0]["reversibility"] = json!("not_governable");
         assert!(report_supports_finding_decision_fields(&report));
+        report.summary["findings"][0]["affected_agents"] = json!(["codex", "hermes"]);
+        assert!(!report_supports_finding_decision_fields(&report));
+        report.summary["findings"][0]["affected_agents"] = json!(["codex"]);
+        report
+            .summary
+            .as_object_mut()
+            .unwrap()
+            .remove("roster_guidance_version");
+        assert!(!report_supports_finding_decision_fields(&report));
     }
 
     #[test]
@@ -13663,6 +12852,25 @@ mod recovery_tests {
         assert_eq!(rollups[0]["finding_count"], 2);
         assert_eq!(rollups[0]["affected_skill_count"], 2);
         assert_eq!(rollups[0]["affected_placement_count"], 3);
+    }
+
+    #[test]
+    fn compact_report_keeps_safety_findings_and_one_available_plan() {
+        let report = json!({"findings": [
+            {"id": "unsafe", "severity": "high", "actionability": "blocked"},
+            {"id": "unknown", "severity": "high", "actionability": "blocked"},
+            {"id": "readonly", "severity": "medium", "actionability": "blocked"},
+            {"id": "mutable", "severity": "medium", "actionability": "plan_available"}
+        ]});
+        let compact = compact_report(&report);
+        let ids = compact["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|finding| finding["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["unsafe", "unknown", "mutable"]);
+        assert_eq!(compact, compact_report(&report));
     }
 
     #[test]

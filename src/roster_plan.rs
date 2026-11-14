@@ -1,3 +1,5 @@
+mod discovery_scope;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -731,6 +733,7 @@ pub fn derive(
     let mut needs_backup_root = false;
     let mut before_exposure = 0_usize;
     let mut after_exposure = 0_usize;
+    let mut after_exposed_placements = Vec::new();
     let mut affected_agents = BTreeSet::new();
     let mut affected_skills = BTreeSet::new();
     let mut affected_placements = BTreeSet::new();
@@ -819,6 +822,11 @@ pub fn derive(
             let modes = placements
                 .iter()
                 .filter(|placement| placement.agent == Some(AgentKind::ClaudeCode))
+                .filter(|placement| {
+                    !(desired.get(&AgentKind::ClaudeCode) == Some(&RosterState::Core)
+                        && is_retained_native_unknown(scan, placement)
+                        && placement.content_digest == exact_digest)
+                })
                 .filter_map(|placement| visibility.placements.get(&placement.id).copied())
                 .collect::<Vec<_>>();
             let blocked = modes
@@ -858,6 +866,12 @@ pub fn derive(
                     .as_ref()
                     .and_then(|visibility| visibility.placements.get(&placement.id).copied())
                     .unwrap_or(CatalogVisibility::Unknown);
+                if *state == RosterState::Core
+                    && is_retained_native_unknown(scan, placement)
+                    && placement.content_digest == exact_digest
+                {
+                    continue;
+                }
                 if mode == CatalogVisibility::Unknown
                     || (*state == RosterState::Core && mode == CatalogVisibility::Off)
                 {
@@ -881,6 +895,14 @@ pub fn derive(
                     .as_ref()
                     .and_then(|visibility| visibility.placements.get(&placement.id).copied())
                     .unwrap_or(CatalogVisibility::Unknown);
+                if *state == RosterState::Core
+                    && (is_preserved_discovery_gap(scan, placement)
+                        || is_retained_native_unknown(scan, placement))
+                    && placement.content_digest == exact_digest
+                    && placement.link_status != LinkStatus::Broken
+                {
+                    continue;
+                }
                 if mode == CatalogVisibility::Unknown
                     || (*state == RosterState::Core && mode != CatalogVisibility::On)
                 {
@@ -1052,6 +1074,11 @@ pub fn derive(
                 canonical_placement_id: canonical.id.clone(),
                 placement_ids: placements
                     .iter()
+                    .filter(|placement| {
+                        removal.iter().any(|removed| removed.id == placement.id)
+                            || placement.physical_directory_or_logical()
+                                == canonical.physical_directory_or_logical()
+                    })
                     .map(|placement| placement.id.clone())
                     .collect(),
                 requested_state: "hosted".into(),
@@ -1186,6 +1213,9 @@ pub fn derive(
                 needs_backup_root |= !backup_root.exists();
                 before_exposure += usize::from(placement.default_exposed);
                 after_exposure += usize::from(placement.default_exposed);
+                if placement.default_exposed {
+                    after_exposed_placements.push((*placement).clone());
+                }
                 affected_placements.insert(placement.id.clone());
                 if let Some(agent) = placement.agent {
                     affected_agents.insert(agent.id().to_owned());
@@ -1250,6 +1280,13 @@ pub fn derive(
                 .iter()
                 .any(|placement| retargeted_placements.contains(&placement.id))
             {
+                let retained = existing.iter().copied().filter(|placement| {
+                    placement.default_exposed && !retargeted_placements.contains(&placement.id)
+                });
+                for placement in retained {
+                    after_exposure += 1;
+                    after_exposed_placements.push(placement.clone());
+                }
                 exclusions.push(json!({
                     "agent": request.agent,
                     "skill_id": skill_id,
@@ -1263,7 +1300,15 @@ pub fn derive(
                         removal.iter().any(|removed| target == &removed.directory)
                     })
             }) {
-                after_exposure += 1;
+                // Core is selected by Skill identity, but exposure and bytes count
+                // every retained placement, including copies in the same Agent.
+                for placement in existing
+                    .iter()
+                    .filter(|placement| placement.default_exposed)
+                {
+                    after_exposure += 1;
+                    after_exposed_placements.push((**placement).clone());
+                }
                 exclusions.push(json!({
                     "agent": request.agent,
                     "skill_id": skill_id,
@@ -1380,6 +1425,11 @@ pub fn derive(
             });
             *operation_groups.entry("add_core_exposure").or_default() += 1;
             after_exposure += 1;
+            if let Some(placement) = placements.iter().find(|p| p.content_digest == exact_digest) {
+                let mut projected = (*placement).clone();
+                projected.agent = Some(requested_agent);
+                after_exposed_placements.push(projected);
+            }
         }
 
         for request in requests {
@@ -1420,6 +1470,7 @@ pub fn derive(
         *operation_groups.entry("create_library").or_default() += 1;
     }
     ensure_unique_operation_paths(&operations)?;
+    discovery_scope::validate_operations(scan, &operations)?;
 
     for placement in &scan.placements {
         if placement.default_exposed
@@ -1433,6 +1484,7 @@ pub fn derive(
         {
             before_exposure += 1;
             after_exposure += 1;
+            after_exposed_placements.push(placement.clone());
         }
     }
 
@@ -1442,6 +1494,10 @@ pub fn derive(
         impact: json!({
             "before_default_exposure": before_exposure,
             "after_default_exposure": after_exposure,
+            "exposed_metadata_footprint": {
+                "before": crate::footprint::exposed(scan),
+                "after": crate::footprint::summarize(scan, &after_exposed_placements),
+            },
             "exposure_reduction": before_exposure.saturating_sub(after_exposure),
             "exposure_reduction_percent": if before_exposure == 0 { 0.0 } else {
                 (before_exposure.saturating_sub(after_exposure) as f64 * 100.0)
@@ -1624,6 +1680,53 @@ fn unchanged_core_exposure(
                 && placement.fingerprint_completeness == FingerprintCompleteness::Complete))
 }
 
+fn is_retained_native_unknown(scan: &ScanResult, placement: &SkillPlacement) -> bool {
+    placement.default_exposed
+        && placement.link_status != LinkStatus::Broken
+        && scan.placement_native_visibility(placement)
+            == Some(&crate::claude_visibility::CatalogVisibility::Unknown)
+}
+
+pub(crate) fn validate_preserved_discovery_gaps(
+    plan: &change::PreparedPlan,
+    scan: &ScanResult,
+) -> Result<()> {
+    for root in scan.roots.iter().filter(|root| {
+        root.kind == RootKind::Skills
+            && root.status == RootStatus::Included
+            && !root.discovery_complete
+            && root.agent.is_some_and(|agent| {
+                plan.roster_changes
+                    .iter()
+                    .any(|request| request.agent == agent.id())
+            })
+    }) {
+        discovery_scope::preserved_gaps(scan, root)?;
+    }
+    discovery_scope::validate_paths(
+        scan,
+        plan.operations
+            .iter()
+            .flat_map(|operation| std::iter::once(operation.target()).chain(operation.source()))
+            .collect(),
+    )
+}
+
+/// A retained unreadable branch is a frozen exposure boundary, not a new
+/// Core load or a claim about unknown native visibility.
+pub(crate) fn is_preserved_discovery_gap(scan: &ScanResult, placement: &SkillPlacement) -> bool {
+    placement.default_exposed
+        && !placement.is_mutable()
+        && scan
+            .roots
+            .iter()
+            .filter(|root| root.path == placement.root && !root.discovery_complete)
+            .any(|root| {
+                discovery_scope::preserved_gaps(scan, root)
+                    .is_ok_and(|gaps| gaps.iter().any(|gap| gap.path == placement.directory))
+            })
+}
+
 fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
     let root = scan
         .roots
@@ -1634,14 +1737,16 @@ fn agent_root(scan: &ScanResult, agent: AgentKind) -> Result<PathBuf> {
                 && root.kind == RootKind::Skills
                 && root.status == RootStatus::Included
         })
-        .ok_or_else(|| anyhow!("Agent {} has no included Skill root", agent.id()))?;
+        .ok_or_else(|| {
+            if scan.roots.iter().any(|root| root.agent == Some(agent)
+                && root.kind == RootKind::Skills && root.status == RootStatus::Included && root.shared) {
+                anyhow!("Agent {} has shared read-only Skill roots, but no exclusive Skill root for Roster changes; inspect the explicit shared-adoption preview from check or report, keep this Roster, or configure an exclusive Agent root and rescan. Source read permission cannot make a shared root mutable", agent.id())
+            } else {
+                anyhow!("Agent {} has no included Skill root; inspect the configured Agent roots before planning Roster changes", agent.id())
+            }
+        })?;
     if !root.discovery_complete {
-        return Err(RosterDiscoveryIncomplete {
-            agent: agent.id().into(),
-            path: root.path.clone(),
-            detail: root.detail.clone(),
-        }
-        .into());
+        discovery_scope::preserved_gaps(scan, root)?;
     }
     Ok(root.path.clone())
 }
@@ -1776,7 +1881,11 @@ mod tests {
         let mut options = ScanOptions::for_home(home);
         options.include_session_evidence = false;
         let snapshot = scan(&options).unwrap();
-        assert!(agent_root(&snapshot, AgentKind::Codex).is_err());
+        let blocked = agent_root(&snapshot, AgentKind::Codex)
+            .unwrap_err()
+            .to_string();
+        assert!(blocked.contains("shared read-only Skill roots"));
+        assert!(blocked.contains("configure an exclusive Agent root and rescan"));
         options
             .explicit_skill_roots
             .push(crate::scan::ExplicitSkillRoot {
@@ -2789,7 +2898,7 @@ mod tests {
             ("skills: [\n", "on_demand", CatalogVisibility::Unknown),
             (
                 "skills:\n  platform_disabled:\n    telegram: [shared]\n",
-                "core",
+                "on_demand",
                 CatalogVisibility::Unknown,
             ),
         ] {

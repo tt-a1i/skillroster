@@ -137,7 +137,7 @@ impl ActionContext {
                     }
                 }
             }
-            "report" => {
+            "report" | "check" => {
                 if let Some(choice) = result.pointer_mut("/resolution/content_choice") {
                     self.apply_content_choice(choice);
                 }

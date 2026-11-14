@@ -5,11 +5,11 @@ description: >
   broken links, Core/On-demand proposals, Plans, Receipts, Apply, and Undo.
   Also find a specialized local Skill when the user requests one or the task
   would benefit from instructions beyond the visible catalog. Ordinary work
-  can proceed with the Agent's existing capabilities. Not for installing
-  third-party Skills or migrating, distributing, synchronizing, or repairing shared
-  Skill-manager directories.
+  can proceed with the Agent's existing capabilities. Explicit shared Skill
+  adoption uses a reviewed SkillRoster Plan. Not for third-party installation
+  or general shared-directory synchronization and repair.
 metadata:
-  bootstrap-version: "1.8.52"
+  bootstrap-version: "1.8.54"
   skillroster-routing-triggers: "route task to local Skill; inventory installed Agent Skills; analyze duplicate or unused Agent Skills; govern a Skill Roster; prepare or apply approved Skill Plan; create or undo Skill Receipt"
 ---
 
@@ -21,26 +21,18 @@ command uses explicit `--json`. Validate `schema_version` and `ok` before using
 
 ## Choose one path
 
-- For SkillRoster inventory, evidence, governance, setup, Apply, Undo, lifecycle,
-  or recovery requests, read the matching reference below.
-- For another task, follow an already-visible exact Skill when one clearly
-  applies. Search below when a specialized Skill would help; otherwise proceed
-  with the Agent's normal tools and the user's task.
+- Inventory, usage, duplicates or Roster proposals: read `references/governance.md`.
+- Setup, Apply, Undo, lifecycle or recovery: read `references/mutation.md`.
+- Another task: use an already-visible exact Skill when applicable. Search
+  below when specialized instructions would help; otherwise use normal tools.
 
-SkillRoster is a local lookup and governance bridge, not a replacement for the
-host Agent's Harness. Its contract is the CLI and its JSON; the host still
-decides whether a Skill is listed, activated, or enforced. Do not call it for
-ordinary work that needs no specialized procedure.
+The host Agent controls activation. SkillRoster returns local facts and verified
+instructions; retrieval does not install, expose, endorse or authorize a Skill.
 
 ## Find a specialized Skill
 
-Use this search before relying on a Skill that is absent from the visible
-catalog. Read-only task context may inform whether a search is useful.
-
-Find searches the latest completed local Snapshot, not only the default catalog.
-It may return an On-demand, provider, or source-only Skill. Loading one returns
-verified instructions to the caller; it does not activate, install, expose,
-endorse, or establish success for the user's task.
+Find searches the latest Snapshot, including On-demand, provider and source-only
+Skills. Read-only task context may inform the search.
 
 1. Keep the complete user message as `TASK`, byte-for-byte in its original
    language, including paths, limits, and output requirements. Do not summarize,
@@ -86,31 +78,17 @@ first; these flags do not authorize a material change. For any other typed
 blocker, read `references/routing.md` and follow its bounded branch; execute a
 returned action only when one is present.
 
-If the result is empty, clearly from another domain, or the required-name check
-remains unresolved, retry at most once. Keep `TASK`
-unchanged; refine the existing hint, or add one capability hint when the first
-English call had none. Use the recovery procedure in `references/routing.md`;
-all hint refinements share this one-retry budget. If no usable result remains
-and no particular Skill is required, continue the original task with normal tools. State that no suitable
-Skill was found only when it affects the result. If the user or applicable
-instructions require a particular Skill, explain its absence and request only
-the missing prerequisite. A permission denial, untrusted source, drift,
-ambiguity, or incomplete load follows its typed recovery action; it is not an
-ordinary no-match and cannot be bypassed by reading or executing the package.
+Empty, wrong-domain, weak-evidence and unresolved required-name results share
+one hint-refinement retry. Follow `references/routing.md`, keeping `TASK` intact.
+After that, continue with normal tools if the Skill is optional; for a required
+Skill, request its missing prerequisite. Permission denial, untrusted source,
+drift, ambiguity and incomplete loads retain their typed recovery branches.
+They cannot be bypassed by reading or executing the package.
 
-## Govern a roster
-
-For inventory, usage, exposure, duplicate, broken-link, Core/On-demand, or Plan
-requests, read `references/governance.md` before acting. Inspection and planning
-do not change Agent files. Prefer the bounded summary first; load exhaustive
-detail only for a decision that needs it.
-
-## Mutate or recover
-
-For setup, Apply, Undo, lifecycle cleanup, or recovery, read
-`references/mutation.md` before acting. A validated Plan is not permission to
-apply it. Show the complete bounded impact and obtain one explicit confirmation.
-Only a successful Receipt verifies that Agent files changed.
+Inspection and Plan preparation change no Agent files. Before Apply or Undo,
+show complete bounded impact and obtain one explicit confirmation, following
+`references/mutation.md`. Use CLI setup/confirmation/Apply even when read-only
+MCP tools are available; human-only `init` is not an Agent execution path.
 
 Never parse styled terminal output, invent a health score, infer token savings,
 claim unobserved usage, or weaken ambiguity, drift, trust, and recovery checks.

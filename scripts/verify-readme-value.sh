@@ -42,13 +42,19 @@ require_literal "$readme_en" "| Unmanaged | $unmanaged_exposure | $unmanaged_dup
 require_literal "$readme_en" "| Careful manual governance | $manual_exposure | $manual_duplicates |"
 require_literal "$readme_en" "| After SkillRoster Apply | **$roster_exposure** | **$roster_duplicates** |"
 require_literal "$readme_en" "Undo restored the Agent tree byte-for-byte"
-require_literal "$readme_en" "It does not prove token or labor"
-require_literal "$readme_en" "production performance, model quality, or universally superior"
+require_literal "$readme_en" "counts do not measure token, labor or task-quality"
+require_literal "$readme_en" "does not estimate runtime tokens"
 
 require_literal "$readme_zh" "| 未治理 | $unmanaged_exposure | $unmanaged_duplicates |"
 require_literal "$readme_zh" "| 谨慎人工治理 | $manual_exposure | $manual_duplicates |"
 require_literal "$readme_zh" "| SkillRoster Apply 后 | **$roster_exposure** | **$roster_duplicates** |"
 require_literal "$readme_zh" "Undo 按字节恢复 Agent tree"
-require_literal "$readme_zh" "不是对 token、人工成本、生产性能、模型质量"
-require_literal "$readme_zh" "Core / On-demand 划分普遍优越性的证明"
+require_literal "$readme_zh" "不代表实际 token、人工成本或任务质量收益"
+require_literal "$readme_zh" "本地磁盘实测 UTF-8 字节数"
 require_literal "$readme_zh" 'skillroster find --hint "review a Pull Request on GitHub" --load --limit 1 --json -- "审查这个 Pull Request"'
+
+for readme in "$readme_zh" "$readme_en"; do
+  require_literal "$readme" "skillroster check"
+  require_literal "$readme" "skillroster init --agent codex"
+  require_literal "$readme" "skillroster mcp"
+done
