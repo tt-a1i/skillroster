@@ -258,6 +258,16 @@ Optional stdio MCP can replace Bootstrap installation for read-only discovery:
 same Find/load facts and refusals. Honor envelope version, `ok`, identity and
 verification in either transport. Capability judgment stays with the Agent.
 Find prepares a Snapshot only when needed and does not generate a Report.
+Implicit reads compare local filesystem metadata so externally installed,
+removed or edited Skills trigger refresh. Exact load hashes remain independent.
+A blocked load retains `error.details.retrieval.matches`; inspect these facts,
+refine capability hints if necessary, and never treat ranking as authorization.
+Supported Findings expose `planning.request_template` directly in inspection.
+Use `plan --stdin` with `schema_version: 1`, or `plan --finding ID`; shared
+adoption remains an explicitly separate `plan --adopt-shared` preview.
+`--core-limit` is a deliberate user preference, not a measured usefulness score.
+Project-local directory hints require explicit root selection and establish no
+read or mutation permission by themselves.
 Supplying `require_snapshot` disables automatic Scan: honor the returned CLI
 drift/missing-Snapshot continuation before retrying that optimistic read.
 MCP exposes no mutations; use CLI Setup/Plan, one user confirmation and Apply

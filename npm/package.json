@@ -1,6 +1,6 @@
 {
   "name": "skillroster",
-  "version": "1.9.0",
+  "version": "1.9.1",
   "description": "One library. The right roster for every agent. Local Rust CLI and read-only MCP.",
   "license": "Apache-2.0",
   "repository": "github:tt-a1i/skillroster",
@@ -8,9 +8,9 @@
   "bin": { "skillroster": "bin/skillroster.cjs" },
   "files": ["bin/", "platforms.json", "README.md", "LICENSE"],
   "optionalDependencies": {
-    "@tt-a1i/skillroster-darwin-arm64": "1.9.0",
-    "@tt-a1i/skillroster-darwin-x64": "1.9.0",
-    "@tt-a1i/skillroster-linux-x64": "1.9.0",
-    "@tt-a1i/skillroster-win32-x64": "1.9.0"
+    "@tt-a1i/skillroster-darwin-arm64": "1.9.1",
+    "@tt-a1i/skillroster-darwin-x64": "1.9.1",
+    "@tt-a1i/skillroster-linux-x64": "1.9.1",
+    "@tt-a1i/skillroster-win32-x64": "1.9.1"
   }
 }

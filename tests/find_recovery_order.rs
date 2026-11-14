@@ -120,7 +120,7 @@ fn weak_ambiguous_load_first_recovers_selection_evidence() {
 }
 
 #[test]
-fn cjk_and_wrong_domain_weak_ambiguity_block_but_english_no_hint_keeps_ambiguity() {
+fn weak_ambiguity_requires_selection_evidence_in_every_language() {
     let temp = fixture();
     let (ok, cjk) = run(
         &temp,
@@ -139,7 +139,7 @@ fn cjk_and_wrong_domain_weak_ambiguity_block_but_english_no_hint_keeps_ambiguity
     let (ok, english) = run(&temp, &["find", "--load", "--", "deployment status pod"]);
     assert!(!ok);
     assert_eq!(
-        english["error"]["details"]["reason"], "same_name_variants_ambiguous",
+        english["error"]["details"]["reason"], "direct_selection_evidence_required",
         "{english}"
     );
     let (ok, wrong) = run(

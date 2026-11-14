@@ -2088,7 +2088,12 @@ pub(crate) fn find_matching_with_evidence(
     let query_phrase_tokens = query_phrases
         .iter()
         .map(|phrase| tokens(phrase))
-        .filter(|phrase_tokens| phrase_tokens.len() >= 2)
+        .filter(|phrase_tokens| {
+            phrase_tokens.len() >= 2
+                && phrase_tokens
+                    .iter()
+                    .any(|token| !is_generic_load_token(token))
+        })
         .collect::<Vec<_>>();
     let placement_groups = placements_by_skill(scan);
     let mut variants_by_name = BTreeMap::<String, Vec<String>>::new();
@@ -2177,10 +2182,76 @@ pub(crate) fn find_matching_with_evidence(
                 .intersection(&all_text_tokens)
                 .filter(|token| contains_cjk(token))
                 .count();
-            let mut score = name_overlap as f64 * 24.0
-                + trigger_overlap as f64 * 18.0
-                + description_overlap as f64 * 12.0
-                + overlap as f64 * 3.0
+            let metadata_tokens = name_tokens
+                .union(&trigger_tokens)
+                .cloned()
+                .chain(description_tokens.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let specific_feature_count = query_phrase_tokens
+                .iter()
+                .map(|phrase_tokens| {
+                    phrase_tokens
+                        .intersection(&metadata_tokens)
+                        .filter(|token| !contains_cjk(token) && !is_generic_load_token(token))
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            // A concise two-feature hint may omit a vendor prefix or suffix.
+            // Require complete meaningful phrase coverage and corroboration in
+            // both the name and declared metadata; a lone verb remains weak.
+            let corroborated_feature_pair = query_phrase_tokens.iter().any(|phrase_tokens| {
+                let features = phrase_tokens
+                    .iter()
+                    .filter(|token| {
+                        !contains_cjk(token)
+                            && (!is_generic_load_token(token) || token.as_str() == "write")
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                features.len() >= 2
+                    && features.iter().any(|token| !is_generic_load_token(token))
+                    && features.is_subset(&metadata_tokens)
+                    && features.intersection(&name_tokens).count() >= 2
+                    && (!features.is_disjoint(&description_tokens)
+                        || !features.is_disjoint(&trigger_tokens))
+            });
+            let specific_metadata_phrase_coverage =
+                query_phrase_tokens.iter().any(|phrase_tokens| {
+                    let features = phrase_tokens
+                        .iter()
+                        .filter(|token| {
+                            !contains_cjk(token)
+                                && (!is_generic_load_token(token) || token.as_str() == "write")
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let positive_features = description_tokens
+                        .union(&trigger_tokens)
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    features.len() >= 3
+                        && features.is_subset(&metadata_tokens)
+                        && features.intersection(&positive_features).count() >= 2
+                        && (!features.is_disjoint(&name_tokens)
+                            || features.is_subset(&positive_features))
+                });
+            let weighted_overlap = |metadata: &BTreeSet<String>| {
+                query_tokens
+                    .intersection(metadata)
+                    .map(|token| {
+                        if is_domain_generic_token(token) {
+                            0.1
+                        } else {
+                            1.0
+                        }
+                    })
+                    .sum::<f64>()
+            };
+            let mut score = weighted_overlap(&name_tokens) * 24.0
+                + weighted_overlap(&trigger_tokens) * 18.0
+                + weighted_overlap(&description_tokens) * 12.0
+                + weighted_overlap(&all_text_tokens) * 3.0
                 - exclusion_penalty_tokens as f64 * 18.0;
             let mut reasons = Vec::new();
             if query_phrases.contains(&name) {
@@ -2194,6 +2265,19 @@ pub(crate) fn find_matching_with_evidence(
             {
                 score += 35.0;
                 reasons.push("declared_trigger".into());
+                if query_phrases
+                    .iter()
+                    .filter(|phrase| triggers.contains(phrase.as_str()))
+                    .any(|phrase| {
+                        tokens(phrase)
+                            .iter()
+                            .any(|token| !is_generic_load_token(token))
+                    })
+                {
+                    reasons.push("specific_declared_trigger".into());
+                } else {
+                    reasons.push("generic_declared_trigger".into());
+                }
             }
             if !positive_description.is_empty()
                 && query_phrases
@@ -2203,11 +2287,26 @@ pub(crate) fn find_matching_with_evidence(
                 score += 25.0;
                 reasons.push("description_phrase".into());
             }
-            if query_phrase_tokens
-                .iter()
-                .any(|phrase_tokens| phrase_tokens.is_subset(&description_tokens))
-            {
+            if query_phrase_tokens.iter().any(|phrase_tokens| {
+                phrase_tokens.is_subset(&description_tokens)
+                    && phrase_tokens
+                        .iter()
+                        .filter(|token| !is_generic_load_token(token) || token.as_str() == "write")
+                        .count()
+                        >= 2
+            }) {
                 reasons.push("description_token_phrase".into());
+            }
+            if specific_metadata_phrase_coverage {
+                reasons.push("specific_metadata_phrase_coverage".into());
+            }
+            if corroborated_feature_pair {
+                reasons.push("corroborated_metadata_feature_pair".into());
+            }
+            if specific_feature_count >= 3 {
+                reasons.push(format!(
+                    "specific_metadata_features:{specific_feature_count}"
+                ));
             }
             if name_overlap > 0 {
                 reasons.push(format!("name_tokens:{name_overlap}"));
@@ -2468,6 +2567,16 @@ pub(crate) fn fuse_retrieval_channels(
         has_protectable_task_evidence: bool,
     }
 
+    // Preserve exact native routing evidence independently of the expanded
+    // channel. Correlated CJK/body overlap receives bounded protection, but
+    // cannot veto a caller's fully covered specific capability phrase.
+    let direct_task_capabilities = task_matches
+        .iter()
+        .filter(|matched| {
+            has_direct_metadata_reason(matched) || has_complete_name_token_evidence(matched)
+        })
+        .map(|matched| normalize_skill_name(&matched.name))
+        .collect::<BTreeSet<_>>();
     let mut fused = Vec::<FusedMatch>::new();
     for matched in task_matches {
         let rank = matched.rank;
@@ -2553,6 +2662,14 @@ pub(crate) fn fuse_retrieval_channels(
     let leading_match_is_weak_augmented_only = fused.first().is_some_and(|matched| {
         matched.task_rank.is_none() && !has_direct_hint_evidence(&matched.matched)
     });
+    let leading_match_has_specific_metadata_coverage = fused.first().is_some_and(|matched| {
+        matched.task_rank.is_none()
+            && matched
+                .matched
+                .match_reasons
+                .iter()
+                .any(|reason| reason == "specific_metadata_phrase_coverage")
+    });
     let protected_task_capabilities = fused
         .iter()
         .filter(|fused| fused.task_rank == Some(1) && fused.has_protectable_task_evidence)
@@ -2592,7 +2709,10 @@ pub(crate) fn fuse_retrieval_channels(
         else {
             continue;
         };
-        let protected_rank_index = if leading_match_is_weak_augmented_only {
+        let protected_rank_index = if leading_match_is_weak_augmented_only
+            && (!leading_match_has_specific_metadata_coverage
+                || direct_task_capabilities.contains(protected))
+        {
             0
         } else {
             PROTECTED_TASK_MAX_RANK - 1
@@ -2616,7 +2736,29 @@ fn tokens(text: &str) -> BTreeSet<String> {
     let mut output = BTreeSet::new();
     let mut word = String::new();
     let mut cjk_run = Vec::new();
-    for character in text.chars() {
+    let mut canonical = text.to_lowercase();
+    let pull_requests = canonical
+        .match_indices("pull request")
+        .map(|(start, phrase)| (start, start + phrase.len()))
+        .collect::<Vec<_>>();
+    for (start, mut end) in pull_requests.into_iter().rev() {
+        if canonical[end..].starts_with('s') {
+            end += 1;
+        }
+        if canonical[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+            || canonical[end..]
+                .chars()
+                .next()
+                .is_some_and(char::is_alphanumeric)
+        {
+            continue;
+        }
+        canonical.replace_range(start..end, "pr");
+    }
+    for character in canonical.chars() {
         if is_cjk(character) {
             insert_word_token(&mut output, &mut word);
             cjk_run.push(character);
@@ -2689,6 +2831,22 @@ fn is_search_stopword(token: &str) -> bool {
             | "to"
             | "use"
             | "using"
+            | "please"
+            | "help"
+            | "me"
+            | "my"
+            | "want"
+            | "need"
+            | "can"
+            | "could"
+            | "would"
+            | "you"
+            | "we"
+            | "our"
+            | "some"
+            | "about"
+            | "then"
+            | "also"
             | "with"
             | "一个"
             | "一份"
@@ -2727,6 +2885,29 @@ pub(crate) fn candidate_search_text(text: &str) -> String {
             terms.push(normalized);
         }
     }
+    // SQLite indexes original metadata, so keep canonical aliases reachable
+    // before the deterministic in-memory ranking pass.
+    for token in tokens(text) {
+        let aliases: &[&str] = match token.as_str() {
+            "pr" => &["pr", "pull", "request", "requests"],
+            "technical" => &["tech", "technical"],
+            "chinese" => &["zh", "chinese"],
+            "write" => &["write", "writer", "writing"],
+            "install" => &[
+                "install",
+                "installer",
+                "installation",
+                "installed",
+                "installing",
+            ],
+            _ => &[],
+        };
+        for alias in aliases {
+            if seen.insert((*alias).to_owned()) {
+                terms.push((*alias).to_owned());
+            }
+        }
+    }
     terms.join(" ")
 }
 
@@ -2741,7 +2922,38 @@ fn normalize_token(token: &str) -> String {
     {
         normalized.pop();
     }
-    normalized
+    match normalized.as_str() {
+        "tech" => "technical".into(),
+        "zh" => "chinese".into(),
+        "writer" | "writing" => "write".into(),
+        "installer" | "installation" | "installed" | "installing" => "install".into(),
+        _ => normalized,
+    }
+}
+
+fn is_domain_generic_token(token: &str) -> bool {
+    matches!(token, "skill" | "agent" | "ai" | "tool" | "workflow")
+}
+
+// These words can rank a candidate but cannot establish a specific capability.
+fn is_generic_load_token(token: &str) -> bool {
+    matches!(
+        token,
+        "write"
+            | "create"
+            | "generate"
+            | "make"
+            | "task"
+            | "work"
+            | "file"
+            | "use"
+            | "skill"
+            | "helper"
+            | "agent"
+            | "ai"
+            | "tool"
+            | "workflow"
+    )
 }
 
 fn description_routing_sections(description: &str) -> (String, String) {
@@ -2929,27 +3141,62 @@ fn has_protectable_task_evidence(matched: &FindMatch) -> bool {
 pub(crate) fn has_strong_verified_load_evidence(matched: &FindMatch) -> bool {
     // Rank fusion may preserve broad lexical evidence. Returning complete Skill
     // instructions requires direct selection evidence instead.
-    let has_exact_metadata_phrase = matched
-        .match_reasons
-        .iter()
-        .any(|reason| matches!(reason.as_str(), "exact_name" | "declared_trigger"));
+    let has_exact_metadata_phrase =
+        matched
+            .match_reasons
+            .iter()
+            .any(|reason| match reason.as_str() {
+                "exact_name" => tokens(&matched.name)
+                    .iter()
+                    .any(|token| !is_generic_load_token(token)),
+                "declared_trigger" => {
+                    matched
+                        .match_reasons
+                        .iter()
+                        .any(|reason| reason == "specific_declared_trigger")
+                        || !matched
+                            .match_reasons
+                            .iter()
+                            .any(|reason| reason == "generic_declared_trigger")
+                }
+                _ => false,
+            });
     let has_complete_name_tokens = has_complete_name_token_evidence(matched);
     let has_specific_description_phrase = matched
         .match_reasons
         .iter()
         .any(|reason| reason == "description_token_phrase");
-    has_exact_metadata_phrase || has_complete_name_tokens || has_specific_description_phrase
+    let has_multiple_specific_features = matched
+        .match_reasons
+        .iter()
+        .any(|reason| reason == "specific_metadata_phrase_coverage");
+    has_exact_metadata_phrase
+        || has_complete_name_tokens
+        || has_specific_description_phrase
+        || has_multiple_specific_features
+        || matched
+            .match_reasons
+            .iter()
+            .any(|reason| reason == "corroborated_metadata_feature_pair")
 }
 
 fn has_direct_hint_evidence(matched: &FindMatch) -> bool {
-    has_direct_metadata_reason(matched)
+    matched
+        .match_reasons
+        .iter()
+        .any(|reason| reason == "corroborated_metadata_feature_pair")
+        || has_direct_metadata_reason(matched)
         || has_complete_name_token_evidence(matched)
         || match_reason_count(matched, "trigger_tokens:").is_some_and(|count| count >= 2)
 }
 
 fn has_complete_name_token_evidence(matched: &FindMatch) -> bool {
     let name_token_count = tokens(&matched.name).len();
-    name_token_count > 0 && match_reason_count(matched, "name_tokens:") == Some(name_token_count)
+    name_token_count > 0
+        && tokens(&matched.name)
+            .iter()
+            .any(|token| !is_generic_load_token(token))
+        && match_reason_count(matched, "name_tokens:") == Some(name_token_count)
 }
 
 fn has_direct_metadata_reason(matched: &FindMatch) -> bool {
@@ -2962,11 +3209,15 @@ fn has_direct_metadata_reason(matched: &FindMatch) -> bool {
 }
 
 fn match_reason_count(matched: &FindMatch, prefix: &str) -> Option<usize> {
-    matched.match_reasons.iter().find_map(|reason| {
-        reason
-            .strip_prefix(prefix)
-            .and_then(|count| count.parse::<usize>().ok())
-    })
+    matched
+        .match_reasons
+        .iter()
+        .filter_map(|reason| {
+            reason
+                .strip_prefix(prefix)
+                .and_then(|count| count.parse::<usize>().ok())
+        })
+        .max()
 }
 
 fn fnv1a64(bytes: &[u8]) -> String {
@@ -4332,6 +4583,16 @@ mod tests {
     #[test]
     fn verified_load_strength_requires_direct_selection_evidence() {
         assert!(!has_strong_verified_load_evidence(&matched(
+            "mysql-tuning",
+            1,
+            &["specific_metadata_features:3"],
+        )));
+        assert!(has_strong_verified_load_evidence(&matched(
+            "mysql-tuning",
+            1,
+            &["specific_metadata_phrase_coverage"],
+        )));
+        assert!(!has_strong_verified_load_evidence(&matched(
             "request-refactor-plan",
             1,
             &["name_tokens:1", "all_text_tokens:1"],
@@ -4374,6 +4635,40 @@ mod tests {
             "github-code-review",
             1,
             &["description_token_phrase", "description_tokens:4"],
+        )));
+    }
+
+    #[test]
+    fn capability_aliases_and_stopwords_are_deterministic() {
+        assert_eq!(
+            tokens("please help me write a technical Chinese PR"),
+            tokens("tech zh writer pull requests")
+        );
+        assert!(tokens("please help me use").is_empty());
+        assert!(!tokens("upull request requested").contains("pr"));
+        let search = candidate_search_text("technical Chinese writing pr");
+        for alias in ["tech", "zh", "write", "writer", "pull", "request"] {
+            assert!(
+                search.split_whitespace().any(|term| term == alias),
+                "{search}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_domain_words_and_a_lone_writer_cannot_supply_load_specificity() {
+        for token in ["agent", "ai", "skill", "tool", "workflow", "write"] {
+            assert!(is_generic_load_token(token), "{token}");
+        }
+        assert!(!has_strong_verified_load_evidence(&matched(
+            "agent-ai-skill-tool-workflow",
+            1,
+            &["name_tokens:5", "description_tokens:5"],
+        )));
+        assert!(!has_strong_verified_load_evidence(&matched(
+            "writer",
+            1,
+            &["name_tokens:1", "description_tokens:1"],
         )));
     }
 

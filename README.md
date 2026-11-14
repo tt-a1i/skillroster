@@ -180,6 +180,8 @@ SkillRoster 会报告这些边界，不会假设所有 Adapter 都一样。
 
 ## 项目状态
 
+v1.9.1 源码候选体验用于检索、会话采样与本地新鲜度打磨，尚未发布。公开安装仍为 v1.9.0。
+
 当前公开版本为 **v1.9.0**，已覆盖发现、报告、检索、规划、Apply/Undo、恢复和 8 个直接 Agent Adapter。发布产物、受控验收与独立用户使用证据分别记录。
 
 - [最新版本](https://github.com/tt-a1i/skillroster/releases/latest)

@@ -182,6 +182,45 @@ fn collect_object_observations(
     event_index: usize,
     output: &mut Vec<SessionObservation>,
 ) -> bool {
+    // Wrappers and ordinary message objects have no atomic Skill event. Avoid
+    // cloning and serializing their entire conversation subtree before walking
+    // the actual tool calls below them.
+    let has_explicit_signal = [
+        "outcome_skill",
+        "applied_skill",
+        "invoked_skill",
+        "loaded_skill",
+        "selected_skill",
+        "matched_skill",
+    ]
+    .iter()
+    .any(|field| object.contains_key(*field));
+    let has_event_marker = [
+        "type",
+        "name",
+        "event",
+        "tool",
+        "tool_name",
+        "subtype",
+        "event_type",
+    ]
+    .iter()
+    .filter_map(|key| object.get(*key).and_then(Value::as_str))
+    .any(|event| {
+        let event = event.to_ascii_lowercase();
+        matches!(
+            event.as_str(),
+            "tool_use" | "toolcall" | "custom_tool_call" | "function_call" | "function"
+        ) || ["skill", "read", "load", "open"]
+            .iter()
+            .any(|marker| event.contains(marker))
+    });
+    let codex_user_message = agent == AgentKind::Codex
+        && object.get("type").and_then(Value::as_str) == Some("message")
+        && object.get("role").and_then(Value::as_str) == Some("user");
+    if !has_explicit_signal && !has_event_marker && !codex_user_message {
+        return true;
+    }
     let record_text = Value::Object(object.clone()).to_string();
     let mut object_observations = Vec::new();
     for (field, signal) in [
@@ -204,6 +243,17 @@ fn collect_object_observations(
 
     if let Some(observation) = structured_tool_observation(object, event_index, &record_text) {
         object_observations.push(observation);
+        append_unique_observations(output, object_observations);
+        return false;
+    }
+    if matches!(
+        object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("tool_use" | "toolcall" | "custom_tool_call" | "function_call")
+    ) {
         append_unique_observations(output, object_observations);
         return false;
     }
@@ -244,20 +294,6 @@ fn collect_object_observations(
         && ["read_file", "read", "load", "open"]
             .iter()
             .any(|marker| event.contains(marker));
-    let codex_shell_read = agent == AgentKind::Codex
-        && object.get("type").and_then(Value::as_str) == Some("custom_tool_call")
-        && object.get("name").and_then(Value::as_str) == Some("exec")
-        && object
-            .get("input")
-            .and_then(Value::as_str)
-            .is_some_and(|input| {
-                let input = input.to_ascii_lowercase();
-                input.contains("skill.md")
-                    && input.contains("exec_command")
-                    && ["sed ", "rg ", "head ", "tail ", "awk ", "grep ", "less "]
-                        .iter()
-                        .any(|marker| input.contains(marker))
-            });
     let codex_user_skill_reference = agent == AgentKind::Codex
         && object.get("type").and_then(Value::as_str) == Some("message")
         && object.get("role").and_then(Value::as_str) == Some("user")
@@ -269,10 +305,7 @@ fn collect_object_observations(
         && (event.contains("invoke_skill") || event.contains("apply_skill"))
     {
         Some(SessionSignal::Applied)
-    } else if reads_skill_file
-        || codex_shell_read
-        || (!generic_references.is_empty() && event.contains("load_skill"))
-    {
+    } else if reads_skill_file || (!generic_references.is_empty() && event.contains("load_skill")) {
         Some(SessionSignal::Loaded)
     } else if codex_user_skill_reference
         || (!generic_references.is_empty() && event.contains("match_skill"))
@@ -317,7 +350,7 @@ fn structured_tool_observation(
         .map(str::to_ascii_lowercase);
     let direct_call = matches!(
         call_type.as_deref(),
-        Some("tool_use" | "toolcall" | "custom_tool_call")
+        Some("tool_use" | "toolcall" | "custom_tool_call" | "function_call")
     );
     let function = object.get("function").and_then(Value::as_object);
     let function_call = call_type.as_deref() == Some("function")
@@ -338,22 +371,11 @@ fn structured_tool_observation(
     } else {
         function.and_then(|function| function.get("arguments"))
     };
-    let serialized = arguments
-        .map(Value::to_string)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     let explicit_references = argument_skill_references(arguments);
-    let reads_skill_file = serialized.contains("skill.md")
-        && (matches!(
-            name.as_str(),
-            "read" | "read_file" | "open" | "load" | "rg" | "grep"
-        ) || (matches!(name.as_str(), "bash" | "exec" | "shell" | "terminal")
-            && ["cat ", "sed ", "rg ", "grep ", "head ", "tail ", "less "]
-                .iter()
-                .any(|marker| serialized.contains(marker))));
+    let read_text = tool_read_text(&name, arguments);
     let signal = if name == "skill" && !explicit_references.is_empty() {
         SessionSignal::Applied
-    } else if reads_skill_file {
+    } else if read_text.is_some() {
         SessionSignal::Loaded
     } else {
         return None;
@@ -361,9 +383,165 @@ fn structured_tool_observation(
     Some(SessionObservation {
         event_index,
         signal,
-        record_text: record_text.to_owned(),
+        record_text: read_text.map_or_else(
+            || record_text.to_owned(),
+            |text| Value::String(text).to_string(),
+        ),
         explicit_references,
     })
+}
+
+/// Only an actual read argument contributes a path. Other arguments, message
+/// prose and the bodies of scripts that write fixtures are never read Evidence.
+fn tool_read_text(name: &str, arguments: Option<&Value>) -> Option<String> {
+    let parsed = arguments
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let value = parsed.as_ref().or(arguments)?;
+    let name = name.rsplit('.').next().unwrap_or(name);
+    if matches!(name, "read" | "read_file" | "open" | "load" | "rg" | "grep") {
+        let path = ["path", "file_path", "filePath"]
+            .into_iter()
+            .find_map(|key| value.get(key).and_then(Value::as_str))?;
+        return path
+            .to_ascii_lowercase()
+            .contains("skill.md")
+            .then(|| path.to_owned());
+    }
+    if !matches!(
+        name,
+        "bash" | "exec" | "exec_command" | "shell" | "terminal"
+    ) {
+        return None;
+    }
+    let commands = if let Some(command) = ["cmd", "command"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str))
+    {
+        vec![command.to_owned()]
+    } else if let Some(input) = value.as_str() {
+        if name == "exec" {
+            literal_commands(input)
+        } else {
+            vec![input.to_owned()]
+        }
+    } else {
+        Vec::new()
+    };
+    let reads = commands
+        .iter()
+        .flat_map(|command| {
+            // A here-document body is data, even when it contains shell examples.
+            if command.contains("<<") || command.contains(['$', '`', '#', '>']) {
+                return Vec::new();
+            }
+            command
+                .split(['\n', ';', '&', '|'])
+                .filter_map(|segment| {
+                    let executable = segment.split_whitespace().next()?.rsplit('/').next()?;
+                    (matches!(
+                        executable,
+                        "cat" | "sed" | "head" | "tail" | "rg" | "grep" | "awk" | "less"
+                    ) && segment.to_ascii_lowercase().contains("skill.md"))
+                    .then(|| segment.to_owned())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    (!reads.is_empty()).then(|| reads.join("\n"))
+}
+
+/// Extract literal cmd/command properties from Codex's JavaScript exec wrapper.
+/// Consume each quoted string once: a command's quoted fixture contents must
+/// never become a second apparent command. Dynamic template strings are refused.
+fn literal_commands(input: &str) -> Vec<String> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    let mut commands = Vec::new();
+    let mut command_value = false;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"//") {
+            index += bytes[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap_or(bytes.len() - index);
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            index += bytes[index..]
+                .windows(2)
+                .position(|part| part == b"*/")
+                .map_or(bytes.len() - index, |end| end + 2);
+            continue;
+        }
+        let quote = bytes[index];
+        if matches!(quote, b'\'' | b'"' | b'`') {
+            index += 1;
+            let mut text = Vec::new();
+            let mut closed = false;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if byte == quote {
+                    closed = true;
+                    break;
+                }
+                if byte == b'\\' && index < bytes.len() {
+                    let escaped = bytes[index];
+                    index += 1;
+                    text.push(match escaped {
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        other => other,
+                    });
+                } else {
+                    text.push(byte);
+                }
+            }
+            let text = String::from_utf8_lossy(&text).into_owned();
+            let mut next = index;
+            while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if command_value
+                && closed
+                && !text.contains("${")
+                && matches!(bytes.get(next), Some(b',' | b'}'))
+            {
+                commands.push(text.clone());
+            }
+            command_value =
+                matches!(text.as_str(), "cmd" | "command") && bytes.get(next) == Some(&b':');
+            if command_value {
+                index = next + 1;
+            }
+            continue;
+        }
+        if quote.is_ascii_alphabetic() || quote == b'_' {
+            let start = index;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            let key = &input[start..index];
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            command_value = matches!(key, "cmd" | "command") && bytes.get(index) == Some(&b':');
+            if command_value {
+                index += 1;
+            }
+            continue;
+        }
+        if !quote.is_ascii_whitespace() {
+            command_value = false;
+        }
+        index += 1;
+    }
+    commands
 }
 
 fn argument_skill_references(arguments: Option<&Value>) -> Vec<String> {
@@ -660,6 +838,43 @@ mod tests {
             classify_session_record(AgentKind::Hermes, &hermes.to_string()),
             Some(SessionSignal::Loaded)
         );
+    }
+
+    #[test]
+    fn codex_function_calls_scope_loaded_paths_to_literal_read_commands() {
+        for name in ["exec_command", "functions.exec_command"] {
+            let record = serde_json::json!({"type":"response_item", "payload":{
+                "type":"function_call", "name":name,
+                "arguments":serde_json::json!({"cmd":"cat /skills/research/SKILL.md && echo /skills/other/SKILL.md"}).to_string()
+            }});
+            let observations = session_record_observations(AgentKind::Codex, &record.to_string());
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].signal, SessionSignal::Loaded);
+            assert!(observations[0].record_text.contains("research/SKILL.md"));
+            assert!(!observations[0].record_text.contains("other/SKILL.md"));
+        }
+        let write = serde_json::json!({"type":"response_item", "payload":{
+            "type":"function_call", "name":"exec_command",
+            "arguments":serde_json::json!({"cmd":"cat /tmp/template.md > /skills/research/SKILL.md"}).to_string()
+        }});
+        assert!(session_record_observations(AgentKind::Codex, &write.to_string()).is_empty());
+    }
+
+    #[test]
+    fn fixture_writers_and_prompt_examples_are_not_loaded_reads() {
+        for input in [
+            "await tools.exec_command({cmd: \"python3 - <<'PY'\\nprint('cat /skills/research/SKILL.md')\\nPY\"})",
+            "await tools.exec_command({cmd: \"printf '%s' 'cat /skills/research/SKILL.md' > fixture.json\"})",
+            "// example: cmd: 'cat /skills/research/SKILL.md'\nawait tools.exec_command({cmd: 'true'})",
+            "await tools.exec_command({cmd: `cat ${root}/skills/research/SKILL.md`})",
+            "await tools.exec_command({cmd: 'cat /skills/research/SKILL.md' + '.fixture'})",
+            "await tools.exec_command({cmd: 'cat fixture.json # /skills/research/SKILL.md'})",
+        ] {
+            let record = serde_json::json!({"type":"response_item", "payload":{"type":"custom_tool_call","name":"exec","input":input}});
+            assert!(session_record_observations(AgentKind::Codex, &record.to_string()).is_empty());
+        }
+        let prompt = serde_json::json!({"type":"message","message":{"role":"user","content":[{"type":"text","text":"Example: cat /skills/research/SKILL.md"}]}});
+        assert!(session_record_observations(AgentKind::Pi, &prompt.to_string()).is_empty());
     }
 
     #[test]

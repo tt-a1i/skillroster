@@ -519,3 +519,14 @@ fn adoption_preserves_distinct_content_variants_of_the_same_identity() {
         );
     }
 }
+
+#[test]
+fn shared_adoption_cli_previews_without_changing_agent_files() {
+    let f = Fixture::new();
+    f.ok(&["check"], None);
+    let plan = f.ok(&["plan", "--adopt-shared", "--core-limit", "4"], None);
+    assert_eq!(plan["result"]["state"], "ready");
+    assert!(plan["result"]["receipt_id"].is_null());
+    assert!(f.shared.join("alpha/SKILL.md").is_file());
+    assert_eq!(link(&f.home.join(".codex/skills")), f.shared);
+}

@@ -107,7 +107,7 @@ Show Agent coverage as it progresses, then independent Skill count, placement co
 ### `check` and metadata footprint
 
 `check` is the recommended human first call. Missing, invalidated or
-configuration-drifted Snapshots trigger one read-only Scan and the compact
+configuration- or filesystem-drifted Snapshots trigger one read-only Scan and the compact
 Report; current Snapshots are reused. Show `scanned now` or `reused`, core
 metrics, up to three review Findings and the same Report next steps. JSON adds
 `scan_performed` and retains Snapshot/Report IDs.
@@ -200,14 +200,23 @@ the deterministic confidence floor are omitted instead of filling the first
 view with incidental body-token matches. Empty results are calm, successful
 output. `--load` is an Agent-oriented opt-in that returns the complete verified
 Top-1 `SKILL.md` in JSON after roster, trust, path, 128 KiB transport bound,
-identity, and drift checks. For an unhinted CJK task, load also requires strong
-direct metadata evidence or correlated CJK evidence; otherwise it returns the
-typed `cjk_hint_required_for_weak_match` blocker instead of upgrading a weak
-lexical candidate into complete instructions. A load blocker fails the whole
-command without partial instructions. Find/load never implies activation or
+identity, and drift checks. All loads require specific direct metadata evidence,
+including English calls without hints. Small deterministic aliases and a
+corroborated capability/domain pair permit concise cross-language hints without
+requiring every vendor/suffix token. Generic domain words cannot authorize a
+load. A blocked load fails with no instructions while preserving bounded
+`error.details.retrieval.matches`, the abstention reason and exact Snapshot.
+Find/load never implies activation or
 task success.
 
 ### `plan`
+
+`plan --finding ID [--core-limit N]` previews ordinary large-Roster governance;
+`plan --adopt-shared [--core-limit N]` previews explicit shared adoption. Both
+reuse the existing request validation and never Apply. Check presents these
+entrances; JSON summaries carry the canonical `planning.request_template`.
+Plan help and unknown-field errors name `finding_roster_changes`,
+`finding_library_changes` and `adopt_shared_skills` alongside the raw fields.
 
 The first Report view exposes `plan_available` when a Plan is available and a
 separate `shared_adoption` request template for the explicit adoption choice.
@@ -219,7 +228,11 @@ Show before/after Roster counts, affected Agents and Skills, operation categorie
 
 ### `apply` and `undo`
 
-Human TTY mode repeats the exact Plan or Receipt impact before confirmation. JSON mode never prompts because the calling Agent already obtained user approval. The final summary always includes verification, changed-path count, Receipt ID, and exact Undo availability.
+Human TTY mode repeats the exact Plan or Receipt impact before confirmation.
+Undo aggregates recorded operations, affected counts and the Receipt-only
+boundary; it links to original Plan detail instead of listing internal backup
+paths. Errors known to occur before confirmation report `files_changed: false`
+and human `File changes: none.`. Unknown post-mutation outcomes stay unknown. JSON mode never prompts because the calling Agent already obtained user approval. The final summary always includes verification, changed-path count, Receipt ID, and exact Undo availability.
 
 ### `setup`
 

@@ -255,7 +255,7 @@ Older Snapshots missing these observations require one new Scan.
 - **Routing:** default exposure, searchability, and missing task-to-Skill routes.
 - **Lifecycle:** update drift, stale sources, management state, and archive candidates.
 
-Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large active JSONL files contribute bounded complete-line tails, large monolithic JSON files contribute bounded complete nested objects from their tails, and the fixed byte budget is spread across multiple recent sessions. Reports distinguish missing, inaccessible, sampled-but-limited, and complete observable session roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
+Usage evidence is labeled `observed`, `inferred`, or `unknown`. Missing evidence never becomes proof that a Skill is useless. Raw prompts and responses are parsed read-only in place and are not copied into SkillRoster storage. Recent session selection happens after bounded discovery; large files contribute disjoint beginning, middle and end regions aligned to complete records, and a fair byte allocation prevents a few large recent sessions from exhausting the Agent budget. Read and JSON-parse budgets are independent: at most 250 recent files, 512 MiB read per Agent, 64 MiB per file, 16 MiB parsed per Agent and 500,000 inspected lines. Large samples use a literal Skill/event-marker prefilter; skipped records, parse allocation and unread regions remain typed partial coverage, not a complete denominator. Reports distinguish missing, inaccessible, sampled-but-limited, and complete observable session roots. A usage percentage is emitted only when the observable-session denominator is complete; bounded samples support observed event counts and stages, not an “unused” claim.
 
 New session Scans record every completeness boundary at its trigger point as typed, multi-value Coverage limitations. Each fact freezes its code, root/file/Agent scope, count quality, observed value, active limit, unit, and scanner source; aggregate coverage fields remain compatibility projections. Repeated occurrences aggregate by code within one Agent without persisting session paths, and count quality states whether the reported observation is exact, a lower bound, or unknown. Public Coverage Evidence classifies which unchanged boundaries will recur, which local read failures may resolve, and which roots require verification before a rescan. Scanner caps are not configurable through the CLI. Legacy Snapshots without typed limitations remain `legacy_unknown` and never inherit the current binary's limits or claim a reliable denominator.
 
@@ -488,6 +488,8 @@ skillroster scan [--summary] [--json]
 skillroster report [--summary | --full | --findings [--category <category>] [--severity <severity>] | --finding <id> [--full]] [--limit <n>] [--offset <n>] [--json]
 skillroster find [--hint <text>]... [--limit <n>] [--load] [--variant-skill-id <skill-id>] [--variant-placement-id <placement-id>] [--require-snapshot <scan-id>] [--json] -- <task>
 skillroster plan --stdin [--json]
+skillroster plan --finding <finding-id> [--core-limit <n>] [--json]
+skillroster plan --adopt-shared [--core-limit <n>] [--json]
 skillroster plan --show <plan-id> [--json]
 skillroster apply <plan-id> [--json]
 skillroster undo <receipt-id> [--json]
@@ -516,12 +518,28 @@ persisted Report.
 Findings and typed next actions. It runs a complete read-only Scan only when no
 completed Snapshot exists, mutation/source-permission invalidation requires one,
 or the existing content/native configuration contract detects drift or legacy
-data. Otherwise it reuses the Snapshot and cached Report. It does not watch
-Skill files or expire Snapshots by age; explicit `scan` remains the requested
-refresh path. JSON keeps the versioned envelope with `command: check`,
+data. Otherwise it reuses the Snapshot and cached Report. Reuse compares a bounded filesystem metadata signature over known roots,
+directory entries, links and package files. Added, deleted or modified Skills
+trigger Scan; this is a change detector, not a replacement for byte-level
+verification or a daemon. Incomplete or legacy signatures cannot authorize
+reuse. Explicit `scan` remains available. JSON keeps the versioned envelope with `command: check`,
 `scan_performed`, `snapshot_id`, `report_id`, `primary_metrics` and
 `exposed_metadata_footprint`. Independent Scan/Report behavior is unchanged.
 Snapshot/Report persistence changes only local observation state.
+A pinned MCP `require_snapshot` read validates the existing Snapshot and disk
+signature without refreshing; mismatching IDs retain optimistic-lock errors.
+Project-local `.agents/skills` and `.claude/skills` under the current directory
+produce bounded explicit-selection hints when not already selected. Merely
+seeing these directories reads no contents, adds no roots and grants no
+mutation authority. Their exact argv preserves the executable and state context.
+
+Supported large-Roster Findings in Check/MCP summaries include their bounded
+`planning.request_template` with schema version and Snapshot identity.
+`plan --finding ID` and `plan --adopt-shared` create only the existing immutable
+preview using the same canonical validators as stdin. Apply still requires a
+separate reviewed Plan and user confirmation; stdin help/errors enumerate both
+raw and Finding/shared-adoption request fields.
+
 
 `init` requires human TTY stdin/stdout and rejects `--json` before state
 initialization. It uses Check's freshness decision and the normal Setup Plan,
@@ -812,19 +830,19 @@ verified Top-1 content result. It requires one unambiguous routable identity, a
 current non-Archived roster state, an eligible placement, complete package and
 entrypoint digests from the latest Snapshot, a regular file contained by an
 approved root, valid UTF-8, and at most 128 KiB of raw `SKILL.md` bytes. The
-load also requires direct selection evidence whenever the Agent supplied a
-retrieval hint; weak fused Top-1 overlap remains visible through ordinary Find
-but cannot return complete instructions until the Agent refines the hint. The
-load also abstains when a CJK task has no Agent-authored hint and Top-1 has no
-direct selection evidence. Direct selection requires an exact declared name or
-trigger, complete Skill-name token coverage, an exact description phrase with
-at least two matching tokens, or complete normalized token coverage for one
-task or hint phrase with at least two tokens. Broad
-description-token or CJK bigram overlap may preserve an ordinary lexical
-candidate but cannot authorize
-complete instruction loading. Ordinary Find still returns the bounded lexical
-candidates and its actionable hint warning; the blocked load returns no partial
-instructions. Known incomplete package fingerprints are not automatically classified as
+load requires direct selection evidence for every language and transport, even
+without hints. Exact specific names/triggers and complete meaningful metadata
+phrases remain eligible. A complete pair of capability/domain features can also
+qualify when one task or hint is covered and corroborated by both name and
+positive description/trigger metadata. Small deterministic aliases normalize
+PR/pull request, tech/technical, zh/Chinese and write/writer/writing; vendor
+prefixes and suffixes need not all be guessed. Domain-generic words such as
+skill, agent, ai, tool and workflow cannot supply specificity. This is lexical
+selection evidence, not a semantic relevance or task-success claim.
+Every blocked load retains bounded ranked summaries (at most ten) in
+`error.details.retrieval`, plus its reason, Snapshot ID, counts and truncation.
+No partial Skill instructions are returned. The same-name/content ambiguity,
+trust, path, fingerprint and transport bounds remain unchanged. Known incomplete package fingerprints are not automatically classified as
 Snapshot drift. Scan records a typed `entrypoint_read_error` when an authorized
 bounded entrypoint read fails and does not fabricate an empty-file digest.
 A repeated permission, encoding, or entrypoint-size failure on the same physical

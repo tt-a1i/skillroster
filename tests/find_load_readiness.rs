@@ -25,6 +25,31 @@ fn run(temp: &TempDir, args: &[&str]) -> (bool, Value) {
 }
 
 #[test]
+fn missing_distinguishing_hint_does_not_load_an_unrelated_skill() {
+    let temp = TempDir::new().unwrap();
+    let package = temp.path().join("home/.codex/skills/mysql-tuning");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(package.join("SKILL.md"), "---\nname: mysql-tuning\ndescription: MySQL database query performance\n---\nMySQL instructions\n").unwrap();
+    assert!(run(&temp, &["scan"]).0);
+    let (ok, response) = run(
+        &temp,
+        &[
+            "find",
+            "--hint",
+            "PostgreSQL database query performance",
+            "--load",
+            "--",
+            "优化数据库查询",
+        ],
+    );
+    assert!(!ok, "{response}");
+    assert_eq!(
+        response["error"]["details"]["retrieval"]["matches"][0]["name"],
+        "mysql-tuning"
+    );
+}
+
+#[test]
 fn find_exposes_missing_selection_evidence_and_executable_read_only_recovery() {
     let temp = TempDir::new().unwrap();
     let package = temp.path().join("home/.codex/skills/deployment-helper");

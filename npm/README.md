@@ -1,6 +1,7 @@
 # SkillRoster npm distribution
 
-The v1.9.0 distribution contains one `skillroster` launcher and four exact-version
+The source templates target v1.9.1 (unpublished); the public npm release remains
+v1.9.0. The distribution contains one `skillroster` launcher and four exact-version
 optional binary packages.
 
 ```sh

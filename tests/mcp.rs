@@ -402,3 +402,38 @@ fn required_snapshot_never_silently_scans_before_reading_or_reporting_drift() {
         "find_snapshot_changed"
     );
 }
+
+#[test]
+fn weak_find_load_retains_bounded_candidates_in_mcp_error_details() {
+    let temp = fixture();
+    let path = temp.path().join("home/.codex/skills/general-helper");
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("SKILL.md"), "---\nname: general-helper\ndescription: Work with code and files for everyday tasks\n---\nPRIVATE_GENERIC_INSTRUCTIONS\n").unwrap();
+    let responses = exchange(
+        &temp,
+        [
+            handshake(),
+            vec![call(
+                2,
+                "find_skill",
+                json!({"task":"Please help me inspect files", "load":true}),
+            )],
+        ]
+        .concat(),
+    );
+    let result = &responses[1]["result"];
+    assert_eq!(result["isError"], true);
+    let envelope = &result["structuredContent"];
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "verified_skill_load_blocked");
+    assert_eq!(
+        envelope["error"]["details"]["reason"],
+        "direct_selection_evidence_required"
+    );
+    assert_eq!(
+        envelope["error"]["details"]["retrieval"]["matches"][0]["name"],
+        "general-helper"
+    );
+    assert!(envelope["error"]["details"]["retrieval"]["loaded_skill"].is_null());
+    assert!(!result.to_string().contains("PRIVATE_GENERIC_INSTRUCTIONS"));
+}

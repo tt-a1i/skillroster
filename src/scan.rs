@@ -1,3 +1,6 @@
+mod freshness;
+pub(crate) use freshness::filesystem_fingerprint;
+
 use crate::harness::{
     AgentKind, SessionSignal, SkillDiscoverySemantics, known_agent_roots,
     session_record_observations,
@@ -14,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::time::SystemTime;
@@ -22,14 +25,18 @@ use std::time::UNIX_EPOCH;
 
 // v2 records preserved branch boundaries for disjoint mutable-subset planning.
 pub const HERMES_DISCOVERY_CONTRACT_VERSION: u32 = 2;
-pub const SESSION_PARSE_CONTRACT_VERSION: u32 = 1;
+pub const SESSION_PARSE_CONTRACT_VERSION: u32 = 2;
 pub const CONTENT_IDENTITY_ALGORITHM: &str = "sha256-content-unicode-v2";
 const MAX_REMOTE_PLUGIN_INSTALL_BYTES: u64 = 16 * 1024;
 const MAX_SESSION_DISCOVERY_FILES_PER_ROOT: usize = 10_000;
 const MAX_SESSION_FILES_PER_ROOT: usize = 250;
-const MAX_SESSION_BYTES_PER_AGENT: u64 = 4 * 1024 * 1024;
-const MAX_SESSION_BYTES_PER_FILE: u64 = 512 * 1024;
-const MAX_SESSION_LINES_PER_AGENT: usize = 20_000;
+const MAX_SESSION_BYTES_PER_AGENT: u64 = 512 * 1024 * 1024;
+const MAX_SESSION_BYTES_PER_FILE: u64 = 64 * 1024 * 1024;
+const MAX_SESSION_LINES_PER_AGENT: usize = 500_000;
+const MAX_SESSION_JSON_RECORDS_PER_FILE: usize = 20_000;
+const MAX_SESSION_PARSE_BYTES_PER_AGENT: u64 = 16 * 1024 * 1024;
+
+mod session_sampling;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanOptions {
@@ -384,6 +391,8 @@ pub enum SessionCoverageLimitationCode {
     FilePathNotUnicode,
     JsonExtractionLimit,
     JsonRecordLimit,
+    JsonParseByteLimit,
+    RecordPrefilter,
     LineAlignmentLoss,
 }
 
@@ -516,6 +525,9 @@ impl SessionCoverage {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ScanResult {
+    /// Bounded metadata signature for implicit check/MCP reuse; not content identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_fingerprint: Option<String>,
     /// Invocation scope for implicit Snapshot reuse; absent on legacy scans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_configuration: Option<SnapshotConfiguration>,
@@ -1151,6 +1163,7 @@ fn contained_directory(base: &Path, candidate: &Path) -> Option<PathBuf> {
 
 pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
     require_unicode_scan_options(options)?;
+    let before = filesystem_fingerprint(options);
     let mut result = ScanResult {
         entrypoint_bytes_observed: true,
         hermes_discovery_contract_version: Some(HERMES_DISCOVERY_CONTRACT_VERSION),
@@ -1343,6 +1356,11 @@ pub fn scan(options: &ScanOptions) -> io::Result<ScanResult> {
         }
     }
 
+    let after = filesystem_fingerprint(options);
+    result.filesystem_fingerprint = before.filter(|before| Some(before) == after.as_ref());
+    if result.filesystem_fingerprint.is_none() {
+        result.warnings.push("Filesystem inventory changed during Scan or exceeded the bounded metadata walk; check and unpinned MCP reads will refresh before reuse".into());
+    }
     result.skills.sort_by(|a, b| a.id.cmp(&b.id));
     result.placements.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
@@ -3193,6 +3211,8 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
     let mut lines_observed = 0_usize;
     let mut non_unicode_files_skipped = 0_u64;
     let mut files_with_parse_failures = 0_u64;
+    let mut parsed_bytes = 0_u64;
+    let mut prefiltered_records = 0_u64;
 
     for root in roots {
         let status = match fs::read_dir(root) {
@@ -3315,6 +3335,12 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             );
         }
         files.truncate(MAX_SESSION_FILES_PER_ROOT);
+        let allocations = session_sampling::fair_allocations(
+            &files,
+            MAX_SESSION_BYTES_PER_AGENT.saturating_sub(bytes_observed),
+            MAX_SESSION_BYTES_PER_FILE,
+        );
+        let prefilter = allocations.iter().sum::<u64>() > MAX_SESSION_PARSE_BYTES_PER_AGENT;
         for (index, file) in files.iter().enumerate() {
             let remaining_bytes = MAX_SESSION_BYTES_PER_AGENT.saturating_sub(bytes_observed);
             if remaining_bytes == 0 || lines_observed >= MAX_SESSION_LINES_PER_AGENT {
@@ -3380,10 +3406,10 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 }
             };
             let is_json = file.extension().and_then(|extension| extension.to_str()) == Some("json");
-            let sample_limit = remaining_bytes.min(MAX_SESSION_BYTES_PER_FILE);
-            let file_byte_limit_applies = metadata.len() > MAX_SESSION_BYTES_PER_FILE;
+            let sample_limit = remaining_bytes.min(allocations[index]);
+            let file_byte_limit_applies = metadata.len() > sample_limit;
             let agent_byte_limit_applies =
-                remaining_bytes < MAX_SESSION_BYTES_PER_FILE && remaining_bytes < metadata.len();
+                sample_limit < MAX_SESSION_BYTES_PER_FILE && sample_limit < metadata.len();
             if agent_byte_limit_applies {
                 record_session_limitation(
                     &mut limitations,
@@ -3395,23 +3421,27 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     SessionCoverageLimitationSource::SessionSampling,
                 );
             }
-            let (sample, sample_bytes, alignment_lost) =
-                match read_session_tail_with_facts(file, metadata.len(), sample_limit, !is_json) {
-                    Ok(sample) => sample,
-                    Err(_) => {
-                        coverage.files_skipped += 1;
-                        record_session_limitation(
-                            &mut limitations,
-                            SessionCoverageLimitationCode::FileReadFailure,
-                            SessionCoverageScope::File,
-                            SessionCoverageCountKind::Unknown,
-                            None,
-                            None,
-                            SessionCoverageLimitationSource::SessionSampling,
-                        );
-                        continue;
-                    }
-                };
+            let (samples, sample_bytes, alignment_lost) = match session_sampling::read_windows(
+                file,
+                metadata.len(),
+                sample_limit,
+                !is_json,
+            ) {
+                Ok(sample) => sample,
+                Err(_) => {
+                    coverage.files_skipped += 1;
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::FileReadFailure,
+                        SessionCoverageScope::File,
+                        SessionCoverageCountKind::Unknown,
+                        None,
+                        None,
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
+                    continue;
+                }
+            };
             if alignment_lost {
                 record_session_limitation(
                     &mut limitations,
@@ -3430,7 +3460,7 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                     SessionCoverageScope::File,
                     SessionCoverageCountKind::Exact,
                     Some(sample_bytes),
-                    Some(MAX_SESSION_BYTES_PER_FILE),
+                    Some(sample_limit),
                     SessionCoverageLimitationSource::SessionSampling,
                 );
             }
@@ -3461,44 +3491,67 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
             );
             let source_path_digest = stable_digest(file_identity.as_bytes());
             let mut file_parse_failed = false;
-            let records = if is_json && sample_bytes == metadata.len() {
-                let physical_lines = sample.split_inclusive(|byte| *byte == b'\n').count();
-                vec![(sample, physical_lines)]
-            } else if is_json {
-                let extracted = extract_complete_json_objects_with_facts(&sample);
-                if extracted.extraction_limited {
-                    record_session_limitation(
-                        &mut limitations,
-                        SessionCoverageLimitationCode::JsonRecordLimit,
-                        SessionCoverageScope::File,
-                        SessionCoverageCountKind::LowerBound,
-                        Some(extracted.records.len() as u64),
-                        Some(MAX_SESSION_LINES_PER_AGENT as u64),
-                        SessionCoverageLimitationSource::SessionJson,
-                    );
+            let mut file_parse_bytes = 0_u64;
+            let parse_limit = MAX_SESSION_PARSE_BYTES_PER_AGENT.saturating_sub(parsed_bytes)
+                / files.len().saturating_sub(index).max(1) as u64;
+            let mut extraction_remaining = parse_limit / 2;
+            let mut records = Vec::new();
+            let remaining_jsonl_lines = MAX_SESSION_LINES_PER_AGENT.saturating_sub(lines_observed);
+            for sample in samples {
+                if !is_json && records.len() > remaining_jsonl_lines {
+                    break;
                 }
-                if extracted.parse_boundary {
-                    record_session_limitation(
-                        &mut limitations,
-                        SessionCoverageLimitationCode::JsonExtractionLimit,
-                        SessionCoverageScope::File,
-                        SessionCoverageCountKind::Unknown,
-                        None,
-                        Some(8 * MAX_SESSION_BYTES_PER_FILE),
-                        SessionCoverageLimitationSource::SessionJson,
-                    );
-                }
-                extracted
-                    .records
-                    .into_iter()
-                    .map(|(record, lines)| (record.into_bytes(), lines))
-                    .collect()
-            } else {
-                sample
-                    .split_inclusive(|byte| *byte == b'\n')
-                    .map(|line| (line.to_vec(), 1))
-                    .collect::<Vec<_>>()
-            };
+                let mut chunk_records = if is_json
+                    && sample_bytes == metadata.len()
+                    && sample.len() as u64 <= parse_limit
+                {
+                    let physical_lines = sample.split_inclusive(|byte| *byte == b'\n').count();
+                    vec![(sample, physical_lines)]
+                } else if is_json {
+                    file_partially_observed = true;
+                    coverage.truncated = true;
+                    let extraction_budget = extraction_remaining;
+                    let extracted =
+                        extract_complete_json_objects_with_facts(&sample, extraction_budget);
+                    extraction_remaining =
+                        extraction_remaining.saturating_sub(extracted.parse_bytes);
+                    parsed_bytes = parsed_bytes.saturating_add(extracted.parse_bytes);
+                    file_parse_bytes = file_parse_bytes.saturating_add(extracted.parse_bytes);
+                    if extracted.extraction_limited {
+                        record_session_limitation(
+                            &mut limitations,
+                            SessionCoverageLimitationCode::JsonRecordLimit,
+                            SessionCoverageScope::File,
+                            SessionCoverageCountKind::LowerBound,
+                            Some(extracted.records.len() as u64),
+                            Some(MAX_SESSION_JSON_RECORDS_PER_FILE as u64),
+                            SessionCoverageLimitationSource::SessionJson,
+                        );
+                    }
+                    if extracted.parse_boundary || sample_bytes == metadata.len() {
+                        record_session_limitation(
+                            &mut limitations,
+                            SessionCoverageLimitationCode::JsonExtractionLimit,
+                            SessionCoverageScope::File,
+                            SessionCoverageCountKind::Unknown,
+                            None,
+                            Some(extraction_budget),
+                            SessionCoverageLimitationSource::SessionJson,
+                        );
+                    }
+                    extracted
+                        .records
+                        .into_iter()
+                        .map(|(record, lines)| (record.into_bytes(), lines))
+                        .collect()
+                } else {
+                    session_sampling::bounded_jsonl_records(
+                        &sample,
+                        remaining_jsonl_lines.saturating_sub(records.len()),
+                    )
+                };
+                records.append(&mut chunk_records);
+            }
             for (line, physical_lines) in records {
                 if lines_observed.saturating_add(physical_lines) > MAX_SESSION_LINES_PER_AGENT {
                     file_partially_observed = true;
@@ -3522,6 +3575,40 @@ fn scan_sessions(agent: AgentKind, roots: &[PathBuf], result: &mut ScanResult) {
                 {
                     continue;
                 }
+                if prefilter
+                    && !is_json
+                    && !session_sampling::has_usage_candidate(&line, matcher.as_ref())
+                {
+                    prefiltered_records += 1;
+                    file_partially_observed = true;
+                    coverage.truncated = true;
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::RecordPrefilter,
+                        SessionCoverageScope::Agent,
+                        SessionCoverageCountKind::Exact,
+                        Some(prefiltered_records),
+                        None,
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
+                    continue;
+                }
+                if file_parse_bytes.saturating_add(line.len() as u64) > parse_limit {
+                    file_partially_observed = true;
+                    coverage.truncated = true;
+                    record_session_limitation(
+                        &mut limitations,
+                        SessionCoverageLimitationCode::JsonParseByteLimit,
+                        SessionCoverageScope::File,
+                        SessionCoverageCountKind::LowerBound,
+                        Some(file_parse_bytes.saturating_add(line.len() as u64)),
+                        Some(parse_limit),
+                        SessionCoverageLimitationSource::SessionSampling,
+                    );
+                    continue;
+                }
+                parsed_bytes += line.len() as u64;
+                file_parse_bytes += line.len() as u64;
                 let line = match std::str::from_utf8(&line) {
                     Ok(line) if serde_json::from_str::<serde_json::Value>(line).is_ok() => line,
                     _ => {
@@ -3711,34 +3798,11 @@ const fn limitation_unit(code: SessionCoverageLimitationCode) -> SessionCoverage
         | SessionCoverageLimitationCode::FileByteLimit => SessionCoverageUnit::Bytes,
         SessionCoverageLimitationCode::SampledLineLimit
         | SessionCoverageLimitationCode::LineAlignmentLoss => SessionCoverageUnit::Lines,
-        SessionCoverageLimitationCode::JsonExtractionLimit => SessionCoverageUnit::Bytes,
-        SessionCoverageLimitationCode::JsonRecordLimit => SessionCoverageUnit::Records,
+        SessionCoverageLimitationCode::JsonExtractionLimit
+        | SessionCoverageLimitationCode::JsonParseByteLimit => SessionCoverageUnit::Bytes,
+        SessionCoverageLimitationCode::JsonRecordLimit
+        | SessionCoverageLimitationCode::RecordPrefilter => SessionCoverageUnit::Records,
     }
-}
-
-fn read_session_tail_with_facts(
-    path: &Path,
-    file_bytes: u64,
-    maximum: u64,
-    align_to_line: bool,
-) -> io::Result<(Vec<u8>, u64, bool)> {
-    let mut file = File::open(path)?;
-    let offset = file_bytes.saturating_sub(maximum);
-    file.seek(SeekFrom::Start(offset))?;
-    let mut sample = Vec::with_capacity(maximum as usize);
-    file.take(maximum).read_to_end(&mut sample)?;
-    let bytes_read = sample.len() as u64;
-    let mut alignment_lost = false;
-    if offset != 0 && align_to_line {
-        if let Some(newline) = sample.iter().position(|byte| *byte == b'\n') {
-            alignment_lost = newline > 0;
-            sample.drain(..=newline);
-        } else {
-            alignment_lost = !sample.is_empty();
-            sample.clear();
-        }
-    }
-    Ok((sample, bytes_read, alignment_lost))
 }
 
 #[derive(Default)]
@@ -3746,9 +3810,13 @@ struct JsonExtractionFacts {
     records: Vec<(String, usize)>,
     extraction_limited: bool,
     parse_boundary: bool,
+    parse_bytes: u64,
 }
 
-fn extract_complete_json_objects_with_facts(bytes: &[u8]) -> JsonExtractionFacts {
+fn extract_complete_json_objects_with_facts(
+    bytes: &[u8],
+    maximum_parse_bytes: u64,
+) -> JsonExtractionFacts {
     let mut candidates = Vec::<(usize, usize)>::new();
     // A tail can begin either inside or outside a JSON string. Try both bounded
     // parser states, then retain only the largest non-overlapping valid values.
@@ -3792,7 +3860,7 @@ fn extract_complete_json_objects_with_facts(bytes: &[u8]) -> JsonExtractionFacts
             continue;
         }
         let candidate_bytes = (end - start) as u64;
-        if parse_bytes.saturating_add(candidate_bytes) > 8 * MAX_SESSION_BYTES_PER_FILE {
+        if parse_bytes.saturating_add(candidate_bytes) > maximum_parse_bytes {
             parse_boundary = true;
             continue;
         }
@@ -3803,9 +3871,9 @@ fn extract_complete_json_objects_with_facts(bytes: &[u8]) -> JsonExtractionFacts
         }
     }
     selected.sort_by_key(|(start, _)| *start);
-    let extraction_limited = selected.len() > MAX_SESSION_LINES_PER_AGENT;
+    let extraction_limited = selected.len() > MAX_SESSION_JSON_RECORDS_PER_FILE;
     if extraction_limited {
-        selected.drain(..selected.len() - MAX_SESSION_LINES_PER_AGENT);
+        selected.drain(..selected.len() - MAX_SESSION_JSON_RECORDS_PER_FILE);
     }
     JsonExtractionFacts {
         records: selected
@@ -3820,12 +3888,14 @@ fn extract_complete_json_objects_with_facts(bytes: &[u8]) -> JsonExtractionFacts
             .collect(),
         extraction_limited,
         parse_boundary,
+        parse_bytes,
     }
 }
 
 #[cfg(test)]
 fn extract_complete_json_objects(sample: &str) -> Vec<(String, usize)> {
-    extract_complete_json_objects_with_facts(sample.as_bytes()).records
+    extract_complete_json_objects_with_facts(sample.as_bytes(), MAX_SESSION_PARSE_BYTES_PER_AGENT)
+        .records
 }
 
 #[derive(Default)]
@@ -6083,8 +6153,8 @@ enabled = true
                     "type": "custom_tool_call",
                     "name": "exec",
                     "input": format!(
-                        "await tools.exec_command({{cmd: \"sed -n '1,80p' {}\"}})",
-                        entrypoint.display()
+                        "await tools.exec_command({{cmd: {}}})",
+                        serde_json::to_string(&format!("sed -n '1,80p' '{}'", entrypoint.display())).unwrap()
                     )
                 }
             }),
@@ -6227,7 +6297,7 @@ enabled = true
         )
         .unwrap();
 
-        let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_AGENT as usize + 1];
+        let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_FILE as usize + 1];
         records.push(b'\n');
         records.extend_from_slice(br#"{"type":"load_skill","loaded_skill":"research"}"#);
         records.push(b'\n');
@@ -6349,7 +6419,7 @@ enabled = true
                 format!("---\nname: {name}\ndescription: {name} workflow\n---\n"),
             )
             .unwrap();
-            let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_AGENT as usize + 1];
+            let mut records = vec![b'x'; MAX_SESSION_BYTES_PER_FILE as usize + 1];
             records.push(b'\n');
             records.extend_from_slice(
                 format!(r#"{{"type":"load_skill","loaded_skill":"{name}"}}"#).as_bytes(),
@@ -6380,6 +6450,91 @@ enabled = true
         assert_eq!(result.coverage[0].files_partially_observed, 2);
         assert!(result.coverage[0].bytes_observed <= MAX_SESSION_BYTES_PER_AGENT);
 
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn bounded_sampling_preserves_positive_events_across_many_recent_sessions() {
+        let home = temp_directory("many-positive-sessions");
+        let root = home.join(".codex/sessions");
+        let skill = home.join(".codex/skills/research");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+        let event = "{\"loaded_skill\":\"research\"}\n";
+        let padding = format!("{{\"padding\":\"{}\"}}\n", "x".repeat(1024 * 1024));
+        for index in 0..24 {
+            fs::write(
+                root.join(format!("{index:02}.jsonl")),
+                format!("{event}{padding}{event}{padding}{event}"),
+            )
+            .unwrap();
+        }
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|item| item.agent == AgentKind::Codex)
+            .unwrap();
+        assert_eq!(coverage.files_observed, 24);
+        assert!(coverage.bytes_observed <= MAX_SESSION_BYTES_PER_AGENT);
+        assert!(
+            coverage
+                .limitations
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|fact| fact.code == SessionCoverageLimitationCode::RecordPrefilter)
+        );
+        assert!(!coverage.denominator_is_reliable());
+        assert_eq!(
+            result
+                .usage
+                .iter()
+                .filter(|usage| usage.stage == UsageStage::Loaded)
+                .map(|usage| usage.event_count)
+                .sum::<u64>(),
+            72
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn large_session_retains_head_middle_tail_events_without_joining_giant_lines() {
+        let home = temp_directory("stratified-positive-session");
+        let root = home.join(".codex/sessions");
+        let skill = home.join(".codex/skills/research");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "---\nname: research\n---\n").unwrap();
+        let event = "{\"loaded_skill\":\"research\"}\n";
+        let padding = format!(
+            "{{\"padding\":\"{}\"}}\n",
+            "x".repeat(MAX_SESSION_BYTES_PER_FILE as usize / 2)
+        );
+        fs::write(
+            root.join("large.jsonl"),
+            format!("{event}{padding}{event}{padding}{event}"),
+        )
+        .unwrap();
+        let result = scan(&ScanOptions::for_home(&home)).unwrap();
+        let coverage = result
+            .coverage
+            .iter()
+            .find(|item| item.agent == AgentKind::Codex)
+            .unwrap();
+        assert_eq!(coverage.bytes_observed, MAX_SESSION_BYTES_PER_FILE);
+        assert_eq!(coverage.files_partially_observed, 1);
+        assert!(!coverage.denominator_is_reliable());
+        assert_eq!(
+            result
+                .usage
+                .iter()
+                .filter(|usage| usage.stage == UsageStage::Loaded)
+                .map(|usage| usage.event_count)
+                .sum::<u64>(),
+            3
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -6518,7 +6673,10 @@ enabled = true
         let home = temp_directory("large-monolithic-json");
         let sessions = home.join(".hermes/sessions");
         fs::create_dir_all(&sessions).unwrap();
-        for (name, padding_bytes) in [("research", 5 * 1024 * 1024), ("review", 700 * 1024)] {
+        for (name, padding_bytes) in [
+            ("research", MAX_SESSION_BYTES_PER_FILE as usize + 1),
+            ("review", MAX_SESSION_BYTES_PER_FILE as usize + 2),
+        ] {
             let skill = home.join(".hermes/skills").join(name);
             fs::create_dir_all(&skill).unwrap();
             fs::write(
@@ -6597,7 +6755,7 @@ enabled = true
     fn json_object_extraction_is_bounded_for_many_siblings() {
         let sample = format!("[{}]", vec!["{}"; 100_000].join(","));
         let records = extract_complete_json_objects(&sample);
-        assert_eq!(records.len(), MAX_SESSION_LINES_PER_AGENT);
+        assert_eq!(records.len(), MAX_SESSION_JSON_RECORDS_PER_FILE);
         assert!(
             records
                 .iter()
@@ -6613,11 +6771,11 @@ enabled = true
         fs::write(&path, "discarded-partial\nkept\n").unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
-        let (sample, bytes_read, alignment_lost) =
-            read_session_tail_with_facts(&path, metadata.len(), 10, true).unwrap();
+        let (samples, bytes_read, alignment_lost) =
+            session_sampling::read_windows(&path, metadata.len(), 10, true).unwrap();
 
         assert_eq!(bytes_read, 10);
-        assert_eq!(sample, b"kept\n");
+        assert!(samples.iter().all(Vec::is_empty));
         assert!(alignment_lost);
         fs::remove_dir_all(home).unwrap();
     }

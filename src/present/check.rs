@@ -53,6 +53,27 @@ pub(super) fn render(value: &Value, lines: &mut Vec<String>, width: usize) {
         ],
         width,
     );
+    if let Some(roots) = value["project_local_skill_roots"]
+        .as_array()
+        .filter(|roots| !roots.is_empty())
+    {
+        fact_items(
+            lines,
+            "Project Skills",
+            roots
+                .iter()
+                .take(2)
+                .map(|root| {
+                    middle_truncate(
+                        &format!("{}: {}", text(root, "agent"), text(root, "path")),
+                        width.saturating_sub(24),
+                    )
+                })
+                .collect(),
+            width,
+        );
+        lines.push("Not included; choose --root AGENT=PATH to inspect.".into());
+    }
     lines.push("Scope: local files; session catalog unobserved.".into());
     lines.push("Missing usage is unknown, not unused.".into());
     lines.push(String::new());
@@ -106,8 +127,15 @@ pub(super) fn render(value: &Value, lines: &mut Vec<String>, width: usize) {
             lines.push("Review exact external paths before permitting reads.".into());
         }
     }
+    if let Some(id) = findings
+        .iter()
+        .find(|finding| finding["planning"]["request_template"].is_object())
+        .and_then(|finding| finding["id"].as_str())
+    {
+        lines.push(format!("Preview: plan --finding {id}"));
+    }
     if value["shared_adoption"].is_object() {
-        lines.push("Shared Skills: explicit adoption preview in report --full.".into());
+        lines.push("Shared Skills preview: skillroster plan --adopt-shared".into());
     }
     lines.push(format!("Report: {}", text(value, "report_id")));
     lines.extend(summary(

@@ -69,7 +69,7 @@ pub enum Command {
     Report(ReportArgs),
     /// Rank locally known Skills for a task without activating them.
     Find(FindArgs),
-    /// Validate an Agent-authored immutable Plan from stdin.
+    /// Preview a Finding or shared adoption, or validate a JSON Plan from stdin.
     Plan(PlanArgs),
     /// Apply one previously validated Plan.
     Apply(IdArgs),
@@ -248,12 +248,28 @@ fn parse_non_empty_task(value: &str) -> Result<String, String> {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_long_help = "JSON requests accept finding_roster_changes, finding_library_changes, or adopt_shared_skills, as well as raw governance fields. Use a request_template from check or report."
+)]
 pub struct PlanArgs {
-    #[arg(long, default_value_t = true)]
+    /// Read a schema_version 1 JSON request from stdin (the default).
+    #[arg(long, conflicts_with_all = ["show", "finding", "adopt_shared", "core_limit"])]
     pub stdin: bool,
 
+    /// Preview the complete Roster change for this current Finding.
+    #[arg(long, value_name = "FINDING_ID", conflicts_with_all = ["show", "adopt_shared"])]
+    pub finding: Option<String>,
+
+    /// Preview explicit adoption of the observed shared Skills.
+    #[arg(long, conflicts_with_all = ["show", "finding"])]
+    pub adopt_shared: bool,
+
+    /// Maximum Core Skills per affected Agent (default: 50 for a Finding, 15 for shared adoption).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=50))]
+    pub core_limit: Option<u16>,
+
     /// Show the complete stored representation of an immutable Plan.
-    #[arg(long, value_name = "PLAN_ID")]
+    #[arg(long, value_name = "PLAN_ID", conflicts_with = "core_limit")]
     pub show: Option<String>,
 }
 

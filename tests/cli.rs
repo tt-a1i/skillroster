@@ -1612,6 +1612,18 @@ fn scan_summary_preserves_report_facts_and_bounds_agent_context() {
             row.get(0)
         })
         .unwrap();
+    let mut full_payload: Value = serde_json::from_str(&full_payload).unwrap();
+    let mut summary_payload: Value = serde_json::from_str(&summary_payload).unwrap();
+    // Freshness binds the active state directory's Library root. These Scans
+    // deliberately use different state directories, so only their inventory
+    // facts, not their scope-bound metadata signatures, must be identical.
+    for payload in [&mut full_payload, &mut summary_payload] {
+        assert!(payload["filesystem_fingerprint"].is_string());
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("filesystem_fingerprint");
+    }
     assert_eq!(summary_payload, full_payload);
 
     let mut full_report_result = full_report["result"].clone();
@@ -2321,7 +2333,7 @@ fn find_load_abstains_from_a_weak_unhinted_cross_language_match() {
     ));
     assert_eq!(
         unhinted["result"]["matches"][0]["name"],
-        "request-refactor-plan"
+        "github-code-review"
     );
     assert!(
         unhinted["result"]["warnings"]
@@ -4871,6 +4883,14 @@ fn untrusted_same_name_variants_route_to_source_confirmation_without_a_rescan_lo
         "same_name_variants_ambiguous"
     );
     assert!(blocked_load["error"]["details"].get("content").is_none());
+    assert_eq!(
+        blocked_load["error"]["details"]["retrieval"]["matches"][0]["variant_finding"]["argv"],
+        context_action_argv(
+            &home,
+            &state,
+            &["report", "--finding", finding_id, "--json"]
+        ),
+    );
 
     let repeated_scan = json_output(&run(&[&common[..], &["scan"]].concat(), None));
     let repeated_report = json_output(&run(&[&common[..], &["report"]].concat(), None));
@@ -7667,7 +7687,15 @@ fn suggested_scan_refreshes_inventory_after_verified_apply() {
     let found = json_output(&run(
         &[
             &common[..],
-            &["find", "help me govern skills", "--load", "--limit", "1"],
+            &[
+                "find",
+                "help me govern skills",
+                "--hint",
+                "skillroster",
+                "--load",
+                "--limit",
+                "1",
+            ],
         ]
         .concat(),
         None,

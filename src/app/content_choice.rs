@@ -185,6 +185,7 @@ pub(super) fn select_top_match_variant(
         expected_digest: None,
         actual_digest: None,
         retry_argv: None,
+        retrieval: None,
     };
     if requested_skill_id.is_none() && requested_placement_id.is_none() {
         return Ok(ranked.clone());

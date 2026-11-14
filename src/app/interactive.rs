@@ -18,7 +18,8 @@ pub(super) fn init_command(
     args: &crate::cli::InitArgs,
     state_lock: &change::StateLock,
 ) -> Result<(Value, Vec<SuggestedAction>)> {
-    inspection::ensure_snapshot(store, home, state_dir, roots, source_roots)?;
+    inspection::ensure_snapshot(store, home, state_dir, roots, source_roots)
+        .map_err(error::before_mutation)?;
     let mut setup = setup_command_for_agent(
         store,
         home,
@@ -26,14 +27,15 @@ pub(super) fn init_command(
         args.modified_choice,
         false,
         args.agent,
-    )?;
+    )
+    .map_err(error::before_mutation)?;
     let Some(id) = setup["plan_id"].as_str() else {
         return Ok((setup, vec![]));
     };
     eprintln!("{}\n", crate::present::human("setup", &setup));
     eprintln!("{}\n", human_plan_preview(store, id)?);
     // Exact stored operations are shown before the single human confirmation.
-    let detail = plan_detail_command(store, id)?;
+    let detail = plan_detail_command(store, id).map_err(error::before_mutation)?;
     for operation in detail["operations"].as_array().into_iter().flatten() {
         eprintln!(
             "  {}: {}",
@@ -44,7 +46,7 @@ pub(super) fn init_command(
             eprintln!("    from: {source}");
         }
     }
-    if !confirm(&format!("Apply Bootstrap Plan {id}?"))? {
+    if !confirm(&format!("Apply Bootstrap Plan {id}?")).map_err(error::before_mutation)? {
         setup["status"] = json!("cancelled");
         return Ok((setup, vec![]));
     }

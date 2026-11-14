@@ -138,6 +138,16 @@ impl ActionContext {
                 }
             }
             "report" | "check" => {
+                for root in result
+                    .get_mut("project_local_skill_roots")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(argv) = root.get_mut("argv") {
+                        self.apply_json_argv(argv);
+                    }
+                }
                 if let Some(choice) = result.pointer_mut("/resolution/content_choice") {
                     self.apply_content_choice(choice);
                 }

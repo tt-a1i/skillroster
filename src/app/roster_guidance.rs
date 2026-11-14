@@ -1,5 +1,34 @@
 use super::*;
 
+pub(super) fn plan_from_finding_or_shared(
+    store: &StateStore,
+    state_dir: &Path,
+    args: &crate::cli::PlanArgs,
+    argv_prefix: &[String],
+) -> Result<Value> {
+    let budget = args
+        .core_limit
+        .unwrap_or(if args.finding.is_some() { 50 } else { 15 });
+    let input = if let Some(id) = &args.finding {
+        json!({"schema_version": 1, "finding_roster_changes": [{
+            "finding_id": id, "core_budget": budget, "protected_skill_ids": []
+        }]})
+    } else {
+        let (scan_id, _): (ScanId, ScanResult) = latest_scan(store)?;
+        json!({"schema_version": 1, "scan_id": scan_id,
+            "adopt_shared_skills": {"core_budget": budget, "protected_skill_ids": []}})
+    };
+    prepare_plan(
+        store,
+        state_dir,
+        input,
+        PlanOrigin::Agent,
+        None,
+        argv_prefix,
+        None,
+    )
+}
+
 #[derive(Clone, Copy)]
 struct FindingRosterPlanningOptions {
     full: bool,
@@ -481,7 +510,19 @@ fn finding_roster_planning_impl(
         })));
     }
     if decision_facts_only {
-        return Ok(Some(json!({"supported": true})));
+        return Ok(Some(json!({
+            "supported": true,
+            "reason": "large_default_roster",
+            "snapshot_id": scan_id,
+            "request_template": {
+                "schema_version": 1,
+                "finding_roster_changes": [{
+                    "finding_id": finding.id,
+                    "core_budget": crate::roster_recommendation::MAX_CORE_BUDGET,
+                    "protected_skill_ids": []
+                }]
+            }
+        })));
     }
     Ok(Some(json!({
         "supported": true,

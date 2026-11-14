@@ -808,3 +808,77 @@ fn init_discards_split_escape_and_arrow_sequences_before_returning_to_the_shell(
         );
     }
 }
+
+#[test]
+fn check_template_and_human_finding_preview_make_read_only_plans() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    for index in 0..51 {
+        let name = format!("skill{index:02}");
+        skill(
+            &home,
+            &format!(".codex/skills/{name}"),
+            format!("---\nname: {name}\ndescription: Unique capability {index}\n---\nBody\n"),
+        );
+    }
+    let check = run(&temp, &["check"], None);
+    let finding = check["result"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| {
+            finding["kind"] == "large_default_roster"
+                && finding["actionability"] == "plan_available"
+        })
+        .unwrap();
+    let template = &finding["planning"]["request_template"];
+    assert_eq!(template["schema_version"], 1);
+    assert_eq!(
+        finding["planning"]["snapshot_id"],
+        check["result"]["snapshot_id"]
+    );
+    let from_template = run(&temp, &["plan", "--stdin"], Some(template.clone()));
+    assert_eq!(from_template["result"]["state"], "ready");
+    let id = finding["id"].as_str().unwrap();
+    let preview = run(&temp, &["plan", "--finding", id, "--core-limit", "5"], None);
+    assert_eq!(preview["result"]["state"], "ready");
+    assert!(home.join(".codex/skills/skill00/SKILL.md").is_file());
+    assert!(preview["result"]["receipt_id"].is_null());
+
+    let invalid = command(&temp)
+        .args(["plan", "--finding", id, "--adopt-shared"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    let help = command(&temp).args(["plan", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    for field in [
+        "finding_roster_changes",
+        "finding_library_changes",
+        "adopt_shared_skills",
+    ] {
+        assert!(help.contains(field), "{help}");
+    }
+    let mut child = command(&temp)
+        .args(["--json", "plan", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"schema_version":1,"typo":true}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stdout);
+    for field in [
+        "finding_roster_changes",
+        "finding_library_changes",
+        "adopt_shared_skills",
+    ] {
+        assert!(message.contains(field), "{message}");
+    }
+}
